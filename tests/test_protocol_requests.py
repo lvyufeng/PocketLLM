@@ -137,3 +137,25 @@ def test_build_chat_request_rejects_invalid_messages(messages):
             {"messages": messages},
             SamplingParams(max_tokens=1),
         )
+
+
+def test_add_generation_prompt_is_carried_only_when_a_request_overrides_it():
+    """The flag decides whether the prompt ends with the assistant header the model answers into.
+
+    Carried only when it overrides the default, which is what every backend already does -- the same
+    way ``reasoning_effort`` and ``tools`` are -- so a request that does not mention it carries no
+    extra key and a backend reads the flag with a default of true. A completion carries none either
+    way: its prompt is literal text with no template to add an assistant header to.
+    """
+    default = build_chat_request({"messages": [{"role": "user", "content": "hi"}]})
+    assert "add_generation_prompt" not in default.metadata
+
+    off = build_chat_request(
+        {"messages": [{"role": "user", "content": "hi"}], "add_generation_prompt": False}
+    )
+    assert off.metadata["add_generation_prompt"] is False
+
+    from pocketllm.protocol import build_completion_request
+
+    completion = build_completion_request({"prompt": "raw"})
+    assert "add_generation_prompt" not in completion.metadata

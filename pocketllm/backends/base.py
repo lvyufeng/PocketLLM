@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 from pocketllm.api import (
@@ -16,6 +16,7 @@ from pocketllm.api import (
     TensorParallelSupervisorError,
     TokenEvent,
 )
+from pocketllm.protocol.contract import CHAT, FieldRefusal
 
 
 #: What a byte-level tokenizer's decode puts where a token ended inside a character.
@@ -104,6 +105,28 @@ class BackendBase:
     def active_request_count(self) -> int:
         with self._state_lock:
             return len(self._active_requests)
+
+    def audit_request(self, body: Mapping[str, Any], *, endpoint: str = CHAT) -> FieldRefusal | None:
+        """The first field in ``body`` this backend cannot serve, or ``None``.
+
+        A field the runtime will not apply, sent with a value that would have changed the answer,
+        has to be refused by name: answering it with a 200 and text generated as if the field were
+        absent is a response the caller has no way to tell from the one it asked for. The refusal
+        says what arrived, what the server does instead, and what the caller can do -- all four
+        parts, because a caller who cannot tell "dropped" from "ignored" from "wrong spelling" has
+        to read the source to find out.
+
+        Shape is not this method's business. It is checked for every request before this runs,
+        because a ``stop`` of ``5`` is wrong on every runtime; what is left here is the question
+        only the backend can answer.
+
+        ``None`` by default, and deliberately: a runtime that has not stated which fields it applies
+        has no claim to hold a request to, and refusing every field in the table for every adapter
+        that has not been audited would replace a silent ignore with a blanket refusal. The C++
+        adapter is the one that declares -- it is the runtime whose own front end is being retired,
+        so its contract is the one being carried over.
+        """
+        return None
 
     def metrics(self) -> dict[str, float]:
         """Metric values the engine owns, as ``name -> value``, for the server's exporter.

@@ -854,13 +854,20 @@ def test_invalid_eos_override_is_rejected() -> None:
 
 
 def test_cpp_backend_rejects_unexposed_sampling_controls() -> None:
+    """A temperature this engine cannot apply is refused by name, not generated as if greedy.
+
+    The engine built here is the serialized session's, whose sampler is fixed at what the adapter
+    constructed it with; asking for 0.5 and getting greedy text back is the failure the refusal
+    exists to prevent. The message names the field and the value the engine would use instead, so a
+    caller can act on it without reading this test.
+    """
     backend, _ = make_backend()
     request = GenerationRequest(
         prompt_tokens=[1],
         sampling_params=SamplingParams(max_tokens=1, temperature=0.5),
     )
 
-    with pytest.raises(UnsupportedFeatureError, match="greedy"):
+    with pytest.raises(UnsupportedFeatureError, match='"temperature" = 0.5'):
         backend.generate([request])
 
 
@@ -1181,4 +1188,319 @@ def test_the_stream_sends_reasoning_as_its_own_field(tmp_path) -> None:
     # The answer a stream sends equals the answer the unstreamed path returns, which is what makes
     # the two routes comparable at all. The marker itself belongs to neither field.
     assert "".join(event.text for event in events) == "done"
+    backend.close()
+
+
+# --------------------------------------------------------------------------------------------------
+# The request surface the native front end answered
+# --------------------------------------------------------------------------------------------------
+
+
+def test_a_stop_sequence_cuts_the_answer_the_engine_returned(tmp_path) -> None:
+    """`stop` is matched here, not in the engine: the scheduler cannot see a text-level sequence.
+
+    The native server truncated the decoded text and reported "stop" for it, so a client asking the
+    same thing of the same engine gets the same completion out of either front end. The engine's run
+    is untouched -- it goes to its budget, because a sequence the sampler never sees cannot end one --
+    which is why the budget below is "length" and the answer's reason is still "stop".
+    """
+    backend = _scripted_backend(
+        _declaring_checkpoint(tmp_path, "qwen3_5"), "the answer USER: more", finish_reason="length"
+    )
+    try:
+        result = backend.generate([
+            GenerationRequest(
+                prompt_tokens=[1, 2],
+                request_id="req-stop",
+                sampling_params=SamplingParams(max_tokens=8, stop=["USER:"]),
+                metadata={"messages": [{"role": "user", "content": "hi"}]},
+            )
+        ])[0]
+    finally:
+        backend.close()
+
+    assert result.text == "the answer "
+    assert result.finish_reason == "stop"
+    # The tokens are what the engine executed, so they are not cut with the text: `usage` reports the
+    # steps that were really taken, which is the pair the native server reported.
+    assert result.token_ids == [1, 2, 3]
+    assert result.usage.completion_tokens == 3
+
+
+def test_a_stop_sequence_is_applied_before_the_answer_is_read(tmp_path) -> None:
+    """The cut comes first, so a sequence that stops before a call does not leave a call behind.
+
+    This is the order `openai_server.cpp` used, and the difference only shows when the answer is
+    both text and markup: reading the whole decode first would find the call, report it, and send
+    `finish_reason: "tool_calls"` -- telling a client to run a function it had asked to stop short
+    of. Reading the cut instead finds no call, which is what the client asked for.
+    """
+    backend = _scripted_backend(
+        _declaring_checkpoint(tmp_path, "qwen3_5"),
+        "Paris is nice" + QWEN_CALL,
+        finish_reason="length",
+    )
+    try:
+        result = backend.generate([
+            GenerationRequest(
+                prompt_tokens=[1, 2],
+                request_id="req-stop-before-call",
+                sampling_params=SamplingParams(max_tokens=8, stop=["<tool_call>"]),
+                metadata={
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [QWEN_TOOL],
+                    "thinking_mode": "chat",
+                },
+            )
+        ])[0]
+    finally:
+        backend.close()
+
+    assert result.text == "Paris is nice"
+    assert result.finish_reason == "stop"
+    assert "tool_calls" not in result.metadata
+
+
+def test_a_stream_ends_at_a_stop_sequence() -> None:
+    """A stop sequence ends the stream, rather than the budget ending it three tokens later.
+
+    The scheduler still runs to `max_tokens` -- it has no way to see a text-level sequence -- so the
+    run is abandoned here instead. The tokens already sent are the answer up to the sequence, and
+    `usage` counts the steps that produced them rather than the budget.
+    """
+    backend = CppBackend(
+        EngineArgs(model="model", backend="cpp"),
+        engine=FakeEngine(),
+        tokenizer=RunningTextTokenizer(["ans", "answer", "answer USER:", "answer USER: x"]),
+    )
+    request = GenerationRequest(
+        prompt_tokens=[1],
+        request_id="req-stop-stream",
+        sampling_params=SamplingParams(max_tokens=8, stop=["USER:"]),
+    )
+
+    events = list(backend.stream(request))
+
+    assert [event.text for event in events] == ["ans", "wer", " "]
+    assert [event.finish_reason for event in events] == [None, None, "stop"]
+    assert "".join(event.text for event in events) == "answer "
+    assert events[-1].usage is not None
+    assert events[-1].usage.completion_tokens == 3
+    # The stop token is the one the sequence was found in, and nothing was decoded after it.
+    assert backend._engine.calls == [
+        ("prefill", [1]),
+        ("decode_step", 10),
+        ("decode_step", 11),
+    ]
+    backend.close()
+
+
+def test_a_stream_withholds_a_tail_that_could_become_a_stop_sequence() -> None:
+    """A prefix of a sequence waits for the token that decides it, then goes out whole.
+
+    A stream cannot take a character back, so "U" is not "U" until the next token says whether it
+    was the start of "USER:". The withheld tail is not lost: this one turns out not to be a
+    sequence at all, and it is sent with the token that settles it.
+    """
+    backend = CppBackend(
+        EngineArgs(model="model", backend="cpp"),
+        engine=FakeEngine(),
+        tokenizer=RunningTextTokenizer(["hello U", "hello US", "hello USR"]),
+    )
+    request = GenerationRequest(
+        prompt_tokens=[1],
+        request_id="req-stop-prefix",
+        sampling_params=SamplingParams(max_tokens=3, stop=["USER:"]),
+    )
+
+    events = list(backend.stream(request))
+
+    assert [event.text for event in events] == ["hello ", "", "USR"]
+    assert [event.finish_reason for event in events] == [None, None, "length"]
+    assert "".join(event.text for event in events) == "hello USR"
+    backend.close()
+
+
+def test_choices_are_refused_by_name_rather_than_answered_with_one(tmp_path) -> None:
+    """`n` is the host's to fan out, and it is not there yet, so more than one choice is refused.
+
+    Answering a request for four choices with one is the response the field contract exists to
+    prevent: a client that asked for four independent samples has no way to tell that it got one.
+    The refusal names the field, so it lands in OpenAI's `param` slot.
+    """
+    backend = _scripted_backend(_declaring_checkpoint(tmp_path, "qwen3_5"), "x")
+    try:
+        refusal = backend.audit_request({"n": 4})
+        assert refusal is not None
+        assert refusal.field == "n"
+        assert refusal.requested == "4"
+        assert '"n"' in refusal.message
+        # One choice is what this server does anyway, so the default costs a client nothing.
+        assert backend.audit_request({"n": 1}) is None
+        assert backend.audit_request({}) is None
+    finally:
+        backend.close()
+
+
+def test_the_typed_surface_is_audited_by_the_same_contract(tmp_path) -> None:
+    """`LLM.chat` never produces a body, and a field set on it is more visible than a JSON key.
+
+    One policy, two spellings: the typed request is mapped back onto the body keys the audit reads,
+    so the library surface cannot disagree with the HTTP one about what this backend serves.
+    """
+    backend = _scripted_backend(_declaring_checkpoint(tmp_path, "qwen3_5"), "x")
+    try:
+        for params, expected in (
+            (SamplingParams(n=3), '"n" = 3'),
+            (SamplingParams(logprobs=True), '"logprobs" = true'),
+            (SamplingParams(min_p=0.1), '"min_p" = 0.1'),
+            (SamplingParams(repetition_penalty=1.2), '"repetition_penalty" = 1.2'),
+            (SamplingParams(temperature=0.7), '"temperature" = 0.7'),
+        ):
+            request = GenerationRequest(
+                prompt_tokens=[1], request_id="req-typed", sampling_params=params
+            )
+            with pytest.raises(UnsupportedFeatureError, match=expected):
+                backend.generate([request])
+        # The defaults and the stop sequences this backend does serve are not refused.
+        backend.generate([
+            GenerationRequest(
+                prompt_tokens=[1],
+                request_id="req-typed-ok",
+                sampling_params=SamplingParams(
+                    max_tokens=1, stop=["USER:"], top_p=1.0, n=1, logprobs=False
+                ),
+            )
+        ])
+    finally:
+        backend.close()
+
+
+def test_add_generation_prompt_false_reaches_the_prompt_builder() -> None:
+    """The native front end's field, which had no way through this adapter before.
+
+    A request that asked to encode the conversation as it stands -- no assistant header after the
+    last message -- was answered as if it had asked for the header, because the builder was called
+    with the template's own default and nothing could override it.
+    """
+    tokenizer = TemplateTokenizer()
+    backend, _ = make_backend()
+    backend._tokenizer = tokenizer
+    request = GenerationRequest(
+        prompt="user: hi",
+        request_id="req-no-assistant-header",
+        sampling_params=SamplingParams(max_tokens=1),
+        metadata={
+            "messages": [{"role": "user", "content": "hi"}],
+            "add_generation_prompt": False,
+        },
+    )
+
+    assert backend._prompt_ids(request) == [71, 72]
+    assert tokenizer.template_calls[0][1]["add_generation_prompt"] is False
+    backend.close()
+
+
+def test_a_stop_sequence_inside_the_reasoning_block_does_not_end_the_answer(tmp_path) -> None:
+    """`stop` ends the answer, and on a chat request the reasoning block is not part of it.
+
+    The sequences clients actually use are the ones this matters for: `"\\n\\n"` is common and a
+    reasoning block is full of blank lines, so matching the whole decode would end the answer before
+    the model had written any of it -- and the client would read that as an empty answer rather than
+    as a truncated one. The block is a separate field whose text is not the completion.
+    """
+    backend = _scripted_backend(
+        _declaring_checkpoint(tmp_path, "qwen3_5"),
+        "weighing USER: it up</think>the answer USER: and more",
+        finish_reason="length",
+    )
+    try:
+        result = backend.generate([
+            GenerationRequest(
+                prompt_tokens=[1, 2],
+                request_id="req-stop-reasoning",
+                sampling_params=SamplingParams(max_tokens=8, stop=["USER:"]),
+                metadata={
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "thinking_mode": "thinking",
+                },
+            )
+        ])[0]
+    finally:
+        backend.close()
+
+    assert result.metadata["reasoning_content"] == "weighing USER: it up"
+    assert result.text == "the answer "
+    assert result.finish_reason == "stop"
+
+
+def test_a_stop_sequence_inside_a_call_leaves_no_call_behind(tmp_path) -> None:
+    """A call the client asked to stop short of is not a call it should act on.
+
+    The parse is all-or-nothing, so handing it the truncated text is what makes "a reported call is
+    complete" hold: half a call read as a whole one would have a client run a function with
+    arguments the model never finished writing.
+    """
+    backend = _scripted_backend(
+        _declaring_checkpoint(tmp_path, "qwen3_5"),
+        QWEN_CALL + "trailing",
+        finish_reason="length",
+    )
+    try:
+        result = backend.generate([
+            GenerationRequest(
+                prompt_tokens=[1, 2],
+                request_id="req-stop-inside-call",
+                sampling_params=SamplingParams(max_tokens=8, stop=["</parameter>"]),
+                metadata={
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [QWEN_TOOL],
+                    "thinking_mode": "chat",
+                },
+            )
+        ])[0]
+    finally:
+        backend.close()
+
+    assert "tool_calls" not in result.metadata
+    assert result.finish_reason == "stop"
+    assert "</parameter>" not in result.text
+    assert result.text.startswith("<tool_call>")
+
+
+def test_a_stream_does_not_end_on_a_sequence_inside_the_reasoning_block() -> None:
+    """The streaming reading of the same rule: the block's text is not the completion.
+
+    A client watching `reasoning_content` sees a sequence there in full and the answer still
+    arrives, which is the one place the two fields are visibly independent rather than two views of
+    one string.
+    """
+    backend = CppBackend(
+        EngineArgs(model="model", backend="cpp"),
+        engine=FakeEngine(),
+        tokenizer=RunningTextTokenizer(
+            [
+                "USER: thinking",
+                "USER: thinking</think>",
+                "USER: thinking</think>the answer",
+                "USER: thinking</think>the answer USER:",
+            ]
+        ),
+    )
+    request = GenerationRequest(
+        prompt_tokens=[1],
+        request_id="req-stream-reasoning-stop",
+        sampling_params=SamplingParams(max_tokens=4, stop=["USER:"]),
+        metadata={
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_mode": "thinking",
+        },
+    )
+
+    events = list(backend.stream(request))
+
+    assert [event.text for event in events] == ["", "", "the answer", " "]
+    assert [event.finish_reason for event in events] == [None, None, None, "stop"]
+    assert "".join(event.text for event in events) == "the answer "
+    assert [event.metadata.get("reasoning_content") for event in events][0] == "USER: thinking"
     backend.close()

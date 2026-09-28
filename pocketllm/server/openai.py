@@ -26,6 +26,7 @@ from pocketllm.api import (
     UnsupportedFeatureError,
 )
 from pocketllm.protocol import build_chat_request, build_completion_request
+from pocketllm.protocol.contract import CHAT, COMPLETIONS, FieldRefusal, audit_shape
 
 from .metrics import Metrics
 
@@ -36,6 +37,24 @@ def _json_bytes(obj: Any) -> bytes:
 
 def _openai_error(message: str, error_type: str = "invalid_request_error") -> dict[str, Any]:
     return {"error": {"message": message, "type": error_type}}
+
+
+def _field_refusal_error(refusal: FieldRefusal) -> dict[str, Any]:
+    """The 400 body for a field this server will not serve.
+
+    ``param`` is what makes the refusal machine-readable, and it is the reason the field's name
+    travels beside its message rather than being parsed back out of it: a client that can see which
+    parameter to change does not have to read English to act. The same spelling OpenAI uses for the
+    errors its own validators raise.
+    """
+    return {
+        "error": {
+            "message": refusal.message,
+            "type": "invalid_request_error",
+            "param": refusal.field,
+            "code": "unsupported_feature",
+        }
+    }
 
 
 def _result_response(result: GenerationResult, model: str, request_id: str) -> dict[str, Any]:
@@ -264,6 +283,20 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         try:
             completion = path == "/v1/completions"
             body = self._read_body()
+            endpoint = COMPLETIONS if completion else CHAT
+            # Two audits, and the split is deliberate. Shape is the host's: `"n": 2.5` is not a
+            # number of choices on any runtime, and the check is the same cheap JSON inspection
+            # wherever the request lands. Capability is the backend's, because whether the answer
+            # applies a field depends on the runtime and, for the C++ one, on the engine under it.
+            # Both run before dispatch, so a request this server will not serve is refused with a
+            # 400 naming the field rather than streamed halfway and then abandoned.
+            refusal = audit_shape(body, endpoint=endpoint)
+            if refusal is None:
+                refusal = server.backend.audit_request(body, endpoint=endpoint)
+            if refusal is not None:
+                server.metrics.inc("request_errors_total")
+                self._send_json(400, _field_refusal_error(refusal))
+                return
             request = self._request(body, completion=completion)
             if bool(body.get("stream", False)):
                 self._stream(request, started=started, completion=completion)

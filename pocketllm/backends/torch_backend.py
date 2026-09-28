@@ -224,6 +224,7 @@ class TorchBackend(SchedulerHost, BackendBase):
                 thinking_mode=str(request.metadata.get("thinking_mode", "chat")),
                 reasoning_effort=request.metadata.get("reasoning_effort"),
                 tools=request.metadata.get("tools"),
+                add_generation_prompt=bool(request.metadata.get("add_generation_prompt", True)),
                 # The current Torch runtime is the DeepSeek runtime; use its
                 # validated encoder when the checkpoint has no HF template.
                 deepseek_fallback=True,

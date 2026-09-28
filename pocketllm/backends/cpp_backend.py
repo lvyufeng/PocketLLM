@@ -12,7 +12,8 @@ import json
 import os
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from pocketllm.api import (
@@ -29,10 +30,16 @@ from pocketllm.api import (
     Usage,
     UnsupportedFeatureError,
 )
-from pocketllm.protocol import encode_chat_prompt, normalize_tool_calls, render_fallback_prompt
+from pocketllm.protocol import (
+    apply_stop_to_text,
+    encode_chat_prompt,
+    normalize_tool_calls,
+    render_fallback_prompt,
+)
+from pocketllm.protocol.contract import CHAT, FieldRefusal, ServedFields, audit as audit_body
 from pocketllm.protocol.templating import build_templater, detect_architecture
 
-from .base import BackendBase, settled_text
+from .base import BackendBase, hold_back, settled_text
 from .capabilities import declared_capabilities
 from .runtime_engine import card_for_rank, visible_card_count
 
@@ -216,6 +223,179 @@ def _strip_terminal_stop_token(result: Any) -> list[int]:
     if bool(getattr(result, "constraint_completed", False)):
         return tokens
     return tokens[:-1]
+
+
+#: The sampling values the adapter constructs the engine with. They are the engine's effective
+#: values on any path where it cannot be asked -- see :func:`_engine_sampling_refusal`.
+_ENGINE_SAMPLING_DEFAULTS = {
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 20,
+    "sampling_seed": 0,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _EngineSampling:
+    """What an engine applies on its own, in the terms the sampling checks ask in.
+
+    Read off the engine's capability object when there is one to ask, which is the only thing that
+    knows what this build can vary per request. The serialized session has no scheduler and so no
+    capability object to read, and its values are the ones the adapter constructed the engine with
+    -- the same dict it hands that engine, so the two cannot drift.
+    """
+
+    per_request_sampling: bool = False
+    per_request_top_k: bool = False
+    fixed_temperature: float = 0.0
+    fixed_top_p: float = 1.0
+    fixed_top_k: int = 0
+    fixed_seed: int = 0
+
+    @classmethod
+    def of_engine(cls, engine: Any) -> "_EngineSampling":
+        return cls(
+            per_request_sampling=bool(getattr(engine, "per_request_sampling", False)),
+            per_request_top_k=bool(getattr(engine, "per_request_top_k", False)),
+            fixed_temperature=float(getattr(engine, "fixed_temperature", 0.0)),
+            fixed_top_p=float(getattr(engine, "fixed_top_p", 1.0)),
+            fixed_top_k=int(getattr(engine, "fixed_top_k", 0)),
+            fixed_seed=int(getattr(engine, "fixed_seed", 0)),
+        )
+
+    @classmethod
+    def of_serialized_session(cls) -> "_EngineSampling":
+        """The serialized session, whose sampler is fixed at what the engine was built with.
+
+        ``per_request_sampling`` is false because that is what the path *is*: the session hands the
+        engine a prompt and a token budget, one request at a time, with no per-row sampler in it to
+        carry a temperature to. Stating that here rather than leaving the engine's limits unstated
+        is the difference between a request that is refused and one generated as if it had not been
+        made.
+        """
+        return cls(
+            fixed_temperature=float(_ENGINE_SAMPLING_DEFAULTS["temperature"]),
+            fixed_top_p=float(_ENGINE_SAMPLING_DEFAULTS["top_p"]),
+            fixed_top_k=int(_ENGINE_SAMPLING_DEFAULTS["top_k"]),
+            fixed_seed=int(_ENGINE_SAMPLING_DEFAULTS["sampling_seed"]),
+        )
+
+
+def _sampling_body(params: SamplingParams) -> dict[str, Any]:
+    """A typed request as the body keys the field contract reads.
+
+    Only the fields with a body spelling are emitted, and only when they are set: an absent key is
+    "the caller did not ask", which is what the contract's default-value tests are about, so writing
+    ``"top_p": None`` here would be the same answer by a longer route. ``n`` and ``logprobs`` are
+    emitted unconditionally because their defaults (1, false) are the values the contract accepts
+    anyway, and emitting them keeps this mapping total rather than dependent on which defaults
+    :class:`SamplingParams` happens to have.
+
+    ``logit_bias`` is the one field with nowhere else to live: it is not a typed field of
+    :class:`SamplingParams`, so a caller reaches it through ``extra``, which is where the reader
+    below looks.
+    """
+    body: dict[str, Any] = {
+        "n": params.n,
+        "logprobs": params.logprobs,
+        "frequency_penalty": params.frequency_penalty,
+        "presence_penalty": params.presence_penalty,
+        "repetition_penalty": params.repetition_penalty,
+    }
+    logit_bias = params.extra.get("logit_bias")
+    if logit_bias is not None:
+        body["logit_bias"] = logit_bias
+    if params.stop:
+        body["stop"] = list(params.stop)
+    if params.top_logprobs is not None:
+        body["top_logprobs"] = params.top_logprobs
+    if params.min_p is not None:
+        body["min_p"] = params.min_p
+    if params.top_p is not None:
+        body["top_p"] = params.top_p
+    if params.top_k is not None:
+        body["top_k"] = params.top_k
+    if params.seed is not None:
+        body["seed"] = params.seed
+    if params.temperature:
+        body["temperature"] = params.temperature
+    if params.response_format is not None:
+        body["response_format"] = params.response_format
+    return body
+
+
+def _engine_sampling_refusal(body: Mapping[str, Any], sampling: "_EngineSampling") -> FieldRefusal | None:
+    """Refuse sampling the engine cannot vary per request, ported from the native server.
+
+    A request naming a temperature, a ``top_p``, a ``top_k`` or a seed the engine will not apply is
+    answered with something else, and the caller has no way to see that. Refusing it is the only
+    answer that cannot be mistaken for the one that was asked for. A value that *is* what the
+    engine does anyway costs nobody anything, and clients send the defaults explicitly all the time,
+    so the comparison is against the engine's effective values rather than the presence of a field.
+
+    ``temperature`` is compared whatever the sampling mode, because it decides the mode: a request
+    asking for 0.7 against an engine fixed at greedy is not a mismatch of degree. The rest are
+    compared only when the request is stochastic, because under greedy decoding none of them can
+    change a token -- naming a ``top_p`` the engine does not have is not a disagreement when the
+    distribution is never drawn from.
+
+    ``top_k`` and ``seed`` are separate flags from ``per_request_sampling`` because the sampler
+    varies temperature, ``top_p`` and seed per request but has no top-k stage at all, so an engine
+    can apply most of a request and not all of it.
+    """
+
+    def mismatch(field: str, requested: Any, configured: float) -> FieldRefusal:
+        return FieldRefusal.build(
+            field,
+            requested,
+            f"this engine's effective {field} is {configured:g} and it cannot apply "
+            f"{field}={requested} to this request.",
+            "Omit the field to accept the effective value, or run an engine configuration that "
+            "supports it.",
+        )
+
+    def named(field: str) -> Any | None:
+        value = body.get(field)
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    temperature = named("temperature")
+    if not sampling.per_request_sampling and temperature is not None:
+        if abs(float(temperature) - sampling.fixed_temperature) > 1e-5:
+            return mismatch("temperature", temperature, sampling.fixed_temperature)
+
+    stochastic = sampling.fixed_temperature > 1e-5 or (
+        sampling.per_request_sampling
+        and temperature is not None
+        and float(temperature) > 1e-5
+    )
+
+    top_p = named("top_p")
+    if (
+        not sampling.per_request_sampling
+        and stochastic
+        and top_p is not None
+        and abs(float(top_p) - sampling.fixed_top_p) > 1e-5
+    ):
+        return mismatch("top_p", top_p, sampling.fixed_top_p)
+
+    top_k = named("top_k")
+    if (
+        not sampling.per_request_top_k
+        and stochastic
+        and top_k is not None
+        and int(float(top_k)) != sampling.fixed_top_k
+    ):
+        return mismatch("top_k", top_k, float(sampling.fixed_top_k))
+
+    seed = named("seed")
+    if (
+        not sampling.per_request_sampling
+        and stochastic
+        and seed is not None
+        and int(float(seed)) != sampling.fixed_seed
+    ):
+        return mismatch("seed", seed, float(sampling.fixed_seed))
+    return None
 
 
 class CppBackend(BackendBase):
@@ -700,12 +880,9 @@ class CppBackend(BackendBase):
                 "kv_cache_dtype",
                 self._native.parse_qwen_kv_cache_dtype(_native_kv_cache_dtype(self.args.kv_cache_dtype)),
             )
-        for name, value in {
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "top_k": 20,
-            "sampling_seed": 0,
-        }.items():
+        # The engine's own sampler, from the one dict that states it: the same values
+        # `_EngineSampling.of_serialized_session` reads when there is no capability object to ask.
+        for name, value in _ENGINE_SAMPLING_DEFAULTS.items():
             if hasattr(options, name):
                 setattr(options, name, value)
         engine = cls(self.args.checkpoint_dir, options, 0, self._context_tokens())
@@ -812,6 +989,7 @@ class CppBackend(BackendBase):
                 thinking_mode=str(request.metadata.get("thinking_mode", "chat")),
                 reasoning_effort=request.metadata.get("reasoning_effort"),
                 tools=request.metadata.get("tools"),
+                add_generation_prompt=bool(request.metadata.get("add_generation_prompt", True)),
             )
             if encoded is not None:
                 return encoded
@@ -821,13 +999,69 @@ class CppBackend(BackendBase):
         encoded = self._tokenizer.encode(prompt)
         return [int(token) for token in encoded]
 
+    def _served_fields(self) -> ServedFields:
+        """Which request fields this adapter's answers actually apply.
+
+        The capability half of the audit, and it lives beside the adapter rather than in the
+        runtime table because it is not one fact about the runtime: ``stop`` is served by code in
+        this file, and ``choices`` is not served by this file at all.
+
+        These are the fields the native front end answered, and each ``False`` is a field that front
+        end refused by name rather than dropping: the engine's sampler has no repetition, presence
+        or min-p term, its token constraint is not reachable across the binding, and its per-token
+        ranking is not bound to Python. ``stop`` moves from ``False`` to ``True`` here, because this
+        adapter can match a sequence against the decoded text as the native server did.
+
+        ``choices`` stays ``False`` although the native front end served ``n`` by running one
+        scheduler request per choice. The fan-out needs the response to carry more than one choice
+        and ``EngineBackend.generate`` returns exactly one :class:`GenerationResult` per
+        :class:`GenerationRequest`, so there is nowhere for a second choice to go -- it belongs in
+        the host's dispatch, beside the request building, where it is one implementation for every
+        runtime rather than one per adapter. Until it is there, ``n`` greater than 1 is refused by
+        name: answering four choices with one is the response this module exists to prevent.
+        """
+        return ServedFields(choices=False, stop=True)
+
+    def audit_request(
+        self, body: Mapping[str, Any], *, endpoint: str = CHAT
+    ) -> FieldRefusal | None:
+        """The first field in ``body`` this adapter cannot serve, or ``None``.
+
+        Two questions, in this order: does the adapter's answer apply the field at all, and if it
+        does, will the *engine* apply the particular value. The first is :meth:`_served_fields`. The
+        second is the engine's own capability object, which is the only thing that knows whether
+        this build samples per request or holds its sampler fixed -- the same question
+        ``cpp_engine``'s ``check_sampling_supported`` asked, ported here so this front end answers a
+        request the way the native one did.
+        """
+        refusal = audit_body(body, endpoint=endpoint, serves=self._served_fields())
+        if refusal is not None:
+            return refusal
+        engine = self._engine_capabilities()
+        sampling = (
+            _EngineSampling.of_serialized_session()
+            if engine is None
+            else _EngineSampling.of_engine(engine)
+        )
+        return _engine_sampling_refusal(body, sampling)
+
     def _check_sampling(self, params: SamplingParams) -> None:
-        if not params.greedy:
-            raise UnsupportedFeatureError("the initial C++ adapter exposes native greedy generation only")
-        if params.top_p is not None or params.top_k is not None or params.min_p is not None:
-            raise UnsupportedFeatureError("C++ sampling controls are not exposed by the initial binding")
-        if params.n != 1 or params.logprobs or params.stop:
-            raise UnsupportedFeatureError("n, logprobs, and stop require the shared scheduler phase")
+        """The same audit for a request built from typed parameters rather than a JSON body.
+
+        The library surface (``LLM.chat``, ``AsyncLLM``) never produces a body, so the HTTP audit
+        cannot see it -- and a field a caller set on :class:`SamplingParams` is *more* visible than
+        one in a JSON key, not less, so it cannot be dropped either. Rather than write the refusals
+        a second time, the typed request is mapped back onto the body keys the audit reads: one
+        policy, two spellings of the same request, and no way for the two to disagree about what
+        this backend serves.
+
+        Shape is not re-checked here, for the reason it is not checked in ``audit_request``:
+        :class:`SamplingParams` validates its own fields on construction, so ``min_p=2.0`` never
+        reaches a backend.
+        """
+        refusal = self.audit_request(_sampling_body(params))
+        if refusal is not None:
+            raise UnsupportedFeatureError(refusal.message)
 
     @staticmethod
     def _native_token(item: Any) -> int:
@@ -987,6 +1221,54 @@ class CppBackend(BackendBase):
             finish_reason = "tool_calls"
         return str(parsed.get("content", "")), finish_reason, metadata
 
+    def _answer_from_tokens(
+        self, request: GenerationRequest, token_ids: Sequence[int], finish_reason: str
+    ) -> tuple[str, str, dict[str, Any]]:
+        """A finished run read back, with the client's stop sequences applied first.
+
+        A stop sequence ends the *answer*, and on a chat request the reasoning block is not part of
+        it: a sequence is matched against the text after ``</think>`` and not against the text
+        before it. That matters for the sequences clients actually use -- ``"\\n\\n"`` is a common
+        one and a reasoning block is full of blank lines -- where matching the whole decode would
+        end the answer before the model had written any of it.
+
+        The cut comes before the read, not after. A stop sequence that lands inside a tool call has
+        to leave no call behind: the parse is all-or-nothing, so handing it the truncated text is
+        what makes "a reported call is a complete one" hold. The native server cut the whole decode
+        and then parsed, which is the same order with the reasoning block included; this cuts the
+        same place minus the block.
+
+        The token ids are not cut. They are what ``usage`` counts and what the engine really
+        executed -- the scheduler has no way to see a text-level sequence, so the run goes to its
+        budget either way -- which is the same pair the native server reported.
+        """
+        stops = tuple(request.sampling_params.stop)
+        decoded = self._decode(list(token_ids))
+        if stops:
+            decoded, stopped = self._cut_answer(decoded, stops, request)
+            if stopped:
+                finish_reason = "stop"
+        return self._read_answer(request, decoded, finish_reason)
+
+    def _cut_answer(
+        self, decoded: str, stops: Sequence[str], request: GenerationRequest
+    ) -> tuple[str, bool]:
+        """``decoded`` with its answer cut at a stop sequence, and whether one matched.
+
+        The block to cut is found by splitting the way the answer is read, so the two agree on where
+        the answer begins: everything up to the start of the content is handed back untouched, and
+        only the content is searched. A request with no chat reader has no block -- its whole decode
+        is the answer -- which is also what a chat answer with no ``</think>`` in it looks like.
+        """
+        reader = self._answer_reader()
+        if reader is None or "messages" not in request.metadata:
+            return apply_stop_to_text(decoded, stops)
+        _, content = reader.split_reasoning(
+            decoded, str(request.metadata.get("thinking_mode", "chat"))
+        )
+        cut, stopped = apply_stop_to_text(content, stops)
+        return (decoded[: len(decoded) - len(content)] + cut, True) if stopped else (decoded, False)
+
     def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
         """Generate requests with optional batch scheduler."""
         self._ensure_open()
@@ -1037,10 +1319,8 @@ class CppBackend(BackendBase):
                 # `completion_tokens` counts the EOS step the engine executed, so
                 # usage stays comparable with the streamed path.
                 completion_tokens = len(token_ids) + (1 if hit_eos else 0)
-                text, finish_reason, metadata = self._read_answer(
-                    request,
-                    self._decode(token_ids),
-                    "stop" if hit_eos else "length",
+                text, finish_reason, metadata = self._answer_from_tokens(
+                    request, token_ids, "stop" if hit_eos else "length"
                 )
                 outputs.append(
                     GenerationResult(
@@ -1135,8 +1415,8 @@ class CppBackend(BackendBase):
 
             # Convert native result to GenerationResult
             token_ids = _strip_terminal_stop_token(result)
-            text, finish_reason, metadata = self._read_answer(
-                request, self._decode(token_ids), result.finish_reason
+            text, finish_reason, metadata = self._answer_from_tokens(
+                request, token_ids, result.finish_reason
             )
 
             outputs.append(
@@ -1189,6 +1469,7 @@ class CppBackend(BackendBase):
         # out, and `</think>` inside one is four characters the model wrote.
         reader = self._answer_reader() if "messages" in request.metadata else None
         thinking_mode = str(request.metadata.get("thinking_mode", "chat"))
+        stops = tuple(request.sampling_params.stop)
         previous_reasoning = ""
         previous_content = ""
         for index in range(max_tokens):
@@ -1200,9 +1481,12 @@ class CppBackend(BackendBase):
                 # step but is not emitted as visible text -- and what the running
                 # decode was still holding is emitted here, because nothing is
                 # coming that could settle it.
+                # `final=True` because nothing is coming that could settle either a half
+                # character or a stop sequence's first bytes.
                 reasoning, content = self._split_answer(
                     self._decode(generated), reader, thinking_mode
                 )
+                content, _ = self._visible(content, stops, final=True)
                 metadata: dict[str, Any] = {}
                 if reasoning != previous_reasoning:
                     metadata["reasoning_content"] = _suffix(reasoning, previous_reasoning)
@@ -1223,8 +1507,11 @@ class CppBackend(BackendBase):
             # it to settle its tail, and this stream ends where the unstreamed decode
             # ends, so the tail goes out with it rather than being dropped.
             last = index + 1 == max_tokens
-            decoded = self._decode(generated) if last else settled_text(self._decode(generated))
+            decoded = self._decode(generated)
+            if not last:
+                decoded = settled_text(decoded)
             reasoning, content = self._split_answer(decoded, reader, thinking_mode)
+            content, stopped = self._visible(content, stops, final=last)
             text = _suffix(content, previous_content)
             metadata = (
                 {"reasoning_content": _suffix(reasoning, previous_reasoning)}
@@ -1234,14 +1521,49 @@ class CppBackend(BackendBase):
             previous_content = content
             previous_reasoning = reasoning
             event = TokenEvent(request.request_id, token_id=token, text=text, metadata=metadata)
-            if last:
+            if stopped:
+                # A client stop sequence ended the answer, which is what "stop" means to the
+                # caller even though the engine's own reason was the budget. The scheduler
+                # still runs to max_tokens -- it has no way to see a text-level sequence --
+                # so the run ends here rather than being continued for text nobody reads.
+                event.finish_reason = "stop"
+                event.usage = Usage(len(prompt_ids), len(generated))
+            elif last:
                 event.finish_reason = "length"
                 event.usage = Usage(len(prompt_ids), len(generated))
             yield event
+            if stopped:
+                return
             if index + 1 < max_tokens:
                 self._ensure_open()
                 self._check_cancelled(request.request_id)
                 result = self._tp_decode_step(token)
+
+    @staticmethod
+    def _visible(
+        decoded: str, stops: Sequence[str], *, final: bool
+    ) -> tuple[str, bool]:
+        """``decoded`` cut at the client's first stop sequence, and whether one was found.
+
+        Applied to the *answer*, not to the decode: a chat request's reasoning block is a separate
+        field and a sequence inside it must not end the answer that follows, so the caller passes
+        the content and not the whole text. For a completion, and for a chat answer with no block in
+        it, the two are the same string.
+
+        Ported from the native server's ``scan_stop_strings``, and the two cases it distinguishes
+        are why this is not two lines of ``find``. While more tokens may still arrive, a tail that
+        is a *prefix* of a sequence is withheld, because the next token may complete it and a stream
+        cannot take a character back; once generation has ended that tail can no longer complete, so
+        it is part of the answer rather than a withheld prefix. ``hold_back`` is the first half of
+        that and ``final`` is the second, and both callers pass the flag they need -- the running
+        loop ``False``, the EOS and budget exits ``True``.
+        """
+        if not stops:
+            return decoded, False
+        cut = min((decoded.find(stop) for stop in stops if stop in decoded), default=-1)
+        if cut >= 0:
+            return decoded[:cut], True
+        return (decoded if final else hold_back(decoded, stops)), False
 
     def _split_answer(
         self, decoded: str, reader: Any | None, thinking_mode: str

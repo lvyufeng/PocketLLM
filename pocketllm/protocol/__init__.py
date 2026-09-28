@@ -21,11 +21,14 @@ from .chat import (
     tool_choice_instruction,
     tool_names,
 )
+from .contract import FieldRefusal, ServedFields
 from .prompt import encode_chat_prompt, template_messages
 from .requests import build_chat_request, build_completion_request
 
 __all__ = [
     "ChatRequest",
+    "FieldRefusal",
+    "ServedFields",
     "build_chat_request",
     "build_completion_request",
     "apply_stop_to_text",
