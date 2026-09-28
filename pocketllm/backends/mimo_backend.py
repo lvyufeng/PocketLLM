@@ -71,8 +71,9 @@ from pocketllm.api import (
     Usage,
 )
 
-from .base import BackendBase, TokenStreamer, byte_size, settled_text
+from .base import BackendBase, TokenStreamer, settled_text
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
+from .options import BackendOption, Kind, decode_options
 from .runtime_engine import RuntimeSpec, SchedulerHost, device_index
 
 DEFAULT_MAX_SEQ_LEN = 32768
@@ -156,30 +157,72 @@ before it. It costs the cold prefill one chunk boundary, since a position can on
 forward boundary, and it is paid on a miss only: a resumed prefill skips it.
 """
 
-_KNOWN_OPTIONS = frozenset({
-    "chunk_rows",
-    "deal",
-    "device",
-    "expert_deal",
-    "expert_rows",
-    "pin",
-    "prefill_chunk",
-    "prefix_cache_bytes",
-    "prefix_cache_head_tokens",
-    "resident_rows",
-    "slots",
-})
-
-
-def _flag(value: Any, name: str) -> bool:
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "on"}:
-        return True
-    if text in {"0", "false", "no", "off"}:
-        return False
-    raise ConfigurationError(f"{name} is a flag and {value!r} is not one")
+#: Every option this runtime reads, declared once. ``chunk_rows`` and ``deal`` are each known by a
+#: second name -- this adapter answered to ``expert_rows`` and ``expert_deal`` before it was
+#: ``MimoBackend``, and a launch script that still says one of those keeps working.
+OPTIONS: tuple[BackendOption, ...] = (
+    BackendOption(
+        "chunk_rows",
+        Kind.INTEGER,
+        DEFAULT_EXPERT_ROWS,
+        "experts one expert-kernel call stages, which is the arena's width in bands; `null` leaves "
+        "this a decode model, feeding a prompt one token at a time",
+        aliases=("expert_rows",),
+        minimum=0,
+    ),
+    BackendOption(
+        "deal",
+        Kind.STRING,
+        "sorted",
+        "which deal divides the experts: `sorted` balances them across ranks, `id` leaves them in "
+        "checkpoint order; `null` takes the process's POCKETLLM_MIMO_EXPERT_DEAL",
+        aliases=("expert_deal",),
+        choices=("id", "sorted"),
+    ),
+    BackendOption(
+        "device", Kind.STRING, None, "the card this rank runs on; the rank's own when unset"
+    ),
+    BackendOption(
+        "pin",
+        Kind.FLAG,
+        True,
+        "page-lock the staging buffers, which is what makes the copies asynchronous",
+    ),
+    BackendOption(
+        "prefill_chunk",
+        Kind.INTEGER,
+        DEFAULT_PREFILL_CHUNK,
+        "tokens one prefill call takes, which is the width the prompt's rate was measured at",
+        minimum=1,
+    ),
+    BackendOption(
+        "prefix_cache_bytes",
+        Kind.BYTES,
+        DEFAULT_PREFIX_CACHE_BYTES,
+        "host memory a rank's prefix store may hold",
+    ),
+    BackendOption(
+        "prefix_cache_head_tokens",
+        Kind.INTEGER,
+        DEFAULT_PREFIX_CACHE_HEAD_TOKENS,
+        "the fixed-length anchor a prefill also stores, or 0 for the prompt's end alone",
+        minimum=0,
+    ),
+    BackendOption(
+        "resident_rows",
+        Kind.INTEGER,
+        DEFAULT_RESIDENT_ROWS,
+        "experts of each routed layer the card keeps instead of staging a token",
+        minimum=0,
+    ),
+    BackendOption(
+        "slots",
+        Kind.INTEGER,
+        DEFAULT_EXPERT_SLOTS,
+        "expert arena slots: one call in flight while the next one's copy lands",
+        minimum=1,
+    ),
+)
 
 
 @dataclass(slots=True)
@@ -206,37 +249,14 @@ class _Options:
 
     @classmethod
     def from_args(cls, args: Any) -> "_Options":
-        values = dict(getattr(args, "backend_options", None) or {})
-        for name in IGNORED_OPTIONS:
-            values.pop(name, None)
-        unknown = sorted(set(values) - _KNOWN_OPTIONS)
-        if unknown:
-            raise ConfigurationError(
-                f"backend='mimo' has no option {unknown[0]!r}; it knows "
-                f"{', '.join(sorted(_KNOWN_OPTIONS))}"
-            )
-        rows = values.pop("chunk_rows", values.pop("expert_rows", DEFAULT_EXPERT_ROWS))
-        deal = values.pop("deal", values.pop("expert_deal", "sorted"))
-        prefill = int(values.pop("prefill_chunk", DEFAULT_PREFILL_CHUNK))
-        slots = int(values.pop("slots", DEFAULT_EXPERT_SLOTS))
-        resident = int(values.pop("resident_rows", DEFAULT_RESIDENT_ROWS))
-        budget = byte_size(
-            values.pop("prefix_cache_bytes", DEFAULT_PREFIX_CACHE_BYTES), "prefix_cache_bytes"
+        values = decode_options(
+            OPTIONS,
+            getattr(args, "backend_options", None),
+            runtime="mimo",
+            ignored=IGNORED_OPTIONS,
         )
-        head = int(values.pop("prefix_cache_head_tokens", DEFAULT_PREFIX_CACHE_HEAD_TOKENS))
-        pin = _flag(values.pop("pin", True), "pin")
-        if rows is not None and int(rows) < 0:
-            raise ConfigurationError(f"chunk_rows is an expert count and {rows!r} is not one")
-        if prefill < 1:
-            raise ConfigurationError(f"prefill_chunk is a token count and {prefill} is not one")
-        if slots < 1:
-            raise ConfigurationError(f"slots is a slot count and {slots} is not one")
-        if resident < 0:
-            raise ConfigurationError(f"resident_rows is an expert count and {resident!r} is not one")
-        if head < 0:
-            raise ConfigurationError(f"prefix_cache_head_tokens is a count and {head!r} is not one")
-        if deal is not None and str(deal) not in {"id", "sorted"}:
-            raise ConfigurationError(f"deal is `id` or `sorted`, got {deal!r}")
+        budget = values["prefix_cache_bytes"]
+        head = values["prefix_cache_head_tokens"]
         if not bool(getattr(args, "enable_prefix_caching", True)):
             # ``--enable-prefix-caching`` is the CLI's switch. The two options above are the *shape*
             # of the store and not a second switch, so the CLI is what turns it off and a zero budget
@@ -246,15 +266,15 @@ class _Options:
             budget = 0
             head = 0
         return cls(
-            chunk_rows=None if rows is None else int(rows),
-            deal=None if deal is None else str(deal),
-            device=values.pop("device", None),
-            pin=pin,
-            prefill_chunk=prefill,
+            chunk_rows=values["chunk_rows"],
+            deal=values["deal"],
+            device=values["device"],
+            pin=values["pin"],
+            prefill_chunk=values["prefill_chunk"],
             prefix_cache_bytes=budget,
             prefix_cache_head_tokens=head,
-            resident_rows=resident,
-            slots=slots,
+            resident_rows=values["resident_rows"],
+            slots=values["slots"],
         )
 
 
