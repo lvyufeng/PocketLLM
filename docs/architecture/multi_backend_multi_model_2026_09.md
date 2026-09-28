@@ -716,6 +716,20 @@ make the front end a library too, so the native binary is a **host of the same i
 than a copy of it. In the same commit the two capability declarations (`pocket::Capabilities` and
 `pocketllm.api.types.BackendCapabilities`) become one, because they are the same fact in two languages.
 
+The order of that deletion is not arbitrary, and it was checked rather than assumed. The C++ front end
+is not only a second HTTP surface: three of its behaviours existed nowhere else in the tree — the
+architecture-selected chat templater and its `qwen3_5` tool-call parser (`src/server/cpp_sidecar.py`),
+the reading of a generated text back into `content` / `reasoning_content` / `tool_calls`, and the
+token-masking for `response_format` (`core/json_constraint.cpp`). A served-path capability is not
+something to lose to a refactor, so the first two moved to
+`pocketllm/protocol/templating.py` and the `cpp` backend applies them, *before* the server is deleted;
+the third is a sampling-time kernel feature rather than a front-end one and survives the deletion,
+but reaching it from the Python host needs the schema to cross `BatchSamplingParams` into the engine,
+which is one new binding and its own issue. The measured consequence is in
+[the API guide](../guides/pocketllm_api.md#tool-calls): a `cpp` request through `pocketllm serve`
+used to answer with a call as prose and return `"stop"` where the native binary returned
+`tool_calls`.
+
 ### 8.5 The boundary
 
 | One implementation | Written per model, deliberately |

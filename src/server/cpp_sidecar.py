@@ -2,12 +2,11 @@
 
 Reads JSON-line requests on stdin, writes JSON-line responses on stdout.
 
-Chat templating is per-architecture, mirroring the C++ model registry: the
-checkpoint declares a ``model_type`` and that selects a templater.  DeepSeek-V4
-keeps ``src.encoding.deepseek_v4``, which renders DSML tool-call syntax,
-thinking_mode and reasoning_effort.  Everything else goes through the
-checkpoint's own HF chat template, which is what makes the C++ server able to
-serve a model this repo has no bespoke encoder for.
+The templating itself lives in :mod:`pocketllm.protocol.templating`, because it is not this
+transport's business and because the Python host needs the same answer: a checkpoint's architecture
+selects a chat template, and that template's output has to be read back into content, reasoning and
+tool calls the same way whichever front end asked. This module is the pipe between the C++ engine
+and that implementation, and nothing else.
 
 Protocol (one JSON object per stdin/stdout line):
 
@@ -46,8 +45,10 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, 
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from src.encoding import qwen_tool_calls  # noqa: E402  (needs _REPO_ROOT on sys.path)
-from pocketllm.protocol import template_messages  # noqa: E402  (needs _REPO_ROOT on sys.path)
+from pocketllm.protocol.templating import (  # noqa: E402  (needs _REPO_ROOT on sys.path)
+    build_templater,
+    detect_architecture,
+)
 
 
 def _configure_stdio() -> None:
@@ -67,194 +68,6 @@ def _emit(obj: dict[str, Any]) -> None:
 
 def _err(msg: str) -> None:
     _emit({"ok": False, "err": msg})
-
-
-def detect_architecture(ckpt: str) -> str:
-    """The checkpoint's architecture, normalized the way the C++ registry does.
-
-    Same rule as ``pocket::detect_architecture`` in core/model_registry.cpp,
-    including folding ``qwen3_5_text`` (where the multimodal wrapper hides the
-    text model's type) onto ``qwen3_5``.  Returns "" when nothing is declared,
-    which selects the generic templater.
-    """
-    try:
-        with open(os.path.join(ckpt, "config.json"), encoding="utf-8") as handle:
-            config = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return ""
-    model_type = config.get("model_type")
-    if not model_type:
-        text_config = config.get("text_config")
-        if isinstance(text_config, dict):
-            model_type = text_config.get("model_type")
-    model_type = str(model_type or "").lower()
-    return "qwen3_5" if model_type == "qwen3_5_text" else model_type
-
-
-def _splice_tools(messages: list[dict[str, Any]], tools: Any) -> list[dict[str, Any]]:
-    """Attach `tools` to the system/developer message, adding one if absent."""
-    messages = list(messages)
-    attach_idx = None
-    for idx, msg in enumerate(messages):
-        if msg.get("role") in {"system", "developer"}:
-            attach_idx = idx
-            break
-    if attach_idx is None:
-        messages.insert(0, {"role": "system", "content": ""})
-        attach_idx = 0
-    messages[attach_idx] = {**messages[attach_idx], "tools": tools}
-    return messages
-
-
-class DeepSeekV4Templater:
-    """DSML chat template, thinking modes and tool-call parsing for DeepSeek-V4."""
-
-    def __init__(self, tokenizer) -> None:
-        from src.encoding.deepseek_v4 import (
-            encode_messages,
-            eos_token,
-            parse_message_from_completion_text,
-        )
-
-        self._tokenizer = tokenizer
-        self._encode_messages = encode_messages
-        self._eos_token = eos_token
-        self._parse = parse_message_from_completion_text
-
-    def encode(self, req: dict[str, Any]) -> tuple[str, list[int]]:
-        messages = list(req.get("messages") or [])
-        tools = req.get("tools")
-        if isinstance(tools, list) and tools:
-            messages = _splice_tools(messages, tools)
-        prompt_text = self._encode_messages(
-            messages,
-            thinking_mode=req.get("thinking_mode", "chat"),
-            context=req.get("context"),
-            drop_thinking=bool(req.get("drop_thinking", True)),
-            add_default_bos_token=bool(req.get("add_generation_prompt", True)),
-            reasoning_effort=req.get("reasoning_effort"),
-        )
-        return prompt_text, list(self._tokenizer.encode(prompt_text))
-
-    def parse(self, text: str, thinking_mode: str, tools: Any = None) -> dict[str, Any]:
-        # `tools` is accepted and unused here: DSML marks every parameter as a
-        # string or not inside the syntax itself, so the schema adds nothing.
-        # parse_message_from_completion_text requires the EOS token to be
-        # present.  The C++ engine emits raw decoded text without re-inserting
-        # the EOS string (it stops on the EOS token id), so append it if missing.
-        if not text.endswith(self._eos_token):
-            text = text + self._eos_token
-        return self._parse(text, thinking_mode)
-
-
-# Which tool-call syntax each architecture emits, by the name the C++ model
-# registry reports.  An architecture absent from this table returns no tool calls
-# and leaves the call syntax in the content, which is what the generic templater
-# did for every model before this table existed: inventing a parse for a model
-# whose syntax has not been read would drop or corrupt calls silently.
-_TOOL_CALL_PARSERS = {
-    # Qwen's own chat template, the one every Qwen3.5 checkpoint ships.
-    "qwen3_5": qwen_tool_calls.parse,
-}
-
-
-def _token_id_list(encoded: Any) -> list[int]:
-    """Normalize ``apply_chat_template(..., tokenize=True)`` to a list of ids.
-
-    The return type is not stable across tokenizers and transformers versions:
-    a plain list, or a ``BatchEncoding`` whose ``input_ids`` holds the ids.
-    A ``BatchEncoding`` iterates as its *keys*, so the naive
-    ``[int(t) for t in encoded]`` raises ``invalid literal for int() with base
-    10: 'input_ids'`` - a failure that surfaces as an HTTP 400 on every chat
-    request while the completions path, which tokenizes in C++, keeps working.
-    Both shapes are accepted rather than pinning a transformers version.
-    """
-    input_ids = getattr(encoded, "input_ids", None)
-    if input_ids is not None:
-        encoded = input_ids
-    return [int(token) for token in encoded]
-
-
-class ChatTemplateTemplater:
-    """The checkpoint's own HF chat template, for models with no bespoke encoder.
-
-    Deliberately narrower than the DeepSeek path.  ``reasoning_effort``,
-    ``context`` and ``drop_thinking`` have no equivalent in a stock chat template
-    and are ignored.  Tool calls are parsed only for an architecture whose
-    emitted syntax is known (see ``_TOOL_CALL_PARSERS``); anywhere else they are
-    left in the content, which keeps them visible instead of inventing a parse
-    that would silently drop them.
-    """
-
-    def __init__(self, tokenizer, tool_call_parser=None) -> None:
-        self._tokenizer = tokenizer
-        self._tool_call_parser = tool_call_parser
-
-    def _apply(self, messages, tools, add_generation_prompt, thinking_mode, tokenize):
-        kwargs: dict[str, Any] = {
-            "add_generation_prompt": add_generation_prompt,
-            "tokenize": tokenize,
-        }
-        if tools:
-            kwargs["tools"] = tools
-        # Qwen and several other templates gate the reasoning block on
-        # `enable_thinking`; templates that do not take it raise TypeError, so
-        # fall back rather than refusing the request.
-        try:
-            return self._tokenizer.apply_chat_template(
-                messages, enable_thinking=(thinking_mode == "thinking"), **kwargs
-            )
-        except TypeError:
-            return self._tokenizer.apply_chat_template(messages, **kwargs)
-
-    def encode(self, req: dict[str, Any]) -> tuple[str, list[int]]:
-        messages = list(req.get("messages") or [])
-        tools = req.get("tools")
-        tools = tools if isinstance(tools, list) and tools else None
-        add_generation_prompt = bool(req.get("add_generation_prompt", True))
-        thinking_mode = req.get("thinking_mode", "chat")
-        # A replayed assistant message carries its `tool_calls[].function.arguments`
-        # as the JSON string OpenAI specifies, while Qwen's template iterates them
-        # as an object (`arguments|items`).  The template gets the converted copy;
-        # the caller's list is left as it was received.
-        messages = template_messages(messages)
-        # Tokenize through the template rather than re-encoding the rendered
-        # text: a template that emits a BOS would otherwise get a second one
-        # from encode().
-        token_ids = self._apply(messages, tools, add_generation_prompt, thinking_mode, True)
-        prompt_text = self._apply(messages, tools, add_generation_prompt, thinking_mode, False)
-        return str(prompt_text), _token_id_list(token_ids)
-
-    def parse(self, text: str, thinking_mode: str, tools: Any = None) -> dict[str, Any]:
-        reasoning = ""
-        content = text
-        marker = "</think>"
-        if marker in text:
-            head, _, tail = text.partition(marker)
-            # A prompt built with enable_thinking ends inside the block, so the
-            # opening tag is usually part of the prompt rather than the answer.
-            reasoning = head.removeprefix("<think>")
-            content = tail
-        elif thinking_mode == "thinking":
-            # Generation stopped before closing the block; all of it is reasoning.
-            reasoning = text.removeprefix("<think>")
-            content = ""
-        tool_calls: list[dict[str, Any]] = []
-        if self._tool_call_parser is not None:
-            # None means the completion carries no call this parser can read in
-            # full, so the text stands as it was written.  That is the same
-            # answer as "this model's calls are not parsed", and it is the one
-            # that cannot show a client a truncated call.
-            parsed = self._tool_call_parser(content, tools)
-            if parsed is not None:
-                content, tool_calls = parsed
-        return {"content": content, "reasoning_content": reasoning, "tool_calls": tool_calls}
-
-
-def build_templater(architecture: str, tokenizer):
-    if architecture == "deepseek_v4":
-        return DeepSeekV4Templater(tokenizer)
-    return ChatTemplateTemplater(tokenizer, _TOOL_CALL_PARSERS.get(architecture))
 
 
 def _handle_encode(templater, req: dict[str, Any]) -> None:

@@ -1,8 +1,12 @@
 """Backend-neutral request/response protocol helpers.
 
-This subpackage holds pure normalization logic shared by the legacy DeepSeek
-server and the unified PocketLLM server.  It imports no Torch, CUDA, or native
-module, so both control planes can depend on it.
+This subpackage holds normalization, prompt encoding and answer reading that no device backend
+owns, so every host reaches one implementation: request bodies in, prompt ids and structured
+assistant messages out.  It imports no Torch, CUDA, or native module.
+
+It was shared by two control planes -- the legacy DeepSeek server and the unified one -- until the
+former was retired to a single runtime module; see
+[#447](https://github.com/lvyufeng/PocketLLM/issues/447).
 """
 
 from .chat import (

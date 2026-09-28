@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 import pytest
@@ -959,3 +960,225 @@ def test_a_length_capped_answer_keeps_its_last_token() -> None:
         backend.close()
 
     assert result.token_ids == [1, 2, 3]
+
+
+# --------------------------------------------------------------------------------------------------
+# How an answer is read back
+# --------------------------------------------------------------------------------------------------
+
+
+class ScriptedTextTokenizer(FakeTokenizer):
+    """A tokenizer whose decode is whatever the test scripted.
+
+    What is under test is the reading of a decoded text, so the ids only have to be non-empty and
+    the text only has to be the shape the engine would have produced.
+    """
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def decode(self, token_ids: list[int]) -> str:
+        return self.text
+
+
+class RunningTextTokenizer(FakeTokenizer):
+    """The running decode of N tokens, scripted one entry per token.
+
+    A stream calls ``decode`` with the whole generated prefix on every token, so a tokenizer that
+    answered the same text each time would hand the split a marker it had not reached yet.
+    """
+
+    def __init__(self, texts: list[str]) -> None:
+        self.texts = texts
+
+    def decode(self, token_ids: list[int]) -> str:
+        return self.texts[min(len(token_ids), len(self.texts)) - 1]
+
+
+QWEN_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+        },
+    },
+}
+
+QWEN_CALL = (
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n"
+    "<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>"
+)
+
+
+def _declaring_checkpoint(tmp_path, architecture: str) -> str:
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text(
+        json.dumps({"model_type": architecture}), encoding="utf-8"
+    )
+    return str(ckpt)
+
+
+def _scripted_backend(checkpoint: str, text: str, *, finish_reason: str = "stop"):
+    backend = CppBackend(
+        EngineArgs(model=checkpoint, backend="cpp"),
+        engine=FakeEngine(),
+        tokenizer=ScriptedTextTokenizer(text),
+    )
+    backend._native = ScriptedNativeModule()
+    backend._scheduler = ScriptedScheduler(
+        ScriptedNativeResult(tokens=[1, 2, 3], finish_reason=finish_reason)
+    )
+    backend._batching_enabled = True
+    return backend
+
+
+def test_a_tool_call_is_read_out_of_the_answer(tmp_path) -> None:
+    """The engine returns text; which part of it is a call is this checkpoint's architecture.
+
+    `pocketllm serve --backend cpp` returned the call as prose while the same checkpoint through the
+    C++ front end returned `tool_calls`, because the reading lived in that front end's sidecar. A
+    client branching on the field would have run nothing.
+    """
+    backend = _scripted_backend(_declaring_checkpoint(tmp_path, "qwen3_5"), QWEN_CALL)
+    try:
+        result = backend.generate(
+            [
+                GenerationRequest(
+                    prompt_tokens=[1, 2],
+                    request_id="req-call",
+                    metadata={
+                        "messages": [{"role": "user", "content": "weather?"}],
+                        "tools": [QWEN_TOOL],
+                        "thinking_mode": "chat",
+                    },
+                )
+            ]
+        )[0]
+    finally:
+        backend.close()
+
+    assert result.text == ""
+    # A call is *why* the generation ended: under "stop" a client reads it as the final answer.
+    assert result.finish_reason == "tool_calls"
+    call = result.metadata["tool_calls"][0]
+    assert call["function"]["name"] == "get_weather"
+    # A client echoes this back to attribute a tool result to the call it answers, so it has to be
+    # named even though Qwen's own reading of a call -- out of a prompt -- has no id to give.
+    assert call["id"]
+    # The schema is what makes "3" an integer rather than the string the XML spelling alone gives.
+    assert json.loads(call["function"]["arguments"]) == {"city": "Paris", "days": 3}
+
+
+def test_a_thinking_answer_is_split_into_reasoning_and_content(tmp_path) -> None:
+    backend = _scripted_backend(
+        _declaring_checkpoint(tmp_path, "qwen3_5"), "weighing it up</think>the answer"
+    )
+    try:
+        result = backend.generate(
+            [
+                GenerationRequest(
+                    prompt_tokens=[1, 2],
+                    request_id="req-think",
+                    metadata={
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "thinking_mode": "thinking",
+                    },
+                )
+            ]
+        )[0]
+    finally:
+        backend.close()
+
+    assert result.text == "the answer"
+    assert result.metadata["reasoning_content"] == "weighing it up"
+    assert "tool_calls" not in result.metadata
+
+
+def test_an_undeclared_architecture_reads_no_tool_calls(tmp_path) -> None:
+    """No call syntax is registered, so the XML is what the client sees.
+
+    Inventing a parse for a syntax nobody has read would drop or corrupt calls silently. The
+    reasoning split is a different question and is generic -- it is the marker text every
+    thinking-mode template writes -- so it still happens.
+    """
+    undeclared = tmp_path / "plain"
+    undeclared.mkdir()
+    backend = _scripted_backend(str(undeclared), QWEN_CALL)
+    try:
+        result = backend.generate(
+            [
+                GenerationRequest(
+                    prompt_tokens=[1, 2],
+                    request_id="req-plain",
+                    metadata={
+                        "messages": [{"role": "user", "content": "weather?"}],
+                        "tools": [QWEN_TOOL],
+                        "thinking_mode": "chat",
+                    },
+                )
+            ]
+        )[0]
+    finally:
+        backend.close()
+
+    assert result.text == QWEN_CALL
+    assert "tool_calls" not in result.metadata
+
+
+def test_a_completion_is_never_read_back(tmp_path) -> None:
+    """Text in, text out: `</think>` in a completion is four characters the model wrote.
+
+    The C++ front end drew the same line -- it parsed the assistant message and handed
+    `/v1/completions` the raw decode -- and `messages` in the metadata is what tells the two routes
+    apart here, the same field `_prompt_ids` already keys on.
+    """
+    backend = _scripted_backend(
+        _declaring_checkpoint(tmp_path, "qwen3_5"), "weighing it up</think>the answer"
+    )
+    try:
+        result = backend.generate(
+            [GenerationRequest(prompt="just text", request_id="req-completion")]
+        )[0]
+    finally:
+        backend.close()
+
+    assert result.text == "weighing it up</think>the answer"
+    assert result.metadata == {}
+
+
+def test_the_stream_sends_reasoning_as_its_own_field(tmp_path) -> None:
+    """A thinking answer streams its reasoning rather than hiding it until the marker closes."""
+    backend = CppBackend(
+        EngineArgs(model=_declaring_checkpoint(tmp_path, "qwen3_5"), backend="cpp"),
+        engine=FakeEngine(),
+        tokenizer=RunningTextTokenizer(
+            ["plan", "plan</think>", "plan</think>done"]
+        ),
+    )
+    request = GenerationRequest(
+        prompt_tokens=[4],
+        request_id="req-stream-think",
+        sampling_params=SamplingParams(max_tokens=3),
+        metadata={
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_mode": "thinking",
+        },
+    )
+
+    events = list(backend.stream(request))
+
+    # The prompt ended inside the thinking block, so the first tokens are reasoning and the content
+    # does not begin until the marker closes it -- which is the C++ front end's reading too.
+    assert [event.text for event in events] == ["", "", "done"]
+    assert [event.metadata.get("reasoning_content") for event in events] == [
+        "plan",
+        None,
+        None,
+    ]
+    # The answer a stream sends equals the answer the unstreamed path returns, which is what makes
+    # the two routes comparable at all. The marker itself belongs to neither field.
+    assert "".join(event.text for event in events) == "done"
+    backend.close()
