@@ -1,6 +1,6 @@
 import json
 
-from src.server.cpp_sidecar import (
+from pocketllm.protocol.templating import (
     ChatTemplateTemplater,
     DeepSeekV4Templater,
     build_templater,
@@ -56,7 +56,28 @@ class BatchEncodingTokenizer:
         return "rendered prompt"
 
 
-def test_cpp_sidecar_detects_root_and_nested_architectures(tmp_path):
+def _write_gguf(path, architecture: str) -> None:
+    """A GGUF header and nothing else: enough for ``general.architecture`` to be read."""
+    import struct
+
+    def string(value: str) -> bytes:
+        raw = value.encode("utf-8")
+        return struct.pack("<Q", len(raw)) + raw
+
+    metadata = struct.pack("<Q", 1) + string("general.architecture") + struct.pack("<I", 8) + string(
+        architecture
+    )
+    header = b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0) + metadata
+    path.write_bytes(header + struct.pack("<Q", 0))
+
+
+def test_an_architecture_is_read_from_a_config_file_or_a_gguf(tmp_path):
+    """The two container types a checkpoint can arrive in, and the empty answer.
+
+    ``detect_architecture`` used to read ``config.json`` only, which is right for the sidecar
+    (the C++ registry handed it the answer) and wrong for the Python host, where a GGUF is found
+    by scanning the model path. A GGUF declares the same fact under ``general.architecture``.
+    """
     root = tmp_path / "root"
     root.mkdir()
     (root / "config.json").write_text(
@@ -76,6 +97,26 @@ def test_cpp_sidecar_detects_root_and_nested_architectures(tmp_path):
     undeclared.mkdir()
     (undeclared / "config.json").write_text("{}", encoding="utf-8")
     assert detect_architecture(str(undeclared)) == ""
+
+    assert detect_architecture("") == ""
+    assert detect_architecture(str(tmp_path / "missing")) == ""
+
+
+def test_a_gguf_declares_its_architecture_in_its_own_metadata(tmp_path):
+    gguf = tmp_path / "model.gguf"
+    _write_gguf(gguf, "qwen3_5")
+    assert detect_architecture(str(gguf)) == "qwen3_5"
+    # A directory holding exactly one GGUF is the same checkpoint, and is how the Python host
+    # resolves a model path, so the two readings must not disagree.
+    assert detect_architecture(str(tmp_path)) == "qwen3_5"
+
+
+def test_two_ggufs_in_one_directory_name_no_architecture(tmp_path):
+    """No way to say which artifact was meant, so neither is guessed at."""
+    _write_gguf(tmp_path / "a.gguf", "qwen3_5")
+    _write_gguf(tmp_path / "b.gguf", "deepseek_v4")
+
+    assert detect_architecture(str(tmp_path)) == ""
 
 
 def test_generic_sidecar_uses_checkpoint_chat_template_for_ids_and_text():
@@ -277,4 +318,24 @@ def test_build_templater_selects_a_templater_per_architecture():
     assert isinstance(build_templater("llama", RecordingTokenizer()), ChatTemplateTemplater)
     assert isinstance(
         build_templater("deepseek_v4", RecordingTokenizer()), DeepSeekV4Templater
+    )
+
+
+def test_every_templater_can_split_a_running_answer():
+    """The split a *stream* needs, which is not the same reading as ``parse``.
+
+    ``parse`` reads a whole grammar and refuses a generation that has not finished arriving;
+    DeepSeek-V4's in particular raises on a missing EOS. A stream does not have a finished
+    generation to hand it -- it has a prefix, on every token -- so it needs the marker split alone.
+    Both templater classes therefore expose one, and it is the same one.
+    """
+    text = "weighing it up</think>the answer"
+
+    assert ChatTemplateTemplater(RecordingTokenizer()).split_reasoning(text, "thinking") == (
+        "weighing it up",
+        "the answer",
+    )
+    assert DeepSeekV4Templater(RecordingTokenizer()).split_reasoning(text, "thinking") == (
+        "weighing it up",
+        "the answer",
     )

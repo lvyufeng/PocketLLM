@@ -12,7 +12,7 @@ if ! flock -n 9; then
   exit 1
 fi
 
-TORCHRUN="${TORCHRUN:-torchrun}"
+PYTHON="${PYTHON:-python}"
 MASTER_PORT="${MASTER_PORT:-29975}"
 PORT="${PORT:-8071}"
 HOST="${HOST:-127.0.0.1}"
@@ -85,21 +85,26 @@ trap cleanup EXIT INT TERM
 
 rm -f "$LOG" "$OUT"
 
-PYTHONPATH="$REPO_ROOT" "$TORCHRUN" \
-  --master-port "$MASTER_PORT" \
-  --nproc-per-node "$NPROC_PER_NODE" \
-  --module src.server.openai \
+# `pocketllm serve` owns the rank fan-out now: the supervisor assigns the rendezvous
+# environment and runs each nonzero rank through the torch backend's worker loop.
+# This script used to start `torchrun --module src.server.openai`, a second front end
+# that has since been deleted (issue #447). `--master-port` went with torchrun, so the
+# port this script picks has to be exported for the supervisor to read it.
+export MASTER_PORT
+PYTHONPATH="$REPO_ROOT" "$PYTHON" -m pocketllm serve \
+  --backend torch \
   --host "$HOST" \
   --port "$PORT" \
-  --ckpt-path "$CKPT_PATH" \
-  --ckpt-format gguf \
+  --model "$CKPT_PATH" \
+  --model-format gguf \
   --tokenizer-path "$TOKENIZER_PATH" \
-  --config "$CONFIG" \
-  --model "$MODEL_ID" \
+  --config-path "$CONFIG" \
+  --served-model-name "$MODEL_ID" \
   --routed-experts-device "$ROUTED_EXPERTS_DEVICE" \
   --pd-mode "$PD_MODE" \
-  --partition-policy "$PARTITION_POLICY" \
+  --backend-option "partition_policy=$PARTITION_POLICY" \
   --max-model-len "$MAX_MODEL_LEN" \
+  --tensor-parallel-size "$NPROC_PER_NODE" \
   > "$LOG" 2>&1 &
 server_pid=$!
 

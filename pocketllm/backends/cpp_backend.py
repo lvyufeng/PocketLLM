@@ -29,13 +29,28 @@ from pocketllm.api import (
     Usage,
     UnsupportedFeatureError,
 )
-from pocketllm.protocol import encode_chat_prompt, render_fallback_prompt
+from pocketllm.protocol import encode_chat_prompt, normalize_tool_calls, render_fallback_prompt
+from pocketllm.protocol.templating import build_templater, detect_architecture
 
 from .base import BackendBase, settled_text
 from .capabilities import declared_capabilities
 
 
 _NATIVE_MODULE_NAMES = ("pocketllm_cpp", "_pocketllm_cpp", "cpp_engine")
+
+#: The "not built yet" marker for the lazily built answer reader.  ``None`` is a real answer -- no
+#: tokenizer, so no reading -- and has to stay distinguishable from it.
+_READER_UNSET = object()
+
+
+def _suffix(text: str, prefix: str) -> str:
+    """``text`` with ``prefix`` removed, or all of ``text`` when it does not start that way.
+
+    The running decode grows monotonically, so the fallback is the reading that cannot lose an
+    answer: a stream may repeat a piece, which a client can see, but never silently drop one.
+    """
+    return text[len(prefix):] if text.startswith(prefix) else text
+
 
 #: Rows the batch scheduler runs when the batch path is on and nobody named a width. Eight is what
 #: `enable_batching` has meant since it existed, and the engine sizes its KV cache for this many
@@ -268,6 +283,7 @@ class CppBackend(BackendBase):
         self._request_lock = threading.Lock()
         self._tokenizer = tokenizer if tokenizer is not None else self._load_tokenizer()
         self._eos_ids, self._eos_source = self._resolve_eos_ids()
+        self._answer_reader_cache: Any = _READER_UNSET
 
         # Phase 3.4: the batch scheduler, on by default and only on rank 0.  Only rank 0 drives
         # scheduling: the scheduler runs a background thread that issues collectives, and on a worker
@@ -926,6 +942,75 @@ class CppBackend(BackendBase):
             return str(decode_tokens(token_ids))
         return ""
 
+    def _answer_reader(self) -> Any | None:
+        """The templater that reads this checkpoint's answers, built once.
+
+        The engine hands back decoded text and nothing else, so which of it is the answer, which is
+        the reasoning block and which is a tool call has to be read out of the text -- and that
+        reading is per architecture. It is the same selection the C++ front end's sidecar made; see
+        :mod:`pocketllm.protocol.templating` for why it is shared rather than the C++ side's private
+        business.
+
+        ``None`` means no tokenizer, which already makes ``_prompt_ids`` refuse a text prompt: there
+        is nothing to read an answer with, and the caller returns the raw decode.
+        """
+        if self._answer_reader_cache is _READER_UNSET:
+            reader = None
+            if self._tokenizer is not None:
+                reader = build_templater(
+                    detect_architecture(self.args.checkpoint_dir or ""), self._tokenizer
+                )
+            self._answer_reader_cache = reader
+        return self._answer_reader_cache
+
+    def _read_answer(
+        self, request: GenerationRequest, text: str, finish_reason: str
+    ) -> tuple[str, str, dict[str, Any]]:
+        """An answer's visible text, its finish reason, and the split the metadata carries.
+
+        A call is *why* the generation ended, which is OpenAI's own reading of the same answer: a
+        client that branches on ``"tool_calls"`` to decide whether to run something and send the
+        result back would, under ``"stop"``, read the call as the final answer and stop there. The
+        parse is all-or-nothing, so a reported call is a complete one.
+
+        A parse that raises leaves the text exactly as the engine produced it. That is what the C++
+        front end did with a sidecar reply that was not ``ok``, and it is the reading that cannot
+        lose an answer; the reason is published under ``answer_parse_error`` rather than swallowed,
+        because a client seeing markup in its content should be able to find out why.
+
+        Only a chat request is read. ``messages`` in the metadata is what ``_prompt_ids`` already
+        uses to tell the two routes apart, and it is the same line the C++ front end drew: it parsed
+        the assistant message and handed ``/v1/completions`` the raw decode. A completion is text in
+        and text out, and a model that wrote ``</think>`` into one meant it as four characters of
+        the answer.
+        """
+        reader = self._answer_reader()
+        if reader is None or "messages" not in request.metadata:
+            return text, finish_reason, {}
+        try:
+            parsed = reader.parse(
+                text,
+                str(request.metadata.get("thinking_mode", "chat")),
+                request.metadata.get("tools"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return text, finish_reason, {"answer_parse_error": f"{type(exc).__name__}: {exc}"}
+        metadata: dict[str, Any] = {}
+        reasoning = parsed.get("reasoning_content")
+        if reasoning:
+            metadata["reasoning_content"] = reasoning
+        # Normalized rather than forwarded as parsed: DeepSeek's encoder leaves the ``id`` out of a
+        # call, because the calls it reads come out of a *prompt* where the id was the client's to
+        # write. A call this backend reports has no such history -- a client that validates against
+        # OpenAI's typed models rejects a call without an id, and one that echoes the call back to
+        # attribute a tool result to it has nothing to name it by. The Qwen parser already mints
+        # one, and this is the same helper the DeepSeek runtime and the V4.1 adapter use.
+        tool_calls = normalize_tool_calls(parsed.get("tool_calls"))
+        if tool_calls:
+            metadata["tool_calls"] = tool_calls
+            finish_reason = "tool_calls"
+        return str(parsed.get("content", "")), finish_reason, metadata
+
     def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
         """Generate requests with optional batch scheduler."""
         self._ensure_open()
@@ -976,17 +1061,23 @@ class CppBackend(BackendBase):
                 # `completion_tokens` counts the EOS step the engine executed, so
                 # usage stays comparable with the streamed path.
                 completion_tokens = len(token_ids) + (1 if hit_eos else 0)
+                text, finish_reason, metadata = self._read_answer(
+                    request,
+                    self._decode(token_ids),
+                    "stop" if hit_eos else "length",
+                )
                 outputs.append(
                     GenerationResult(
                         request_id=request.request_id,
                         token_ids=token_ids,
-                        text=self._decode(token_ids),
-                        finish_reason="stop" if hit_eos else "length",
+                        text=text,
+                        finish_reason=finish_reason,
                         usage=Usage(len(prompt_ids), completion_tokens),
                         timings=TimingMetrics(
                             total_seconds=time.perf_counter() - started,
                             ttft_seconds=ttft,
                         ),
+                        metadata=metadata,
                     )
                 )
             finally:
@@ -1068,19 +1159,22 @@ class CppBackend(BackendBase):
 
             # Convert native result to GenerationResult
             token_ids = _strip_terminal_stop_token(result)
-            text = self._decode(token_ids)
+            text, finish_reason, metadata = self._read_answer(
+                request, self._decode(token_ids), result.finish_reason
+            )
 
             outputs.append(
                 GenerationResult(
                     request_id=request.request_id,
                     token_ids=token_ids,
                     text=text,
-                    finish_reason=result.finish_reason,
+                    finish_reason=finish_reason,
                     usage=Usage(result.prompt_tokens, result.completion_tokens),
                     timings=TimingMetrics(
                         total_seconds=result.total_seconds,
                         ttft_seconds=result.ttft_seconds,
                     ),
+                    metadata=metadata,
                 )
             )
 
@@ -1106,7 +1200,21 @@ class CppBackend(BackendBase):
         # next one, matching the native generate() result ordering.
         result = self._tp_prefill(prompt_ids)
         generated: list[int] = []
-        previous_text = ""
+        # A thinking-mode answer is split as it arrives, the way the V4.1 adapter splits its own:
+        # everything before `</think>` goes out as `reasoning_content` and everything after as
+        # `content`, so a client watches the reasoning rather than waiting for the answer. The C++
+        # front end split on the `</think>` *token id* instead; this reads the running text, which
+        # is the same split the unstreamed path takes below, and one reading of the same block
+        # across a backend's two paths is worth more here than matching a front end that is on its
+        # way out. The one case it leaves is the marker straddling a token boundary -- a client is
+        # then sent the marker's first characters as reasoning and cannot have them back, which is
+        # a boundary of the format rather than of this diff.
+        # A chat request only, for the reason `_read_answer` gives: a completion is text in and text
+        # out, and `</think>` inside one is four characters the model wrote.
+        reader = self._answer_reader() if "messages" in request.metadata else None
+        thinking_mode = str(request.metadata.get("thinking_mode", "chat"))
+        previous_reasoning = ""
+        previous_content = ""
         for index in range(max_tokens):
             self._ensure_open()
             self._check_cancelled(request.request_id)
@@ -1116,11 +1224,18 @@ class CppBackend(BackendBase):
                 # step but is not emitted as visible text -- and what the running
                 # decode was still holding is emitted here, because nothing is
                 # coming that could settle it.
+                reasoning, content = self._split_answer(
+                    self._decode(generated), reader, thinking_mode
+                )
+                metadata: dict[str, Any] = {}
+                if reasoning != previous_reasoning:
+                    metadata["reasoning_content"] = _suffix(reasoning, previous_reasoning)
                 yield TokenEvent(
                     request.request_id,
-                    text=self._final_tail(generated, previous_text),
+                    text=_suffix(content, previous_content),
                     finish_reason="stop",
                     usage=Usage(len(prompt_ids), len(generated) + 1),
+                    metadata=metadata,
                 )
                 return
             generated.append(token)
@@ -1133,9 +1248,16 @@ class CppBackend(BackendBase):
             # ends, so the tail goes out with it rather than being dropped.
             last = index + 1 == max_tokens
             decoded = self._decode(generated) if last else settled_text(self._decode(generated))
-            text = decoded[len(previous_text):] if decoded.startswith(previous_text) else decoded
-            previous_text = decoded
-            event = TokenEvent(request.request_id, token_id=token, text=text)
+            reasoning, content = self._split_answer(decoded, reader, thinking_mode)
+            text = _suffix(content, previous_content)
+            metadata = (
+                {"reasoning_content": _suffix(reasoning, previous_reasoning)}
+                if reasoning != previous_reasoning
+                else {}
+            )
+            previous_content = content
+            previous_reasoning = reasoning
+            event = TokenEvent(request.request_id, token_id=token, text=text, metadata=metadata)
             if last:
                 event.finish_reason = "length"
                 event.usage = Usage(len(prompt_ids), len(generated))
@@ -1145,16 +1267,23 @@ class CppBackend(BackendBase):
                 self._check_cancelled(request.request_id)
                 result = self._tp_decode_step(token)
 
-    def _final_tail(self, generated: list[int], previous_text: str) -> str:
-        """What the running decode held back, once there is no longer a token to settle it.
+    def _split_answer(
+        self, decoded: str, reader: Any | None, thinking_mode: str
+    ) -> tuple[str, str]:
+        """A running decode as ``(reasoning, content)``, recomputed whole each token.
 
-        The tail was withheld because it could still have become a character; the generation is
-        over, so it is what it is. Sending it is what keeps a stream of a generation equal to the
-        generation: `generate` decodes the same ids and has the replacement character in the same
-        place. It is empty in the ordinary case, where the last token ended on a character boundary.
+        Recomputed rather than accumulated because the marker is plain text and its offset moves as
+        the byte-level pieces underneath it settle; the caller diffs against what it already sent.
+        Without a reader the whole decode is the answer, which is what this backend did before it
+        could read one at all -- the reader is ``None`` only when no tokenizer loaded, and that
+        already makes ``_prompt_ids`` refuse a text prompt.
         """
-        final = self._decode(generated)
-        return final[len(previous_text):] if final.startswith(previous_text) else ""
+        if reader is None:
+            return "", decoded
+        try:
+            return reader.split_reasoning(decoded, thinking_mode)
+        except Exception:  # noqa: BLE001
+            return "", decoded
 
     def stream(self, request: GenerationRequest) -> Iterator[TokenEvent]:
         # A primitive lock can span generator yields even when AsyncLLM resumes
@@ -1190,6 +1319,7 @@ class CppBackend(BackendBase):
                     pass
         self._engine = None
         self._tokenizer = None
+        self._answer_reader_cache = _READER_UNSET
         self._native = None
         self._ready = False
         close = getattr(engine, "close", None)

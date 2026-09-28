@@ -29,7 +29,7 @@ esac
 export DEEPSEEK_SERVING_PREFILL_CHUNK_TOKENS="${DEEPSEEK_SERVING_PREFILL_CHUNK_TOKENS:-256}"
 export DEEPSEEK_GGUF_ROUTES_NATIVE_MAX_BATCH="${DEEPSEEK_GGUF_ROUTES_NATIVE_MAX_BATCH:-$DEEPSEEK_SERVING_PREFILL_CHUNK_TOKENS}"
 
-TORCHRUN="${TORCHRUN:-torchrun}"
+PYTHON="${PYTHON:-python}"
 MASTER_PORT="${MASTER_PORT:-29920}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 HOST="${HOST:-0.0.0.0}"
@@ -51,24 +51,30 @@ ROUTED_EXPERTS_DEVICE="${ROUTED_EXPERTS_DEVICE:-cpu}"
 PD_MODE="${PD_MODE:-scheduler}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 
+# `pocketllm serve` owns the rank fan-out now. `--tensor-parallel-size` starts the
+# supervisor, which assigns the rendezvous environment and runs each nonzero rank
+# through the torch backend's worker loop. This script used to hand the same job to
+# `torchrun --module src.server.openai`, a second front end that has since been
+# deleted (issue #447). `--master-port` went with torchrun; the supervisor reads
+# MASTER_PORT from the environment instead, so keeping it exported keeps the port
+# choice this script made.
+export MASTER_PORT
 ARGS=(
+  --backend torch
   --host "$HOST"
   --port "$PORT"
-  --ckpt-path "$CKPT_PATH"
-  --ckpt-format "$CKPT_FORMAT"
-  --config "$CONFIG"
-  --model "$MODEL_ID"
+  --model "$CKPT_PATH"
+  --model-format "$CKPT_FORMAT"
+  --config-path "$CONFIG"
+  --served-model-name "$MODEL_ID"
   --routed-experts-device "$ROUTED_EXPERTS_DEVICE"
   --pd-mode "$PD_MODE"
-  --partition-policy "$PARTITION_POLICY"
+  --backend-option "partition_policy=$PARTITION_POLICY"
   --max-model-len "$MAX_MODEL_LEN"
+  --tensor-parallel-size "$NPROC_PER_NODE"
 )
 if [[ -n "$TOKENIZER_PATH" ]]; then
   ARGS+=(--tokenizer-path "$TOKENIZER_PATH")
 fi
 
-PYTHONPATH="$ROOT" exec "$TORCHRUN" \
-  --master-port "$MASTER_PORT" \
-  --nproc-per-node "$NPROC_PER_NODE" \
-  --module src.server.openai \
-  "${ARGS[@]}"
+PYTHONPATH="$ROOT" exec "$PYTHON" -m pocketllm serve "${ARGS[@]}"

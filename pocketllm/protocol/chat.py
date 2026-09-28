@@ -5,8 +5,10 @@ semantics the legacy DeepSeek server validated over time: multimodal content
 flattening, tool attachment and ``tool_choice`` instructions, reasoning mode
 detection, tool-call normalization, and stop-string truncation.
 
-``src.server.openai`` re-exports these so there is one implementation rather
-than a simplified copy in the unified server.
+Both servers re-exported these so there was one implementation rather than a
+simplified copy in the unified one, and with a single front end that is now just
+where they live: `src/models/deepseek_v4/serving.py` imports them by name because
+its payload builder and streaming decoder are the callers.
 """
 
 from __future__ import annotations

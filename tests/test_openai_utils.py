@@ -1,7 +1,7 @@
 import json
 
 from src.encoding.deepseek_v4 import REASONING_EFFORT_PROMPTS, encode_messages
-from src.server.openai import (
+from src.models.deepseek_v4.serving import (
     _completion_response,
     _make_payload,
     _normalize_tool_calls,

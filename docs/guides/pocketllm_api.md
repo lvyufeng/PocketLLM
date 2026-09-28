@@ -409,10 +409,16 @@ Five things are worth knowing before relying on the field:
 - **Only a call syntax this server has read is parsed.** That is Qwen's template (`qwen3_5`,
   including the `qwen3_5_text` spelling) and DeepSeek-V4's own encoder, which already parsed its
   DSML calls. Any other architecture keeps the older behaviour and leaves the call in `content`;
-  inventing a parse for a syntax nobody has read would drop or corrupt calls silently.
+  inventing a parse for a syntax nobody has read would drop or corrupt calls silently. The
+  selection is one implementation (`pocketllm/protocol/templating.py`), so the checkpoint's
+  architecture decides it the same way whichever backend served the request — that module used to be
+  the C++ front end's sidecar, which is why a `cpp` request through `pocketllm serve` answered with
+  the call as prose while the same checkpoint through the native binary answered with `tool_calls`.
 - **Streaming is not supported.** A streamed response carries the call syntax as content, exactly as
   it did before, and reports the engine's own `finish_reason`. Ask for a non-streaming response when
-  you want `tool_calls`.
+  you want `tool_calls`. The *reasoning* split is a different matter and does happen on a stream: a
+  thinking-mode answer sends everything before `</think>` as `reasoning_content` deltas, so a client
+  watches the reasoning instead of waiting for the answer.
 - **The selection policy is not applied.** `tool_choice` other than `"auto"` and
   `parallel_tool_calls: false` are 400s, listed below: the model still decides whether to call
   anything and how many calls to make.
@@ -606,10 +612,13 @@ the routed experts in host memory, one process a rank under `--tensor-parallel-s
 
 ## Request normalization
 
-`pocketllm.protocol` holds the request normalization shared by the unified server and the legacy
-`src.server.openai` server: OpenAI content-block flattening, tool attachment and `tool_choice`
-instructions, `reasoning`/`reasoning_effort` handling, tool-call shaping, and stop-string truncation.
-There is one implementation, and it imports neither Torch nor the native module.
+`pocketllm.protocol` holds the request normalization the server runs: OpenAI content-block
+flattening, tool attachment and `tool_choice` instructions, `reasoning`/`reasoning_effort` handling,
+tool-call shaping, and stop-string truncation. There is one implementation, and it imports neither
+Torch nor the native module. It used to be shared with a second, model-owned server
+(`src.server.openai`, since retired with the rest of the duplicate front ends — see
+[#447](https://github.com/lvyufeng/PocketLLM/issues/447)); the module that server's runtime half
+became is `src/models/deepseek_v4/serving.py`.
 
 `/v1/chat/completions` puts the normalized messages, thinking mode, reasoning effort, and tool
 metadata in `GenerationRequest.metadata`. The shared prompt boundary first asks the selected

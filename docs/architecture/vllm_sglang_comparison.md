@@ -13,9 +13,10 @@ only from rank 0, forwards termination signals, propagates rank failures, and re
 `--no-tensor-parallel-supervisor` preserves existing `torchrun`/manual rank launch workflows.
 
 Automatic supervision is backend-gated: Torch delegates nonzero ranks to the existing
-`src.server.openai._worker_loop`, while the Python C++ Qwen adapter still has no worker-loop binding
-and therefore requires an external/legacy native launcher. The supervisor controls process lifecycle
-only; it is not a request scheduler and does not add request-local KV state or continuous batching.
+`src.models.deepseek_v4.serving._worker_loop`, while the Python C++ Qwen adapter still has no
+worker-loop binding and therefore requires an external/legacy native launcher. The supervisor
+controls process lifecycle only; it is not a request scheduler and does not add request-local KV
+state or continuous batching.
 
 The supervisor uses backend-specific rendezvous protocols unchanged. Physical KV layouts, recurrent
 state, NCCL/Gloo/HCCL collectives, and CUDA/Ascend kernels remain private to each execution plane.

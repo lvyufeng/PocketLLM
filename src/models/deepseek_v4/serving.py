@@ -1,14 +1,25 @@
+"""The DeepSeek-V4 PyTorch serving runtime: payload in, completion out.
+
+What is here is the half of serving that is about *this* model and format -- how a request becomes a
+payload, how the executor's tokens become text, how a streamed answer is split, and the worker loop a
+non-zero rank runs. What is *not* here is the HTTP surface or the request lifecycle: those are
+`pocketllm/server/openai.py` and `pocketllm/backends/`, and they are shared with every other runtime.
+
+That split is why this module has no `BaseHTTPRequestHandler` in it any more. It used to, and it used
+to have a `main()` that started a server of its own -- a second OpenAI surface, in a repository that
+already had one, serving a subset of the models the first one serves. See
+[#447](https://github.com/lvyufeng/PocketLLM/issues/447).
+"""
+
+from __future__ import annotations
+
 import json
 import os
 import sys
-import threading
 import time
 import uuid
-from argparse import ArgumentParser
 from datetime import timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlparse
 
 
 def _set_best_env_defaults() -> None:
@@ -65,10 +76,8 @@ from src.models.deepseek_v4.generation import (
     generate_stream,
     load_model,
 )
-from src.runtime.prefix_snapshot import PrefixSnapshotCache
 from src.models.deepseek_v4.runtime import ModelArgs, Transformer
 from src.runtime.pd_scheduler import PDExecutionFacade, PDScheduler
-from src.server.engine import DeepSeekServingEngine
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 from pocketllm import protocol  # noqa: E402
@@ -671,253 +680,6 @@ def _sse_line(obj: Any) -> bytes:
     return b"data: " + _json_bytes(obj) + b"\n\n"
 
 
-def _debug_tool_schema(body: dict[str, Any]) -> None:
-    if os.getenv("DEEPSEEK_OPENAI_DEBUG_REQUESTS", "0").lower() not in {"1", "true", "yes"}:
-        return
-    tools = body.get("tools")
-    if not isinstance(tools, list):
-        return
-    for tool in tools:
-        if not isinstance(tool, dict) or not isinstance(tool.get("function"), dict):
-            continue
-        function = tool["function"]
-        if function.get("name") != "builtin_web_search":
-            continue
-        schema = {
-            "name": function.get("name"),
-            "description": function.get("description"),
-            "parameters": function.get("parameters"),
-        }
-        print(f"openai_tool_schema {json.dumps(schema, ensure_ascii=False)[:2000]}", flush=True)
-
-
-
-def _debug_request_summary(body: dict[str, Any], payload: dict[str, Any], prompt_tokens: int) -> None:
-    if os.getenv("DEEPSEEK_OPENAI_DEBUG_REQUESTS", "0").lower() not in {"1", "true", "yes"}:
-        return
-    tools = body.get("tools")
-    tool_names = []
-    if isinstance(tools, list):
-        for tool in tools:
-            if isinstance(tool, dict) and isinstance(tool.get("function"), dict):
-                tool_names.append(str(tool["function"].get("name", "")))
-    print(
-        "openai_request "
-        f"id={payload.get('request_id')} "
-        f"stream={payload.get('stream')} "
-        f"messages={len(body.get('messages') or [])} "
-        f"prompt_tokens={prompt_tokens} "
-        f"tools={len(tools) if isinstance(tools, list) else 0} "
-        f"tool_names={tool_names[:20]} "
-        f"tool_choice={body.get('tool_choice')} "
-        f"payload_tool_choice={payload.get('tool_choice')} "
-        f"parallel_tool_calls={body.get('parallel_tool_calls')} "
-        f"response_format={body.get('response_format')} "
-        f"mcp_keys={[key for key in body.keys() if 'mcp' in str(key).lower()]}",
-        flush=True,
-    )
-    raw_messages = body.get("messages") or []
-    if isinstance(raw_messages, list):
-        for idx, msg in enumerate(raw_messages):
-            if not isinstance(msg, dict):
-                continue
-            role = msg.get("role")
-            content_repr = _normalize_content(msg.get("content"))
-            content_repr = (content_repr or "").replace("\n", "\\n")
-            tool_call_id = msg.get("tool_call_id")
-            tool_calls = msg.get("tool_calls")
-            print(
-                f"openai_request_msg id={payload.get('request_id')} idx={idx} role={role} "
-                f"tool_call_id={tool_call_id} has_tool_calls={bool(tool_calls)} "
-                f"content_len={len(content_repr)} content_head={content_repr[:600]!r}",
-                flush=True,
-            )
-
-
-class OpenAIHandler(BaseHTTPRequestHandler):
-    server_version = "DeepSeekOpenAIServer/0.1"
-
-    def log_message(self, fmt: str, *args: Any) -> None:
-        print(f"{self.address_string()} - {fmt % args}", flush=True)
-
-    def _send_common_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-
-    def _send_json(self, status: int, obj: Any) -> None:
-        data = _json_bytes(obj)
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self._send_common_headers()
-        self.end_headers()
-        self.wfile.write(data)
-
-    def do_OPTIONS(self) -> None:
-        self.send_response(204)
-        self._send_common_headers()
-        self.end_headers()
-
-    def _read_json_body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        raw = self.rfile.read(length) if length else b"{}"
-        return json.loads(raw.decode("utf-8"))
-
-    def do_GET(self) -> None:
-        runtime = self.server.runtime
-        path = urlparse(self.path).path
-        if path == "/health":
-            self._send_json(200, {"status": "ok", "rank": runtime["rank"], "world_size": runtime["world_size"], "model": runtime["model_id"]})
-            return
-        if path == "/v1/models":
-            now = int(time.time())
-            self._send_json(200, {"object": "list", "data": [{"id": runtime["model_id"], "object": "model", "created": now, "owned_by": "local"}]})
-            return
-        self._send_json(404, _openai_error("not found"))
-
-    def do_POST(self) -> None:
-        if urlparse(self.path).path != "/v1/chat/completions":
-            self._send_json(404, _openai_error("not found"))
-            return
-        runtime = self.server.runtime
-        try:
-            body = self._read_json_body()
-            stream = bool(body.get("stream", False))
-            payload = _make_payload(body)
-            prompt_text = encode_messages(
-                payload["messages"],
-                thinking_mode=payload["thinking_mode"],
-                reasoning_effort=payload.get("reasoning_effort"),
-            )
-            payload["_prompt_ids"] = runtime["tokenizer"].encode(prompt_text)
-            _debug_tool_schema(body)
-            max_seq_len = int(getattr(runtime.get("model"), "max_seq_len", 0) or 0)
-            max_tokens = int(payload.get("max_tokens") or 0)
-            if max_seq_len > 0 and len(payload["_prompt_ids"]) + max(max_tokens, 1) > max_seq_len:
-                keep = max(max_seq_len - max(max_tokens, 1), 1)
-                if os.getenv("DEEPSEEK_OPENAI_DEBUG_REQUESTS", "0").lower() in {"1", "true", "yes"}:
-                    print(f"openai_truncate_prompt id={payload.get('request_id')} from={len(payload['_prompt_ids'])} to={keep} max_seq_len={max_seq_len}", flush=True)
-                payload["_prompt_ids"] = payload["_prompt_ids"][-keep:]
-            if PrefixSnapshotCache.enabled() and payload["_prompt_ids"]:
-                payload["_prefix_snapshot_hint"] = PrefixSnapshotCache.instance().lookup_hint(payload["_prompt_ids"])
-            _debug_request_summary(body, payload, len(payload["_prompt_ids"]))
-        except Exception as exc:
-            self._send_json(400, _openai_error(str(exc)))
-            return
-        if not stream:
-            try:
-                result = self.server.engine.submit(payload)
-            except Exception as exc:
-                self._send_json(500, _openai_error(str(exc), "server_error"))
-                return
-            self._send_json(200, _completion_response(runtime, payload, result))
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self._send_common_headers()
-        self.end_headers()
-        disconnected = False
-        stopped_by_sequence = False
-        stop_strings = _stop_strings(payload.get("stop"))
-        stop_hold = ""
-        stop_hold_limit = max((len(item) for item in stop_strings), default=0) - 1
-        decoder = _StreamingDecoder(runtime["tokenizer"], payload["thinking_mode"])
-        self.wfile.write(_sse_line(_chunk_payload(runtime, payload, {"role": "assistant"})))
-        self.wfile.flush()
-        done_event = None
-        try:
-            events = self.server.engine.submit_stream(payload)
-            for event in events:
-                if event.get("type") == "token":
-                    if disconnected:
-                        continue
-                    for delta in decoder.append(event.get("token_ids", [])):
-                        if stopped_by_sequence:
-                            continue
-                        emit_delta = dict(delta)
-                        if "content" in emit_delta and stop_strings:
-                            combined = stop_hold + emit_delta["content"]
-                            earliest = None
-                            for stop_text in stop_strings:
-                                pos = combined.find(stop_text)
-                                if pos >= 0 and (earliest is None or pos < earliest):
-                                    earliest = pos
-                            if earliest is not None:
-                                visible = combined[:earliest]
-                                stopped_by_sequence = True
-                                stop_hold = ""
-                            elif stop_hold_limit > 0:
-                                visible = combined[:-stop_hold_limit] if len(combined) > stop_hold_limit else ""
-                                stop_hold = combined[-stop_hold_limit:]
-                            else:
-                                visible = combined
-                                stop_hold = ""
-                            emit_delta["content"] = visible
-                        if not emit_delta.get("content") and not emit_delta.get("reasoning_content"):
-                            continue
-                        try:
-                            self.wfile.write(_sse_line(_chunk_payload(runtime, payload, emit_delta)))
-                            self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            disconnected = True
-                elif event.get("type") == "done":
-                    done_event = event
-        except Exception as exc:
-            if not disconnected:
-                self._send_json(500, {"error": {"message": str(exc), "type": "server_error"}})
-            return
-        if done_event is None:
-            return
-        if not disconnected and not stopped_by_sequence and stop_hold:
-            try:
-                self.wfile.write(_sse_line(_chunk_payload(runtime, payload, {"content": stop_hold})))
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                disconnected = True
-        final_msg = decoder.final_message(payload["thinking_mode"])
-        final_tool_calls = _normalize_tool_calls(final_msg.get("tool_calls") or [])
-        if final_tool_calls and os.getenv("DEEPSEEK_OPENAI_DEBUG_REQUESTS", "0").lower() in {"1", "true", "yes"}:
-            print(f"openai_tool_calls id={payload.get('request_id')} calls={json.dumps(final_tool_calls, ensure_ascii=False)[:2000]}", flush=True)
-        if not disconnected and final_tool_calls:
-            tool_delta = {
-                "tool_calls": [
-                    {"index": idx, **tool_call}
-                    for idx, tool_call in enumerate(final_tool_calls)
-                ]
-            }
-            self.wfile.write(_sse_line(_chunk_payload(runtime, payload, tool_delta)))
-        finish = "tool_calls" if final_tool_calls else "stop" if stopped_by_sequence else done_event.get("finish_reason", "stop")
-        if not disconnected:
-            include_usage = bool(payload.get("stream_options", {}).get("include_usage", False))
-            final_chunk = _chunk_payload(runtime, payload, {}, finish_reason=finish)
-            if include_usage:
-                final_chunk["usage"] = {
-                    "prompt_tokens": done_event["prompt_tokens"],
-                    "completion_tokens": len(done_event["completion_tokens"][0]),
-                    "total_tokens": done_event["prompt_tokens"] + len(done_event["completion_tokens"][0]),
-                }
-                final_chunk["deepseek_timings"] = _timing_metrics(
-                    done_event["prefill_time"],
-                    done_event["decode_time"],
-                    done_event["prefill_tokens"],
-                    done_event["decode_tokens"],
-                )
-            self.wfile.write(_sse_line(final_chunk))
-            self.wfile.write(_sse_line("[DONE]"))
-            self.wfile.flush()
-        self.close_connection = True
-
-
-class DeepSeekHTTPServer(ThreadingHTTPServer):
-    def __init__(self, server_address, handler_class, runtime, engine):
-        super().__init__(server_address, handler_class)
-        self.runtime = runtime
-        self.engine = engine
-
-
 def _worker_loop(runtime: dict[str, Any]) -> None:
     while True:
         box = [None]
@@ -935,43 +697,3 @@ def _worker_loop(runtime: dict[str, Any]) -> None:
                 _run_payload(runtime, payload)
 
 
-def _serve(runtime: dict[str, Any], host: str, port: int) -> None:
-    engine = DeepSeekServingEngine(runtime, _broadcast_payload, _run_payload, _run_payload_stream)
-    server = DeepSeekHTTPServer((host, port), OpenAIHandler, runtime, engine)
-    print(f"OpenAI-compatible server listening on http://{host}:{port}", flush=True)
-    try:
-        server.serve_forever()
-    finally:
-        engine.close()
-        if runtime["world_size"] > 1:
-            _broadcast_payload({"op": "shutdown"}, runtime)
-        server.server_close()
-
-
-def main() -> None:
-    parser = ArgumentParser()
-    parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--ckpt-path", type=str, default=os.environ.get("CKPT_PATH", os.path.abspath(os.path.join(current_dir, "../../checkpoints/DeepSeek-V4-Flash-w8a8"))))
-    parser.add_argument("--ckpt-format", type=str, choices=["auto", "safetensors", "gguf"], default=os.environ.get("CKPT_FORMAT", "auto"))
-    parser.add_argument("--tokenizer-path", type=str, default=os.environ.get("TOKENIZER_PATH"))
-    parser.add_argument("--config", type=str, default=os.path.abspath(os.path.join(current_dir, "../../configs/config_w8a8.json")))
-    parser.add_argument("--model", type=str, default=DEFAULT_MODEL_ID)
-    parser.add_argument("--routed-experts-device", type=str, choices=["gpu", "cpu"], default="cpu")
-    parser.add_argument("--pd-mode", type=str, choices=["off", "scheduler"], default="scheduler")
-    parser.add_argument("--partition-policy", type=str, choices=["legacy", "baseline_4gpu", "layer_pp_4gpu"], default=os.environ.get("PARTITION_POLICY", "legacy"))
-    parser.add_argument("--max-model-len", type=int, default=4096)
-    args = parser.parse_args()
-    runtime = _init_runtime(args)
-    if runtime["rank"] == 0:
-        _serve(runtime, args.host, args.port)
-    else:
-        _worker_loop(runtime)
-    if dist.is_initialized():
-        dist.destroy_process_group()
-    if runtime.get("shared_cpu_moe_arena") is not None:
-        runtime["shared_cpu_moe_arena"].close(unlink=True)
-
-
-if __name__ == "__main__":
-    main()

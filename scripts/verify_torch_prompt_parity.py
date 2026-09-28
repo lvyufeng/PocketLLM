@@ -4,7 +4,7 @@
 Phase 1.1 moved OpenAI request normalization into ``pocketllm.protocol`` and made
 ``TorchBackend`` apply the DeepSeek chat template itself.  The unified server
 previously flattened messages to "role: content", so the prompt it fed the model
-differed from ``src.server.openai``.  This drives real request bodies through
+differed from the DeepSeek runtime's own encoder.  This drives real request bodies through
 both paths using the real checkpoint's tokenizer and compares the resulting token
 ids, which is the part of the Torch adapter that can be validated without the
 full 156G model on device.
@@ -138,8 +138,8 @@ def main() -> int:
     all_ok = True
     for label, body in BODIES:
         chat = ChatRequest.from_body(body)
-        # Legacy path: src.server.openai encodes the normalized messages with the
-        # DeepSeek template and tokenizes the result.
+        # Reference path: encode the normalized messages with the DeepSeek template
+        # directly, the way the DeepSeek runtime's payload builder does.
         legacy_text = encode_messages(
             chat.messages,
             thinking_mode=chat.thinking_mode,

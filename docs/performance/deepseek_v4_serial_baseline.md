@@ -143,10 +143,13 @@ process, or a second configuration on the same devices, changes the number.
 
 The native server emits no per-token timing on the wire. Its stream cannot be
 used to delimit the phases either: `handle_stream` writes the role chunk
-*before* it calls `sched.submit_request` (`cpp_engine/engine/openai_server.cpp`),
-so the client sees a first event within milliseconds of the request regardless of
-prompt length. The `deepseek_timings` field belongs to the *Python* server
-(`src/server/openai.py`) and never appears on this path.
+*before* it calls `sched.submit_request`, so the client sees a first event within
+milliseconds of the request regardless of prompt length. (That handler has since
+been retired along with the rest of the C++ front end — see
+[#447](https://github.com/lvyufeng/PocketLLM/issues/447) — but the accounting
+below is the engine's and is unaffected.) The `deepseek_timings` field belongs to
+the *Python* server (`src/models/deepseek_v4/serving.py`) and never appears on
+this path.
 
 The engine does keep exact per-request accounting in
 `cpp_engine/core/metrics.cpp` and exports it as Prometheus counters at
