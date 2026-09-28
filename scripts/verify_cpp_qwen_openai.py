@@ -1088,6 +1088,130 @@ def tool_call_arguments(tool_call: dict[str, Any], label: str) -> dict[str, Any]
     return arguments
 
 
+#: A schema small enough that a wrong mask shows up in the answer rather than in a timing: one
+#: required string property and nothing else allowed, so `{"city": "..."}` is the only text that
+#: passes and any prose, fence or extra key is a failure rather than a judgement call.
+STRUCTURED_SCHEMA = {
+    "type": "object",
+    "properties": {"city": {"type": "string"}},
+    "required": ["city"],
+    "additionalProperties": False,
+}
+
+
+def validate_structured_outputs(
+    base_url: str, model_name: str, timeout: float, *, constrained: bool, launch: str
+) -> None:
+    """Checks that `response_format` constrains what is generated, or says by name that it cannot.
+
+    The unit tests cover which factory each shape selects and over whose vocabulary; what they cannot
+    show is that the engine holds the model to the schema, because that happens inside the sampler.
+    So where it can be applied, the claim here is about the generated *text*: it parses, and under a
+    schema it carries the required property and nothing the schema forbade. A server that accepted
+    the field and generated freely would pass every check that only looked at the status code, and
+    the failure would surface at the client as JSON it cannot parse.
+
+    Where it cannot be applied the claim is the other one, and `constrained` is what says which
+    question this run is asking. The constraint travels in the worker command and is applied by the
+    per-row device sampler, so under tensor parallelism -- where every rank has to enter the same
+    sampler collectives and one set of sampling values covers the whole batch -- there is no per-row
+    mask to apply, and the engine declares so.
+
+    Two divergences between the front ends are recorded here rather than smoothed over, because both
+    are answers the native one gives and the unified one does not, and the harness is the thing that
+    is supposed to see them:
+
+      * `{"type": "text"}` **asks for nothing** -- it is what the OpenAI SDK sends by default. The
+        native front end asks whether the engine can constrain before it reads the type, so it
+        refuses this shape too on a configuration where nothing could be constrained anyway; the
+        unified front end reads the shape first and accepts it. Refusing it breaks clients that never
+        wanted a constraint.
+      * The unified front end's refusals carry OpenAI's `param` slot, so a client can act on them
+        without reading prose. The native one answers `server_error` with no `param`, which is the
+        shape a client has to guess about.
+    """
+    messages = [{"role": "user", "content": "Name one city. Reply with JSON only."}]
+
+    # `{"type": "text"}` is the shape that asks for nothing, and it is what an OpenAI client sends by
+    # default, so a runtime that refused it would break clients that never wanted a constraint.
+    plain = http_request(
+        base_url,
+        "/v1/chat/completions",
+        {
+            "messages": messages,
+            "max_tokens": 32,
+            "temperature": 0.0,
+            "response_format": {"type": "text"},
+        },
+        timeout=timeout,
+    )
+    if launch == "native" and not constrained:
+        require(
+            plain.status == 400,
+            "the native front end accepted `response_format: {type: text}` on a configuration it "
+            "cannot constrain -- if that changed, this divergence is closed and the check should "
+            f"stop recording it: HTTP {plain.status}: {plain.text}",
+        )
+    else:
+        require(
+            plain.status == 200,
+            f"response_format text was refused: HTTP {plain.status}: {plain.text}",
+        )
+
+    cases = (
+        ({"type": "json_object"}, False),
+        ({"type": "json_schema", "json_schema": {"name": "City", "schema": STRUCTURED_SCHEMA}}, True),
+    )
+    for response_format, typed in cases:
+        label = response_format["type"]
+        result = http_request(
+            base_url,
+            "/v1/chat/completions",
+            {
+                "messages": messages,
+                "max_tokens": 96,
+                "temperature": 0.0,
+                "response_format": response_format,
+            },
+            timeout=timeout,
+        )
+        if not constrained:
+            require(
+                result.status == 400,
+                f"{label} should be refused where the engine has no per-row sampler: "
+                f"HTTP {result.status}: {result.text}",
+            )
+            if launch != "native":
+                error = refusal_error(result, f"{label} where the engine has no per-row sampler")
+                require(
+                    error.get("param") == "response_format",
+                    f"{label} refusal named {error.get('param')!r} instead of the field",
+                )
+            continue
+        require(result.status == 200, f"{label} was refused: HTTP {result.status}: {result.text}")
+        choice = result.json()["choices"][0]
+        text = choice["message"]["content"]
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"{label} answer is not JSON ({exc}): {text!r}") from exc
+        require(isinstance(parsed, dict), f"{label} answer is JSON and not an object: {text!r}")
+        if not typed:
+            continue
+        # The masked generation cannot produce a fence or a trailing sentence, and it cannot produce
+        # a key the schema does not name -- so anything beyond `city` means the mask was not applied.
+        require(
+            set(parsed) == {"city"} and isinstance(parsed["city"], str),
+            f"the schema was not applied to the answer: {text!r}",
+        )
+        # A schema that is satisfied is a constraint that is complete, and a complete constraint ends
+        # the answer. Running to the token cap instead would mean the object closed by luck.
+        require(
+            choice["finish_reason"] == "stop",
+            f"a completed object did not end the answer: finish_reason={choice['finish_reason']!r}",
+        )
+
+
 def validate_tool_calls(base_url: str, model_name: str, timeout: float) -> None:
     """Checks that a tool call comes back as a tool call and not as prose.
 
@@ -1620,6 +1744,18 @@ def run(args: argparse.Namespace) -> int:
         validate_n_choices(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 
         validate_logprobs(base_url, model_name, timeout=args.request_timeout_seconds + 30)
+
+        # Whether the engine can hold an answer to a schema is the width's answer and not this
+        # launch's: the mask is applied by the per-row device sampler, so a world of one applies it
+        # and a sharded one has one sampler for the whole batch. Both front ends are read the same
+        # way here, which is what makes this a comparison.
+        validate_structured_outputs(
+            base_url,
+            model_name,
+            timeout=args.request_timeout_seconds + 30,
+            constrained=len(devices) == 1,
+            launch=args.launch,
+        )
 
         validate_tool_calls(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 

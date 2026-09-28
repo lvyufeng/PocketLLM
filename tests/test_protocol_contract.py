@@ -22,6 +22,7 @@ from pocketllm.protocol.contract import (
     audit,
     audit_shape,
     is_stop_shape,
+    structured_output_spec,
 )
 
 
@@ -296,3 +297,81 @@ def test_an_unknown_endpoint_name_is_not_silently_treated_as_chat() -> None:
             audit({"n": 2}, endpoint=endpoint, serves=ServedFields(choices=True))
         with pytest.raises(ValueError, match="endpoint"):
             audit_shape({"n": 2}, endpoint=endpoint)
+
+
+def test_a_response_format_is_one_of_three_shapes_or_it_is_refused() -> None:
+    """The values ``response_format`` accepts, and the ones that are well formed JSON and not one.
+
+    Shape rather than capability: these hold on every runtime, including one with no constrained
+    decoding at all -- and each refusal names the piece that is wrong, because a client that sent a
+    `json_schema` without the schema has to be told *that* rather than that the server cannot do
+    structured outputs, which is a different and untrue statement.
+    """
+    schema = {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+
+    assert shape({"response_format": {"type": "text"}}) is None
+    assert shape({"response_format": {"type": "json_object"}}) is None
+    assert shape(
+        {"response_format": {"type": "json_schema", "json_schema": {"name": "City", "schema": schema}}}
+    ) is None
+
+    # A string and a list are not an object with a type, however JSON-shaped they are.
+    for value in ("json_object", 5, ["json_object"], {}, {"type": None}, {"type": "csv"}):
+        field, _ = refusal(shape({"response_format": value}))
+        assert field == "response_format", value
+
+    # The three pieces a `json_schema` needs, each refused for itself.
+    field, message = refusal(shape({"response_format": {"type": "json_schema"}}))
+    assert field == "response_format"
+    assert "json_schema object" in message
+    field, message = refusal(
+        shape({"response_format": {"type": "json_schema", "json_schema": {"name": "City"}}})
+    )
+    assert field == "response_format"
+    assert "json_schema.schema" in message
+    field, message = refusal(
+        shape({"response_format": {"type": "json_schema", "json_schema": {"schema": [1, 2]}}})
+    )
+    assert field == "response_format"
+    assert "json_schema.schema" in message
+
+
+def test_the_spec_hands_back_the_schema_the_adapter_builds_from() -> None:
+    """One reading of the field, so the schema that passed the audit is the schema built from.
+
+    Read twice -- once by the host's audit and once by the adapter that has to turn it into a token
+    mask -- would be two places for the reading to drift, and the drift would be a request answered
+    against a schema nobody validated.
+    """
+    spec = structured_output_spec({"type": "text"})
+    assert (spec.kind, spec.schema, spec.constrains) == ("text", None, False)
+
+    spec = structured_output_spec({"type": "json_object"})
+    assert (spec.kind, spec.schema, spec.constrains) == ("json_object", None, True)
+
+    schema = {"type": "object"}
+    spec = structured_output_spec({"type": "json_schema", "json_schema": {"name": "X", "schema": schema}})
+    assert (spec.kind, spec.constrains) == ("json_schema", True)
+    # The schema itself, unchanged: `json_schema.name` and the description beside it are for the
+    # client's own bookkeeping and are not part of what the answer is held to.
+    assert spec.schema == schema
+
+
+def test_a_runtime_with_constrained_decoding_still_refuses_a_malformed_schema() -> None:
+    """The two halves of the audit are independent, and the order between them is the point.
+
+    A runtime declaring `structured_outputs` is not thereby a runtime that accepts any value of the
+    field: capability answers "can this be applied here", shape answers "is this a thing at all".
+    """
+    served = dict(structured_outputs=True)
+    assert capability({"response_format": {"type": "json_object"}}, **served) is None
+    field, _ = refusal(capability({"response_format": {"type": "json_schema"}}, **served))
+    assert field == "response_format"
+    field, _ = refusal(capability({"response_format": {"type": "csv"}}, **served))
+    assert field == "response_format"
+    # Keys beside the ones the field is read from are ignored, as the native front end ignored them:
+    # a client that attaches its own bookkeeping to the object has not made a request this server
+    # cannot read, and refusing would be refusing the client's prose rather than its intent.
+    assert capability(
+        {"response_format": {"type": "json_object", "vendor_note": "x"}}, **served
+    ) is None
