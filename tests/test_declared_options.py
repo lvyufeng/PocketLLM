@@ -19,8 +19,8 @@ import dataclasses
 import pytest
 
 from pocketllm.api import ConfigurationError, EngineArgs
-from pocketllm.backends import mimo_backend, v41_backend, xing4_backend
-from pocketllm.backends.options import BackendOption, Kind, decode_options
+from pocketllm.backends import mimo_backend, shared_options, v41_backend, xing4_backend
+from pocketllm.backends.options import BackendOption, Group, Kind, decode_options
 
 #: The three runtimes whose options are declared, with a checkpoint name each recognises.
 DECLARED = {
@@ -92,7 +92,9 @@ def test_an_alias_is_the_same_option_under_an_older_name() -> None:
     declared = {option.name: option for option in mimo_backend.OPTIONS}
 
     assert declared["chunk_rows"].aliases == ("expert_rows",)
-    assert declared["deal"].aliases == ("expert_deal",)
+    # ``deal`` was this adapter's canonical name and ``expert_deal`` its alias; the merge with V4.1
+    # swapped them, so the key a launch writes today is the one both runtimes spell the same way.
+    assert declared["expert_deal"].aliases == ("deal",)
 
     renamed = mimo_backend._Options.from_args(
         EngineArgs(model="a-mimo-v2-checkpoint", backend="mimo", backend_options={"expert_rows": 8})
@@ -102,6 +104,17 @@ def test_an_alias_is_the_same_option_under_an_older_name() -> None:
     )
 
     assert renamed.chunk_rows == canonical.chunk_rows == 8
+
+    old_deal = mimo_backend._Options.from_args(
+        EngineArgs(model="a-mimo-v2-checkpoint", backend="mimo", backend_options={"deal": "id"})
+    )
+    new_deal = mimo_backend._Options.from_args(
+        EngineArgs(
+            model="a-mimo-v2-checkpoint", backend="mimo", backend_options={"expert_deal": "id"}
+        )
+    )
+
+    assert old_deal.expert_deal == new_deal.expert_deal == "id"
 
 
 def test_a_flag_spelled_as_a_word_is_read_as_one() -> None:
@@ -281,3 +294,177 @@ def test_every_declared_option_can_describe_itself() -> None:
         for option in module.OPTIONS:
             assert option.help.strip(), f"{runtime}.{option.name} has no help"
             assert option.describe().strip(), f"{runtime}.{option.name} describes nothing"
+
+
+# ----------------------------------------------------------- one concept, declared once
+
+
+def _by_name(declarations) -> dict[str, BackendOption]:
+    return {option.name: option for option in declarations}
+
+
+def test_the_shared_list_is_the_concepts_more_than_one_runtime_declares() -> None:
+    """`shared_options` is a claim about the tree, so the tree is what checks it.
+
+    A concept two runtimes read is the case a duplicated flag comes from, and the way to stop the
+    duplication is for both to reference one declaration -- which is only true while the list says
+    so. Both directions matter: a name in the list that one runtime declares is a declaration nobody
+    shares, and a name two declare that is *not* in the list is the drift this replaced.
+    """
+    readers: dict[str, set[str]] = {}
+    for runtime, (module, _) in DECLARED.items():
+        for option in module.OPTIONS:
+            readers.setdefault(option.name, set()).add(runtime)
+
+    assert {name for name, runs in readers.items() if len(runs) > 1} == {
+        option.name for option in shared_options.SHARED
+    }
+
+
+def test_a_shared_declaration_names_the_runtimes_that_read_it() -> None:
+    """``readers`` is prose about the code, so it is checked against the code."""
+    for shared in shared_options.SHARED:
+        declared_by = {
+            runtime
+            for runtime, (module, _) in DECLARED.items()
+            if shared.name in _by_name(module.OPTIONS)
+        }
+
+        assert declared_by == set(shared.readers), (
+            f"{shared.name}: declared by {sorted(declared_by)}, readers say "
+            f"{sorted(shared.readers)}"
+        )
+
+
+#: The fields of a shared declaration a runtime may state differently:
+#: its own default, its own resolution, and its own sentence appended to the shared one.
+#: Everything else -- the canonical name, the alias, the kind, the group, the accepted values, the
+#: bounds -- is the shape the flag has wherever it is read, and a runtime that changed one of those
+#: would be declaring a second flag under the first flag's name, which is the thing the merge exists
+#: to remove.
+_STATED_PER_RUNTIME = frozenset({"default", "resolution", "help"})
+
+
+def test_a_shared_concept_has_one_shape_wherever_it_is_read() -> None:
+    for shared in shared_options.SHARED:
+        for runtime in shared.readers:
+            module, _ = DECLARED[runtime]
+            option = _by_name(module.OPTIONS)[shared.name]
+
+            for field in dataclasses.fields(BackendOption):
+                if field.name in _STATED_PER_RUNTIME:
+                    continue
+                assert getattr(option, field.name) == getattr(shared, field.name), (
+                    f"{runtime}.{shared.name} disagrees with the shared declaration on {field.name}"
+                )
+            assert option.help.startswith(shared.help), (
+                f"{runtime}.{shared.name} rewrote the shared sentence instead of adding to it"
+            )
+
+
+def test_a_runtime_states_its_own_answer_where_it_differs_and_nowhere_else() -> None:
+    """The differences that remain after the merge, each one a runtime's own answer to a shared
+    question: V4.1 leaves the deal and the prefill width to the loader, MiMo defaults the deal to
+    ``sorted`` and the width to a measured 2048, and Xing4 derives the width from the card."""
+    v41 = _by_name(v41_backend.OPTIONS)
+    mimo = _by_name(mimo_backend.OPTIONS)
+    xing4 = _by_name(xing4_backend.OPTIONS)
+
+    assert v41["expert_deal"].default is None and v41["expert_deal"].resolution
+    assert mimo["expert_deal"].default == "sorted"
+    assert v41["prefill_chunk"].resolution and mimo["prefill_chunk"].default == 2048
+    assert xing4["prefill_chunk"].default is None and xing4["prefill_chunk"].resolution
+    assert xing4["prefix_cache_bytes"].default == 2 << 30
+    assert v41["prefix_cache_bytes"].default == mimo["prefix_cache_bytes"].default == 4 << 30
+
+
+# ------------------------------------------------------------------- groups and resolutions
+
+
+def test_every_declared_option_is_listed_under_a_section_of_the_help() -> None:
+    """`--help` is generated in groups, so a declaration without one has nowhere to appear."""
+    for runtime, (module, _) in DECLARED.items():
+        for option in module.OPTIONS:
+            assert isinstance(option.group, Group), f"{runtime}.{option.name} has no group"
+
+
+def test_no_group_is_a_section_nobody_appears_in() -> None:
+    used = {option.group for _, (module, _) in DECLARED.items() for option in module.OPTIONS}
+
+    assert used == set(Group), f"unused: {sorted(group.value for group in set(Group) - used)}"
+
+
+def test_a_group_that_is_not_one_is_refused() -> None:
+    with pytest.raises(ConfigurationError, match="names the --help group 'Expert'"):
+        BackendOption("x", Kind.FLAG, True, "", group="Expert")
+
+
+def test_an_option_the_runtime_computes_says_so_instead_of_printing_none() -> None:
+    """``None`` is not a value anybody can type, so an unset option that resolves states how."""
+    declared = _by_name(xing4_backend.OPTIONS)["prefill_chunk"]
+
+    assert declared.default is None, "a value computed at load is not a default"
+    assert declared.resolution
+    assert declared.rendered_default() == f"unset (resolved: {declared.resolution})"
+
+
+def test_a_default_and_a_resolution_are_alternatives() -> None:
+    """Both at once is two answers to one question, so it is refused where it is written."""
+    with pytest.raises(ConfigurationError, match="declares both the default 4"):
+        BackendOption("x", Kind.INTEGER, 4, "", resolution="the card's free memory")
+
+
+# ------------------------------------------------------- the value a host flag resolves to
+
+
+def test_a_resolved_value_stands_where_a_default_would() -> None:
+    option = BackendOption("prefill_chunk", Kind.INTEGER, 2048, "")
+
+    assert decode_options([option], None, runtime="r", resolved={"prefill_chunk": 4096}) == {
+        "prefill_chunk": 4096
+    }
+    # An unset outcome of the host's own resolution is unset, and the declaration's default stands.
+    assert decode_options([option], None, runtime="r", resolved={"prefill_chunk": None}) == {
+        "prefill_chunk": 2048
+    }
+    # ``--backend-option`` is the more specific spelling, so it beats the flag it shares a concept
+    # with -- the same rule every other pair on this surface resolves by.
+    assert decode_options(
+        [option], {"prefill_chunk": 512}, runtime="r", resolved={"prefill_chunk": 4096}
+    ) == {"prefill_chunk": 512}
+
+
+def test_a_resolved_value_the_runtime_does_not_declare_is_refused() -> None:
+    """Not a launch's mistake, so not the launch's message: the host and the runtime disagree."""
+    with pytest.raises(
+        ConfigurationError, match="was handed a resolved value for 'prefix_cache_bytes'"
+    ):
+        decode_options(
+            [BackendOption("prefill_chunk", Kind.INTEGER, None, "")],
+            None,
+            runtime="r",
+            resolved={"prefix_cache_bytes": 1 << 30},
+        )
+
+
+@pytest.mark.parametrize("runtime", sorted(DECLARED))
+def test_the_prefill_width_flag_reaches_every_runtime(runtime: str) -> None:
+    """``--prefill-chunk-tokens`` is above the runtimes because every runtime has a prefill.
+
+    MiMo is why this is a test and not a default: its adapter read no such flag before the
+    declarations existed, so a launch that named one was silently prefillng at 2048. A tuning option
+    that does nothing is how a run gets measured on the wrong lever.
+    """
+    module, model = DECLARED[runtime]
+    args = EngineArgs(model=model, backend=runtime, prefill_chunk_tokens=4096)
+
+    assert module._Options.from_args(args).prefill_chunk == 4096
+
+
+@pytest.mark.parametrize("runtime", sorted(DECLARED))
+def test_the_flag_that_names_nothing_leaves_the_runtime_its_own_answer(runtime: str) -> None:
+    """A launch that does not name the width is the bare dataclass, on every runtime."""
+    module, model = DECLARED[runtime]
+    args = EngineArgs(model=model, backend=runtime, prefill_chunk_tokens=0)
+
+    assert module._Options.from_args(args) == module._Options()

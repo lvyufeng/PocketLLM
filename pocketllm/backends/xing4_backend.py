@@ -45,7 +45,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +61,8 @@ from pocketllm.api import (
 
 from .base import BackendBase, TokenStreamer
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
-from .options import BackendOption, Kind, decode_options
+from .options import BackendOption, Group, Kind, decode_options
+from .shared_options import DEVICE, PREFILL_CHUNK, PREFIX_CACHE_BYTES
 from .runtime_engine import RuntimeSpec, SchedulerHost, cancel_key, device_index
 
 DEFAULT_MAX_SEQ_LEN = 32768
@@ -122,42 +123,41 @@ PREFILL_SCORE_BUDGET = 1 << 30
 #: Host memory a rank's prefix store may hold, when prefix caching is on.
 DEFAULT_PREFIX_CACHE_BYTES = 2 << 30
 
-#: Every option this runtime reads, declared once.  ``prefill_chunk`` is the one
-#: whose real default is derived rather than declared: :func:`_chunk_for` picks it
-#: from the context and the card's free memory at load, so the declaration carries
-#: ``None`` and the adapter resolves it.
+#: Every option this runtime reads. Three of them are shared concepts -- the card, the prefill width
+#: and the prefix store's budget -- and are taken from
+#: :mod:`pocketllm.backends.shared_options`, differing only in what this runtime answers. The rest
+#: are Xing4's own.
+#:
+#: ``prefill_chunk`` is the one whose real default is derived rather than declared: :func:`_chunk_for`
+#: picks it from the context and the card's free memory at load, so the declaration carries ``None``
+#: and the adapter resolves it -- and says so in ``--help`` via the ``resolution`` sentence.
 OPTIONS: tuple[BackendOption, ...] = (
-    BackendOption("device", Kind.STRING, None, "the card this rank runs on"),
+    DEVICE,
     BackendOption(
         "gguf",
         Kind.STRING,
         None,
         "the -GGUF sibling to read the weights from, when --model does not name it",
+        group=Group.MODEL,
     ),
-    BackendOption(
-        "prefill_chunk",
-        Kind.INTEGER,
-        None,
-        "tokens one prefill forward takes; derived from the card's free memory when unset",
-        minimum=1,
+    replace(
+        PREFILL_CHUNK,
+        resolution="the card's free memory and the context",
     ),
-    BackendOption(
-        "prefix_cache_bytes",
-        Kind.BYTES,
-        DEFAULT_PREFIX_CACHE_BYTES,
-        "host memory a rank's prefix store may hold",
-    ),
+    replace(PREFIX_CACHE_BYTES, default=DEFAULT_PREFIX_CACHE_BYTES),
     BackendOption(
         "tokenizer",
         Kind.STRING,
         None,
         "the directory holding the tokenizer and chat template, when --model does not",
+        group=Group.MODEL,
     ),
     BackendOption(
         "use_kernel",
         Kind.FLAG,
         True,
         "run the fused kernels rather than the reference modules",
+        group=Group.KERNELS,
     ),
 )
 
@@ -222,6 +222,13 @@ class _Options:
             getattr(args, "backend_options", None),
             runtime="xing4",
             ignored=IGNORED_OPTIONS,
+            resolved={
+                # ``--prefill-chunk-tokens`` is the host's spelling of ``prefill_chunk``, a flag
+                # above the runtimes because every runtime has a prefill. A launch that names both
+                # gets the backend option; a launch that names neither leaves this ``None``, which is
+                # what tells this adapter to derive the width from the card at load.
+                "prefill_chunk": getattr(args, "prefill_chunk_tokens", 0) or None,
+            },
         )
         if not bool(getattr(args, "enable_prefix_caching", True)):
             # `--enable-prefix-caching` is the CLI's switch and the budget is the store's shape, so

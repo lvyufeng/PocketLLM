@@ -176,7 +176,7 @@ def test_the_launcher_levers_are_resolved_and_an_unknown_one_is_refused():
             },
         )
     )
-    assert (options.chunk_rows, options.deal) == (8, "id")
+    assert (options.chunk_rows, options.expert_deal) == (8, "id")
     assert (options.prefill_chunk, options.slots, options.pin) == (512, 3, False)
     assert options.resident_rows == 12
     defaults = _Options.from_args(EngineArgs(model="x", backend="mimo"))
@@ -230,7 +230,7 @@ def test_the_launchers_chunk_and_rows_reach_the_model():
 
     def loader(_args, options):
         seen["chunk_rows"] = options.chunk_rows
-        seen["deal"] = options.deal
+        seen["expert_deal"] = options.expert_deal
         seen["slots"] = options.slots
         seen["pin"] = options.pin
         return ScriptedModel()
@@ -241,7 +241,12 @@ def test_the_launchers_chunk_and_rows_reach_the_model():
         tokenizer=FakeTokenizer(),
     )
     adapter.generate([request(max_tokens=1)])
-    assert seen == {"chunk_rows": DEFAULT_EXPERT_ROWS, "deal": "id", "slots": 2, "pin": True}
+    assert seen == {
+        "chunk_rows": DEFAULT_EXPERT_ROWS,
+        "expert_deal": "id",
+        "slots": 2,
+        "pin": True,
+    }
     assert adapter.capabilities.details["prefill"].startswith("grouped multi-token kernel, 128")
 
 
