@@ -376,6 +376,12 @@ target_include_directories(pocket_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
+# The weight loader spreads its row loops over the host's threads, so the core
+# needs a threading runtime of its own rather than whichever one a vendor SDK
+# happens to pull in. PUBLIC because it is not an implementation detail: anything
+# linking the core links the same runtime the core was built against.
+find_package(Threads REQUIRED)
+target_link_libraries(pocket_core PUBLIC Threads::Threads)
 # The weight map has to know one thing about the backend it is being built for:
 # whether that backend's kernels read a PTQ1_0 weight where it lies, as 28-byte
 # blocks, or want it decoded into fp16 at load. That is a property of the backend
@@ -591,6 +597,13 @@ set_target_properties(test_gguf_ternary_reader PROPERTIES RUNTIME_OUTPUT_DIRECTO
 add_executable(test_ptq1_0_decode tests/test_ptq1_0_decode.cpp)
 target_link_libraries(test_ptq1_0_decode PRIVATE pocket_core)
 set_target_properties(test_ptq1_0_decode PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# Host arithmetic again, and the same synthetic-GGUF approach: the unfold is a
+# load-time path a checkpoint cannot exercise at build time, so the test builds
+# the shard it needs rather than reading one.
+add_executable(test_qwen_hadamard_unfold tests/test_qwen_hadamard_unfold.cpp)
+target_link_libraries(test_qwen_hadamard_unfold PRIVATE pocket_core)
+set_target_properties(test_qwen_hadamard_unfold PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_safetensors_reader tests/test_safetensors_reader.cpp)
 target_link_libraries(test_safetensors_reader PRIVATE pocket_cpp_core)

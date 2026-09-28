@@ -12,10 +12,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 namespace pocket {
 namespace {
@@ -39,6 +44,81 @@ bool has_suffix(const std::string& value, const char* suffix) {
     const std::string tail(suffix);
     return value.size() >= tail.size() &&
            value.compare(value.size() - tail.size(), tail.size(), tail) == 0;
+}
+
+// The number of workers the load's row loops use when QWEN_LOAD_THREADS is
+// unset. A TP4 load is four ranks as four processes on one host, so the useful
+// count is a property of the machine and the rank count rather than of a
+// tensor; the ladder this default was read off is recorded in
+// docs/architecture/bonsai_2_27b_design.md.
+//
+// The knob is read per call, as the tree's other knobs are, so a test can pin
+// the serial path against the parallel one and get the same bytes out of both.
+// A value that is absent, empty, non-numeric, non-positive or absurd keeps the
+// default rather than failing the load, because the number that is wrong is a
+// thread count and not a weight.
+//
+// It is read here rather than through engine/qwen_engine.cpp's `qwen_env_int`
+// because core/ may not include the engine layer; reading `getenv` directly is
+// what core/cmd_channel.cpp already does for POCKETLLM_CPP_NCCL_ID_WAIT_ATTEMPTS.
+constexpr unsigned kDefaultLoadThreads = 16;
+
+unsigned qwen_load_threads() {
+    const char* const text = std::getenv("QWEN_LOAD_THREADS");
+    if (text != nullptr && *text != '\0') {
+        char* end = nullptr;
+        const long parsed = std::strtol(text, &end, 10);
+        if (end != text && *end == '\0' && parsed > 0 && parsed <= 1024) {
+            return static_cast<unsigned>(parsed);
+        }
+    }
+    return kDefaultLoadThreads;
+}
+
+// Runs `body(context, row)` once per row in `[0, rows)`, with one `context` built
+// by `setup` per worker. Rows are independent and each writes a disjoint slice of
+// a destination no other row touches, so the split cannot move a byte: the only
+// thing the worker count decides is which thread visits which row, and nothing
+// here reads that back. That is the whole of why the parallel path is allowed to
+// exist next to the serial one -- it is not an approximation of it.
+//
+// The first exception a body throws is kept and rethrown once every worker has
+// been joined, so a refusal inside a row still surfaces as itself rather than as
+// a `std::terminate`. Sibling workers are left running rather than cancelled:
+// they have nothing to roll back, since the destination belongs to a caller that
+// discards it on the way out.
+template <typename Setup, typename Body>
+void qwen_for_each_row(uint64_t rows, const Setup& setup, const Body& body) {
+    if (rows == 0) return;
+    const uint64_t count =
+        std::min<uint64_t>(static_cast<uint64_t>(qwen_load_threads()), rows);
+    if (count <= 1) {
+        auto context = setup();
+        for (uint64_t row = 0; row < rows; ++row) body(context, row);
+        return;
+    }
+    std::atomic<uint64_t> cursor{0};
+    std::mutex failure_mutex;
+    std::exception_ptr failure;
+    const auto run = [&]() {
+        try {
+            auto context = setup();
+            for (;;) {
+                const uint64_t row = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (row >= rows) break;
+                body(context, row);
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> guard(failure_mutex);
+            if (failure == nullptr) failure = std::current_exception();
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<size_t>(count - 1));
+    for (uint64_t i = 1; i < count; ++i) pool.emplace_back(run);
+    run();
+    for (std::thread& worker : pool) worker.join();
+    if (failure != nullptr) std::rethrow_exception(failure);
 }
 
 void require_tp(int world, int rank) {
@@ -753,7 +833,12 @@ QwenHostTensor qwen_materialize_host_tensor(const QwenCheckpointSource& source,
         // See `qwen_rotation_needs_weight_unfold` for why this is the only way,
         // and `qwen_hadamard_inverse_blockwise` for the transform. It is a
         // load-time cost, paid once, on one tensor per folded matrix whose last
-        // axis the TP world does not divide into whole blocks.
+        // axis the TP world does not divide into whole blocks -- and it is the
+        // largest single term in the load, which is why the loop below transforms
+        // only the blocks the shard reads and spreads the rows over the machine's
+        // cores. Both are properties of *which* blocks and *which* rows are
+        // visited, so neither can move a bit; `qwen_for_each_row` and the block
+        // range below say why in full.
         const uint64_t rows = ref.full_shape[0];
         const uint64_t cols = ref.full_shape[1];
         const uint64_t local_cols = ref.local_shape[1];
@@ -767,37 +852,89 @@ QwenHostTensor qwen_materialize_host_tensor(const QwenCheckpointSource& source,
         }
         const std::vector<int64_t>& signs = spec->signs_for_width(cols);
         const uint64_t block = static_cast<uint64_t>(spec->block_size());
-        // One decoded row, then the same row in fp32. The butterfly accumulates
-        // in fp32 for the reason the device kernel does: ten passes of rounding
-        // in fp16 would cost exactly the low bits a 1.75-bit weight cannot
-        // afford, and the narrowing happens once, after the last pass.
-        std::vector<uint8_t> scratch(
-            static_cast<size_t>(logical_row_numel * device_item_size));
-        std::vector<float> line(static_cast<size_t>(logical_row_numel));
-        for (uint64_t row = 0; row < rows; ++row) {
-            copy_bytes(source_row(row), scratch.data(), logical_row_numel);
-            if (ref.device_dtype == SafeDType::F16) {
-                const uint16_t* halves =
-                    reinterpret_cast<const uint16_t*>(scratch.data());
-                for (uint64_t i = 0; i < logical_row_numel; ++i) {
-                    line[i] = fp16_bits_to_float(halves[i]);
-                }
-            } else {
-                std::memcpy(line.data(), scratch.data(),
-                            static_cast<size_t>(logical_row_numel * sizeof(float)));
-            }
-            qwen_hadamard_inverse_blockwise(line.data(), 1, cols, block, signs.data());
-            uint8_t* dst = destination + row * local_row_bytes;
-            if (ref.device_dtype == SafeDType::F16) {
-                uint16_t* halves = reinterpret_cast<uint16_t*>(dst);
-                for (uint64_t i = 0; i < local_cols; ++i) {
-                    halves[i] = qwen_float_to_fp16_bits(line[ref.shard_start + i]);
-                }
-            } else {
-                std::memcpy(dst, line.data() + ref.shard_start,
-                            static_cast<size_t>(local_cols * sizeof(float)));
-            }
+        // The butterfly is blockwise along the last axis: every element of output
+        // block `b` is a function of input block `b` and of `signs[b * block ...]`
+        // alone. There is no cross-block term, so transforming exactly the blocks
+        // this rank's slice overlaps and then taking the slice is the same
+        // arithmetic in the same order on the same values -- it just computes
+        // fewer blocks. At TP4 that is 5 of `down_proj`'s 17 blocks and 2 of the
+        // 5 in `out_proj`/`o_proj`, so about two thirds of the transform used to
+        // be thrown away immediately after being paid for.
+        //
+        // The grain is a whole number of transform blocks and, for a block-packed
+        // source, a whole number of 128-weight packing blocks as well: the decode
+        // is blockwise too, and a span that started inside one would take half of
+        // that block's scale with it. Both block sizes are powers of two -- the
+        // transform's is checked to be one where the spec is parsed, the
+        // packing's is 128 -- so their least common multiple is their maximum.
+        //
+        // `cols` is a multiple of the grain, so `end_col` cannot leave the row:
+        // `signs_for_width` rejects a declared width that is not a whole number
+        // of transform blocks, and `ternary_row_bytes` rejects one that is not a
+        // whole number of packing blocks. The check is kept because the failure
+        // it prevents is an overread rather than a wrong number.
+        const uint64_t grain = info.ternary_blocks
+                                   ? std::max<uint64_t>(block, kTernaryBlockWeights)
+                                   : block;
+        const uint64_t first_col = ref.shard_start / grain * grain;
+        const uint64_t end_col = ceil_div(ref.shard_start + local_cols, grain) * grain;
+        const uint64_t span = end_col - first_col;
+        const uint64_t inside = ref.shard_start - first_col;
+        if (end_col > cols) {
+            throw std::runtime_error("Qwen folded block span leaves the row: " + ref.name);
         }
+        // The source offset of a block-packed row counts packs and not elements,
+        // which is the same substitution the packed shard branch below makes.
+        const uint64_t source_offset =
+            info.ternary_blocks
+                ? first_col / kTernaryBlockWeights * kTernaryBlockBytes
+                : first_col * source_element_bytes;
+        // One decoded row section, then the same section in fp32. The butterfly
+        // accumulates in fp32 for the reason the device kernel does: ten passes of
+        // rounding in fp16 would cost exactly the low bits a 1.75-bit weight
+        // cannot afford, and the narrowing happens once, after the last pass.
+        //
+        // The buffers belong to a worker rather than to a row, so they are built
+        // once per worker and reused: the fp32 line alone is `span` floats, and
+        // value-initializing it once per row -- 655,360 rows over this checkpoint
+        // -- is tens of gigabytes of zeroing that the next line overwrites.
+        using RowBuffers = std::pair<std::vector<uint8_t>, std::vector<float>>;
+        const auto worker_buffers = [&]() -> RowBuffers {
+            return RowBuffers(
+                std::vector<uint8_t>(static_cast<size_t>(span * device_item_size)),
+                std::vector<float>(static_cast<size_t>(span)));
+        };
+        qwen_for_each_row(
+            rows, worker_buffers,
+            [&](RowBuffers& buffers, uint64_t row) {
+                std::vector<uint8_t>& scratch = buffers.first;
+                std::vector<float>& line = buffers.second;
+                copy_bytes(source_row(row) + source_offset, scratch.data(), span);
+                if (ref.device_dtype == SafeDType::F16) {
+                    const uint16_t* halves =
+                        reinterpret_cast<const uint16_t*>(scratch.data());
+                    for (uint64_t i = 0; i < span; ++i) {
+                        line[i] = fp16_bits_to_float(halves[i]);
+                    }
+                } else {
+                    std::memcpy(line.data(), scratch.data(),
+                                static_cast<size_t>(span * sizeof(float)));
+                }
+                // The sign pointer carries the offset into the row, since the
+                // transform indexes `signs + base` with `base` starting at zero.
+                qwen_hadamard_inverse_blockwise(line.data(), 1, span, block,
+                                                signs.data() + first_col);
+                uint8_t* dst = destination + row * local_row_bytes;
+                if (ref.device_dtype == SafeDType::F16) {
+                    uint16_t* halves = reinterpret_cast<uint16_t*>(dst);
+                    for (uint64_t i = 0; i < local_cols; ++i) {
+                        halves[i] = qwen_float_to_fp16_bits(line[inside + i]);
+                    }
+                } else {
+                    std::memcpy(dst, line.data() + inside,
+                                static_cast<size_t>(local_cols * sizeof(float)));
+                }
+            });
         return out;
     }
     if (shard_dim == 1 && ref.full_shape.size() == 2 && info.ternary_blocks) {

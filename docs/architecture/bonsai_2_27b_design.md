@@ -341,31 +341,67 @@ tensor cut in segments rather than as one range so no rank receives part of a he
 
 | | Result |
 | --- | ---: |
-| Load, 64 layers × 4 ranks | **~122 s** — 12.53 GiB of FP16 weights a rank |
+| Load, 64 layers × 4 ranks | **~23 s** — 12.53 GiB of FP16 weights a rank |
 | Decode, one row | 23.6 tok/s, 15 tokens |
 | Decode, 16 rows batched | **173.6 tok/s**, 92.2 ms a step |
 | Card memory, one row | 19.60 GiB of 32 |
 
 The load is host work, not transfer. The dense sibling checkpoint puts the same 12.53 GiB a rank on
 the card in 35.5 s, because it reads FP16 off disk; here the engine reads 5.95 GB, decodes 402
-ternary tensors on the host, and pushes the same 12.53 GiB. Four runs of the whole runner, two per
-binary and interleaved, put the old engine at 244.82 / 244.21 s and the new one at 123.76 / 124.37 s
-— a **2.0×** halving on bit-identical weights, which the harness proves rather than assumes: the two
-binaries emit the same eight greedy tokens, `verify_mismatches=0`, `batch_repeat_mismatches=0` and
-`seed_mismatches=0` unchanged, and `step_ms` does not move.
+ternary tensors on the host, and pushes the same 12.53 GiB — and it now does that in less time than
+the sibling spends copying. Two changes to the Hadamard weight unfold got it there, and they were
+measured apart from each other.
 
-**Where the 122 s goes, measured on the new engine.** The 244.6 s this page used to record was the
-decode at its old cost, and the decode is no longer the load:
+**Three arms, two runs each, interleaved, same command line.** `model_load_seconds` out of rank 0's
+own startup line, the field both earlier records quoted, with the four-rank mean beside it:
 
-| Region | Time |
+| Arm | Binary | rank 0 | 4-rank mean |
+| --- | --- | ---: | ---: |
+| `old` | `master`, `15d239516d` | 123.79 / 122.99 s | 122.6 / 120.5 s |
+| `blocks` | + the block range, `QWEN_LOAD_THREADS=1`, `c47ffe9f7d` | 63.08 / 62.93 s | 63.7 / 63.6 s |
+| `threads` | + the row fan-out, 16 workers, `c47ffe9f7d` | 22.70 / 24.87 s | 23.1 / 24.6 s |
+
+**5.1× in all**, in two steps of 1.9× and 2.7×, on bit-identical weights. The harness proves that
+rather than assuming it: all three arms emit the same eight greedy tokens, `seed_mismatches=0` and
+`verify_compared=48` are unchanged, and `step_ms` does not move — 90.7 to 91.6 ms across the six runs
+against the 92.2 ms on record. What does move in the logits is the single-row path's own run-to-run
+spread, which is there without this change: two `master` runs of the same command differ by 0.0029 at
+step 5, and the three arms span 0.0065 at the same step. `tests/test_qwen_hadamard_unfold.cpp` is
+where the bit-exactness is actually established, on bytes rather than on logits.
+
+The worker count is not a guess either. A one-run sweep on the final binary, again on the same
+command line, four-rank mean of `model_load_seconds`:
+
+| `QWEN_LOAD_THREADS` | 1 | 2 | 4 | 8 | 16 | 32 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| load | 63.7 s | 42.5 s | 31.0 s | 26.2 s | **23.1 s** | 23.6 s |
+
+16 is the measured winner and is the shipped default. The curve is nearly flat past 8 and turns back
+up at 32, where four ranks' pools oversubscribe the 44 cores.
+
+**Where the ~23 s goes.** The last row and the worker-seconds below come from a temporary per-region
+timer, added for one run and not in the shipped code. The three rows above it are the previous
+record's numbers, because the change does not touch those regions and the arithmetic closes without
+them moving: with the fan-out off the non-unfold load measures 65.4 − 43.8 = 21.5 s, against
+122.6 − 101.0 = 21.6 s before it.
+
+| What the ~23 s goes to | |
 | --- | ---: |
-| Hadamard unfold: `qwen_hadamard_inverse_blockwise`, 128 tensors | 39.4 s |
-| Hadamard unfold: the fp16 ↔ float conversions around it | 35.4 s |
-| Hadamard unfold: scratch bring-up and the fp32 → fp16 narrowing | 17.4 s |
-| Hadamard unfold: the PTQ1_0 decode inside it | 8.8 s |
-| The PTQ1_0 decode outside the unfold | 11.5 s |
+| PTQ1_0 decode outside the unfold, 402 tensors | 11.5 s |
 | Host resize of the 12.53 GiB destination | 4.4 s |
 | Device upload, GGUF read and the rest | 4.6 s |
+| Hadamard unfold, 128 tensors, 16 workers | **~2.7 s** |
+
+The unfold is no longer the load's largest term, which is what this change was for. Its own shape,
+summed over the workers so that it reads as work rather than as wall time — 43.4 worker-seconds over
+the four ranks, or about 2.7 s of wall each:
+
+| The unfold's 43 worker-seconds | |
+| --- | ---: |
+| Checkpoint read and the PTQ1_0 decode of the span | 3.7 s |
+| fp16 → fp32 widening | 10.6 s |
+| The butterfly | 11.8 s |
+| fp32 → fp16 narrowing and the store | 17.3 s |
 
 **Why the decode fell, and why it is no longer the whole story.** A trit is −1, 0 or 1 and a block's
 scale is a finite fp16, so all 128 of a block's weights are one of exactly three fp16 values. The
@@ -385,12 +421,35 @@ that sign. `±scale` multiplies exactly, so the other two entries are `qwen_floa
 and `qwen_float_to_fp16_bits(scale)`, and `tests/test_ptq1_0_decode.cpp` pins all three against an
 independent scalar transcription of the format, on a device with no checkpoint and no vendor SDK.
 
-What the table does not help is the Hadamard unfold, which is now 101 s of the 122 and the largest
-single cost in the load. It is a TP4 consequence rather than a packing one — a column-parallel shard
-that stops inside a 1024-element block cannot rotate its own activation, so the weight is unfolded
-once at load — and it is paid per row, element by element in fp32, on 128 tensors. Making it cheaper
-means vectorizing the butterfly and its conversions, which is a separate concern from the decode and
-is not attempted here.
+**What the unfold was, and the two things that were wrong with it.** It is a TP4 consequence rather
+than a packing one — a column-parallel shard that stops inside a 1024-element block cannot rotate its
+own activation, so the weight is unfolded once at load — and it was paid per row, element by element
+in fp32, on 128 tensors. Two properties of it were free to take, and they are what the 43
+worker-seconds above now buy.
+
+The transform is **blockwise along the last axis**: every element of output block `b` is a function of
+input block `b` and of `signs[b * block …]` alone, so restricting the call to the blocks a shard
+overlaps computes fewer blocks rather than different ones — same scale, same pass order, same signs at
+the same global offsets. At TP4 that is 5 of `down_proj`'s 17 blocks and 2 of the 5 in
+`out_proj`/`o_proj`, so about two thirds of what used to be transformed was discarded immediately
+after being paid for. The butterfly falls from 39.4 s to 11.8 s for it, and the widening with it. The
+span's two ends are rounded to a grain that is a whole number of transform blocks *and*, for this
+block-packed source, of 128-weight packing blocks as well: the decode is blockwise too, and a span
+that started inside a pack would take half of that pack's scale with it.
+
+And **rows are independent and each writes a disjoint slice** of a destination no other row touches,
+so they fan out over `QWEN_LOAD_THREADS` workers with no arithmetic consequence at all. Both are
+properties of *which* blocks and *which* rows are visited, so neither can move a bit — which is what
+the byte-level test holds them to, and why this is a restructuring rather than a tolerance.
+
+**What the unfold did not need was a vectorized butterfly.** That was the next thing the previous
+record proposed, and the measurement above says otherwise: the narrowing, at 17.3 s, is now the
+largest single term in the unfold and untouched by either change, because it still runs over the
+shard's `local_cols` and not over the span. It is also the one part that cannot be vectorized for
+free — it has to reproduce a branchy routine bit for bit, subnormals and the sign of a
+negative-scaled zero included, which is exactly what the three-entry table below avoided rather than
+solved. What is left of the load now sits outside the unfold altogether, at
+`copy_rows`/`copy_bytes` and the fp32 → fp16 narrowing the widening feeds.
 
 The batched figure is gated, not just measured: the harness compares the batched path against a
 synchronous single-row reference at three interleaved steps and checks both tokens and logits.
@@ -398,6 +457,13 @@ synchronous single-row reference at three interleaved steps and checks both toke
 ```bash
 QWEN_BATCH_ROWS=16 QWEN_BATCH_VERIFY=3 scripts/run_qwen_ascend_tp4.sh "The capital of France is" 8
 # verify_mismatches=0 verify_compared=48 batch_repeat_mismatches=0 seed_mismatches=0
+
+# the bit-exactness claim above is a byte comparison, not a tolerance, and it needs
+# no card: a synthetic GGUF, one tensor, materialized at the misaligned shards a
+# 4-way split produces. It skips on a backend that reads the pack and never unfolds
+source scripts/ascend_env.sh && scripts/build_ascend.sh
+cpp_engine/build-ascend/tests/test_qwen_hadamard_unfold
+# QWEN_LOAD_THREADS=1 runs the same case on the serial path; the test does it itself
 ```
 
 ## Correctness and what is not claimed
