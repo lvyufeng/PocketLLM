@@ -11,9 +11,9 @@ Three layers:
   arithmetic (the `output_len <= 1` TPOT exclusion, the pooled ITL, the
   all-SLOs-met goodput rule) is compared with hand-computed numbers exactly.
 * `stream_request` is driven against a stub SSE server that emits a role-only
-  chunk well before any token, which is the shape both PocketLLM servers
-  produce. This is the regression that keeps a client from crediting the role
-  chunk as the first token.
+  chunk well before any token, which is the shape `pocketllm serve` produces.
+  This is the regression that keeps a client from crediting the role chunk as
+  the first token.
 * `arrival_delays` is checked for the two properties the scheduler relies on:
   `inf` means simultaneous, and a finite rate lands the last arrival on
   `num_requests / rate`.
@@ -416,17 +416,23 @@ def test_argument_parsing_helpers():
         raise AssertionError("a goodput entry without ':' must be rejected")
 
 
-def test_server_drain_is_off_unless_asked_for():
-    """The drain is what lets an external `/metrics` scrape see the last request.
+def test_the_server_is_somebody_elses_to_start():
+    """`--base-url` is the one required argument.
 
-    It has to default to zero: a run that takes no scrape would pay a second of
-    wall time for nothing. It sits after the measured window, so it cannot move
-    a figure the bench reports -- which is the property a nonzero value relies
-    on, and the reason it is a hold rather than a warm-up.
+    The harness launched the C++ binary itself once. That front end is gone, and
+    with it the launch: a server started by whoever is tuning it is the shape the
+    two `pocketllm serve` benchmarks beside this one already use, and it is the
+    only shape that can say which scheduler the numbers belong to. The parser has
+    no `--ckpt`, `--binary` or `--devices` to fall back on, so a run that forgot
+    the URL fails at the required-argument check rather than at a launch.
     """
     parser = bench_serving.build_parser()
-    assert parser.parse_args([]).server_drain_seconds == 0.0
-    assert parser.parse_args(["--server-drain-seconds", "1.0"]).server_drain_seconds == 1.0
+    for removed in ("--ckpt", "--binary", "--devices", "--sidecar", "--server-drain-seconds"):
+        assert removed not in parser._option_string_actions, removed
+    # The default is the port `pocketllm serve` binds, which is what the two other
+    # server benchmarks point at too -- so the flag is a convenience, not the only
+    # way to name a server.
+    assert parser.parse_args([]).base_url == bench_serving.DEFAULT_BASE_URL
 
 
 def test_default_percentile_metrics_match_vllm():

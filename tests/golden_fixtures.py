@@ -20,15 +20,12 @@ worth repeating here because they shape the code:
   `test_every_entry_point_has_a_fixture` test in `test_served_path_golden.py` is what keeps the
   *set of recorded fixtures* complete, and it needs no weights at all.
 
-Native entries are driven over HTTP against the `pocketllm_engine` binary, launched the way
-`scripts/bench_cpp_openai_concurrency.py` launches it -- one process a rank, a rendezvous file, and
-a readiness poll -- because that is the only way the binary is reached and the launcher already
-exists. The two entry kinds therefore disagree about what they can compare, and the fixture records
-which: a Python entry yields token ids exactly, while an HTTP entry yields text. A fixture carries
-whichever its entry can produce, and the test compares what is there.
+Every entry point is a Python one: the C++ binary's own HTTP front end was removed, and the `cpp`
+entry point now goes through `pocketllm serve` like the rest. A fixture carries whichever answer its
+entry can produce -- token ids exactly, text at least -- and the test compares what is there.
 
 **One entry point is one process**, which is why `run_isolated` spawns a child rather than calling
-`run` here. Six engines in one interpreter is a configuration nothing else in this repository uses,
+`run` here. Five engines in one interpreter is a configuration nothing else in this repository uses,
 and the failures it produces are not about the fixtures; the docstring on `run_isolated` records the
 two that were observed and why they pass alone.
 """
@@ -37,7 +34,6 @@ from __future__ import annotations
 
 import argparse
 import collections
-import importlib.util
 import json
 import os
 import pathlib
@@ -70,10 +66,7 @@ CHILD_TAIL_LINES = 40
 
 #: Every entry point `tests/README.md` promises a fixture for. The set is asserted by a test, so a
 #: new backend cannot be added without recording one.
-ENTRY_POINTS = ("cpp", "v41", "mimo", "xing4", "torch", "native")
-
-#: Entries driven through the Python package. `native` is the exception: it is the C++ binary.
-PYTHON_ENTRIES = tuple(entry for entry in ENTRY_POINTS if entry != "native")
+ENTRY_POINTS = ("cpp", "v41", "mimo", "xing4", "torch")
 
 #: The opt-in gate for *running* a fixture. The completeness tests need no weights and always run;
 #: this one covers the runs, because the cost across the six spans seconds to the better part of an
@@ -101,10 +94,6 @@ class GoldenFixture:
     commit: str = ""
     taken_at: str = ""
     notes: str = ""
-
-    @property
-    def entry_kind(self) -> str:
-        return "native" if self.entry == "native" else "python"
 
     @property
     def expected_token_ids(self) -> tuple[int, ...]:
@@ -168,8 +157,6 @@ class GoldenFixture:
         path = pathlib.Path(self.checkpoint)
         if not path.exists():
             return f"checkpoint not present: {self.checkpoint}"
-        if self.entry == "native" and not pathlib.Path(self._native_binary()).exists():
-            return f"native binary not built: {self._native_binary()}"
         return self._resource_reason()
 
     def _resource_reason(self) -> str | None:
@@ -193,13 +180,6 @@ class GoldenFixture:
                 f"(rm -rf /dev/shm/pocketllm_*_experts*)"
             )
         return None
-
-    def _native_binary(self) -> str:
-        argv = list(self.argv)
-        if "--binary" in argv:
-            return argv[argv.index("--binary") + 1]
-        return str(REPO_ROOT / "cpp_engine" / "build-python" / "pocketllm_engine")
-
 
 def _dev_shm_free_bytes() -> int | None:
     """Free space on `/dev/shm`, or `None` when it is not a separate mount.
@@ -272,14 +252,11 @@ class Outcome:
 def run(fixture: GoldenFixture) -> Outcome:
     """Run this fixture **in this process**. The suite does not call this; `run_isolated` does.
 
-    Kept in process because the child has to be able to call it, and it is where the dispatch
-    between the Python entries and the native one lives.
+    Kept in process because the child has to be able to call it.
     """
     reason = fixture.unwritable_reason()
     if reason is not None:  # pragma: no cover - the test skips before calling this
         raise RuntimeError(reason)
-    if fixture.entry == "native":
-        return _run_native(fixture)
     return _run_python(fixture)
 
 
@@ -425,99 +402,6 @@ def _run_python(fixture: GoldenFixture) -> Outcome:
         prompt_tokens=int(getattr(result.usage, "prompt_tokens", 0)) or None,
         elapsed_seconds=time.perf_counter() - started,
     )
-
-
-def _load_bench_module():
-    """Import the native launcher; it is a script, not a package member."""
-    path = REPO_ROOT / "scripts" / "bench_cpp_openai_concurrency.py"
-    spec = importlib.util.spec_from_file_location("bench_cpp_openai_concurrency_under_test", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _native_argv_pairs(argv: list[str]) -> dict[str, str]:
-    """Read the fixture's binary flags as name -> value, for a value-flag command line.
-
-    The fixture records the command as an operator types it, so a launcher argument has to be
-    recovered from it rather than stored twice and allowed to drift.
-    """
-    pairs: dict[str, str] = {}
-    index = 0
-    while index < len(argv):
-        item = argv[index]
-        if not item.startswith("--"):
-            index += 1
-            continue
-        value = ""
-        if index + 1 < len(argv) and not argv[index + 1].startswith("--"):
-            value = argv[index + 1]
-            index += 2
-        else:
-            value = "true"
-            index += 1
-        pairs[item[2:].replace("-", "_")] = value
-    return pairs
-
-
-def _run_native(fixture: GoldenFixture) -> Outcome:
-    """Launch the ranks, wait for readiness, send one greedy chat request, read the text back.
-
-    `scripts/bench_cpp_openai_concurrency.py` owns the launch (one process a rank, a rendezvous
-    file, a health poll) and is reused rather than reimplemented: a second copy of it would be a
-    second thing to keep in step with the binary's flags, which is the failure this whole exercise
-    is about.
-    """
-    import tempfile
-
-    bench = _load_bench_module()
-    flags = _native_argv_pairs(list(fixture.argv))
-
-    def _int(name: str, default: int) -> int:
-        raw = flags.get(name)
-        return int(raw) if raw not in (None, "", "true") else default
-
-    server_args = argparse.Namespace(
-        binary=flags.get("binary", fixture._native_binary()),
-        ckpt=fixture.checkpoint,
-        python=flags.get("python", sys.executable),
-        sidecar=flags.get("sidecar", str(REPO_ROOT / "src" / "server" / "cpp_sidecar.py")),
-        devices=flags.get("devices", "2,3"),
-        port=_int("port", 18290),
-        layers=_int("layers", 0),
-        max_context=_int("max_context", 8192),
-        max_batch_size=_int("max_batch_size", 1),
-        prefill_token_budget=_int("prefill_token_budget", 4096),
-        request_timeout_seconds=_int("request_timeout_seconds", 900),
-        kv_block_size=_int("kv_block_size", 16),
-        kv_paged="kv_paged" in flags,
-        device_style=flags.get("device_style", "cuda"),
-        startup_timeout=float(_int("startup_timeout", 900)),
-    )
-    started = time.perf_counter()
-    with tempfile.TemporaryDirectory(prefix="pll-golden-") as tmp:
-        group = bench.start_server(server_args, pathlib.Path(tmp))
-        try:
-            # The server names itself; asking it is how the launcher's own bench gets the id, and
-            # hardcoding one here would be a second place for the served name to live.
-            model = bench.http_request(group.base_url, "/v1/models", timeout=10.0).json()["data"][0]["id"]
-            body = {
-                "messages": [{"role": "user", "content": fixture.prompt}],
-                "max_tokens": int(fixture.sampling.get("max_tokens") or 16),
-                "temperature": 0.0,
-                "stream": False,
-            }
-            result = bench.http_request(
-                group.base_url, "/v1/chat/completions", body, timeout=bench.group_timeout(group)
-            )
-            bench.validate_completion(result, model)
-            payload = result.json()
-            text = payload["choices"][0]["message"]["content"]
-            prompt_tokens = int(payload["usage"]["prompt_tokens"])
-        finally:
-            group.stop()
-    return Outcome(text=text, prompt_tokens=prompt_tokens, elapsed_seconds=time.perf_counter() - started)
 
 
 # --------------------------------------------------------------------------------------------------

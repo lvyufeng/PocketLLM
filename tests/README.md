@@ -91,7 +91,7 @@ to reproduce it:
 
 | Field | What it is |
 | --- | --- |
-| `entry` | the entry point: `cpp`, `v41`, `mimo`, `xing4`, `torch`, or `native` for the `pocketllm_engine` binary |
+| `entry` | the entry point: `cpp`, `v41`, `mimo`, `xing4` or `torch` |
 | `checkpoint` | the checkpoint directory or GGUF, as an absolute path |
 | `env` | the environment variables the run needs (`POCKETLLM_CPP_BATCHED_DECODE`, `CUDA_VISIBLE_DEVICES`, …) |
 | `argv` | the command line, **as an operator types it**, minus `--prompt` |
@@ -99,7 +99,7 @@ to reproduce it:
 | `sampling` | greedy is `temperature: 0.0`; a fixture that samples is a fixture that fails one run in ten |
 | `requires` | a resource the run needs from this host, currently `dev_shm_bytes` |
 | `expected.prompt_tokens` | how many tokens the prompt rendered to for this checkpoint's tokenizer |
-| `expected.token_ids` | what came out (the Python entries; empty for `torch`, whose runtime does not report ids) |
+| `expected.token_ids` | what came out (empty for `torch`, whose runtime does not report ids) |
 | `expected.text` | what came out |
 | `commit`, `taken_at` | the revision and the day it was recorded |
 
@@ -117,8 +117,8 @@ means the model was asked a different question, and comparing only the answer wo
 for it.
 
 **Each fixture runs in its own process.** The test spawns `tests/golden_fixtures.py --entry <name>`
-and compares what the child hands back, rather than running six engines inside pytest's interpreter.
-That is not tidiness — six engines in one process is a configuration nothing else in this repository
+and compares what the child hands back, rather than running five engines inside pytest's interpreter.
+That is not tidiness — five engines in one process is a configuration nothing else in this repository
 uses, and it fails in ways that have nothing to do with the fixtures:
 
 | Order | What happens | Alone |
@@ -144,7 +144,7 @@ model bug. With it, the fixture that cannot fit skips and names the size it want
 worth knowing about for a second reason: they persist, so a *warm* `v41` run is 3 minutes against 41
 cold, and `mimo` is 75 seconds against 12 minutes.
 
-The two consequences of that: a full `POCKETLLM_GOLDEN=1` run covers five of the six fixtures and
+The two consequences of that: a full `POCKETLLM_GOLDEN=1` run covers four of the five fixtures and
 skips whichever of the pair the resident bank crowds out, and *which* one is skipped depends on what
 was already in `/dev/shm` when the run started rather than on the order in the file. Clear the banks
 before a run that is meant to cover both, and expect the first one to pay the cold cost.
@@ -170,7 +170,7 @@ answers in 18 seconds, while `v41` pins a 457.8 GiB resident expert bank and tak
 cold segment. So the *runs* are gated:
 
 ```bash
-python -m pytest tests/test_served_path_golden.py -q                    # 6 skips, one a fixture
+python -m pytest tests/test_served_path_golden.py -q                    # 5 skips, one a fixture
 POCKETLLM_GOLDEN=1 python -m pytest tests/test_served_path_golden.py -q # now they run
 ```
 

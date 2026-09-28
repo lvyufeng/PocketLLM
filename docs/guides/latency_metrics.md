@@ -12,7 +12,7 @@ vLLM row can go in one table without an argument about what the words mean. The
 formulas below were read from the upstream source, not from documentation prose;
 the file and line each came from is in [Provenance](#provenance).
 
-Client: `scripts/bench_serving.py`. Server: `/metrics` on both servers.
+Client: `scripts/bench_serving.py`. Server: `pocketllm serve`, whose `/metrics` carries the counters.
 
 ## The metrics
 
@@ -204,25 +204,24 @@ applies to any number that claims to be `prefill_tps` or `decode_tps`.
 
 ## Invocation
 
+The harness measures a server somebody else started, so the launch is a separate command — the
+two halves are separate on purpose, because only the command line that started the server knows
+which scheduler the numbers belong to:
+
 ```bash
-# Launch a native server and measure it. --device-style picks how the ranks
-# select a card: cuda (the default) uses CUDA_VISIBLE_DEVICES, ascend passes the
-# absolute card index and disables the HCCL whitelist.
-python scripts/bench_serving.py \
-    --ckpt /path/to/checkpoint \
-    --binary cpp_engine/build-ascend/pocketllm_engine \
-    --devices 0,1,2,3 --device-style ascend \
+# 1. Start the server. On Ascend, leave paging off: the engine rejects a paged KV
+# cache on the batched decode path outright
+# (`cpp_engine/engine/qwen_engine.cpp:4501`), which is what --backend-option
+# kv_paged=false says. It is also the cpp backend's default.
+python -m pocketllm serve --model /path/to/checkpoint --backend cpp \
+    --tensor-parallel-size 4 --device-ids 0,1,2,3 --port 8000
+
+# 2. Measure it.
+python scripts/bench_serving.py --base-url http://127.0.0.1:8000 \
     --random-input-len 512 --random-output-len 128 \
     --num-prompts 32 --request-rate 4 --max-concurrency 8 \
     --goodput ttft:2000 tpot:60 --json-out /tmp/serve.json
-
-# Measure a server somebody else started (the vLLM head-to-head mode).
-python scripts/bench_serving.py --base-url http://127.0.0.1:8000
 ```
-
-On Ascend the launch adds `--no-kv-paged` by itself, because the engine rejects a
-paged KV cache on the batched decode path outright
-(`cpp_engine/engine/qwen_engine.cpp:4501`); the CUDA launch is unchanged.
 
 `--num-prompts 1000` and `--request-rate inf` are the defaults, matching vLLM:
 by default the harness saturates the server. `--dataset-name random` (the default)

@@ -12,7 +12,7 @@ Three tests, and they answer different questions.
   is **opt-in**, gated on `POCKETLLM_GOLDEN=1`, and it skips when the checkpoint is not on this
   machine -- the fixture names a path, and the only honest outcome without it is a skip.
 
-Each fixture runs in its own child process, for the reason `run_isolated` documents: six engines in
+Each fixture runs in its own child process, for the reason `run_isolated` documents: five engines in
 one interpreter is a configuration nothing else here uses, and `xing4` after `mimo` and `torch`
 after `mimo` both fail in it for reasons that are not about the checkpoint. The comparison stays
 here, so the failure still names the fixture.

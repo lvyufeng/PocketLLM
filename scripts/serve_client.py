@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
-"""End-to-end HTTP concurrency acceptance test for the native TP OpenAI server.
+"""The HTTP client half of the serving benchmarks, over any OpenAI-compatible server.
 
-Each invocation owns one four-rank server lifetime and runs a single scheduler
-configuration. Run serial and batch configurations in separate processes so model
-construction, NCCL state, and GPU clocks do not contaminate the comparison.
+The launch half of `scripts/bench_cpp_openai_concurrency.py` went away with the C++ binary's own
+HTTP front end; this is what was left, and what was left was never about that front end. The
+requests, the completion and stream validators, and the three concurrent workloads are written
+against a base URL, so `bench_serving.py`, `bench_qwen_vllm_concurrency.py` and any future
+`pocketllm serve` harness all measure the same thing by construction -- the prompt text, the payload
+and the definition of "wall seconds" are one implementation, and a difference between two records
+comes from the engine rather than from the harness.
 
-Example:
-    python scripts/bench_cpp_openai_concurrency.py \
-        --ckpt /mnt/data2/Qwen3.8-27B-FP8 \
-        --binary cpp_engine/build-python/pocketllm_engine \
-        --python /home/lvyufeng/miniconda3/envs/deepseek/bin/python \
-        --mode batch --max-batch-size 8 --json-out batch.json
+`ServerGroup` is the interface those workloads expect of a running server -- a base URL, the
+processes to poll, a log directory to dump on failure, and a `stop` -- and is documented rather than
+constructed here, because the launcher that built one was deleted with the front end.
 """
 
 from __future__ import annotations
 
-import argparse
 import concurrent.futures
 import json
-import os
 import pathlib
 import signal
 import subprocess
-import sys
-import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
-import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -254,66 +250,6 @@ def validate_stream(result: HttpResult, expected_model: str) -> dict[str, Any]:
     return {"events": len(events), "first_event_seconds": result.first_event_seconds, "content_chars": len(content)}
 
 
-def start_server(args: argparse.Namespace, log_dir: pathlib.Path) -> ServerGroup:
-    """Launch one server process per rank and wait for readiness.
-
-    Two device-selection styles. CUDA picks the card with
-    `CUDA_VISIBLE_DEVICES` and every rank then opens device 0; Ascend has no
-    equivalent the runtime honours, so a rank is handed the absolute card index
-    with `--device` and the collective whitelist is disabled the way
-    `scripts/run_qwen_ascend_tp4.sh` does it. `--device-style` chooses; the
-    default keeps every existing caller on the CUDA path.
-    """
-    devices = parse_devices(args.devices)
-    device_style = getattr(args, "device_style", "cuda")
-    rendezvous = log_dir / f"nccl-{uuid.uuid4().hex}.id"
-    processes: list[subprocess.Popen[bytes]] = []
-    handles: list[Any] = []
-    common = [
-        str(pathlib.Path(args.binary).resolve()), "--serve", "--ckpt", str(pathlib.Path(args.ckpt).resolve()),
-        "--tp-world", str(len(devices)), "--nccl-id-path", str(rendezvous),
-        "--smoke-layers", str(args.layers), "--max-context", str(args.max_context),
-        "--max-batch-size", str(args.max_batch_size), "--prefill-token-budget", str(args.prefill_token_budget),
-        "--request-timeout-seconds", str(args.request_timeout_seconds), "--python", str(pathlib.Path(args.python).resolve()),
-        "--sidecar", str(pathlib.Path(args.sidecar).resolve()), "--host", "127.0.0.1", "--port", str(args.port),
-        "--kv-block-size", str(args.kv_block_size),
-    ]
-    if args.kv_paged:
-        common.append("--kv-paged")
-    elif device_style == "ascend":
-        # The CLI defaults kv_paged to true, and the Ascend batched per-row
-        # operators address a slot by a constant element stride, which a paged
-        # arena has no equivalent of. The engine therefore rejects the
-        # combination outright (qwen_engine.cpp:4499). Without this the server
-        # comes up, passes the readiness gate, and then fails every request for
-        # a reason that reads like a client bug.
-        common.append("--no-kv-paged")
-    for rank, visible_device in enumerate(devices):
-        handle = (log_dir / f"rank{rank}.log").open("wb")
-        env = os.environ.copy()
-        if device_style == "ascend":
-            env["HCCL_WHITELIST_DISABLE"] = "1"
-            env.setdefault("POCKETLLM_CPP_NCCL_ID_WAIT_ATTEMPTS", "12000")
-            rank_device = ["--device", visible_device]
-        else:
-            env["CUDA_VISIBLE_DEVICES"] = visible_device
-            rank_device = ["--device", "0"]
-        process = subprocess.Popen(
-            common + ["--tp-rank", str(rank)] + rank_device,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            env=env,
-        )
-        processes.append(process)
-        handles.append(handle)
-    group = ServerGroup(processes, handles, log_dir, rendezvous, f"http://127.0.0.1:{args.port}")
-    try:
-        wait_for_health(group, args.startup_timeout)
-    except Exception:
-        group.stop()
-        raise
-    return group
-
 
 def run_concurrent(group: ServerGroup, expected_model: str, count: int, prompt_words: int, max_tokens: int) -> dict[str, Any]:
     started = time.perf_counter()
@@ -409,91 +345,3 @@ def run_stream_cases(group: ServerGroup, expected_model: str, max_tokens: int) -
     return {"concurrent_streams": streams, "disconnect_events_read": disconnected.text.count("data: "), "recovery": recovery_body}
 
 
-def run(args: argparse.Namespace) -> dict[str, Any]:
-    log_dir = pathlib.Path(args.log_dir or tempfile.mkdtemp(prefix="pocketllm-http-concurrency-"))
-    log_dir.mkdir(parents=True, exist_ok=True)
-    group: ServerGroup | None = None
-    started = time.perf_counter()
-    record: dict[str, Any] = {
-        "mode": args.mode,
-        "checkpoint": str(pathlib.Path(args.ckpt).resolve()),
-        "tp_world": len(parse_devices(args.devices)),
-        "devices": args.devices,
-        "max_batch_size": args.max_batch_size,
-        "prefill_token_budget": args.prefill_token_budget,
-        "kv_paged": args.kv_paged,
-        "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "log_dir": str(log_dir),
-    }
-    try:
-        group = start_server(args, log_dir)
-        models = http_request(group.base_url, "/v1/models", timeout=10.0).json()
-        model = models["data"][0]["id"]
-        record["model"] = model
-
-        # Discarded passes over the measured ladder. The engine's own first
-        # request is not free (kernel module load, allocator growth, and for
-        # TP4 the NCCL communicator's first collective), and it lands on the
-        # count=1 case that the report reads as "single-request latency".
-        # Measuring without this charges that cost to one concurrency level and
-        # makes the remaining levels look faster by comparison.
-        if args.warmup_rounds > 0:
-            warmups: list[dict[str, Any]] = []
-            for _ in range(args.warmup_rounds):
-                for n in [1] + list(args.concurrency):
-                    warm = run_concurrent(group, model, n, args.short_prompt_words, args.max_tokens)
-                    warmups.append({"count": n, "wall_seconds": warm["wall_seconds"]})
-            record["warmup"] = warmups
-
-        single = run_concurrent(group, model, 1, args.short_prompt_words, args.max_tokens)
-        concurrency = [run_concurrent(group, model, n, args.short_prompt_words, args.max_tokens) for n in args.concurrency]
-        interleave = run_interleave(group, model, args.max_tokens)
-        streams = run_stream_cases(group, model, args.max_tokens)
-        record.update({"single": single, "concurrency": concurrency, "interleave": interleave, "streaming": streams, "status": "pass"})
-    except Exception as exc:
-        record.update({"status": "fail", "error": f"{type(exc).__name__}: {exc}", "logs": read_logs(log_dir)})
-        raise
-    finally:
-        if group is not None:
-            group.stop()
-        record["elapsed_seconds"] = time.perf_counter() - started
-        if args.json_out:
-            pathlib.Path(args.json_out).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(record, indent=2))
-    return record
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ckpt", required=True)
-    parser.add_argument("--binary", default="cpp_engine/build-python/pocketllm_engine")
-    parser.add_argument("--python", default=sys.executable)
-    parser.add_argument("--sidecar", default="src/server/cpp_sidecar.py")
-    parser.add_argument("--devices", default="0,1,2,3")
-    parser.add_argument("--port", type=int, default=18280)
-    parser.add_argument("--layers", type=int, default=0)
-    parser.add_argument("--max-context", type=int, default=8192)
-    parser.add_argument("--max-batch-size", type=int, default=8)
-    parser.add_argument("--prefill-token-budget", type=int, default=4096)
-    parser.add_argument("--request-timeout-seconds", type=int, default=900)
-    parser.add_argument("--kv-block-size", type=int, default=16)
-    parser.add_argument("--kv-paged", action="store_true")
-    parser.add_argument("--max-tokens", type=int, default=32)
-    parser.add_argument("--short-prompt-words", type=int, default=128)
-    parser.add_argument("--concurrency", type=int, nargs="+", default=[2, 4, 8])
-    parser.add_argument("--warmup-rounds", type=int, default=1,
-                        help="discarded passes over the measured ladder before measuring (0 disables)")
-    parser.add_argument("--startup-timeout", type=float, default=900.0)
-    parser.add_argument("--log-dir")
-    parser.add_argument("--json-out")
-    parser.add_argument("--mode", choices=("serial", "batch"), default="batch")
-    args = parser.parse_args()
-    if args.mode == "serial":
-        args.max_batch_size = 1
-        args.prefill_token_budget = 0
-    run(args)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -3,8 +3,7 @@
 The end-to-end tests in `test_served_path_golden.py` all skip without a checkpoint, so without these
 the harness would be code that runs nowhere on a machine with no weights -- which is most machines.
 What they cover is the part that decides *what* an end-to-end run means: how a fixture is read and
-written, which flags a native entry recovers from its command line, how a child hands an outcome
-back, and when a fixture is skipped rather than run.
+written, how a child hands an outcome back, and when a fixture is skipped rather than run.
 
 The skip rule is the one worth being explicit about, and it has exactly two reasons, both about the
 machine rather than about the answer: the checkpoint is not here, and a resource the fixture states
@@ -26,7 +25,6 @@ from tests.golden_fixtures import (
     DEFAULT_SAMPLING,
     ENTRY_POINTS,
     GOLDEN_MODULE,
-    PYTHON_ENTRIES,
     REPO_ROOT,
     GoldenFixture,
     Outcome,
@@ -76,45 +74,6 @@ def test_a_fixture_without_the_required_fields_is_refused() -> None:
             GoldenFixture.from_json(payload)
 
 
-def test_a_native_fixture_reads_its_flags_off_the_command_line() -> None:
-    """`argv` is what an operator typed, so the launcher's arguments are recovered from it.
-
-    Storing them twice -- once in `argv` and once as launcher fields -- is how the two drift, and
-    the whole point of recording a command line is that it is the thing that ran.
-    """
-    from tests.golden_fixtures import _native_argv_pairs
-
-    pairs = _native_argv_pairs(
-        [
-            "--ckpt", "/mnt/data2/Qwen3.8-27B-FP8",
-            "--binary", "/repo/cpp_engine/build/pocketllm_engine",
-            "--devices", "0,1,2,3",
-            "--max-context", "4096",
-            "--kv-paged",
-        ]
-    )
-
-    assert pairs["ckpt"] == "/mnt/data2/Qwen3.8-27B-FP8"
-    assert pairs["devices"] == "0,1,2,3"
-    assert pairs["max_context"] == "4096"
-    # A flag with no value is present, with a marker that `_int` can recognise as "use the default".
-    assert pairs["kv_paged"] == "true"
-
-
-def test_the_native_binary_default_is_a_path_that_carries_nccl() -> None:
-    """A default binary that cannot do TP would fail the fixture for a reason the fixture is not about.
-
-    `cpp_engine/build-python/pocketllm_engine` is the build `tests/README.md` and the concurrency
-    bench both name. The `build/cpp_engine/` tree -- the one the root `cpp_engine/README.md` tells a
-    new reader to configure -- is *not* the default here because its `CMakeCache.txt` has
-    `NCCL_LIBRARY-NOTFOUND`, so a rank fails at startup with "Qwen TP requires an NCCL-enabled
-    build". Pinned as a string because the difference is invisible until a four-rank launch.
-    """
-    fixture = GoldenFixture.from_json({**PAYLOAD, "entry": "native"})
-
-    assert fixture._native_binary().endswith("cpp_engine/build-python/pocketllm_engine")
-
-
 def test_a_fixture_is_skipped_only_for_a_missing_checkpoint() -> None:
     fixture = GoldenFixture.from_json(PAYLOAD)
 
@@ -135,9 +94,7 @@ def test_a_fixture_whose_checkpoint_exists_is_not_skipped(tmp_path: pathlib.Path
 
 def test_the_entry_point_set_is_the_one_the_readme_promises() -> None:
     """A new backend cannot be added without either recording a fixture or failing this test."""
-    assert ENTRY_POINTS == ("cpp", "v41", "mimo", "xing4", "torch", "native")
-    assert PYTHON_ENTRIES == ("cpp", "v41", "mimo", "xing4", "torch")
-    assert set(ENTRY_POINTS) - {"native"} == set(PYTHON_ENTRIES)
+    assert ENTRY_POINTS == ("cpp", "v41", "mimo", "xing4", "torch")
 
 
 def test_the_default_sampling_is_greedy() -> None:

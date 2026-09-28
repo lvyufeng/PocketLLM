@@ -194,6 +194,7 @@ nav:
       - Ascend 910A performance roadmap: architecture/ascend_performance_roadmap.md
   - Migration:
       - Overview: migration/index.md
+      - "The C++ binary's --serve front end is removed": migration/native-serve-front-end-removed.md
       - "--device splits into a platform and a card list": migration/device-splits-into-platform-and-cards.md
       - Batching is on by default for the cpp backend: migration/batching-default-on.md
       - The dsv4 to pocket rename: migration/dsv4-to-pocket-rename.md

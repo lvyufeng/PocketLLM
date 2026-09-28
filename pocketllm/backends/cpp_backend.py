@@ -209,8 +209,8 @@ def _strip_terminal_stop_token(result: Any) -> list[int]:
     """The answer without the stop token the engine returns as part of its sequence.
 
     A stop token is the last token of a sequence and the engine counts and returns it, because its KV
-    cache has to agree with what it reports. It is not part of the answer. `openai_server.cpp` drops it
-    before detokenizing -- and before counting `completion_tokens` for the client -- in
+    cache has to agree with what it reports. It is not part of the answer. The deleted C++ front end
+    dropped it, before detokenizing and before counting `completion_tokens`, in its own
     `strip_stop_token`; the batch scheduler's own streaming path does the same by never emitting it.
     The non-streaming result is the one place it leaked through, so a request answered through
     `pocketllm serve` came back with a visible `<|im_end|>` on the end that the same request through
