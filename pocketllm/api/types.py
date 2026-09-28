@@ -79,6 +79,14 @@ class EngineArgs:
     #: default of ``False`` would make that indistinguishable from the ordinary case.
     enable_batching: bool | None = None
     backend_options: dict[str, Any] = field(default_factory=dict)
+    #: The option values the *host's own* command line decided, keyed the way a runtime declares
+    #: them: a flag generated from the declarations, or a host flag that spells one of them
+    #: (``--prefill-chunk-tokens``). It is a separate field from :attr:`backend_options` because the
+    #: two are different tiers and a launch can name both -- ``--backend-option`` names an option
+    #: outright and wins, which is the order ``pocketllm.backends.options.decode_options`` states
+    #: once for every runtime. A caller that builds ``EngineArgs`` directly and wants a runtime's
+    #: option set uses that key, not the host flag's field name.
+    resolved_options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.backend = str(self.backend).lower()
@@ -108,6 +116,17 @@ class EngineArgs:
             raise ConfigurationError("speculative_tokens must be >= 1")
         if self.max_batch_size < 1:
             raise ConfigurationError("max_batch_size must be >= 1")
+        if self.prefill_chunk_tokens and "prefill_chunk" not in self.resolved_options:
+            # Two names for one quantity: the native engine's own field, and the key the runtimes
+            # declare. Every construction path goes through here -- the CLI, the environment bridge,
+            # a worker rank rebuilding rank 0's args, an application building this by hand -- so this
+            # is where they are one value. It is the same tie the CLI makes for its flag (see
+            # `pocketllm.backends.cli_surface.HOST_FLAGS`), and it is an assignment rather than a
+            # `setdefault` so a caller's own ``resolved_options`` dict is never written into.
+            self.resolved_options = {
+                **self.resolved_options,
+                "prefill_chunk": self.prefill_chunk_tokens,
+            }
         if self.enable_batching is False and self.max_batch_size > 1:
             # Both fields are the operator's, and they disagree: a width is a request for a scheduler
             # that runs that many rows, and refusing the scheduler is a request for the serialized

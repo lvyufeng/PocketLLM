@@ -448,15 +448,16 @@ def test_a_resolved_value_the_runtime_does_not_declare_is_refused() -> None:
 
 
 @pytest.mark.parametrize("runtime", sorted(DECLARED))
-def test_the_prefill_width_flag_reaches_every_runtime(runtime: str) -> None:
-    """``--prefill-chunk-tokens`` is above the runtimes because every runtime has a prefill.
+def test_a_resolved_option_reaches_every_runtime_that_declares_it(runtime: str) -> None:
+    """The host flag for a declared option is one tier, and every reader of that option takes it.
 
-    MiMo is why this is a test and not a default: its adapter read no such flag before the
-    declarations existed, so a launch that named one was silently prefillng at 2048. A tuning option
-    that does nothing is how a run gets measured on the wrong lever.
+    MiMo is why this is a test and not a default: its adapter read no prefill width from anywhere
+    before the declarations existed, so a launch that named one prefillled at 2048 regardless. A
+    tuning option that does nothing is how a run gets measured on the wrong lever. The flag itself
+    -- ``--prefill-chunk-tokens`` -- and the tier it lands in are `tests/test_cli_declared_options.py`.
     """
     module, model = DECLARED[runtime]
-    args = EngineArgs(model=model, backend=runtime, prefill_chunk_tokens=4096)
+    args = EngineArgs(model=model, backend=runtime, resolved_options={"prefill_chunk": 4096})
 
     assert module._Options.from_args(args).prefill_chunk == 4096
 
@@ -468,3 +469,23 @@ def test_the_flag_that_names_nothing_leaves_the_runtime_its_own_answer(runtime: 
     args = EngineArgs(model=model, backend=runtime, prefill_chunk_tokens=0)
 
     assert module._Options.from_args(args) == module._Options()
+
+
+@pytest.mark.parametrize("runtime", sorted(DECLARED))
+def test_the_legacy_engine_field_is_the_same_option_by_its_own_name(runtime: str) -> None:
+    """``prefill_chunk_tokens`` and ``prefill_chunk`` are two names for one quantity.
+
+    The field is the native engine's and predates the declarations; the key is what every runtime
+    declares. ``EngineArgs`` is where they are one value, because every construction path goes
+    through it -- the command line, the environment bridge, a worker rank rebuilding rank 0's args,
+    an application building one by hand -- and a caller that reached for the field would otherwise
+    get a runtime that quietly used its own width instead.
+    """
+    module, model = DECLARED[runtime]
+
+    assert EngineArgs(
+        model=model, backend=runtime, prefill_chunk_tokens=4096
+    ).resolved_options == {"prefill_chunk": 4096}
+    assert module._Options.from_args(
+        EngineArgs(model=model, backend=runtime, prefill_chunk_tokens=4096)
+    ).prefill_chunk == 4096

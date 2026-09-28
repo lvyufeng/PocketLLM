@@ -119,9 +119,16 @@ def _args_from_environment(name: str, spec: WorkerSpec) -> EngineArgs:
     The two optional paths are read unconditionally, for every runtime. They are set for every
     worker that starts through `factory`, so a runtime that ignores one is not affected by the
     read, and a runtime that needs one does not need a per-runtime branch here to get it.
+
+    ``POCKETLLM_RESOLVED_OPTIONS`` is the other option tier and travels for the same reason the
+    first one does: a rank that defaulted a prefix budget or a prefill width while rank 0 honoured
+    the flag would evict a different prefix at a different time. Both are read as JSON objects and
+    neither is defaulted here -- an absent variable is an empty tier, not a set of defaults, which
+    is the only reading that cannot invent a value rank 0 never chose.
     """
     backend_options = json.loads(os.environ.get("POCKETLLM_BACKEND_OPTIONS", "{}"))
     backend_options["nccl_id_path"] = _required("POCKETLLM_NCCL_ID_PATH")
+    resolved_options = json.loads(os.environ.get("POCKETLLM_RESOLVED_OPTIONS", "{}"))
     paths = {
         name: os.environ.get(variable) or None for variable, name in spec.path_fields
     }
@@ -136,6 +143,7 @@ def _args_from_environment(name: str, spec: WorkerSpec) -> EngineArgs:
         max_model_len=int(os.environ.get("POCKETLLM_MAX_MODEL_LEN", "8192")),
         kv_cache_dtype=os.environ.get("POCKETLLM_KV_CACHE_DTYPE", "auto"),
         backend_options=backend_options,
+        resolved_options=resolved_options,
         **paths,
         **dict(spec.extra_args),
         **json.loads(os.environ.get("POCKETLLM_WORKER_ARGS", "{}")),

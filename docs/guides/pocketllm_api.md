@@ -117,10 +117,10 @@ python -m pocketllm serve \
   --tensor-parallel-size 4 \
   --max-model-len 2048 \
   --port 8000 \
-  --backend-option expert_pool_rows=288 \
-  --backend-option prefill_chunk=4096 \
-  --backend-option decode_graphs=true \
-  --backend-option threads=22
+  --expert-pool-rows 288 \
+  --prefill-chunk-tokens 4096 \
+  --decode-graphs \
+  --threads 22
 ``` 
 
 For `tensor_parallel_size > 1`, the CLI supervises local tensor-parallel ranks by default. It creates a
@@ -194,15 +194,24 @@ them, because there is no per-request sampling in it to honour them with.
 
 ### Backend options
 
-Every `--backend-option KEY=VALUE` a runtime accepts is *declared* by that runtime — its type, its
-default, its bounds and its accepted values — next to the code that reads it.
-`pocketllm/backends/options.py` is the single reader and each adapter's `OPTIONS` is the single
-list, so the three things a launch can get wrong are answered by one statement rather than by three
-that can disagree:
+Every option a runtime accepts is *declared* by that runtime — its type, its default, its bounds and
+its accepted values — next to the code that reads it. `pocketllm/backends/options.py` is the single
+reader and each adapter's `OPTIONS` is the single list, so the things a launch can get wrong are
+answered by one statement rather than by three that can disagree.
+
+**Each declaration is also a flag.** `python -m pocketllm serve --help` lists them, one flag per
+option, under the section the declaration names — `--expert-pool-rows` beside `--chunk-rows` under
+*Expert arena*, `--prefix-cache-bytes` and `--prefix-cache-head-tokens` under *Prefix cache*. The
+help line says who reads the flag (`v41 only`, `v41 and mimo`) and what each of them answers when
+nobody names it, because one parser holds every runtime's flags and `--backend` may still be `auto`
+when it is parsed. The `--backend-option KEY=VALUE` spelling stays and is the more specific of the
+two — it wins over the flag — which is what makes it the escape hatch for a key with no flag and the
+long form of one that has.
 
 | What a launch did | What happens |
 | --- | --- |
-| Named a key the runtime does not declare | `ConfigurationError` naming the key and listing the ones it does. A tuning option that silently does nothing is how a run ends up measured on the wrong lever. |
+| Named a flag the selected runtime does not read | `ConfigurationError` naming the flag and who does read it: the flags are on one command line, and a tuning option that silently does nothing is how a run ends up measured on the wrong lever. |
+| Named a key the runtime does not declare | `ConfigurationError` naming the key and listing the ones it does. |
 | Gave a value the declared type cannot read | `ConfigurationError` naming the key: `prefill_chunk` is a whole number, `prefix_cache_bytes` takes a `k`/`m`/`g` suffix, `pin` is a flag and reads `true`/`yes`/`on` and their negatives as well as a JSON boolean. |
 | Named one option twice, once by an older spelling | `ConfigurationError`. `chunk_rows`/`expert_rows` and `expert_deal`/`deal` are each one option under two names, and which of the two was meant is not knowable from the values. |
 
@@ -210,9 +219,11 @@ A concept more than one runtime reads is declared once
 (`pocketllm/backends/shared_options.py`): `device`, `prefill_chunk`, `prefix_cache_bytes`,
 `prefix_cache_head_tokens` and `expert_deal`. Each runtime references that declaration and states
 only what it answers for itself — its own default, its own way of resolving an unset value — so the
-flag means one thing wherever it is read. The top-level `--prefill-chunk-tokens` is the same concept
-by its CLI spelling and resolves into the shared key on every runtime, which is why a launch names
-one flag wherever the prefill happens.
+flag means one thing wherever it is read, and `--help` prints the answers side by side
+(`when unset: 4g on v41 and mimo; 2g on xing4`). Two declarations are spelled by a host flag instead
+of a generated one: `prefill_chunk` is `--prefill-chunk-tokens`, which the native engine reads by
+that name, and `device` has no flag until the `--device`/`--device-ids` split (issue #447's U3) —
+the card is reachable as `--backend-option device=cuda:1`, as it is today.
 
 The keys the CLI fills in on every launch — `engine_kind`, `routed_experts_device`, `pd_mode`, and
 `nccl_id_path` for a sharded one — are accepted by every runtime and read by none of the model
@@ -635,12 +646,11 @@ the routed experts in host memory, one process a rank under `--tensor-parallel-s
   the same reason. A rank that decided to stop on its own would leave three peers inside a layer.
 - **`max_model_len` is the KV cache.** A MiMo deployment sizes one cache at startup (32768
   positions by default) and every request is clamped to what is left of it; a prompt that fills it
-  is refused before any work starts, with the number and the flag to raise. Its
-  `--backend-option`s are `prefill_chunk` (tokens a prefill call, default 2048 — the top-level
-  `--prefill-chunk-tokens` resolves into the same key), `chunk_rows` (experts a grouped expert call,
-  which trades arena bytes for call count), `slots`, `expert_deal` (`deal` is the older spelling of
-  the same key) and `pin`, and an unknown option is a `ConfigurationError` rather than a silent
-  default.
+  is refused before any work starts, with the number and the flag to raise. Its options are
+  `--prefill-chunk-tokens` (tokens a prefill call, 2048 by default), `--chunk-rows` (experts a
+  grouped expert call, which trades arena bytes for call count), `--slots`, `--expert-deal` (`deal`
+  is the older spelling of the same option as a `--backend-option` key) and `--pin`, and an unknown
+  one is a `ConfigurationError` rather than a silent default.
 
 ## Request normalization
 

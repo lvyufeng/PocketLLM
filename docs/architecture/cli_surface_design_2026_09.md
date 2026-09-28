@@ -15,9 +15,12 @@ them against any checkout.
 | vLLM | `004e37e` (2026-09-28) | 246 flags in 16 argument groups |
 | SGLang | `f4de6ab` (2026-09-28) | 526 flags in 12 namespace classes |
 | PocketLLM | `fa6b46b` (2026-09-28) | 37 `serve` flags + 34 per-runtime options = 63 distinct names |
+| PocketLLM | after U2b-2 (§7) | 57 flags in 8 `--help` sections, `--help`-derived rather than counted by hand |
 
 Both upstream checkouts are at their tip as of the date on this document — no release tag in
-between, so neither column is a description of an old version.
+between, so neither column is a description of an old version. The first PocketLLM row is the state
+the design was written against; the second is where it landed, and §7 records both why the count
+moved and how the tool's own counting changed with it.
 
 ```bash
 git clone --depth 1 --filter=blob:none --sparse https://github.com/vllm-project/vllm
@@ -41,7 +44,9 @@ python scripts/upstream_cli_inventory.py --vllm /tmp/vllm_ref --sglang /tmp/sgla
 
 Ours are `--device` (top level and all three runtimes), `--prefill-chunk` (v41, mimo, xing4),
 `--prefix-cache-bytes` (v41, mimo, xing4) and `--prefix-cache-head-tokens` (v41, mimo). This is the
-state at `fa6b46b`, the commit the document was written from; U2b-1 (§7) is what merges the four.
+state at `fa6b46b`, the commit the document was written from; U2b-1 and U2b-2 (§7) are what merge the
+four and put the result on the command line, and the tool reads 57 flags with no repeat at that
+commit.
 
 That is not a coincidence about their flags or our flags. It is what a command line is: a name on a
 command line has one meaning, and a name with two meanings is a name the operator has to resolve by
@@ -290,11 +295,47 @@ which is what one declaration read by two runtimes means.
 more than one runtime declares, `readers` matches the tree, and every reader agrees with the shared
 shape on everything except the three fields a runtime answers for itself.
 
-**U2b-2 — generate the CLI.** The parser is built from the declarations, `add_argument_group` per
-`group`, `--backend-option` becomes the alias and escape hatch of §6.6, and a post-parse check
-refuses a key that was declared *and* named but that the selected runtime does not read. Still no
-script changes: every generated flag is additive, and the four merged names keep one of their
-current spellings.
+**U2b-2 — land the flags.** As landed:
+
+* Every declaration generates one flag, `pocketllm/backends/cli_surface.py`, registered under its
+  `group` with `add_argument_group`. **One namespace holds all three runtimes' flags** — vLLM's
+  parser is built from one config struct and SGLang's from one flat field list, and a namespace per
+  runtime would be a namespace the operator has to know the name of before `--backend auto` has
+  answered. MiMo's `--chunk-rows` and V4.1's `--expert-pool-rows` sit in one *Expert arena* section.
+* **A flag the selected runtime does not read is refused, by name, with the runtimes that do.**
+  `factory.select_backend` is where it belongs: it is the first place the runtime is known. Same
+  sentence and same reason as `--backend-option`'s own refusal — a tuning option that silently does
+  nothing is how a run ends up measured on the wrong lever.
+* **`--backend-option` is the more specific spelling and wins**, which is `decode_options`'s
+  existing tiers: the key layer is `backend_options`, the flags are `resolved_options`, and the
+  order between them is stated once. A key with no flag keeps working, which is why U2b-2 needs no
+  script migration.
+* **Two declarations have no generated flag.** `prefill_chunk` is spelled `--prefill-chunk-tokens`
+  by the host, the native engine having read that name since before the declarations existed;
+  `device` is U3's, because today's `--device` means the vendor on one path and the card on another
+  and a generated one would be a second meaning for a name that has one.
+* **A flag nobody named is absent rather than sentinel-valued.** Every generated action is
+  registered with `argparse.SUPPRESS` and writes into one mapping, so the mapping's keys *are* the
+  options the launch named — which is what the refusal reads. That is also why §6's note about
+  SGLang's `---x-explicitly-set` marks stands: our parse has no second pass to tell itself apart
+  from, so "did the operator name this?" is a question about presence.
+* **`--help` says who reads each flag** (`v41 only`, `v41 and mimo`) and what each of them answers
+  when nobody names it (`when unset: 4g on v41 and mimo; 2g on xing4`). It has to: the section is
+  the subsystem, not the runtime, and §6.3 rules out a runtime prefix for a shared concept.
+* The flag set is otherwise identical, no script changes, and the four merged names keep one of
+  their current spellings.
+
+Re-run at that commit, the tool reads **57 registrations, 57 distinct names** for us against
+246/246 and 526/526. Two things moved it from §1's 71/63, and both are worth stating: the merge
+(the same four names are now declared once) and the counting (the tool now counts one spelling per
+flag, because a `BooleanOptionalAction`'s `--no-` half is not a literal in anybody's source —
+upstream's are equally invisible to the reading this does for them).
+
+`tests/test_cli_declared_options.py` is where the generation is checkable, against the parser's own
+actions rather than against a second list: every generated flag is its declaration's name, no
+generated flag collides with one the host declares, a section exists for every group a declaration
+names, the mapping holds exactly what the launch named, and the refusal names the flag and its
+reader.
 
 **U3 — `--device` splits.** `--device auto|cuda|ascend` and `--device-ids L`, with the adapters
 reading the card from the ids rather than from `--device`; the 39 `scripts/` files that mention
@@ -302,10 +343,15 @@ reading the card from the ids rather than from `--device`; the 39 `scripts/` fil
 plus `--device 0` pair wherever it is the rank pattern, because the rank's card is now the default.
 The old spelling is refused by name with the new one in the message, and the change gets a
 `docs/migration/` note. This is the only step with a migration, which is why it is the last one.
+`cli_surface.NO_FLAG` is the one line that changes: `device` joins the generated set, and the two
+adapters that read a base card take the ids instead.
 
 ## Verification
 
 `scripts/upstream_cli_inventory.py` produced §1's table and §3's families, from the checkouts named
 at the top. It reads both upstream projects as text — no import, no dependency — so it re-runs
 against a future commit without installing anything, which is the property that makes the numbers
-in this document checkable rather than asserted.
+in this document checkable rather than asserted. Since U2b-2 its PocketLLM half reads the parser the
+CLI builds rather than the declarations, so the flags it reports are the ones an operator can type,
+and it lists the repeated names, what stands behind each, and the two declarations that have no flag
+of their own.

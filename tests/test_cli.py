@@ -142,6 +142,31 @@ def test_supervised_command_removes_parent_flags_and_preserves_options() -> None
     ]
 
 
+def test_supervised_command_keeps_the_flags_the_declarations_generated() -> None:
+    """A child re-parses the parent's command line, so every generated flag has to survive it.
+
+    The filter above drops the four flags the parent owns and nothing else, deliberately: a
+    generated flag that was dropped would leave the ranks running *different* options under one
+    process group -- a prefix store with a different budget, a prefill at a different width -- and
+    the disagreement shows up as a desynchronized collective rather than as a wrong number.
+    """
+    command = _supervised_command([
+        "serve", "--model", "checkpoint", "--tensor-parallel-size", "4",
+        "--prefix-cache-bytes", "2g", "--expert-deal", "id", "--no-pin",
+        "--prefill-chunk-tokens", "4096",
+    ])
+
+    assert command[:5] == [
+        "serve", "--model", "checkpoint", "--tensor-parallel-size", "4",
+    ]
+    for flag, value in (
+        ("--prefix-cache-bytes", "2g"), ("--expert-deal", "id"),
+        ("--prefill-chunk-tokens", "4096"),
+    ):
+        assert command[command.index(flag) + 1] == value
+    assert "--no-pin" in command
+
+
 def test_supervised_parent_does_not_construct_backend(monkeypatch) -> None:
     captured: dict[str, object] = {}
 

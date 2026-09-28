@@ -101,20 +101,17 @@ def sglang_flags(root: pathlib.Path) -> tuple[dict[str, list[str]], str]:
 
 
 def our_flags() -> tuple[dict[str, list[str]], str]:
-    """``{group: [flag, ...]}`` for this repository's ``serve`` command.
+    """``{section: [flag, ...]}`` for this repository's ``serve`` command, as it now is.
 
-    The top level is argparse's own answer; the per-runtime half is each adapter's ``OPTIONS``,
-    which is what :mod:`pocketllm.backends.options` decodes and what has no CLI spelling yet. Both
-    are printed, because the second is the list the design has to place somewhere.
+    Both halves are read off the parser the CLI builds, so these are the flags an operator can type
+    rather than a list of ones they ought to be able to: the host's own options in one section, and
+    each declared option under the ``--help`` section its declaration names. Nothing is inferred from
+    the ``OPTIONS`` lists -- the generation is
+    :func:`pocketllm.backends.cli_surface.add_declared_options`' job, and this reads its result.
     """
-    groups: dict[str, list[str]] = {"serve (top level)": _our_top_level()}
-    for name, module in _our_modules().items():
-        # The flag each option *would* have, not the key it takes today: `--backend-option` is the
-        # only spelling that exists until the declarations reach the parser, and the collision check
-        # is about the names they are going to take.
-        groups[f"--backend-option, backend={name}"] = sorted(
-            cli_name(option.name) for option in module.OPTIONS
-        )
+    groups: dict[str, list[str]] = {"serve (host flags)": _our_host_flags()}
+    for section, flags in _our_generated_sections().items():
+        groups[f"serve ({section})"] = sorted(flags)
     return groups, commit_of(REPO)
 
 
@@ -126,23 +123,22 @@ def our_repeats() -> list[tuple[str, list[str], str]]:
     several backends. So the interesting half is not that a name repeats; it is whether one
     declaration stands behind it, whether the answers it leaves to a runtime are the only thing that
     differs, and whether anything else does. This is the machine-checkable form of the design
-    document's collision table.
+    document's collision table, and the header it prints under is now empty of the other kind of
+    repeat -- one name, two flags -- which is what the merge was for.
     """
     if str(REPO) not in sys.path:
         sys.path.insert(0, str(REPO))
     from pocketllm.backends import shared_options
     from pocketllm.backends.options import BackendOption
 
-    declared: dict[str, list[tuple[str, BackendOption]]] = collections.defaultdict(list)
-    for name, module in _our_modules().items():
-        for option in module.OPTIONS:
-            declared[option.name].append((name, option))
-
+    declared = {
+        name: [(runtime, option) for runtime, option in readers.items()]
+        for name, readers in _declared().items()
+        if len(readers) > 1
+    }
     shared = {option.name: option for option in shared_options.SHARED}
     found: list[tuple[str, list[str], str]] = []
     for key, readers in sorted(declared.items()):
-        if len(readers) < 2:
-            continue
         reference = shared.get(key) or readers[0][1]
         drifted = sorted(
             field.name
@@ -168,28 +164,75 @@ def our_repeats() -> list[tuple[str, list[str], str]]:
     return found
 
 
-def _our_top_level() -> list[str]:
+def our_host_only() -> list[tuple[str, str]]:
+    """``(flag, why)`` for every declaration that did not become a flag.
+
+    Two of them, and they are the two the design document calls out: the native engine's own
+    ``--prefill-chunk-tokens``, which is the declaration's CLI under another spelling, and
+    ``--device``, whose name is taken by a flag that means the vendor on one path and the card on
+    another -- U3 splits it, and until then a generated one would be a second meaning for a name
+    that has one.
+    """
+    import pocketllm.backends.cli_surface as surface
+
+    found: list[tuple[str, str]] = []
+    for name, attribute in surface.HOST_FLAGS.items():
+        found.append((cli_name(name), f"spelled `--{attribute.replace('_', '-')}` by the host"))
+    for name in sorted(surface.NO_FLAG):
+        found.append((cli_name(name), "the host's `--device` is U3's to split"))
+    return found
+
+
+def _our_host_flags() -> list[str]:
+    """The option strings the ``serve`` parser declares outside the generated sections.
+
+    One spelling per flag -- the one it is named by -- rather than every string argparse registered.
+    A ``BooleanOptionalAction`` registers ``--x`` *and* ``--no-x``, and both halves are real on a
+    command line; upstream's are equally real and equally invisible to the source reader below,
+    which sees the literal ``--x`` and the ``action=`` beside it. Counting ours and not theirs would
+    be a comparison of two different things, so this counts declarations.
+    """
+    generated = {flag for flags in _our_generated_sections().values() for flag in flags}
+    return sorted({
+        action.option_strings[0]
+        for action in _our_serve()._actions
+        if action.option_strings
+        and action.option_strings[0].startswith("--")
+        and action.option_strings[0] not in generated
+    })
+
+
+def _our_generated_sections() -> dict[str, list[str]]:
+    """``{--help section: [flag, ...]}`` for the flags the declarations generate."""
+    found: dict[str, list[str]] = collections.defaultdict(list)
+    for section in _our_serve()._action_groups:
+        for action in section._group_actions:
+            if getattr(action, "option_strings", None) and _is_generated(action):
+                found[section.title].append(action.option_strings[0])
+    return found
+
+
+def _is_generated(action: Any) -> bool:
+    import pocketllm.backends.cli_surface as surface
+
+    return action.dest == surface.DECLARED_DEST
+
+
+def _our_serve() -> Any:
     if str(REPO) not in sys.path:
         sys.path.insert(0, str(REPO))
     from pocketllm.cli import build_parser
 
-    serve = build_parser()._subparsers._group_actions[0].choices["serve"]
-    return sorted({
-        option
-        for action in serve._actions
-        for option in action.option_strings
-        if option.startswith("--")
-    })
+    return build_parser()._subparsers._group_actions[0].choices["serve"]
 
 
-def _our_modules() -> dict[str, Any]:
-    """The adapters that declare options, in the order the factory would pick them."""
+def _declared() -> dict[str, dict[str, Any]]:
+    """``{name: {runtime: declaration}}`` over every runtime that declares options."""
     if str(REPO) not in sys.path:
         sys.path.insert(0, str(REPO))
-    from pocketllm.backends import capabilities, mimo_backend, v41_backend, xing4_backend
+    import pocketllm.backends.cli_surface as surface
 
-    known = {"v41": v41_backend, "mimo": mimo_backend, "xing4": xing4_backend}
-    return {name: known[name] for name in capabilities.AUTO_ORDER if name in known}
+    return surface.declarations()
 
 
 #: The fields of a shared declaration a runtime answers for itself: its own default, its own
@@ -297,6 +340,11 @@ def main(argv: list[str] | None = None) -> int:
         print()
         for flag, readers, standing in our_repeats():
             print(f"- `{flag}` -- {standing}; declared by {', '.join(readers)}")
+        print()
+        print("A declaration with no flag of its own:")
+        print()
+        for flag, why in our_host_only():
+            print(f"- `{flag}` -- {why}")
         print()
 
     if args.overlap and len(stacks) > 1:

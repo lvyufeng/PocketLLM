@@ -285,6 +285,30 @@ def canonical_names(declarations: Iterable[BackendOption]) -> dict[str, str]:
     return {spelling: option.name for option in declarations for spelling in option.names}
 
 
+def decode_args(
+    declarations: Iterable[BackendOption],
+    args: Any,
+    *,
+    runtime: str,
+    ignored: Iterable[str] = (),
+) -> dict[str, Any]:
+    """``decode_options`` for one launch, with the two tiers read off an ``EngineArgs``.
+
+    ``backend_options`` is what a launch named outright -- ``--backend-option KEY=VALUE`` -- and
+    ``resolved_options`` is what the host's own flags settled, including the flags generated from
+    these very declarations. Keeping them apart is what makes ``--backend-option`` the more specific
+    spelling rather than a second opinion, and it is stated once, in :func:`decode_options`; an
+    adapter that passed one mapping would be choosing an order of its own.
+    """
+    return decode_options(
+        declarations,
+        getattr(args, "backend_options", None),
+        runtime=runtime,
+        ignored=ignored,
+        resolved=getattr(args, "resolved_options", None),
+    )
+
+
 def decode_options(
     declarations: Iterable[BackendOption],
     values: Mapping[str, Any] | None,
@@ -335,11 +359,13 @@ def decode_options(
     resolved = dict(resolved or {})
     undeclared = sorted(set(resolved) - {option.name for option in declarations})
     if undeclared:
-        # Not a launch's mistake, so not the launch's message: the host resolved a concept this
-        # runtime does not read, and silently dropping it would make the host's answer a no-op.
+        # Not a launch's typo, so not a launch's message: a *host flag* resolved a concept, and this
+        # runtime has no declaration to take it. The common cause is an operator naming another
+        # runtime's flag -- which `select_backend` refuses first, by the flag's name -- and the rest
+        # is the host and a runtime disagreeing, which silently dropping would turn into a no-op.
         raise ConfigurationError(
             f"backend={runtime!r} was handed a resolved value for {undeclared[0]!r}, which it does "
-            "not declare; the host and the runtime disagree about what this option is"
+            "not declare; a host flag resolved a concept this runtime has no declaration for"
         )
     resolved_set: dict[str, tuple[str, Any]] = {}
     for spelling, value in supplied.items():

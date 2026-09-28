@@ -73,7 +73,7 @@ from pocketllm.api import (
 
 from .base import BackendBase, TokenStreamer, settled_text
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
-from .options import BackendOption, Group, Kind, decode_options
+from .options import BackendOption, Group, Kind, decode_args
 from .shared_options import (
     DEVICE,
     EXPERT_DEAL,
@@ -244,18 +244,7 @@ class _Options:
 
     @classmethod
     def from_args(cls, args: Any) -> "_Options":
-        values = decode_options(
-            OPTIONS,
-            getattr(args, "backend_options", None),
-            runtime="mimo",
-            ignored=IGNORED_OPTIONS,
-            resolved={
-                # ``--prefill-chunk-tokens`` is the host's spelling of ``prefill_chunk``, a flag
-                # above the runtimes because every runtime has a prefill. A launch that names both
-                # gets the backend option, the way every other pair on this surface resolves.
-                "prefill_chunk": getattr(args, "prefill_chunk_tokens", 0) or None,
-            },
-        )
+        values = decode_args(OPTIONS, args, runtime="mimo", ignored=IGNORED_OPTIONS)
         budget = values["prefix_cache_bytes"]
         head = values["prefix_cache_head_tokens"]
         if not bool(getattr(args, "enable_prefix_caching", True)):

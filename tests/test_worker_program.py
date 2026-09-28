@@ -59,6 +59,7 @@ def worker_env(monkeypatch):
         "POCKETLLM_KV_CACHE_DTYPE": "auto",
         "POCKETLLM_NCCL_ID_PATH": "/tmp/nccl-id",
         "POCKETLLM_BACKEND_OPTIONS": '{"threads": 22}',
+        "POCKETLLM_RESOLVED_OPTIONS": '{"prefix_cache_bytes": "2g"}',
         "POCKETLLM_WORKER_ARGS": '{"enable_batching": true, "max_batch_size": 4}',
         "POCKETLLM_TOKENIZER_PATH": "/nonexistent/tokenizer",
         "TP_RANK": "2",
@@ -105,6 +106,9 @@ def test_a_worker_rebuilds_the_args_rank_zero_resolved(worker_env):
     # the engine, and one that only had the options would spawn a second group.
     assert args.backend_options["nccl_id_path"] == "/tmp/nccl-id"
     assert args.backend_options["threads"] == 22
+    # The other tier travels too, and for the same reason: a rank that defaulted a prefix budget
+    # while rank 0 honoured the flag would evict a different prefix at a different time.
+    assert args.resolved_options == {"prefix_cache_bytes": "2g"}
     # The shared fields arrive as one object precisely so a rank cannot default them separately.
     assert args.enable_batching is True
     assert args.max_batch_size == 4
