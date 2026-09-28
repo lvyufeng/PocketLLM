@@ -134,18 +134,22 @@ to tune lifecycle bounds; `--tensor-parallel-master-addr`, `--tensor-parallel-ma
 placement. A caller-provided rendezvous directory is treated as a parent for a fresh private run
 directory and is never removed by PocketLLM.
 
-The built-in supervisor currently works with the Torch backend by reusing its existing NCCL/Gloo
-worker loop, and with the V4.1 adapter, which builds its own ranks the same way — rank 0 loads
-inside the rendezvous window, because a V4.1 backend handed back unloaded would find the group gone.
+The built-in supervisor works with every adapter that serves a checkpoint, and the native `cpp` one
+included: `CppBackend.run_worker` enters the engine's own worker loop, `warmup_tp` brings the NCCL
+communicator up inside construction, the NCCL-ID path arrives through the environment the supervisor
+publishes, and each rank's card is its own index — which works precisely because the supervisor hands
+every rank the same visible device list rather than narrowing it per rank. A V4.1 backend is the
+case that shaped the rest: rank 0 loads inside the rendezvous window, because a backend handed back
+unloaded would find the group gone.
 A rank it starts runs **one program**, `pocketllm/backends/worker.py`, whichever runtime it is
 serving: what tells it which one is `POCKETLLM_WORKER_BACKEND`, set from the `WORKERS` registry, and
 the two things that still differ per runtime are the adapter to import and whether the checkpoint is
 already loaded when the adapter is constructed. Adding a runtime therefore means adding a
 `WorkerSpec` entry rather than writing a second worker script.
-The Python C++ Qwen adapter does not yet expose a native worker entry point, so
-`backend="cpp"` must use the legacy `pocketllm_engine` launcher or opt out with
-`--no-tensor-parallel-supervisor`. Existing `torchrun` and manual rank launchers remain compatible
-through that opt-out. This process supervisor is not a scheduler: it starts ranks and reaps them, and
+`--no-tensor-parallel-supervisor` remains supported for `torchrun` and hand-written rank launchers,
+and is the opt-out for a rank layout this supervisor does not produce (a per-rank
+`CUDA_VISIBLE_DEVICES`, for instance, which the `cpp` adapter detects and honours rather than
+double-counting). This process supervisor is not a scheduler: it starts ranks and reaps them, and
 what runs inside those ranks is the backend's own business. Whether a served backend batches is
 decided separately and per backend — see [Batching on the `cpp` backend](#batching-on-the-cpp-backend)
 — so `--tensor-parallel-size 4` says nothing about the width a request sees.

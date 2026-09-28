@@ -217,20 +217,41 @@ def test_supervised_parent_rejects_explicit_device(monkeypatch) -> None:
         ])
 
 
-def test_supervised_parent_rejects_cpp_before_backend_construction(monkeypatch) -> None:
+def test_supervised_parent_spawns_the_cpp_backend_too(monkeypatch) -> None:
+    """The native adapter is launched by the supervisor like every other one.
+
+    It used to be refused here, because it exposed no worker entry point -- and the advice that came
+    with the refusal was to launch the ranks through `pocketllm_engine` instead. That binary's front
+    end is what this repository is collapsing onto one, so the refusal outlived its reason:
+    `CppBackend.run_worker`, `warmup_tp`, `POCKETLLM_NCCL_ID_PATH` and `_native_rank_device`'s rank
+    offset are the four things that make the child path work, and this test is the statement that
+    they are wired to the same spawn the other adapters use.
+    """
+    captured: dict[str, object] = {}
+
+    class FakeSupervisor:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self):
+            return 0
+
+    monkeypatch.setattr(cli, "TensorParallelSupervisor", FakeSupervisor)
     monkeypatch.setattr(cli, "select_backend", lambda args: "cpp")
     monkeypatch.setattr(cli, "create_backend", lambda args: pytest.fail("backend was constructed"))
-    with pytest.raises(UnsupportedFeatureError, match=r"Python C\+\+ Qwen adapter"):
-        cli.main([
-            "serve", "--model", "checkpoint", "--backend", "cpp", "--tensor-parallel-size", "2",
-        ])
+
+    assert cli.main([
+        "serve", "--model", "checkpoint", "--backend", "cpp", "--tensor-parallel-size", "4",
+    ]) == 0
+    assert captured["world_size"] == 4
+    assert "--supervised-child" in captured["command"]
 
 
 def test_supervised_parent_allows_a_v41_selection(monkeypatch) -> None:
     """The V4.1 adapter is Python-side, so the parent spawns it like the torch one.
 
-    Only the native adapter is rejected here; a V4.1 selection that fell through to
-    the same guard would make `--backend v41 --tensor-parallel-size 4` unlaunchable.
+    Every adapter reaches the spawn by the same rule now; this is the case that established it, and
+    it stays as the guard against a future special case being reintroduced for one of them.
     """
     captured: dict[str, object] = {}
 
