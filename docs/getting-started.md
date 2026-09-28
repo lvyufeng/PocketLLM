@@ -117,10 +117,10 @@ DEEPSEEK_V41_RESIDENT_EXPERTS=1 python -m pocketllm serve \
   --tensor-parallel-size 4 \
   --max-model-len 32768 \
   --port 8000 \
-  --backend-option expert_pool_rows=148 \
-  --backend-option prefill_chunk=4096 \
-  --backend-option decode_graphs=true \
-  --backend-option threads=22
+  --expert-pool-rows 148 \
+  --prefill-chunk-tokens 4096 \
+  --decode-graphs \
+  --threads 22
 ```
 
 Raise `--max-model-len` to `262144` for the longest context the runtime accepts.
@@ -137,8 +137,8 @@ python -m pocketllm serve \
   --tensor-parallel-size 4 \
   --max-model-len 262144 \
   --port 8000 \
-  --backend-option prefill_chunk=2048 \
-  --backend-option chunk_rows=16
+  --prefill-chunk-tokens 2048 \
+  --chunk-rows 16
 ```
 
 It is one request at a time too, and for a firmer reason: every routed layer closes with an

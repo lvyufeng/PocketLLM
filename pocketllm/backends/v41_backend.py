@@ -62,7 +62,7 @@ from pocketllm.api import (
 from ..work_bell import Bell, BellRinger, WorkerBell, bell_path
 from .base import BackendBase, settled_text
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
-from .options import BackendOption, Group, Kind, decode_options
+from .options import BackendOption, Group, Kind, decode_args
 from .shared_options import (
     DEVICE,
     EXPERT_DEAL,
@@ -336,23 +336,9 @@ class _Options:
 
     @classmethod
     def from_args(cls, args: Any) -> "_Options":
-        """The options one launch resolves to, decoded from ``OPTIONS``.
-
-        ``--prefill-chunk-tokens`` is the host's spelling of ``prefill_chunk`` -- a flag above the
-        runtimes, because every runtime has a prefill -- so it is handed in as a resolved value
-        rather than read here. A caller that reaches for both gets the backend option, which is the
-        rule the whole surface follows: the more specific spelling wins.
-        """
+        """The options one launch resolves to, decoded from ``OPTIONS``."""
         options = cls(
-            **decode_options(
-                OPTIONS,
-                getattr(args, "backend_options", None),
-                runtime="v41",
-                ignored=IGNORED_OPTIONS,
-                resolved={
-                    "prefill_chunk": getattr(args, "prefill_chunk_tokens", 0) or None,
-                },
-            )
+            **decode_args(OPTIONS, args, runtime="v41", ignored=IGNORED_OPTIONS)
         )
         if not bool(getattr(args, "enable_prefix_caching", True)):
             # ``--enable-prefix-caching`` is the CLI's switch and it was a no-op on this path until

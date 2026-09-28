@@ -11,9 +11,14 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterator
 
-from pocketllm.api import BackendUnavailableError, EngineArgs, UnsupportedFeatureError
+from pocketllm.api import (
+    BackendUnavailableError,
+    ConfigurationError,
+    EngineArgs,
+    UnsupportedFeatureError,
+)
 
-from . import capabilities
+from . import capabilities, cli_surface
 from .capabilities import runtime_capabilities
 from .cpp_backend import CppBackend
 from .mimo_backend import MimoBackend
@@ -58,6 +63,36 @@ def _refuse_a_capability_the_runtime_lacks(name: str, args: EngineArgs) -> None:
     )
 
 
+def _refuse_options_the_runtime_does_not_read(name: str, args: EngineArgs) -> None:
+    """Refuse a flag the selected runtime does not read, in the parent, before anything loads.
+
+    The counterpart of the flag generation in :mod:`pocketllm.backends.cli_surface`, and the reason
+    one flat namespace is safe: every runtime's flags are on the same command line, so
+    ``--expert-pool-rows`` is offered to a MiMo launch too. Silently ignoring it is the failure this
+    whole surface exists to prevent -- the run is then measured on a lever nobody pulled -- and the
+    refusal can be specific about why, because the declarations say who does read it.
+
+    A ``--backend-option`` key of the same name is *not* this check's business: the adapter's own
+    decoder refuses an undeclared key with the runtime's own message, and it has to keep doing so for
+    a key that will never have a flag.
+    """
+    unread = cli_surface.unread_options(name, args)
+    if not unread:
+        return
+    flags = ", ".join(cli_surface.cli_name(option) for option in unread)
+    readers = cli_surface.readers_of(unread[0])
+    if readers:
+        where = (
+            f"it is {readers[0]}'s" if len(readers) == 1 else f"it belongs to {', '.join(readers)}"
+        )
+    else:
+        where = "no runtime declares it"
+    raise ConfigurationError(
+        f"backend={name!r} does not read {flags}: {where}. A tuning option that silently does "
+        "nothing is how a run ends up measured on the wrong lever"
+    )
+
+
 def select_backend(args: EngineArgs) -> str:
     """Select a backend without silently changing an explicit user choice.
 
@@ -71,6 +106,7 @@ def select_backend(args: EngineArgs) -> str:
         if refusal:
             raise UnsupportedFeatureError(refusal)
         _refuse_a_capability_the_runtime_lacks(args.backend, args)
+        _refuse_options_the_runtime_does_not_read(args.backend, args)
         return args.backend
     # `auto` asks a different question than the explicit path does: not "is this provably not
     # yours" but "does this checkpoint identify you", so a checkpoint presenting no evidence falls
@@ -81,6 +117,7 @@ def select_backend(args: EngineArgs) -> str:
             continue
         if capabilities.identify(name, args).routes_here:
             _refuse_a_capability_the_runtime_lacks(name, args)
+            _refuse_options_the_runtime_does_not_read(name, args)
             return name
     raise AssertionError("capabilities.AUTO_ORDER has no fallback")
 
@@ -308,6 +345,12 @@ def _worker_env(args: EngineArgs, worker: str) -> dict[str, str]:
     place that has to know which runtime reads what, and the first is
     :data:`~pocketllm.backends.worker.WORKERS`.
 
+    Both option tiers travel, and they have to. ``POCKETLLM_BACKEND_OPTIONS`` is what the launch
+    named outright; ``POCKETLLM_RESOLVED_OPTIONS`` is what its flags settled -- a prefix store's byte
+    budget, a prefill width. A rank that defaulted one of those while rank 0 honoured it would
+    evict a different prefix or chunk at a different boundary, and the two would disagree about
+    where a resumed request starts without either of them knowing.
+
     ``POCKETLLM_WORKER_BACKEND`` is what tells the one child program which runtime it is; it comes
     from the registry key rather than from ``args.backend``, which may have been ``auto``.
     """
@@ -318,6 +361,7 @@ def _worker_env(args: EngineArgs, worker: str) -> dict[str, str]:
         "POCKETLLM_MAX_MODEL_LEN": str(args.max_model_len or 8192),
         "POCKETLLM_KV_CACHE_DTYPE": str(args.kv_cache_dtype or "auto"),
         "POCKETLLM_BACKEND_OPTIONS": json.dumps(args.backend_options),
+        "POCKETLLM_RESOLVED_OPTIONS": json.dumps(args.resolved_options),
         "POCKETLLM_WORKER_ARGS": json.dumps(_worker_arg_overrides(args)),
         "POCKETLLM_CONFIG_PATH": str(args.config_path or ""),
         "POCKETLLM_TOKENIZER_PATH": str(args.tokenizer_path or ""),

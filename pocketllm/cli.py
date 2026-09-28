@@ -8,6 +8,7 @@ import os
 import sys
 
 from .api import ConfigurationError, EngineArgs, UnsupportedFeatureError
+from .backends.cli_surface import add_declared_options, resolved_options
 from .backends.factory import create_backend, select_backend
 from .server.openai import serve
 from .supervisor import TensorParallelSupervisor
@@ -94,13 +95,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="KEY=VALUE",
-        help="backend-specific option; repeatable and parsed as JSON when possible",
+        help=(
+            "backend-specific option, by the key a runtime declares it under; repeatable, parsed as "
+            "JSON when possible, and beats the flag that spells the same option"
+        ),
     )
     serve_parser.add_argument(
         "--supervised-child",
         action="store_true",
         help=argparse.SUPPRESS,  # internal flag for supervisor-launched children
     )
+    # The runtimes' own levers, one flag each, read out of the declarations they carry. Added last
+    # so the host's flags above keep their order in `--help` and the generated sections follow them.
+    add_declared_options(serve_parser)
     return parser
 
 
@@ -149,6 +156,11 @@ def _args(namespace: argparse.Namespace) -> EngineArgs:
         speculative_method=namespace.speculative_method,
         speculative_tokens=namespace.speculative_tokens,
         backend_options=_backend_options(namespace),
+        # The flags generated from the runtimes' declarations, plus the host flags that spell one
+        # (`--prefill-chunk-tokens`). They are a separate field from `backend_options` because they
+        # are a different tier: `--backend-option` names an option outright and wins, which is the
+        # order `decode_options` states once for every runtime.
+        resolved_options=resolved_options(namespace),
     )
 
 

@@ -61,7 +61,7 @@ from pocketllm.api import (
 
 from .base import BackendBase, TokenStreamer
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
-from .options import BackendOption, Group, Kind, decode_options
+from .options import BackendOption, Group, Kind, decode_args
 from .shared_options import DEVICE, PREFILL_CHUNK, PREFIX_CACHE_BYTES
 from .runtime_engine import RuntimeSpec, SchedulerHost, cancel_key, device_index
 
@@ -217,19 +217,7 @@ class _Options:
 
     @classmethod
     def from_args(cls, args: Any) -> "_Options":
-        values = decode_options(
-            OPTIONS,
-            getattr(args, "backend_options", None),
-            runtime="xing4",
-            ignored=IGNORED_OPTIONS,
-            resolved={
-                # ``--prefill-chunk-tokens`` is the host's spelling of ``prefill_chunk``, a flag
-                # above the runtimes because every runtime has a prefill. A launch that names both
-                # gets the backend option; a launch that names neither leaves this ``None``, which is
-                # what tells this adapter to derive the width from the card at load.
-                "prefill_chunk": getattr(args, "prefill_chunk_tokens", 0) or None,
-            },
-        )
+        values = decode_args(OPTIONS, args, runtime="xing4", ignored=IGNORED_OPTIONS)
         if not bool(getattr(args, "enable_prefix_caching", True)):
             # `--enable-prefix-caching` is the CLI's switch and the budget is the store's shape, so
             # a zero budget is how the rest of this file spells "off" -- one representation, and
