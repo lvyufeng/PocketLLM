@@ -16,6 +16,7 @@ from pocketllm.api import (
     TensorParallelSupervisorError,
     TokenEvent,
 )
+from pocketllm.choices import CHOICE_MARK
 from pocketllm.protocol.contract import CHAT, FieldRefusal
 
 
@@ -79,11 +80,30 @@ class BackendBase:
         )
 
     def cancel(self, request_id: str) -> bool:
+        """Cancel ``request_id``, and every choice of it when it is a fan-out.
+
+        A request asking for several choices is one request to the client and n engine requests
+        internally, and the client only ever learns the outer id. So a cancellation named for the
+        outer id has to reach the choices as well -- otherwise ``DELETE /v1/.../{id}`` returns
+        success while n-1 generations keep the engine busy, which is the failure mode the endpoint
+        exists to prevent. The shape of a choice's id is what makes that possible; see
+        :data:`pocketllm.choices.CHOICE_MARK`.
+
+        Nothing here requires the fan-out to have happened: at n == 1 the child set is just
+        ``{request_id}``, so this is the same call it always was.
+        """
         with self._state_lock:
             request_id = str(request_id)
-            if self._closed or request_id not in self._active_requests:
+            if self._closed:
                 return False
-            self._cancelled.add(request_id)
+            targets = {
+                name
+                for name in self._active_requests
+                if name == request_id or name.startswith(request_id + CHOICE_MARK)
+            }
+            if not targets:
+                return False
+            self._cancelled |= targets
             return True
 
     def _begin_request(self, request_id: str) -> None:

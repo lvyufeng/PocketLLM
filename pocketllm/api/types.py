@@ -506,6 +506,13 @@ class TokenEvent:
     finish_reason: str | None = None
     usage: Usage | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: Which of the request's choices this event belongs to, 0 for the only one.
+    #:
+    #: A backend never sets this: it is streamed one request, and a request is one choice. It is the
+    #: host's fan-out that tags events, because a client that asked for several choices receives
+    #: them as one response and has to be told which choice each chunk belongs to. Zero is the
+    #: right default for every other reader -- a single-choice stream is choice 0.
+    choice_index: int = 0
 
 
 @dataclass(slots=True)

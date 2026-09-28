@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from types import SimpleNamespace
 import pytest
 
 from pocketllm.api import (
@@ -881,8 +882,10 @@ class ScriptedScheduler:
 
     def __init__(self, result) -> None:
         self.result = result
+        self.submitted: list[object] = []
 
     def submit_request(self, prompt_ids, sampling, callback, on_token=None) -> int:
+        self.submitted.append(sampling)
         return 1
 
     def poll_result(self, request_id, timeout_ms):
@@ -903,11 +906,14 @@ def batched_backend_with(result) -> CppBackend:
 
 
 class ScriptedNativeResult:
-    def __init__(self, *, tokens, finish_reason, constraint_completed=False) -> None:
+    def __init__(self, *, tokens, finish_reason, constraint_completed=False, logprobs=()) -> None:
         self.error = ""
         self.generated_tokens = list(tokens)
         self.finish_reason = finish_reason
         self.constraint_completed = constraint_completed
+        # Parallel to `generated_tokens`, as the binding reports it: one entry per token the engine
+        # produced, including the terminal stop token the answer does not contain.
+        self.logprobs = list(logprobs)
         self.prompt_tokens = 2
         self.completion_tokens = len(tokens)
         self.total_seconds = 0.1
@@ -1000,6 +1006,68 @@ class RunningTextTokenizer(FakeTokenizer):
 
     def decode(self, token_ids: list[int]) -> str:
         return self.texts[min(len(token_ids), len(self.texts)) - 1]
+
+
+class SurfaceTokenizer(FakeTokenizer):
+    """Decodes each id to its own surface, which is what a per-token ranking is indexed against.
+
+    ``ScriptedTextTokenizer`` answers the same string for every id, which is right for a test about
+    how a whole text is read and wrong for one about a ranking: the rendering walks the surfaces to
+    find how many bytes of the answer each position covers, and a tokenizer that gave every position
+    the same answer would give them all the same width.
+    """
+
+    def __init__(self, surfaces: dict[int, str]) -> None:
+        self._surfaces = surfaces
+
+    def decode(self, token_ids: list[int]) -> str:
+        return "".join(self._surfaces.get(int(token), "") for token in token_ids)
+
+
+class ScriptedLogprob:
+    """One position's ranking, in the shape the binding reports it.
+
+    Duck-typed rather than the real ``pocketllm_cpp.TokenLogprob``, for the reason this file's other
+    fakes are: the rendering is Python, and it has to be testable on a build with no extension.
+    """
+
+    def __init__(self, logprob, *, top_tokens=(), top_logprobs=(), present=True) -> None:
+        self.present = present
+        self.logprob = logprob
+        self.top_tokens = list(top_tokens)
+        self.top_logprobs = list(top_logprobs)
+
+
+def _engine_sampling(**fields):
+    """A scheduler that declares what the engine's sampler can vary per request.
+
+    The adapter reads these off the scheduler's capability object, so a scripted scheduler that does
+    not answer ``engine_caps`` is read as the serialized session -- fixed at greedy. Tests that need
+    the other reading attach one of these; the defaults are that session's.
+    """
+    declared = dict(
+        per_request_sampling=False,
+        per_request_top_k=False,
+        fixed_temperature=0.0,
+        fixed_top_p=1.0,
+        fixed_top_k=20,
+        fixed_seed=0,
+    )
+    declared.update(fields)
+    return lambda: SimpleNamespace(**declared)
+
+
+def _ranking_backend(surfaces, tokens, rankings, *, finish_reason="length"):
+    backend, _ = make_backend()
+    backend._tokenizer = SurfaceTokenizer(surfaces)
+    backend._native = ScriptedNativeModule()
+    backend._scheduler = ScriptedScheduler(
+        ScriptedNativeResult(
+            tokens=tokens, finish_reason=finish_reason, logprobs=rankings
+        )
+    )
+    backend._batching_enabled = True
+    return backend
 
 
 QWEN_TOOL = {
@@ -1321,23 +1389,238 @@ def test_a_stream_withholds_a_tail_that_could_become_a_stop_sequence() -> None:
     backend.close()
 
 
-def test_choices_are_refused_by_name_rather_than_answered_with_one(tmp_path) -> None:
-    """`n` is the host's to fan out, and it is not there yet, so more than one choice is refused.
+def test_more_than_one_choice_is_not_this_adapters_to_refuse(tmp_path) -> None:
+    """`n` is served, and it is served one level up.
 
-    Answering a request for four choices with one is the response the field contract exists to
-    prevent: a client that asked for four independent samples has no way to tell that it got one.
-    The refusal names the field, so it lands in OpenAI's `param` slot.
+    A request for four choices is four requests to this adapter, which the host's dispatch builds;
+    the adapter's part of serving the field is to answer each of them, so an audit that refused `n`
+    here would refuse it on every runtime and the fan-out could never happen.
     """
     backend = _scripted_backend(_declaring_checkpoint(tmp_path, "qwen3_5"), "x")
     try:
-        refusal = backend.audit_request({"n": 4})
-        assert refusal is not None
-        assert refusal.field == "n"
-        assert refusal.requested == "4"
-        assert '"n"' in refusal.message
-        # One choice is what this server does anyway, so the default costs a client nothing.
+        assert backend.audit_request({"n": 4}) is None
         assert backend.audit_request({"n": 1}) is None
         assert backend.audit_request({}) is None
+    finally:
+        backend.close()
+
+
+def test_several_choices_are_refused_where_they_could_not_differ(tmp_path) -> None:
+    """The one `n` this server still will not serve, and it is about the seeds rather than the count.
+
+    The choices of one request differ only in the seed the fan-out hands each of them, and an engine
+    that samples at engine-wide values reads no seed it was given. Four runs would then be four
+    copies of one answer presented as independent samples -- which the caller has no way to tell
+    from the field being honoured. Under greedy decoding the same text `n` times is what was asked
+    for, so only the stochastic case is refused; that is the line the native front end drew too.
+    """
+    backend = _scripted_backend(_declaring_checkpoint(tmp_path, "qwen3_5"), "x")
+    # A scheduler that declares the engine's sampler, which is the engine-wide part of the answer.
+    backend._scheduler.engine_caps = _engine_sampling(fixed_temperature=0.7)
+    try:
+        refusal = backend.audit_request({"n": 3})
+        assert refusal is not None
+        assert refusal.field == "n"
+        assert refusal.requested == "3"
+        assert "0.7" in refusal.message
+        # One choice is what a request asking for one gets, and it is not this field's business.
+        assert backend.audit_request({"n": 1}) is None
+        # Where the engine does sample per request the seeds differ, so every count is served.
+        backend._scheduler.engine_caps = _engine_sampling(per_request_sampling=True)
+        assert backend.audit_request({"n": 3}) is None
+    finally:
+        backend.close()
+
+
+def test_a_requested_ranking_comes_back_as_openai_logprobs() -> None:
+    """The engine's per-token ranking, rendered into the shape a caller asked for.
+
+    Three things have to hold at once and each is checked here: the array covers exactly the tokens
+    the answer is made of, in order, so it rejoins into the text beside it; each position reports
+    the probability of the token the engine generated there; and the ranked alternatives are the
+    ones the request asked for, narrowed from whatever width the batch ranked at.
+    """
+    backend = _ranking_backend(
+        {1: "1", 2: ", ", 3: "2"},
+        [1, 2, 3],
+        [
+            ScriptedLogprob(-0.11, top_tokens=[1, 2], top_logprobs=[-0.11, -1.5]),
+            ScriptedLogprob(-0.22, top_tokens=[2, 3], top_logprobs=[-0.22, -2.5]),
+            ScriptedLogprob(-0.33, top_tokens=[3, 1], top_logprobs=[-0.33, -3.5]),
+        ],
+    )
+    try:
+        result = backend.generate([
+            GenerationRequest(
+                prompt_tokens=[1, 2],
+                request_id="req-logprobs",
+                sampling_params=SamplingParams(logprobs=True, top_logprobs=2, max_tokens=3),
+            )
+        ])[0]
+        # The request side: without this the engine ranks nothing and the array comes back empty,
+        # so a rendering test that skipped it would pass on a build that never asked.
+        assert backend._scheduler.submitted[0].logprobs_n == 2
+    finally:
+        backend.close()
+
+    assert result.text == "1, 2"
+    content = result.logprobs["content"]
+    assert [entry["token"] for entry in content] == ["1", ", ", "2"]
+    assert "".join(entry["token"] for entry in content) == result.text
+    assert [entry["logprob"] for entry in content] == [-0.11, -0.22, -0.33]
+    # The bytes are what says where one token ends and the next begins, which the text alone does
+    # not: a caller reassembling an answer by token boundary needs them.
+    assert [entry["bytes"] for entry in content] == [[0x31], [0x2C, 0x20], [0x32]]
+    assert [alt["token"] for alt in content[0]["top_logprobs"]] == ["1", ", "]
+    assert [alt["logprob"] for alt in content[0]["top_logprobs"]] == [-0.11, -1.5]
+
+
+def test_a_ranking_covers_the_answer_and_not_the_reasoning_in_front_of_it() -> None:
+    """Chat answers are a suffix of the decode, so a ranking indexed from zero describes the wrong text.
+
+    A thinking model decodes its reasoning first. Reporting a probability for those positions beside
+    an answer that does not contain them gives a caller an array it cannot line up against the
+    content -- and one that is longer than the answer, which is how a client would notice.
+    """
+    backend = _ranking_backend(
+        {1: "weighing it up", 2: "</think>", 3: "the answer"},
+        [1, 2, 3],
+        [ScriptedLogprob(-9.0), ScriptedLogprob(-9.1), ScriptedLogprob(-0.5)],
+    )
+    try:
+        result = backend.generate([
+            GenerationRequest(
+                prompt_tokens=[1, 2],
+                request_id="req-logprobs-chat",
+                sampling_params=SamplingParams(logprobs=True, max_tokens=3),
+                metadata={
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "thinking_mode": "chat",
+                },
+            )
+        ])[0]
+    finally:
+        backend.close()
+
+    assert result.text == "the answer"
+    assert result.metadata["reasoning_content"] == "weighing it up"
+    assert [entry["token"] for entry in result.logprobs["content"]] == ["the answer"]
+    assert [entry["logprob"] for entry in result.logprobs["content"]] == [-0.5]
+
+
+def test_a_ranking_stops_where_a_stop_sequence_ended_the_text() -> None:
+    """A position outside the answer describes text the caller never received.
+
+    The stop sequence is matched on decoded text and lands after the answer, so the tokens from it
+    onwards have probabilities that belong to no part of what was returned. The array is cut at the
+    same byte the text was.
+    """
+    backend = _ranking_backend(
+        {1: "1", 2: ", ", 3: "2", 4: "END", 5: "!"},
+        [1, 2, 3, 4, 5],
+        [ScriptedLogprob(-0.1) for _ in range(5)],
+    )
+    try:
+        result = backend.generate([
+            GenerationRequest(
+                prompt_tokens=[1, 2],
+                request_id="req-logprobs-stop",
+                sampling_params=SamplingParams(logprobs=True, stop=["END"], max_tokens=5),
+            )
+        ])[0]
+    finally:
+        backend.close()
+
+    assert result.text == "1, 2"
+    assert result.finish_reason == "stop"
+    assert [entry["token"] for entry in result.logprobs["content"]] == ["1", ", ", "2"]
+
+
+def test_a_position_the_engine_never_ranked_fails_the_request() -> None:
+    """An array shorter than the text is the one outcome not allowed.
+
+    A caller reading a probability per token has no way to notice that the array describes fewer
+    positions than the answer covers, so the native front end failed the choice and so does this.
+    Speculative decoding is where it happens: the engine describes the first token a row emitted,
+    and a row that emitted several leaves the rest absent.
+    """
+    backend = _ranking_backend(
+        {1: "a", 2: "b"},
+        [1, 2],
+        [ScriptedLogprob(-0.1), ScriptedLogprob(0.0, present=False)],
+    )
+    try:
+        with pytest.raises(RuntimeError, match="no log probabilities for a position"):
+            backend.generate([
+                GenerationRequest(
+                    prompt_tokens=[1],
+                    request_id="req-logprobs-short",
+                    sampling_params=SamplingParams(logprobs=True, max_tokens=2),
+                )
+            ])
+    finally:
+        backend.close()
+
+
+def test_logprobs_is_refused_where_there_is_no_scheduler_to_rank() -> None:
+    """One field, one answer per build: no scheduler, no ranking, and a refusal rather than an empty array.
+
+    ``batching=false`` selects the serialized compatibility session, whose ``generate`` reports
+    tokens and nothing about their probabilities. Answering the field with an empty array would be
+    the caller's own ranking silently replaced by nothing.
+    """
+    backend = _ranking_backend({1: "a"}, [1], [])
+    backend._batching_enabled = False
+    try:
+        refusal = backend.audit_request({"logprobs": True})
+        assert refusal is not None
+        assert refusal.field == "logprobs"
+        assert "per-token log probabilities" in refusal.message
+        assert backend.audit_request({"logprobs": False}) is None
+    finally:
+        backend.close()
+
+
+def test_a_seed_the_caller_named_reaches_the_sampler() -> None:
+    """Until now it did not, which made the fan-out unable to vary anything.
+
+    The choices of an `n`-choice request differ only in the seed the host hands each of them, so a
+    field this adapter never assigned turned several choices into one answer written out several
+    times -- and silently ignored a seed on a request that asked for one choice.
+    """
+    backend = _ranking_backend({1: "a"}, [1], [])
+    backend._scheduler.engine_caps = _engine_sampling(per_request_sampling=True)
+    try:
+        backend.generate([
+            GenerationRequest(
+                prompt_tokens=[1],
+                request_id="req-seed",
+                sampling_params=SamplingParams(seed=7, temperature=0.7, max_tokens=1),
+            )
+        ])
+        assert backend._scheduler.submitted[0].seed == 7
+    finally:
+        backend.close()
+
+
+def test_a_negative_seed_is_masked_into_the_engines_unsigned_field() -> None:
+    """The engine's seed is a ``uint64_t`` and a Python int is not, so the wrap has to be explicit.
+
+    A negative seed that reached the binding unmasked would raise there, turning a request the field
+    contract accepted into a 500 rather than a run: the shape check has no reason to refuse a
+    negative seed, and the native front end reinterpreted one the same way this does.
+    """
+    backend = _ranking_backend({1: "a"}, [1], [])
+    backend._scheduler.engine_caps = _engine_sampling(per_request_sampling=True)
+    try:
+        backend.generate([
+            GenerationRequest(
+                prompt_tokens=[1],
+                request_id="req-seed-negative",
+                sampling_params=SamplingParams(seed=-1, temperature=0.7, max_tokens=1),
+            )
+        ])
+        assert backend._scheduler.submitted[0].seed == 0xFFFFFFFFFFFFFFFF
     finally:
         backend.close()
 
@@ -1347,12 +1630,14 @@ def test_the_typed_surface_is_audited_by_the_same_contract(tmp_path) -> None:
 
     One policy, two spellings: the typed request is mapped back onto the body keys the audit reads,
     so the library surface cannot disagree with the HTTP one about what this backend serves.
+
+    `n` and `logprobs` are absent from the refused list because this backend serves both now -- the
+    first through the host's fan-out, the second through the scheduler -- and what holds their
+    behaviour is `tests/test_choices.py` and the ranking tests below rather than a refusal.
     """
     backend = _scripted_backend(_declaring_checkpoint(tmp_path, "qwen3_5"), "x")
     try:
         for params, expected in (
-            (SamplingParams(n=3), '"n" = 3'),
-            (SamplingParams(logprobs=True), '"logprobs" = true'),
             (SamplingParams(min_p=0.1), '"min_p" = 0.1'),
             (SamplingParams(repetition_penalty=1.2), '"repetition_penalty" = 1.2'),
             (SamplingParams(temperature=0.7), '"temperature" = 0.7'),

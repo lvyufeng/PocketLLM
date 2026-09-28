@@ -165,6 +165,38 @@ def test_chat_stream_uses_shared_request_path():
     llm.close()
 
 
+def test_the_library_surface_fans_out_choices_the_way_the_http_one_does():
+    """One dispatch rule for both hosts, which is the reason `pocketllm.choices` is not in either.
+
+    `LLM.chat(..., SamplingParams(n=3))` and an HTTP `"n": 3` are the same request, so they have to
+    be three generations on both. Each result carries the choice's own id -- which is also how
+    `LLM.cancel` reaches all three from the one the caller holds -- and each runtime request asks for
+    a single choice.
+    """
+    llm = InjectedLLM()
+    results = llm.chat([{"role": "user", "content": "hi"}], SamplingParams(n=3))
+
+    assert len(results) == 3
+    assert len({result.request_id for result in results}) == 3
+    assert [result.request_id.rsplit("#", 1)[1] for result in results] == ["0", "1", "2"]
+    assert {request.sampling_params.n for request in llm.backend.seen} == {1}
+    llm.close()
+
+
+def test_a_choice_count_past_the_ceiling_is_refused_where_the_contract_cannot_see_it():
+    """The library builds no body, so the field contract's ceiling never runs on this path.
+
+    One choice is one queued request, and the ceiling is what bounds how much of the queue a single
+    caller can occupy. Without this the HTTP endpoint would refuse `n: 129` and `LLM.chat` would
+    happily queue 129 requests.
+    """
+    llm = InjectedLLM()
+    with pytest.raises(ConfigurationError, match="128 or less"):
+        llm.chat([{"role": "user", "content": "hi"}], SamplingParams(n=129))
+    assert llm.backend.seen == []
+    llm.close()
+
+
 def test_chat_and_generate_preserve_sampling_fields():
     llm = InjectedLLM()
     params = SamplingParams(max_tokens=4, temperature=0.2)

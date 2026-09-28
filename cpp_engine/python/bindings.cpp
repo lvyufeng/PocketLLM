@@ -863,10 +863,15 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         // (ignore_eos) or stop on its own tokenizer's ids (stop_token_ids)
         // instead of the checkpoint's.
         .def_readwrite("stop_token_ids", &BatchSamplingParams::stop_token_ids)
-        .def_readwrite("ignore_eos", &BatchSamplingParams::ignore_eos);
+        .def_readwrite("ignore_eos", &BatchSamplingParams::ignore_eos)
+        // How wide a ranking to produce at each generated position, 0 for none. This is what
+        // turns the per-token ranking on at all -- a request that leaves it at 0 gets an empty
+        // `logprobs` vector back even though the engine could have ranked the position, because
+        // the kernels only keep the candidates when a caller asked for them.
+        .def_readwrite("logprobs_n", &BatchSamplingParams::logprobs_n);
 
-    py::class_<SchedulerGenerationResult>(module, "SchedulerGenerationResult")
-        .def(py::init<>())
+    py::class_<SchedulerGenerationResult> result_class(module, "SchedulerGenerationResult");
+    result_class.def(py::init<>())
         .def_readwrite("request_id", &SchedulerGenerationResult::request_id)
         .def_readwrite("generated_tokens", &SchedulerGenerationResult::generated_tokens)
         .def_readwrite("finish_reason", &SchedulerGenerationResult::finish_reason)
@@ -888,6 +893,13 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("prefill_seconds", &SchedulerGenerationResult::prefill_seconds)
         .def_readwrite("decode_seconds", &SchedulerGenerationResult::decode_seconds)
         .def_readwrite("error", &SchedulerGenerationResult::error);
+
+    // The ranking for each generated position, parallel to `generated_tokens` and truncated by the
+    // scheduler at the same points that vector is. Empty unless the request set `logprobs_n`, and
+    // an entry whose `present` is false is a position the engine ran but could not describe -- a
+    // row that reduced to nothing has no distribution to report, which is not the same as a
+    // probability of zero and must not be rendered as one.
+    read_only_vector(result_class, "logprobs", &SchedulerGenerationResult::logprobs);
 
     py::class_<BatchScheduler::Stats>(module, "QwenBatchSchedulerStats")
         .def(py::init<>())
