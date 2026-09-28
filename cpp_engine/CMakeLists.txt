@@ -586,6 +586,12 @@ add_executable(test_gguf_ternary_reader tests/test_gguf_ternary_reader.cpp)
 target_link_libraries(test_gguf_ternary_reader PRIVATE pocket_cpp_core)
 set_target_properties(test_gguf_ternary_reader PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+# Links pocket_core only: the decode is host arithmetic with no device and no
+# vendor SDK behind it, so this runs on either machine from a synthetic block.
+add_executable(test_ptq1_0_decode tests/test_ptq1_0_decode.cpp)
+target_link_libraries(test_ptq1_0_decode PRIVATE pocket_core)
+set_target_properties(test_ptq1_0_decode PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_safetensors_reader tests/test_safetensors_reader.cpp)
 target_link_libraries(test_safetensors_reader PRIVATE pocket_cpp_core)
 set_target_properties(test_safetensors_reader PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

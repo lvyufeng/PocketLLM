@@ -341,14 +341,56 @@ tensor cut in segments rather than as one range so no rank receives part of a he
 
 | | Result |
 | --- | ---: |
-| Load, 64 layers × 4 ranks | **244.6 s** — 12.53 GiB of FP16 weights a rank |
+| Load, 64 layers × 4 ranks | **~122 s** — 12.53 GiB of FP16 weights a rank |
 | Decode, one row | 23.6 tok/s, 15 tokens |
 | Decode, 16 rows batched | **173.6 tok/s**, 92.2 ms a step |
 | Card memory, one row | 19.60 GiB of 32 |
 
-The load is host decode, not transfer. The dense sibling checkpoint puts the same 12.53 GiB a rank on
-the card in 35.5 s, because it reads FP16 off disk; here the engine reads 5.95 GB, decodes 402 ternary
-tensors on the host, and pushes the same 12.53 GiB. The **7×** is the expansion.
+The load is host work, not transfer. The dense sibling checkpoint puts the same 12.53 GiB a rank on
+the card in 35.5 s, because it reads FP16 off disk; here the engine reads 5.95 GB, decodes 402
+ternary tensors on the host, and pushes the same 12.53 GiB. Four runs of the whole runner, two per
+binary and interleaved, put the old engine at 244.82 / 244.21 s and the new one at 123.76 / 124.37 s
+— a **2.0×** halving on bit-identical weights, which the harness proves rather than assumes: the two
+binaries emit the same eight greedy tokens, `verify_mismatches=0`, `batch_repeat_mismatches=0` and
+`seed_mismatches=0` unchanged, and `step_ms` does not move.
+
+**Where the 122 s goes, measured on the new engine.** The 244.6 s this page used to record was the
+decode at its old cost, and the decode is no longer the load:
+
+| Region | Time |
+| --- | ---: |
+| Hadamard unfold: `qwen_hadamard_inverse_blockwise`, 128 tensors | 39.4 s |
+| Hadamard unfold: the fp16 ↔ float conversions around it | 35.4 s |
+| Hadamard unfold: scratch bring-up and the fp32 → fp16 narrowing | 17.4 s |
+| Hadamard unfold: the PTQ1_0 decode inside it | 8.8 s |
+| The PTQ1_0 decode outside the unfold | 11.5 s |
+| Host resize of the 12.53 GiB destination | 4.4 s |
+| Device upload, GGUF read and the rest | 4.6 s |
+
+**Why the decode fell, and why it is no longer the whole story.** A trit is −1, 0 or 1 and a block's
+scale is a finite fp16, so all 128 of a block's weights are one of exactly three fp16 values. The
+narrowing — a branchy trit extraction plus a branchy software fp16 conversion, 128 times a block —
+is therefore done three times, into a three-entry table, and each weight becomes a lookup. Two
+properties of the packing are what make that a restructuring rather than a rewrite. The three
+regions of `ptq1_0_trit_at` are each *a byte index cycling within a fixed width and a position
+advancing once per cycle* (5 × 16, 5 × 8, 4 × 2), so writing them out as nested loops with the
+position outer makes the byte index a constant offset in the innermost loop while preserving the
+sequential 0…127 store order; and `(byte * pow3[stage])` truncated to `uint8_t` and then `(q * 3) >>
+8` depends only on the byte and the position, so the trit is a 5 × 256 table. That table is *derived
+from* `ptq1_0_trit_at` at static-init rather than written beside it, so the two cannot drift.
+
+The one entry that is not obvious is zero. It must be `qwen_float_to_fp16_bits(0.0f * scale)` and not
+a literal fp16 zero: a negative scale makes the product `-0.0f`, and the block reader's kernels store
+that sign. `±scale` multiplies exactly, so the other two entries are `qwen_float_to_fp16_bits(-scale)`
+and `qwen_float_to_fp16_bits(scale)`, and `tests/test_ptq1_0_decode.cpp` pins all three against an
+independent scalar transcription of the format, on a device with no checkpoint and no vendor SDK.
+
+What the table does not help is the Hadamard unfold, which is now 101 s of the 122 and the largest
+single cost in the load. It is a TP4 consequence rather than a packing one — a column-parallel shard
+that stops inside a 1024-element block cannot rotate its own activation, so the weight is unfolded
+once at load — and it is paid per row, element by element in fp32, on 128 tensors. Making it cheaper
+means vectorizing the butterfly and its conversions, which is a separate concern from the decode and
+is not attempted here.
 
 The batched figure is gated, not just measured: the harness compares the batched path against a
 synchronous single-row reference at three interleaved steps and checks both tokens and logits.
