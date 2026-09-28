@@ -111,6 +111,18 @@ def test_a_gguf_declares_its_architecture_in_its_own_metadata(tmp_path):
     assert detect_architecture(str(tmp_path)) == "qwen3_5"
 
 
+def test_the_gguf_spelling_of_qwen_folds_onto_the_registry_key(tmp_path):
+    """``qwen35`` is what the released GGUF export declares, and it is not a fourth architecture.
+
+    ``pocket::canonical_architecture`` folds it (``core/model_registry.cpp``) and this must agree:
+    the answer here selects the tool-call parser, so a checkpoint left unfolded would read its
+    answers one way through the C++ front end and another way through the Python host.
+    """
+    gguf = tmp_path / "bonsai.gguf"
+    _write_gguf(gguf, "qwen35")
+    assert detect_architecture(str(gguf)) == "qwen3_5"
+
+
 def test_two_ggufs_in_one_directory_name_no_architecture(tmp_path):
     """No way to say which artifact was meant, so neither is guessed at."""
     _write_gguf(tmp_path / "a.gguf", "qwen3_5")

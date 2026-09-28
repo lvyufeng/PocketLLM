@@ -92,10 +92,45 @@ def _handle_parse(templater, req: dict[str, Any]) -> None:
     _emit({"ok": True, **parsed})
 
 
+def load_tokenizer(ckpt: str, tokenizer_path: str | None = None):
+    """The checkpoint's vocabulary, however that checkpoint carries it.
+
+    A safetensors export ships ``tokenizer.json`` beside its config and
+    ``AutoTokenizer`` assembles the pair. A GGUF ships the same facts -- the
+    vocabulary, the merges, the special-token ids and the chat template -- in its
+    own header, and the released ternary artifact is one such file with nothing
+    beside it, so there is no directory for ``transformers`` to read and asking
+    it for one fails before the engine is ever reached. Both branches return the
+    same class, which is what lets the rest of this module stay unaware of which
+    container it is serving. An explicit ``tokenizer_path`` still wins: a caller
+    who names one wants that one.
+    """
+
+    if tokenizer_path:
+        return AutoTokenizer.from_pretrained(tokenizer_path)
+    # Imported here rather than at module scope: the sidecar is also run against
+    # safetensors checkpoints, where neither the adapter package nor the GGUF
+    # reader is needed, and a failure to import either should not be able to
+    # stop the path that does not use them.
+    from pocketllm.backends.cpp_backend import gguf_checkpoint_file
+
+    gguf = gguf_checkpoint_file(ckpt)
+    if gguf:
+        from src.encoding.gguf_tokenizer import build_gguf_hf_tokenizer
+
+        tokenizer, _metadata = build_gguf_hf_tokenizer(gguf)
+        return tokenizer
+    return AutoTokenizer.from_pretrained(ckpt)
+
+
 def main() -> int:
     _configure_stdio()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", required=True, help="Path to the model checkpoint (used to load the HF tokenizer)")
+    parser.add_argument(
+        "--ckpt",
+        required=True,
+        help="Path to the model checkpoint the vocabulary is read from",
+    )
     parser.add_argument("--tokenizer-path", default=None, help="Optional override for tokenizer directory")
     parser.add_argument(
         "--architecture",
@@ -104,8 +139,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    tokenizer_path = args.tokenizer_path or args.ckpt
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    tokenizer = load_tokenizer(args.ckpt, args.tokenizer_path)
     # The C++ server passes the answer from pocket::detect_architecture so the
     # two halves cannot select different models. Detection here is only the
     # standalone-script fallback used by tests and manual protocol probes.
