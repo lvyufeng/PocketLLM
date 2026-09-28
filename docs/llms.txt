@@ -104,6 +104,7 @@ by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script
 - [vLLM and SGLang architecture analysis](https://lvyufeng.github.io/PocketLLM/architecture/vllm_sglang_architecture_analysis/)
 - [Multi-backend and multi-model (vLLM 0.30, SGLang 0.5.20)](https://lvyufeng.github.io/PocketLLM/architecture/multi_backend_multi_model_2026_09/)
 - [vLLM and SGLang comparison (pre-Phase-1)](https://lvyufeng.github.io/PocketLLM/architecture/vllm_sglang_comparison/)
+- [The command-line surface against vLLM and SGLang](https://lvyufeng.github.io/PocketLLM/architecture/cli_surface_design_2026_09/)
 - [Ascend 910A performance roadmap](https://lvyufeng.github.io/PocketLLM/architecture/ascend_performance_roadmap/)
 
 ## Migration
