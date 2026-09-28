@@ -483,6 +483,14 @@ SafeDType qwen_device_dtype(SafeDType storage_dtype);
 // it has no kernel for.
 bool qwen_backend_reads_packed_ternary();
 
+// The same decode, applied to one run of a materialized host tensor: `elements`
+// counts weights, the run must start on a block boundary, and `dst` receives one
+// fp16 per weight. Declared here so the arithmetic can be checked against a
+// second transcription of the format without a checkpoint and without a device;
+// see tests/test_ptq1_0_decode.cpp. Nothing but the materializer calls it.
+void qwen_decode_ptq1_0(const uint8_t* src, uint8_t* dst, uint64_t elements,
+                        const std::string& name);
+
 uint16_t qwen_bf16_to_fp16_bits(uint16_t bits);
 // Round-to-nearest-even FP32 -> FP16, for the norms a GGUF stores in fp32 where
 // the kernels want fp16 gamma.

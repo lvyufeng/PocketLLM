@@ -11,6 +11,7 @@
 #include "weight_source.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <sstream>
@@ -121,35 +122,38 @@ int ptq1_0_trit_at(const uint8_t* block, uint64_t index) {
     return static_cast<int>((q * 3) >> 8) - 1;
 }
 
-// A run of packed weights into fp16, for the backends that keep a ternary weight
-// decoded rather than read it in place. See qwen_backend_reads_packed_ternary.
+// The trit a byte contributes at each of the five positions, offset by one so the
+// value is an index into the per-block table `qwen_decode_ptq1_0` builds.
 //
-// `elements` counts weights and the run has to start on a block boundary. Both
-// hold for every caller in this file: a row is a whole number of blocks, and a
-// row's pitch is therefore a whole number of blocks too, so a run that spans rows
-// is the same byte sequence as one long row would be and the flat index below
-// needs no row arithmetic.
-void decode_ptq1_0(const uint8_t* src, uint8_t* dst, uint64_t elements,
-                   const std::string& name) {
-    if (elements % kTernaryBlockWeights != 0) {
-        throw std::runtime_error(
-            "a ternary run is not a whole number of 128-weight blocks: " + name);
-    }
-    uint16_t* halves = reinterpret_cast<uint16_t*>(dst);
-    for (uint64_t base = 0; base < elements; base += kTernaryBlockWeights) {
-        const uint8_t* block = src + base / kTernaryBlockWeights * kTernaryBlockBytes;
-        // The block scale is the last two bytes: `ggml_half d`, the block's amax.
-        uint16_t scale_bits = 0;
-        std::memcpy(&scale_bits, block + 26, sizeof(scale_bits));
-        const float scale = fp16_bits_to_float(scale_bits);
-        for (uint64_t index = 0; index < kTernaryBlockWeights; ++index) {
-            // A trit is -1, 0 or 1 and the scale is a finite fp16, so this product
-            // is exact in fp16 and lands on the same bits the block reader's
-            // kernels produce -- this is a decode, not an approximation of one.
-            halves[base + index] =
-                qwen_float_to_fp16_bits(static_cast<float>(ptq1_0_trit_at(block, index)) * scale);
+// The whole of `ptq1_0_trit_at` above that depends on the index is the pair (`byte`
+// source, `shift`): all three of its regions are a byte index that cycles within a
+// fixed width and a position that advances once per cycle, so 5 x 256 answers
+// cover every weight of every block, and hoisting them out is what turns the
+// conversion into a lookup.
+//
+// It is *built from* `ptq1_0_trit_at` rather than written beside it. That function
+// is the definition of the packing -- there is a CUDA kernel that has to agree
+// with it -- and a second transcription of the same arithmetic is a second thing
+// that can be wrong. The probe is one index per (stage, byte): index `stage * 16`
+// takes the first region's branch, reads `block[0]`, and multiplies by
+// `kPow3[stage]`, so a block whose first byte is the value under test and whose
+// 27 other bytes are zero answers the question for all three regions at once.
+using Ptq1_0TritIndex = std::array<std::array<uint8_t, 256>, 5>;
+
+const Ptq1_0TritIndex& ptq1_0_trit_index() {
+    static const Ptq1_0TritIndex table = [] {
+        Ptq1_0TritIndex built{};
+        uint8_t block[kTernaryBlockBytes] = {};
+        for (int stage = 0; stage < 5; ++stage) {
+            for (int byte = 0; byte < 256; ++byte) {
+                block[0] = static_cast<uint8_t>(byte);
+                built[stage][byte] = static_cast<uint8_t>(
+                    ptq1_0_trit_at(block, static_cast<uint64_t>(stage) * 16) + 1);
+            }
         }
-    }
+        return built;
+    }();
+    return table;
 }
 
 // A ternary pack is not an element array, so a descriptor's storage shape is not
@@ -264,6 +268,75 @@ void validate_model_tp(const QwenConfig& config, int world) {
 }
 
 }  // namespace
+
+// A run of packed weights into fp16, for the backends that keep a ternary weight
+// decoded rather than read it in place. See qwen_backend_reads_packed_ternary.
+//
+// `elements` counts weights and the run has to start on a block boundary. Both
+// hold for every caller in this file: a row is a whole number of blocks, and a
+// row's pitch is therefore a whole number of blocks too, so a run that spans rows
+// is the same byte sequence as one long row would be and the flat index below
+// needs no row arithmetic.
+//
+// It is declared in qwen_weights.hpp rather than kept internal because the
+// arithmetic is the part of this file a checkpoint cannot exercise at build time:
+// whether a trit lands on the right weight is a question about the packing, and it
+// is answered by comparing this against a transcription of the format, which is a
+// test in another translation unit. See tests/test_ptq1_0_decode.cpp.
+void qwen_decode_ptq1_0(const uint8_t* src, uint8_t* dst, uint64_t elements,
+                        const std::string& name) {
+    if (elements % kTernaryBlockWeights != 0) {
+        throw std::runtime_error(
+            "a ternary run is not a whole number of 128-weight blocks: " + name);
+    }
+    uint16_t* halves = reinterpret_cast<uint16_t*>(dst);
+    const Ptq1_0TritIndex& trits = ptq1_0_trit_index();
+    for (uint64_t base = 0; base < elements; base += kTernaryBlockWeights) {
+        const uint8_t* block = src + base / kTernaryBlockWeights * kTernaryBlockBytes;
+        // The block scale is the last two bytes: `ggml_half d`, the block's amax.
+        uint16_t scale_bits = 0;
+        std::memcpy(&scale_bits, block + 26, sizeof(scale_bits));
+        const float scale = fp16_bits_to_float(scale_bits);
+        // A trit is -1, 0 or 1 and the scale is a finite fp16, so a product is
+        // exact in fp16 and lands on the same bits the block reader's kernels
+        // produce -- this is a decode, not an approximation of one. It also means
+        // a block holds exactly *three* distinct weights, in the sense that
+        // matters here: the same three fp16 values, 128 times over. So the
+        // narrowing runs three times a block instead of 128, and the per-weight
+        // work drops to two table lookups.
+        //
+        // The zero is narrowed from the block's own scale rather than written as
+        // an fp16 zero: a negative scale makes this product `-0.0f`, and the
+        // block reader's kernels store that sign. `+1` and `-1` multiply exactly,
+        // so the other two entries are the scale and its negation.
+        const uint16_t lut[3] = {
+            qwen_float_to_fp16_bits(-scale),
+            qwen_float_to_fp16_bits(0.0f * scale),
+            qwen_float_to_fp16_bits(scale),
+        };
+        // The 128 weights in the three runs `ptq1_0_trit_at` describes, each one a
+        // position count times a byte width: 5 x 16, then 5 x 8, then 4 x 2. With
+        // the position as the outer loop the byte index becomes a constant offset
+        // in the inner one, which is what the per-weight form could not give it --
+        // and the stores still run 0, 1, 2 ... 127 in order.
+        uint16_t* out = halves + base;
+        for (int position = 0; position < 5; ++position) {
+            for (int index = 0; index < 16; ++index) {
+                out[position * 16 + index] = lut[trits[position][block[index]]];
+            }
+        }
+        for (int position = 0; position < 5; ++position) {
+            for (int index = 0; index < 8; ++index) {
+                out[80 + position * 8 + index] = lut[trits[position][block[16 + index]]];
+            }
+        }
+        for (int position = 0; position < 4; ++position) {
+            for (int index = 0; index < 2; ++index) {
+                out[120 + position * 2 + index] = lut[trits[position][block[24 + index]]];
+            }
+        }
+    }
+}
 
 SafeDType QwenCheckpointSource::device_dtype(SafeDType storage_dtype) const {
     return qwen_device_dtype(storage_dtype);
@@ -562,7 +635,7 @@ QwenHostTensor qwen_materialize_host_tensor(const QwenCheckpointSource& source,
                 std::memcpy(dst, src, static_cast<size_t>(
                                          ternary_row_bytes(elements, ref.name)));
             } else {
-                decode_ptq1_0(src, dst, elements, ref.name);
+                qwen_decode_ptq1_0(src, dst, elements, ref.name);
             }
         } else if (ref.dtype == SafeDType::BF16) {
             if (ref.device_dtype != SafeDType::F16) {

@@ -34,6 +34,7 @@ cmake --build "${BUILD_DIR}" -j"$(nproc)" --target \
     test_qwen_config \
     test_qwen_bf16_checkpoint \
     test_ipc_allreduce_envelope \
+    test_ptq1_0_decode \
     test_qwen_ascend_norm_gamma \
     test_qwen_ascend_ops \
     test_qwen_ascend_group_b \
@@ -50,7 +51,8 @@ status=0
 # Single-process tests. Binaries land in different directories depending on
 # whether the target sets RUNTIME_OUTPUT_DIRECTORY, so search rather than assume.
 for name in test_device_runtime test_qwen_config test_qwen_bf16_checkpoint \
-            test_ipc_allreduce_envelope test_qwen_ascend_norm_gamma \
+            test_ipc_allreduce_envelope test_ptq1_0_decode \
+            test_qwen_ascend_norm_gamma \
             test_qwen_ascend_ops test_qwen_ascend_group_b; do
     binary="$(find "${BUILD_DIR}" -name "${name}" -type f -perm -u+x | head -1)"
     if [ -z "${binary}" ]; then
