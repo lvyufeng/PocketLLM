@@ -5,11 +5,9 @@
 #include "gguf_reader.hpp"
 #include "model_config.hpp"
 #include "model_registry.hpp"
-#include "openai_server.hpp"
 #include "persistent_engine.hpp"
 #include "qwen_config.hpp"
 #include "qwen_engine.hpp"
-#include "python_sidecar.hpp"
 #include "safetensors_reader.hpp"
 #include "tokenizer.hpp"
 #include "tp_comm.hpp"
@@ -37,10 +35,6 @@ struct Args {
     std::string token_ids_csv;
     std::string token_ids_file;
     int smoke_layers = 1;
-    // Lets serving default to the checkpoint's full depth while preserving the
-    // one-layer default of the standalone smoke commands. The same option is an
-    // explicit reduced-depth server request only when it appeared on the CLI.
-    bool smoke_layers_explicit = false;
     int forward_token = -1;
     int position = 0;
     int max_new_tokens = 1;
@@ -88,27 +82,11 @@ struct Args {
     bool qwen_mtp_adaptive = false;
     std::string qwen_dspark_checkpoint;
     std::string qwen_dflash2_checkpoint;
-    bool serve = false;
-    int port = 8000;
-    std::string host = "0.0.0.0";
-    // Completions the server may run at once. Clamped down to whatever the
-    // engine declares, so leaving this at 8 costs nothing on an engine that
-    // serves one session at a time.
+    // Rows the `--batch-decode` report runs at once, and the batch the Qwen
+    // reports build their slot tables from.
     int max_batch_size = 8;
-    // Prompt tokens advanced per scheduler prefill iteration. 0 preserves the
-    // server default; the engine may clamp or ignore this according to caps().
-    int prefill_token_budget = 4096;
-    int request_timeout_seconds = 900;
-    // Paged KV lets requests share one block pool instead of each reserving
-    // max_context tokens upfront, so batch size scales with actual token use
-    // rather than the worst-case reservation. FP16 only; pass --no-kv-paged
-    // to fall back to the contiguous arena (required with non-FP16 caches).
-    bool kv_paged = true;
-    int kv_block_size = 16;
     // 0 derives the Qwen prefix-cache budget from the paged KV pool.
     uint64_t prefix_cache_bytes = 0;
-    std::string python_bin = "python";
-    std::string sidecar_script;
 };
 
 bool path_exists(const std::string& path) {
@@ -121,7 +99,7 @@ bool path_exists(const std::string& path) {
 // work on a machine with no vendor runtime, and with --tp-world 4 on a host that
 // does not have four visible devices.
 bool is_host_only_mode(const Args& args) {
-    return !args.serve && !args.smoke_forward && !args.generate_token &&
+    return !args.smoke_forward && !args.generate_token &&
            !args.resident_bench && !args.use_persistent &&
            !args.qwen_persistent_stdin;
 }
@@ -157,7 +135,6 @@ Args parse_args(int argc, char** argv) {
             args.qwen_persistent_stdin = true;
         } else if (arg == "--smoke-layers" && i + 1 < argc) {
             args.smoke_forward = true;
-            args.smoke_layers_explicit = true;
             args.smoke_layers = std::stoi(argv[++i]);
         } else if (arg == "--forward-token" && i + 1 < argc) {
             args.smoke_forward = true;
@@ -241,31 +218,11 @@ Args parse_args(int argc, char** argv) {
             args.qwen_dspark_checkpoint = argv[++i];
         } else if (arg == "--qwen-dflash2" && i + 1 < argc) {
             args.qwen_dflash2_checkpoint = argv[++i];
-        } else if (arg == "--serve") {
-            args.serve = true;
-        } else if (arg == "--port" && i + 1 < argc) {
-            args.port = std::stoi(argv[++i]);
-        } else if (arg == "--host" && i + 1 < argc) {
-            args.host = argv[++i];
         } else if (arg == "--max-batch-size" && i + 1 < argc) {
             args.max_batch_size = std::stoi(argv[++i]);
-        } else if (arg == "--prefill-token-budget" && i + 1 < argc) {
-            args.prefill_token_budget = std::stoi(argv[++i]);
-        } else if (arg == "--request-timeout-seconds" && i + 1 < argc) {
-            args.request_timeout_seconds = std::stoi(argv[++i]);
-        } else if (arg == "--kv-paged") {
-            args.kv_paged = true;
-        } else if (arg == "--no-kv-paged") {
-            args.kv_paged = false;
-        } else if (arg == "--kv-block-size" && i + 1 < argc) {
-            args.kv_block_size = std::stoi(argv[++i]);
         } else if ((arg == "--prefix-cache-bytes" ||
                     arg == "--qwen-prefix-cache-bytes") && i + 1 < argc) {
             args.prefix_cache_bytes = std::stoull(argv[++i]);
-        } else if (arg == "--python" && i + 1 < argc) {
-            args.python_bin = argv[++i];
-        } else if (arg == "--sidecar" && i + 1 < argc) {
-            args.sidecar_script = argv[++i];
         } else {
             throw std::runtime_error("unknown or incomplete argument: " + arg);
         }
@@ -288,15 +245,6 @@ Args parse_args(int argc, char** argv) {
     }
     if (args.max_batch_size <= 0) {
         throw std::runtime_error("--max-batch-size must be positive");
-    }
-    if (args.prefill_token_budget < 0) {
-        throw std::runtime_error("--prefill-token-budget must not be negative");
-    }
-    if (args.request_timeout_seconds <= 0) {
-        throw std::runtime_error("--request-timeout-seconds must be positive");
-    }
-    if (args.kv_block_size <= 0) {
-        throw std::runtime_error("--kv-block-size must be positive");
     }
     const int external_drafter_count =
         (!args.qwen_dspark_checkpoint.empty() ? 1 : 0) +
@@ -483,71 +431,6 @@ int main(int argc, char** argv) {
         if (args.tp_world > 1) {
             std::cout << "tp_world=" << args.tp_world << " tp_rank=" << args.tp_rank
                       << " device=" << (args.device >= 0 ? args.device : args.tp_rank) << "\n";
-        }
-        if (args.serve) {
-            if (args.ckpt.empty()) throw std::runtime_error("--serve requires --ckpt");
-            pocket::register_builtin_engines();
-            // Whatever the registry has a factory for can be served. The server
-            // takes an InferenceEngine& and drives it through BatchScheduler, so
-            // nothing here needs to know which model it got -- an engine that
-            // declares paged KV and continuous batching gets both, and one that
-            // declares a single session is serialised for free.
-            const std::string architecture = pocket::detect_architecture(args.ckpt);
-            const int max_context = args.max_context > 0 ? args.max_context : 8192;
-            pocket::EngineOptions engine_options;
-            engine_options.tp_world = args.tp_world;
-            engine_options.tp_rank = args.tp_rank;
-            engine_options.device = args.device >= 0 ? args.device : args.tp_rank;
-            engine_options.nccl_id_path = args.nccl_id_path;
-            // A production server loads the checkpoint's full depth unless the
-            // operator explicitly asks for a reduced-depth smoke server.
-            engine_options.layer_count =
-                args.smoke_layers_explicit ? args.smoke_layers : 0;
-            engine_options.max_context = max_context;
-            engine_options.max_batch_size = args.max_batch_size;
-            engine_options.prefill_chunk_tokens = args.prefill_chunk_tokens;
-            engine_options.kv_paged = args.kv_paged;
-            engine_options.kv_block_size = args.kv_block_size;
-            engine_options.prefix_cache_bytes = args.prefix_cache_bytes;
-            engine_options.temperature = args.temperature;
-            engine_options.top_p = args.top_p;
-            engine_options.top_k = args.top_k;
-            engine_options.seed = args.seed;
-            std::unique_ptr<pocket::InferenceEngine> engine =
-                pocket::create_engine(args.ckpt, engine_options);
-            std::cout << "server_architecture=" << architecture << "\n";
-            std::cout << "server_max_context=" << engine->max_context() << "\n";
-            engine->warmup_tp();
-            if (args.tp_rank > 0) {
-                // Worker rank: park on the CmdChannel unix socket until rank 0
-                // sends SHUTDOWN.
-                engine->run_worker_loop();
-                return 0;
-            }
-            // Rank 0 only, and only once the workers are parked: the warmup
-            // forward has to be announced over the command channel so the other
-            // ranks take the same collectives.
-            engine->warmup_kernels(true);
-            const std::string sidecar_script = args.sidecar_script.empty()
-                ? std::string("src/server/cpp_sidecar.py")
-                : args.sidecar_script;
-            pocket::PythonSidecar sidecar(args.python_bin, sidecar_script, args.ckpt,
-                                           architecture);
-            // The server's own tokenizer, not the engine's: detokenizing a
-            // response is a serving concern, and QwenEngine carries no Tokenizer
-            // at all.
-            const pocket::Tokenizer tokenizer(args.ckpt);
-            pocket::OpenAIServerConfig cfg;
-            cfg.port = args.port;
-            cfg.host = args.host;
-            cfg.model_name = architecture.empty() ? std::string("pocketllm") : architecture;
-            cfg.max_batch_size = args.max_batch_size;
-            cfg.prefill_token_budget = args.prefill_token_budget;
-            cfg.request_timeout_seconds = args.request_timeout_seconds;
-            pocket::OpenAIServer server(*engine, tokenizer, sidecar, cfg);
-            server.run();
-            engine->shutdown_tp_workers();
-            return 0;
         }
         if (!args.ckpt.empty()) {
             const bool qwen_checkpoint =

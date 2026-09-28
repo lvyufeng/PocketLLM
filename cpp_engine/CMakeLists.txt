@@ -29,14 +29,12 @@ option(POCKET_BUILD_PYTHON "Build the optional pocketllm_cpp Python module" OFF)
 set(POCKET_STATIC_PIC ${POCKET_BUILD_PYTHON})
 
 # Sources that touch no vendor SDK. Keeping this list free of vendor headers is
-# what lets a second backend reuse the loaders, tokenizer and HTTP server
-# unchanged; see check_layering below, which enforces it.
+# what lets a second backend reuse the loaders and the tokenizer unchanged; see
+# check_layering below, which enforces it.
 set(POCKET_CORE_SOURCES
     core/json_lite.cpp
     core/json_constraint.cpp
     core/token_constraint.cpp
-    core/openai_request_fields.cpp
-    core/openai_stop_strings.cpp
     core/gguf_reader.cpp
     core/safetensors_reader.cpp
     core/safetensors_model.cpp
@@ -53,9 +51,6 @@ set(POCKET_CORE_SOURCES
     core/tensor.cpp
     core/sampler.cpp
     core/cmd_channel.cpp
-    core/python_sidecar.cpp
-    core/metrics.cpp
-    third_party/httplib.cpp
 )
 
 # One engine implementation shared by every backend. These reach the device only
@@ -69,10 +64,6 @@ set(POCKET_ENGINE_SOURCES
     engine/batch_scheduler.cpp
     engine/persistent_engine_adapter.cpp
     engine/engine_registry_builtin.cpp
-    # Drives the engine through BatchScheduler, which reaches the device
-    # runtime, so it sits with the engine rather than in pocket_core -- which
-    # must stay linkable on its own by the checkpoint-inspection tools.
-    engine/openai_server.cpp
 )
 
 # Engines that still call CUDA kernels by name. A runtime guard cannot help here:
@@ -985,24 +976,6 @@ set_target_properties(test_json_constraint PROPERTIES RUNTIME_OUTPUT_DIRECTORY $
 add_executable(test_token_constraint tests/test_token_constraint.cpp)
 target_link_libraries(test_token_constraint PRIVATE pocket_core)
 set_target_properties(test_token_constraint PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
-
-# The request-field audit is pure JSON and string work, so it is testable without
-# a checkpoint, a device, or a running server.
-add_executable(test_openai_request_fields tests/test_openai_request_fields.cpp)
-target_link_libraries(test_openai_request_fields PRIVATE pocket_core)
-set_target_properties(test_openai_request_fields PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
-
-# The metrics collector is a struct of relaxed atomics and a serializer, so it is
-# testable the same way: no checkpoint, no device, no server.
-add_executable(test_engine_metrics tests/test_engine_metrics.cpp)
-target_link_libraries(test_engine_metrics PRIVATE pocket_core)
-set_target_properties(test_engine_metrics PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
-
-# Stop-sequence matching is pure string work over decoded text, so it is
-# testable the same way and without a server to stream through.
-add_executable(test_openai_stop_strings tests/test_openai_stop_strings.cpp)
-target_link_libraries(test_openai_stop_strings PRIVATE pocket_core)
-set_target_properties(test_openai_stop_strings PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_qwen_fp8_online tests/test_qwen_fp8_online.cpp)
 target_link_libraries(test_qwen_fp8_online PRIVATE pocket_cpp_core)

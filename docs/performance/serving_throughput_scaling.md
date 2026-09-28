@@ -1,5 +1,11 @@
 # Serving concurrency, throughput and the TFLOPS behind them
 
+> **The front end behind these numbers is retired.** Every measurement below was taken over the
+> C++ binary's own HTTP server (`pocketllm_engine --serve`), which no longer exists; the engine
+> it measured is unchanged, so the numbers stand and the launch commands quoted here do not.
+> [The `--serve` migration note](../migration/native-serve-front-end-removed.md) records what
+> serves today and which flag replaced which.
+
 This page pushes on the workload
 [serving_latency_optimized.md](serving_latency_optimized.md) left at 70.29 tok/s:
 how many streams the engine actually runs at once, what raising that number

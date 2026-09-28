@@ -23,9 +23,9 @@ from typing import Iterator
 # same sample in a different bucket than vLLM puts it in, which is exactly the
 # resolution a head-to-head comparison reads.
 #
-# These mirror the C++ server's families in cpp_engine/core/metrics.hpp, which
-# carries the same three sets.  A family that is not listed there is recorded by
-# neither server.
+# These were the three sets the C++ server's cpp_engine/core/metrics.hpp carried,
+# and the unified server publishes the same families: a record taken over either
+# front end lines up line for line.
 REQUEST_LATENCY_BOUNDS: tuple[float, ...] = (
     0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0,
     30.0, 40.0, 50.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0,

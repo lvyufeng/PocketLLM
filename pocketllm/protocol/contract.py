@@ -29,11 +29,11 @@ So this module is split the same way, and the split is the point:
 
 The policy itself -- which fields are refusable and what each refusal says -- was the native C++
 front end's, in ``cpp_engine/core/openai_request_fields.cpp`` and ``check_sampling_supported`` in
-``cpp_engine/engine/openai_server.cpp``. It is ported rather than re-decided: the unified front end
-serves the same engine, so deleting that binary without carrying the contract over would trade an
-honest 400 for a silent ignore on every request naming a field the engine cannot apply. What the
-port changes is *where the answer comes from*: those files asked one engine, and this asks whichever
-runtime is running.
+``cpp_engine/engine/openai_server.cpp``, both deleted with that front end. It is ported rather than
+re-decided: the unified front end serves the same engine, so deleting that binary without carrying
+the contract over would have traded an honest 400 for a silent ignore on every request naming a
+field the engine cannot apply. What the port changes is *where the answer comes from*: those files
+asked one engine, and this asks whichever runtime is running.
 """
 
 from __future__ import annotations

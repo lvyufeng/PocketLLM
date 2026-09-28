@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """Split single-request latency into prefill and decode for ``pocketllm serve``.
 
-``bench_cpp_openai_phases.py`` does this for the *native* server
-(``cpp_engine/.../pocketllm_engine``), whose `/metrics` carries the
-``pocket_*`` families.  This is its counterpart for the Python server that
-``pocketllm serve`` starts, whatever backend it selected, whose families are
-``pocketllm_*``.  The two are separate scripts because they are separate
-servers, not because the measurement differs.
+The metrics read are the ``pocketllm_*`` families, which every backend's server
+publishes.  The C++ binary had its own `/metrics` and its own version of this
+script; both went away with its HTTP front end, so there is now one server to
+measure and one script that measures it.
 
 The phase split is read from the engine's own clock rather than from chunk
-arrival times, for the reason that script documents at length: client-side
-timestamps measure the client's read loop as much as the model's.  Only the
-streamed path is used, because `handle_stream` latches TTFT on the first event
-that carries a token -- a non-streamed response produces no TTFT at all.
+arrival times: client-side timestamps measure the client's read loop as much as
+the model's.  Only the streamed path is used, because `handle_stream` latches
+TTFT on the first event that carries a token -- a non-streamed response produces
+no TTFT at all.
 
 Per request, from the deltas of one streamed call:
 

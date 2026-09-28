@@ -1,5 +1,11 @@
 # DeepSeek-V4 PersistentEngine serial baseline
 
+> **The front end behind these numbers is retired.** Every measurement below was taken over the
+> C++ binary's own HTTP server (`pocketllm_engine --serve`), which no longer exists; the engine
+> it measured is unchanged, so the numbers stand and the launch commands quoted here do not.
+> [The `--serve` migration note](../migration/native-serve-front-end-removed.md) records what
+> serves today and which flag replaced which.
+
 Issue #163 asks the PersistentEngine / DeepSeek-V4 path to run multiple requests
 concurrently without breaking TP ordering, token correctness, or single-request
 latency. Its acceptance criteria name throughput and single-request latency, and
@@ -151,10 +157,11 @@ below is the engine's and is unaffected.) The `deepseek_timings` field belongs t
 the *Python* server (`src/models/deepseek_v4/serving.py`) and never appears on
 this path.
 
-The engine does keep exact per-request accounting in
-`cpp_engine/core/metrics.cpp` and exports it as Prometheus counters at
-`/metrics`. Reading them before and after one streamed request gives that
-request's split from the engine's own clock:
+The engine does keep exact per-request accounting, and the deleted server
+exported it as Prometheus counters at `/metrics` from `cpp_engine/core/metrics.cpp`
+— both the collector and the endpoint are gone with the front end. Reading the
+counters before and after one streamed request gave that request's split from the
+engine's own clock:
 
 ```
 prefill_seconds = pocket_ttft_seconds_sum delta

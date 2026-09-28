@@ -5,12 +5,10 @@ This is an opt-in integration check rather than a unit test. It starts one
 process per tensor-parallel rank, exercises the HTTP surface, and tears the group
 down on every exit path.
 
-``--launch`` chooses the front end under test. ``native`` starts the
-``pocketllm_engine --serve`` binary directly, one process a rank. ``pocketllm``
-starts a single ``pocketllm serve --backend cpp``, which supervises its own
-ranks. Both are the same engine and the same scheduler underneath, so the checks
-below are the same checks; running both is how the entry point that replaces the
-binary is held to the surface the binary was held to.
+The front end under test is ``pocketllm serve --backend cpp``, which supervises
+its own ranks. The C++ binary had its own HTTP server and this harness could run
+against either one, comparing them field by field; that server is gone, so there
+is one launch and the checks below are the surface the engine is held to.
 """
 
 from __future__ import annotations
@@ -30,7 +28,6 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-import uuid
 from typing import Any
 
 
@@ -144,72 +141,6 @@ def read_logs(log_dir: pathlib.Path) -> str:
     return "\n".join(chunks)
 
 
-def launch_native(
-    args: argparse.Namespace,
-    checkpoint: pathlib.Path,
-    python_bin: pathlib.Path,
-    sidecar: pathlib.Path,
-    devices: list[str],
-    log_dir: pathlib.Path,
-    rendezvous: pathlib.Path,
-) -> list[subprocess.Popen[bytes]]:
-    """One ``pocketllm_engine --serve`` process per rank, each pinned to its card."""
-    binary = pathlib.Path(args.binary).resolve()
-    require(binary.exists(), f"native binary does not exist: {binary}")
-    sidecar = sidecar.resolve()
-    require(sidecar.exists(), f"sidecar script does not exist: {sidecar}")
-
-    common = [
-        str(binary),
-        "--serve",
-        "--ckpt",
-        str(checkpoint),
-        "--tp-world",
-        str(len(devices)),
-        "--nccl-id-path",
-        str(rendezvous),
-        "--smoke-layers",
-        str(args.layers),
-        "--max-context",
-        str(args.max_context),
-        "--max-batch-size",
-        str(args.max_batch_size),
-        "--prefill-token-budget",
-        str(args.prefill_token_budget),
-        "--request-timeout-seconds",
-        str(args.request_timeout_seconds),
-        "--python",
-        str(python_bin),
-        "--sidecar",
-        str(sidecar),
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(args.port),
-        "--kv-block-size",
-        str(args.kv_block_size),
-    ]
-    if args.prefill_chunk_tokens > 0:
-        common.extend(["--prefill-chunk-tokens", str(args.prefill_chunk_tokens)])
-    if args.kv_paged:
-        common.append("--kv-paged")
-
-    processes: list[subprocess.Popen[bytes]] = []
-    for rank, visible_device in enumerate(devices):
-        log = (log_dir / f"rank{rank}.log").open("wb")
-        environment = os.environ.copy()
-        environment["CUDA_VISIBLE_DEVICES"] = visible_device
-        process = subprocess.Popen(
-            common + ["--tp-rank", str(rank), "--device", "0"],
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            env=environment,
-        )
-        processes.append(process)
-        log.close()
-    return processes
-
-
 def launch_pocketllm(
     args: argparse.Namespace,
     checkpoint: pathlib.Path,
@@ -223,10 +154,9 @@ def launch_pocketllm(
     placement: rank r takes the rth card of ``--devices``. That is why there is
     one process here rather than one per rank and no ``--device`` anywhere.
 
-    The binary's own tuning flags that have no ``pocketllm serve`` spelling are
-    translated to backend options where a counterpart exists and dropped where
-    none does -- ``--smoke-layers`` is a native debug flag, and the prefill
-    budget is derived from ``--prefill-chunk-tokens`` by the scheduler.
+    The flags this harness takes that have no ``pocketllm serve`` spelling of
+    their own are translated to backend options -- ``--kv-block-size`` and
+    ``--kv-paged`` -- and the prefill budget is the scheduler's.
     """
     python_bin = pathlib.Path(args.pocketllm_python).resolve()
     require(python_bin.exists(), f"Python executable does not exist: {python_bin}")
@@ -360,13 +290,13 @@ REFUSED_CHAT_FIELDS: tuple[tuple[str, Any], ...] = (
     ("parallel_tool_calls", False),
 )
 
-# Tool selection, which the two front ends disagree about by design. The binary forwards the tool
-# definitions to the chat template and applies no policy of its own, so anything but "auto" named a
-# choice it could not carry out and was refused. The unified front end applies the policy the field
-# names -- "none" drops the definitions, "required" and a named function become an instruction in
-# the prompt -- which is the field being served rather than dropped, so on that launch these are
-# accepted and the tool-call checks below are what hold the behaviour.
-TOOL_CHOICE_REFUSED_ON_NATIVE: tuple[tuple[str, Any], ...] = (
+# Tool selection, which the deleted binary refused for anything but "auto": it forwarded the
+# definitions to the chat template and applied no policy of its own, so a choice it could not carry
+# out was rejected rather than dropped. The unified front end applies the policy the field names --
+# "none" drops the definitions, "required" and a named function become an instruction in the prompt
+# -- which is the field being served rather than dropped, so these are accepted and the tool-call
+# checks below are what hold the behaviour.
+TOOL_CHOICE_APPLIED: tuple[tuple[str, Any], ...] = (
     ("tool_choice", "required"),
     ("tool_choice", "none"),
     ("tool_choice", {"type": "function", "function": {"name": "get_weather"}}),
@@ -418,15 +348,11 @@ def refusal_error(result: HttpResult, label: str) -> dict[str, Any]:
 
 # `n` and `logprobs` were the last two checks the unified front end did not pass, held here as a
 # mapping from check name to the reason it was still refused. Both are ported now, so the mapping is
-# gone and the checks run the same way as every other one: a check that cannot pass has to fail the
-# run rather than be recorded as expected, or the entry that excuses it outlives the gap it named.
-# The native front end is deleted next, and the two launches are compared field by field until then
-# by `validate_request_field_refusals`.
+# gone and every check runs the same way: a check that cannot pass has to fail the run rather than be
+# recorded as expected, or the entry that excuses it outlives the gap it named.
 
 
-def validate_request_field_refusals(
-    base_url: str, model_name: str, timeout: float, *, launch: str
-) -> None:
+def validate_request_field_refusals(base_url: str, model_name: str, timeout: float) -> None:
     """Checks the request-field contract on both OpenAI endpoints."""
     messages = [{"role": "user", "content": "This request is inspected, not generated."}]
     base = {"messages": messages, "max_tokens": 1}
@@ -441,22 +367,15 @@ def validate_request_field_refusals(
             f"{field} refusal named {error.get('param')!r} instead of {field!r}",
         )
 
-    # The tool-selection policy: refused where nothing carries it out, answered where the policy
-    # reaches the prompt.
-    for field, value in TOOL_CHOICE_REFUSED_ON_NATIVE:
+    # The tool-selection policy reaches the prompt rather than constraining the sampler, so a
+    # request naming a policy is answered.
+    for field, value in TOOL_CHOICE_APPLIED:
         result = http_request(
             base_url, "/v1/chat/completions", {**base, field: value}, timeout=timeout
         )
-        if launch == "native":
-            error = refusal_error(result, f"chat {field}={value!r}")
-            require(
-                error.get("param") == field,
-                f"{field} refusal named {error.get('param')!r} instead of {field!r}",
-            )
-            continue
         require(
             result.status == 200,
-            f"chat {field}={value!r} is applied by this launch, but it answered "
+            f"chat {field}={value!r} is applied by this server, but it answered "
             f"HTTP {result.status}: {result.text}",
         )
 
@@ -499,7 +418,7 @@ def validate_request_field_refusals(
     # /v1/completions 0 is a real request for the sampled token's probability, so
     # only chat has an inert spelling of the field here.
     #
-    # Which reason is the right one depends on what this launch does with the same
+    # Which reason is the right one depends on what this server does with the same
     # request *without* streaming: a runtime that ranks tokens refuses the streamed
     # spelling for being streamed, and one that ranks nothing refuses both for being
     # a request it cannot answer at all.
@@ -1100,7 +1019,7 @@ STRUCTURED_SCHEMA = {
 
 
 def validate_structured_outputs(
-    base_url: str, model_name: str, timeout: float, *, constrained: bool, launch: str
+    base_url: str, model_name: str, timeout: float, *, constrained: bool
 ) -> None:
     """Checks that `response_format` constrains what is generated, or says by name that it cannot.
 
@@ -1115,20 +1034,8 @@ def validate_structured_outputs(
     question this run is asking. The constraint travels in the worker command and is applied by the
     per-row device sampler, so under tensor parallelism -- where every rank has to enter the same
     sampler collectives and one set of sampling values covers the whole batch -- there is no per-row
-    mask to apply, and the engine declares so.
-
-    Two divergences between the front ends are recorded here rather than smoothed over, because both
-    are answers the native one gives and the unified one does not, and the harness is the thing that
-    is supposed to see them:
-
-      * `{"type": "text"}` **asks for nothing** -- it is what the OpenAI SDK sends by default. The
-        native front end asks whether the engine can constrain before it reads the type, so it
-        refuses this shape too on a configuration where nothing could be constrained anyway; the
-        unified front end reads the shape first and accepts it. Refusing it breaks clients that never
-        wanted a constraint.
-      * The unified front end's refusals carry OpenAI's `param` slot, so a client can act on them
-        without reading prose. The native one answers `server_error` with no `param`, which is the
-        shape a client has to guess about.
+    mask to apply, and the engine declares so. A refusal carries OpenAI's `param` slot, so a client
+    can act on it without reading prose.
     """
     messages = [{"role": "user", "content": "Name one city. Reply with JSON only."}]
 
@@ -1145,18 +1052,10 @@ def validate_structured_outputs(
         },
         timeout=timeout,
     )
-    if launch == "native" and not constrained:
-        require(
-            plain.status == 400,
-            "the native front end accepted `response_format: {type: text}` on a configuration it "
-            "cannot constrain -- if that changed, this divergence is closed and the check should "
-            f"stop recording it: HTTP {plain.status}: {plain.text}",
-        )
-    else:
-        require(
-            plain.status == 200,
-            f"response_format text was refused: HTTP {plain.status}: {plain.text}",
-        )
+    require(
+        plain.status == 200,
+        f"response_format text was refused: HTTP {plain.status}: {plain.text}",
+    )
 
     cases = (
         ({"type": "json_object"}, False),
@@ -1181,12 +1080,11 @@ def validate_structured_outputs(
                 f"{label} should be refused where the engine has no per-row sampler: "
                 f"HTTP {result.status}: {result.text}",
             )
-            if launch != "native":
-                error = refusal_error(result, f"{label} where the engine has no per-row sampler")
-                require(
-                    error.get("param") == "response_format",
-                    f"{label} refusal named {error.get('param')!r} instead of the field",
-                )
+            error = refusal_error(result, f"{label} where the engine has no per-row sampler")
+            require(
+                error.get("param") == "response_format",
+                f"{label} refusal named {error.get('param')!r} instead of the field",
+            )
             continue
         require(result.status == 200, f"{label} was refused: HTTP {result.status}: {result.text}")
         choice = result.json()["choices"][0]
@@ -1652,23 +1550,9 @@ def validate_langchain_tool_call(base_url: str, model_name: str, timeout: float)
 
 def run(args: argparse.Namespace) -> int:
     checkpoint = pathlib.Path(args.ckpt).resolve()
-    python_bin = pathlib.Path(args.python).resolve()
     devices = parse_devices(args.devices)
 
-    # Only the launch that needs a path is asked for it: a `pocketllm` run does
-    # not have a binary or a sidecar to find, and requiring them would report a
-    # missing file where nothing was going to look for one.
-    required = [(checkpoint, "checkpoint")]
-    if args.launch == "native":
-        required.extend(
-            (
-                (pathlib.Path(args.binary).resolve(), "native binary"),
-                (pathlib.Path(args.sidecar).resolve(), "sidecar script"),
-                (python_bin, "Python executable"),
-            )
-        )
-    for path, label in required:
-        require(path.exists(), f"{label} does not exist: {path}")
+    require(checkpoint.exists(), f"checkpoint does not exist: {checkpoint}")
     require((checkpoint / "config.json").exists(), "checkpoint has no config.json")
     require((checkpoint / "tokenizer.json").exists(), "checkpoint has no tokenizer.json")
 
@@ -1681,22 +1565,10 @@ def run(args: argparse.Namespace) -> int:
         temporary_log_dir = tempfile.mkdtemp(prefix="pocketllm-qwen-openai-")
         log_dir = pathlib.Path(temporary_log_dir)
 
-    rendezvous = log_dir / f"nccl-{uuid.uuid4().hex}.id"
     processes: list[subprocess.Popen[bytes]] = []
     base_url = f"http://127.0.0.1:{args.port}"
     try:
-        if args.launch == "native":
-            processes = launch_native(
-                args,
-                checkpoint,
-                python_bin,
-                pathlib.Path(args.sidecar),
-                devices,
-                log_dir,
-                rendezvous,
-            )
-        else:
-            processes = launch_pocketllm(args, checkpoint, devices, log_dir)
+        processes = launch_pocketllm(args, checkpoint, devices, log_dir)
 
         wait_for_health(base_url, processes, args.startup_timeout)
 
@@ -1713,12 +1585,6 @@ def run(args: argparse.Namespace) -> int:
         require(isinstance(model_data, list) and model_data, "models endpoint has no data")
         model_name = model_data[0].get("id")
         require(isinstance(model_name, str) and model_name, f"no served model id: {model_name!r}")
-        # The binary is constructed with the registry's name for the checkpoint;
-        # `pocketllm serve` reports the checkpoint it was pointed at unless told
-        # otherwise, so only the binary's id is a fixed string.
-        if args.launch == "native":
-            require(model_name == "qwen3_5", f"unexpected served model: {model_name!r}")
-
         nonstream = http_request(
             base_url,
             "/v1/chat/completions",
@@ -1735,9 +1601,7 @@ def run(args: argparse.Namespace) -> int:
         )
         validate_stream(stream, model_name)
 
-        validate_request_field_refusals(
-            base_url, model_name, timeout=10.0, launch=args.launch
-        )
+        validate_request_field_refusals(base_url, model_name, timeout=10.0)
 
         validate_stop_sequences(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 
@@ -1745,16 +1609,14 @@ def run(args: argparse.Namespace) -> int:
 
         validate_logprobs(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 
-        # Whether the engine can hold an answer to a schema is the width's answer and not this
-        # launch's: the mask is applied by the per-row device sampler, so a world of one applies it
-        # and a sharded one has one sampler for the whole batch. Both front ends are read the same
-        # way here, which is what makes this a comparison.
+        # Whether the engine can hold an answer to a schema is the width's answer and not the
+        # server's: the mask is applied by the per-row device sampler, so a world of one applies it
+        # and a sharded one has one sampler for the whole batch.
         validate_structured_outputs(
             base_url,
             model_name,
             timeout=args.request_timeout_seconds + 30,
             constrained=len(devices) == 1,
-            launch=args.launch,
         )
 
         validate_tool_calls(base_url, model_name, timeout=args.request_timeout_seconds + 30)
@@ -1799,41 +1661,21 @@ def run(args: argparse.Namespace) -> int:
             concurrent_results = list(pool.map(concurrent_request, (0, 1)))
         require(len(concurrent_results) == 2, "concurrent request count mismatch")
 
-        logs = read_logs(log_dir)
-        # These two lines are the binary's own report of what it was
-        # constructed with; `pocketllm serve` takes the same width through the
-        # flag it already asserts by accepting, and derives the prefill budget
-        # from --prefill-chunk-tokens rather than logging it, so there is no
-        # counterpart line to read back.
-        if args.launch == "native":
-            expected_width = min(args.max_batch_size, 2)
-            require(
-                f"[server] batch width {expected_width}" in logs,
-                "rank-0 log did not report the requested scheduler width",
-            )
-            require(
-                f"prefill budget {args.prefill_token_budget}" in logs,
-                "rank-0 log did not report the configured prefill budget",
-            )
         clients = ", ".join(
             f"{client}={status}" for client, status in sorted(TOOL_CLIENT_RESULTS.items())
         )
         print(
-            f"[PASS] Qwen OpenAI serving via {args.launch}: tp={len(devices)} "
+            f"[PASS] Qwen OpenAI serving: tp={len(devices)} "
             f"model={model_name} log_dir={log_dir} "
             f"concurrent_requests={len(concurrent_results)} tool_clients=[{clients}]"
         )
         return 0
     except Exception:
-        print(f"[FAIL] Qwen OpenAI serving via {args.launch}", file=sys.stderr)
+        print("[FAIL] Qwen OpenAI serving", file=sys.stderr)
         print(read_logs(log_dir), file=sys.stderr)
         raise
     finally:
         terminate_processes(processes)
-        try:
-            rendezvous.unlink()
-        except FileNotFoundError:
-            pass
         if temporary_log_dir is not None:
             shutil.rmtree(temporary_log_dir, ignore_errors=True)
 
@@ -1842,29 +1684,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt", required=True, help="Qwen Safetensors checkpoint directory")
     parser.add_argument(
-        "--launch",
-        choices=["native", "pocketllm"],
-        default="native",
-        help=(
-            "which front end to test: the pocketllm_engine --serve binary "
-            "(one process a rank), or `pocketllm serve --backend cpp` (one "
-            "process, supervising its own ranks)"
-        ),
-    )
-    parser.add_argument("--binary", default="build/cpp_engine/pocketllm_engine")
-    parser.add_argument("--python", default=sys.executable, help="Python with transformers installed")
-    parser.add_argument(
         "--pocketllm-python",
         default=sys.executable,
-        help="interpreter to run `pocketllm serve` with, for --launch pocketllm",
+        help="interpreter to run `pocketllm serve` with",
     )
-    parser.add_argument("--sidecar", default="src/server/cpp_sidecar.py")
     parser.add_argument("--devices", default="0,1,2,3", help="Comma-separated CUDA device IDs")
     parser.add_argument("--port", type=int, default=18080)
-    parser.add_argument("--layers", type=int, default=0, help="0 means complete Qwen depth")
     parser.add_argument("--max-context", type=int, default=2048)
     parser.add_argument("--max-batch-size", type=int, default=2)
-    parser.add_argument("--prefill-token-budget", type=int, default=4096)
     parser.add_argument("--prefill-chunk-tokens", type=int, default=0)
     parser.add_argument("--request-timeout-seconds", type=int, default=900)
     parser.add_argument("--kv-block-size", type=int, default=16)

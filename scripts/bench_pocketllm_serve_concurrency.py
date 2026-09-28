@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """Aggregate throughput at several concurrency levels against ``pocketllm serve``.
 
-The third of the server benchmarks: `bench_cpp_openai_phases.py` splits one
-request into phases for the *native* server, `bench_pocketllm_serve_phases.py`
-does the same for the Python one, and this measures what several requests at once
-cost and buy on that same Python server.  It talks to a server that is already
-running, because which scheduler the server started with is the thing under test
-and only the command line that started it knows.
+The second of the two server benchmarks: `bench_pocketllm_serve_phases.py`
+splits one request into phases, and this measures what several requests at once
+cost and buy on the same server.  It talks to a server that is already running,
+because which scheduler the server started with is the thing under test and only
+the command line that started it knows.
 
 The requests are non-streamed.  That is not a convenience: the streaming path in
-the cpp adapter holds one lock for the whole generation, because the native
-engine has a single mutable KV session, so a streamed run would measure the lock
-rather than the scheduler.  The non-streamed path goes through
+the cpp adapter holds one lock for the whole generation, because its engine has a
+single mutable KV session, so a streamed run would measure the lock rather than
+the scheduler.  The non-streamed path goes through
 ``generate([request])``, which is the path the batch scheduler is on.
 
 The metric is aggregate tokens a second -- generated tokens over the wall time

@@ -1,5 +1,11 @@
 # Native C++ OpenAI tool-calling acceptance
 
+> **The front end behind these numbers is retired.** Every measurement below was taken over the
+> C++ binary's own HTTP server (`pocketllm_engine --serve`), which no longer exists; the engine
+> it measured is unchanged, so the numbers stand and the launch commands quoted here do not.
+> [The `--serve` migration note](../migration/native-serve-front-end-removed.md) records what
+> serves today and which flag replaced which.
+
 This document records the end-to-end acceptance test for tool calling on the native
 `pocketllm_engine` OpenAI server, taken for the remaining acceptance work on #155. It
 is the first record here that drives a tool conversation through **more than one

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vLLM-side counterpart of the native-server HTTP concurrency acceptance test.
+"""vLLM-side counterpart of the PocketLLM HTTP concurrency acceptance test.
 
 `docs/performance/cpp_openai_concurrency_validation.md` records PocketLLM's concurrent
 throughput (1.43x/2.64x/2.93x wall speedup at 2/4/8 requests), but every number
@@ -8,12 +8,12 @@ concurrency, so "PocketLLM multiplexes requests" and "PocketLLM multiplexes
 requests as well as vLLM does" are not the same claim and only the first is
 supported. This harness produces the missing half.
 
-The client side is imported from `scripts/bench_cpp_openai_concurrency.py`
-rather than reimplemented. That is deliberate: the prompt text, the request
-payload, the completion validation, and the definition of "wall seconds" are
-then provably identical on both sides, so a difference between the two records
-comes from the engine and not from the harness. The only thing that differs is
-which server answers on the port.
+The client side is imported from `scripts/serve_client.py` rather than
+reimplemented. That is deliberate: the prompt text, the request payload, the
+completion validation, and the definition of "wall seconds" are then provably
+identical on both sides, so a difference between the two records comes from the
+engine and not from the harness. The only thing that differs is which server
+answers on the port.
 
 Both modes launch a real `vllm.entrypoints.openai.api_server` over HTTP, because
 PocketLLM's published numbers were taken over HTTP and comparing an in-process
@@ -45,9 +45,9 @@ from typing import Any
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-# Reused verbatim from the PocketLLM harness so both sides measure the same
+# Reused verbatim from the PocketLLM client so both sides measure the same
 # thing: see the module docstring.
-from bench_cpp_openai_concurrency import (  # noqa: E402
+from serve_client import (  # noqa: E402
     http_request,
     parse_devices,
     require,
@@ -64,7 +64,7 @@ DEFAULT_CKPT = "/mnt/data2/Qwen3.8-27B-FP8"
 class VllmServer:
     """A single fastapi/uvicorn server process.
 
-    Duck-typed against `ServerGroup` from the PocketLLM harness so its
+    Duck-typed against `ServerGroup` from `scripts/serve_client.py` so its
     `run_concurrent`, `run_interleave`, and `group_timeout` can be reused
     unchanged. `processes` holds one entry, which is what makes
     `wait_for_health` and the timeout arithmetic work.

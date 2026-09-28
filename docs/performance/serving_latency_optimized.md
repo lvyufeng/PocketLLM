@@ -1,5 +1,11 @@
 # Serving latency with IPC all-reduce and device-side wait
 
+> **The front end behind these numbers is retired.** Every measurement below was taken over the
+> C++ binary's own HTTP server (`pocketllm_engine --serve`), which no longer exists; the engine
+> it measured is unchanged, so the numbers stand and the launch commands quoted here do not.
+> [The `--serve` migration note](../migration/native-serve-front-end-removed.md) records what
+> serves today and which flag replaced which.
+
 This record measures the same workload as
 [serving_latency_baseline.md](serving_latency_baseline.md) with two optimizations
 enabled: the hand-written IPC all-reduce and the device-side arrival wait, then

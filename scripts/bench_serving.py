@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Serving benchmark for PocketLLM's OpenAI-compatible servers, on vLLM's terms.
 
-`scripts/bench_cpp_openai_concurrency.py` answers "does the server multiplex
-requests correctly, and how much faster is it under load" - it fires a fixed
-number of requests at once and reports wall seconds and a per-request latency.
-That answers an acceptance question, not the question a serving number has to
-answer: *at a controlled arrival rate, what latency does a client see, split
+`scripts/bench_pocketllm_serve_concurrency.py` answers "does the server
+multiplex requests correctly, and how much faster is it under load" - it fires a
+fixed number of requests at once and reports wall seconds and a per-request
+latency. That answers an acceptance question, not the question a serving number
+has to answer: *at a controlled arrival rate, what latency does a client see, split
 into TTFT / TPOT / ITL / E2EL, and what throughput and goodput does the server
 sustain.*
 
@@ -16,11 +16,17 @@ one table without an argument about what the words mean. The definitions, and
 the upstream file and line each one was read from, are in
 `docs/guides/latency_metrics.md`.
 
-Client side is reused from `scripts/bench_cpp_openai_concurrency.py` rather
-than reimplemented (the same reason `bench_qwen_vllm_concurrency.py` imports
-it): the prompt generator, the readiness gate, process teardown and the JSON
-record shape then match the existing measurements, so a difference between two
-records comes from the engine.
+Client side is reused from `scripts/serve_client.py` rather than reimplemented
+(the same reason `bench_qwen_vllm_concurrency.py` imports it): the prompt
+generator and the completion validators then match the existing measurements, so
+a difference between two records comes from the engine.
+
+**This script measures a server somebody else started.** It was written with a
+mode that launched the native binary itself, one process a rank; that binary's
+HTTP front end is gone, and the mode went with it. The two `pocketllm serve`
+benchmarks beside it work the same way -- one command line starts the server,
+the harness points at its URL -- and a launcher for the unified server is what
+issue #478 adds back.
 
 Two deliberate departures from a literal copy of vLLM's client, both documented
 in the guide and both reported rather than hidden:
@@ -43,15 +49,10 @@ installed in either development environment. `numpy` is used for the statistics
 because vLLM's are `numpy`'s (population standard deviation, linear-interpolated
 percentiles) and matching them by hand would be a bug farm.
 
-Examples:
-    # Against a server this script launches itself.
-    python scripts/bench_serving.py --ckpt /mnt/data1/modelscope/Qwen/Qwen3.8-27B \\
-        --binary cpp_engine/build-ascend/pocketllm_engine --devices 0,1,2,3 \\
-        --random-input-len 128 --random-output-len 32 --num-prompts 16 \\
+Example:
+    python scripts/bench_serving.py --base-url http://127.0.0.1:8123 --model Qwen3.8-27B \
+        --random-input-len 128 --random-output-len 32 --num-prompts 16 \
         --request-rate 2 --goodput ttft:2000 tpot:60 --json-out /tmp/serve.json
-
-    # Against a server somebody else started (this is the vLLM head-to-head mode).
-    python scripts/bench_serving.py --base-url http://127.0.0.1:8000 --model Qwen3.8-27B
 """
 
 from __future__ import annotations
@@ -62,7 +63,6 @@ import json
 import math
 import pathlib
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -73,18 +73,20 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-# Reused verbatim from the existing acceptance harness: one prompt generator,
-# one readiness gate, one teardown, one JSON record shape.
-from bench_cpp_openai_concurrency import (  # noqa: E402
-    ServerGroup,
+# Reused verbatim from the shared client: one prompt generator, one JSON record
+# shape, one set of completion validators.
+from serve_client import (  # noqa: E402
     http_request,
     prompt_text,
-    read_logs,
     require,
-    start_server,
 )
 
 MILLISECONDS_TO_SECONDS = 1000.0
+
+#: The port `pocketllm serve` binds by default, and the one the two other server
+#: benchmarks point at. This harness no longer starts a server of its own: the
+#: launch is the operator's, so that a record names the command line it belongs to.
+DEFAULT_BASE_URL = "http://127.0.0.1:8123"
 
 # The metrics `--goodput` accepts, in the order vLLM zips them
 # (`vllm/benchmarks/serve.py:638-660`).
@@ -691,23 +693,12 @@ def parse_goodput(values: list[str] | None) -> dict[str, float] | None:
     return config
 
 
-def resolve_base_url(args: argparse.Namespace) -> tuple[str, ServerGroup | None, pathlib.Path | None]:
-    if args.base_url:
-        return args.base_url.rstrip("/"), None, None
-    log_dir = pathlib.Path(args.log_dir or tempfile.mkdtemp(prefix="pocketllm-serve-bench-"))
-    log_dir.mkdir(parents=True, exist_ok=True)
-    group = start_server(args, log_dir)
-    return group.base_url, group, log_dir
-
-
 def run(args: argparse.Namespace) -> dict[str, Any]:
     require(args.num_prompts > 0, "--num-prompts must be positive")
     metrics_percentiles = parse_percentiles(args.metric_percentiles)
     goodput_config = parse_goodput(args.goodput)
 
     started = time.perf_counter()
-    group: ServerGroup | None = None
-    log_dir: pathlib.Path | None = None
     record: dict[str, Any] = {
         "script": "scripts/bench_serving.py",
         "endpoint": args.endpoint,
@@ -728,38 +719,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "percentile_metrics": sorted(selected_percentile_metrics(args)),
         "git_commit": subprocess_git_head(),
     }
-    if args.ckpt:
-        record["checkpoint"] = str(pathlib.Path(args.ckpt).resolve())
-    if args.devices:
-        record["devices"] = args.devices
-
     try:
-        base_url, group, log_dir = resolve_base_url(args)
+        base_url = args.base_url.rstrip("/")
         record["base_url"] = base_url
-        if group is not None:
-            # The knobs this script launched the server with. They are recorded
-            # because they are not recoverable from the client-observed figures:
-            # `--max-context` and `--max-batch-size` together size the KV arena,
-            # so a record that omits them cannot be traced back to the
-            # concurrency it was actually able to admit.
-            record["server"] = {
-                "max_batch_size": args.max_batch_size,
-                "max_context": args.max_context,
-                "prefill_token_budget": args.prefill_token_budget,
-                "kv_block_size": args.kv_block_size,
-                # False is not the same as "unspecified": on the Ascend path
-                # start_server() passes --no-kv-paged whenever this is off, so
-                # the engine runs the contiguous arena either way.
-                "kv_paged": bool(args.kv_paged),
-                "device_style": args.device_style,
-                "port": args.port,
-                # Recorded because it dates the /metrics scrape artifacts: a
-                # sweep's `<tag>.metrics` is only the run's full totals if the
-                # server was still up when the scrape was taken.
-                "drain_seconds": args.server_drain_seconds,
-            }
-        if log_dir is not None:
-            record["log_dir"] = str(log_dir)
         model = args.model or discover_model(base_url)
         record["model"] = model
 
@@ -788,20 +750,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         record["status"] = "pass" if metrics["failed"] == 0 else "partial"
     except Exception as exc:
         record.update({"status": "fail", "error": f"{type(exc).__name__}: {exc}"})
-        if log_dir is not None:
-            record["logs"] = read_logs(log_dir)
         raise
     finally:
-        if group is not None:
-            # The engine's counters are cumulative and outlive the client, but
-            # they do not outlive the server: a scrape taken from outside this
-            # process needs the server up for at least one poll interval after
-            # the last request finishes, or that request is never counted. The
-            # drain is after `run_measured` returned, so it moves no figure
-            # this script reports.
-            if args.server_drain_seconds > 0:
-                time.sleep(args.server_drain_seconds)
-            group.stop()
         record["elapsed_seconds"] = time.perf_counter() - started
         if args.json_out:
             pathlib.Path(args.json_out).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
@@ -853,7 +803,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # Client surface, named as vLLM names it.
     parser.add_argument("--backend", default="openai", choices=["openai"], help="Serving backend to benchmark.")
-    parser.add_argument("--base-url", default=None, help="Benchmark an already-running server at this URL instead of launching one.")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="The already-running server to benchmark; start it yourself.")
     parser.add_argument("--endpoint", default="/v1/completions", help="API endpoint.")
     parser.add_argument("--model", default=None, help="Model id to send; discovered from /v1/models when omitted.")
     parser.add_argument("--max-concurrency", type=int, default=None, help="Maximum number of in-flight requests.")
@@ -882,38 +832,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-stream", dest="stream", action="store_false", help="Use blocking requests; ITL and TPOT are then undefined.")
     parser.set_defaults(stream=True)
 
-    # Server launch, mirroring scripts/bench_cpp_openai_concurrency.py so
-    # start_server() can be reused unchanged.
-    parser.add_argument("--ckpt", default=None)
-    parser.add_argument("--binary", default="cpp_engine/build-python/pocketllm_engine")
-    parser.add_argument("--python", default=sys.executable)
-    parser.add_argument("--sidecar", default="src/server/cpp_sidecar.py")
-    parser.add_argument("--devices", default="0,1,2,3")
-    parser.add_argument("--device-style", default="cuda", choices=["cuda", "ascend"],
-                        help="cuda selects devices via CUDA_VISIBLE_DEVICES; ascend passes --device <n> and sets HCCL_WHITELIST_DISABLE.")
-    parser.add_argument("--port", type=int, default=18280)
-    parser.add_argument("--layers", type=int, default=0)
-    parser.add_argument("--max-context", type=int, default=8192)
-    parser.add_argument("--max-batch-size", type=int, default=8)
-    parser.add_argument("--prefill-token-budget", type=int, default=4096)
-    parser.add_argument("--request-timeout-seconds", type=int, default=900)
-    parser.add_argument("--kv-block-size", type=int, default=16)
-    parser.add_argument("--kv-paged", action="store_true")
-    parser.add_argument("--server-drain-seconds", type=float, default=0.0,
-                        help="Leave a launched server up this long after the measured run, so an "
-                             "external scrape of its counters sees the final request. No effect "
-                             "with --base-url, and none on the client-side figures.")
-    parser.add_argument("--startup-timeout", type=float, default=900.0)
-    parser.add_argument("--log-dir")
     parser.add_argument("--json-out")
     return parser
 
 
 def main() -> int:
-    args = build_parser().parse_args()
-    if not args.base_url:
-        require(args.ckpt, "--ckpt is required unless --base-url points at a running server")
-    run(args)
+    run(build_parser().parse_args())
     return 0
 
 

@@ -91,14 +91,15 @@ A separate C++ kernel milestone measured 512-token GGUF Q2 prefill at 60.42 tok/
 
 ## Reproduction
 
-Build the C++ engine as documented in the repository root, then launch the Safetensors server:
+Build the C++ engine as documented in the repository root, then launch the Safetensors backend:
 
 ```bash
-CKPT=/path/to/DeepSeek-V4-Flash \
-PORT=8000 \
-MAX_CONTEXT=8192 \
-PYTHON=python \
-bash scripts/run_cpp_serve_tp4.sh
+python -m pocketllm serve \
+  --model /path/to/DeepSeek-V4-Flash \
+  --backend cpp \
+  --tensor-parallel-size 4 \
+  --max-model-len 8192 \
+  --port 8000
 ```
 
 PyTorch OpenAI-compatible serving:
@@ -129,7 +130,9 @@ PYTHONPATH=$PWD python -m src.cli.inspect_gguf \
 - Host-resident routed experts make decode sensitive to PCIe, NUMA, page-cache, and CPU behavior.
 - One-GPU GGUF Q2 mode is functional for short smoke tests but is not practical for long prompts.
 - FlashMemory runtime scoring and 1M-context functionality have their own enablement and validation constraints.
-- The C++ executable still carries the compatibility name `pocketllm_engine`.
+- The C++ front end is gone; this path is served by `pocketllm serve --backend cpp`. The
+  `pocketllm_engine` binary remains a checkpoint-inspection and smoke tool, without a `--serve`
+  mode of its own.
 
 ## Evidence and related notes
 

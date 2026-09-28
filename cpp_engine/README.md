@@ -2,7 +2,7 @@
 
 [Project home](../README.md) · [Model guides](../docs/models/README.md) · [Benchmarking](../docs/guides/benchmarking.md)
 
-`cpp_engine/` is PocketLLM's native C++/CUDA runtime and model-inspection layer. It currently contains performance-oriented DeepSeek-V4 paths, a validated Qwen3.8-27B-FP8 TP4 text runtime, GGUF/Safetensors readers, NCCL helpers, and model-specific CUDA tests.
+`cpp_engine/` is PocketLLM's native C++/CUDA runtime and model-inspection layer. It currently contains performance-oriented DeepSeek-V4 paths, a validated Qwen3.8-27B-FP8 TP4 text runtime, GGUF/Safetensors readers, NCCL helpers, and model-specific CUDA tests. It serves nothing over HTTP: `pocketllm serve` owns the front end, and the binary is a library driver, a checkpoint-inspection tool and a test host.
 
 The executable is still named `pocketllm_engine` for compatibility with existing scripts. The name does not mean every code path is DeepSeek-specific.
 
@@ -10,12 +10,12 @@ The executable is still named `pocketllm_engine` for compatibility with existing
 
 | Model/format | C++ capability |
 | --- | --- |
-| DeepSeek-V4 Safetensors FP4/FP8 | Persistent generation and OpenAI-compatible TP4 server |
+| DeepSeek-V4 Safetensors FP4/FP8 | Persistent generation, TP4, driven by `pocketllm serve --backend cpp` |
 | DeepSeek-V4 GGUF Q2/IQ2/IQ1 | Inspect, low-bit kernels, TP4 generation/smoke paths |
-| Qwen3.8-27B-FP8 Safetensors | GPU-resident TP4 text runtime and native OpenAI-compatible text server |
+| Qwen3.8-27B-FP8 Safetensors | GPU-resident TP4 text runtime, driven by `pocketllm serve --backend cpp` |
 | Other GGUF architectures | Generic reader/inspection tools; generation may live in the Python raw-block runtime |
 
-Qwen vision execution and multimodal serving are not implemented. The text-only Qwen path, including the native OpenAI-compatible server, is validated separately from vision support.
+Qwen vision execution and multimodal serving are not implemented.
 
 ## Build
 
@@ -57,7 +57,7 @@ build/cpp_engine/pocketllm_engine \
   --qwen-audit
 ```
 
-See the [Qwen model guide](../docs/models/qwen3.8-27b-fp8.md) for the four-rank timed generation command and the [DeepSeek model guide](../docs/models/deepseek-v4.md) for server usage.
+See the [Qwen model guide](../docs/models/qwen3.8-27b-fp8.md) for the four-rank timed generation command and the [DeepSeek model guide](../docs/models/deepseek-v4.md) for serving.
 
 ## Standalone inspection tools
 

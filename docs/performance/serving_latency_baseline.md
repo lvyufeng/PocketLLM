@@ -1,5 +1,11 @@
 # Serving latency baseline (vLLM convention)
 
+> **The front end behind these numbers is retired.** Every measurement below was taken over the
+> C++ binary's own HTTP server (`pocketllm_engine --serve`), which no longer exists; the engine
+> it measured is unchanged, so the numbers stand and the launch commands quoted here do not.
+> [The `--serve` migration note](../migration/native-serve-front-end-removed.md) records what
+> serves today and which flag replaced which.
+
 This is the first record taken with `scripts/bench_serving.py`, the client that
 reports TTFT, TPOT, ITL, E2EL, throughput and goodput on the definitions in
 [Serving latency metrics](../guides/latency_metrics.md). Everything else under

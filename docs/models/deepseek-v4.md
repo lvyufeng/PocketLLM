@@ -43,12 +43,13 @@ experts live matters more here than which kernel runs.
 ## Run it
 
 ```bash
-# native C++ Safetensors server, TP4
-CKPT=/path/to/DeepSeek-V4-Flash \
-PORT=8000 \
-MAX_CONTEXT=8192 \
-PYTHON=python \
-bash scripts/run_cpp_serve_tp4.sh
+# C++ Safetensors backend, TP4
+python -m pocketllm serve \
+  --model /path/to/DeepSeek-V4-Flash \
+  --backend cpp \
+  --tensor-parallel-size 4 \
+  --max-model-len 8192 \
+  --port 8000
 ```
 
 ```bash
@@ -113,7 +114,9 @@ prompt and warm state are directly comparable.
   [the DSpark note](../performance/dspark.md) before making parity claims.
 - **FlashMemory's 1M context is a separate path** with its own enablement and validation constraints,
   not an extension of the validated 65,536-token configuration.
-- **The C++ executable still carries the compatibility name `pocketllm_engine`.**
+- **The C++ front end is gone; this path is served by `pocketllm serve --backend cpp`.** The
+  `pocketllm_engine` binary still exists as a checkpoint-inspection and smoke tool, and it no longer
+  has a `--serve` mode of its own.
 
 ## Where the detail is
 

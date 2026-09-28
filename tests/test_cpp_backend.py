@@ -986,10 +986,10 @@ def test_a_stop_token_is_not_part_of_the_answer() -> None:
     """The engine returns the stop token; the client must not see it.
 
     The engine keeps it because its KV cache has to agree with what it reports, and every consumer is
-    responsible for dropping it: `openai_server.cpp::strip_stop_token` does it before detokenizing,
-    and the scheduler's streaming path never emits it. The non-streaming result was the one place it
-    leaked through, so one request answered through `pocketllm serve` came back with a visible
-    `<|im_end|>` on the end and the same request through the native binary did not. The `cpp`
+    responsible for dropping it: the deleted C++ front end's `strip_stop_token` did it before
+    detokenizing, and the scheduler's streaming path never emits it. The non-streaming result was the
+    one place it leaked through, so one request answered through `pocketllm serve` came back with a
+    visible `<|im_end|>` on the end and the same request through the native binary did not. The `cpp`
     served-path fixture is what found it -- it is recorded from the serial path and compares ids.
     """
     backend = batched_backend_with(
@@ -1365,8 +1365,8 @@ def test_a_stop_sequence_cuts_the_answer_the_engine_returned(tmp_path) -> None:
 def test_a_stop_sequence_is_applied_before_the_answer_is_read(tmp_path) -> None:
     """The cut comes first, so a sequence that stops before a call does not leave a call behind.
 
-    This is the order `openai_server.cpp` used, and the difference only shows when the answer is
-    both text and markup: reading the whole decode first would find the call, report it, and send
+    This is the order the deleted C++ front end used, and the difference only shows when the answer
+    is both text and markup: reading the whole decode first would find the call, report it, and send
     `finish_reason: "tool_calls"` -- telling a client to run a function it had asked to stop short
     of. Reading the cut instead finds no call, which is what the client asked for.
     """

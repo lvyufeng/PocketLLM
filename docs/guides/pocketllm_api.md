@@ -507,9 +507,10 @@ Five things are worth knowing before relying on the field:
   DSML calls. Any other architecture keeps the older behaviour and leaves the call in `content`;
   inventing a parse for a syntax nobody has read would drop or corrupt calls silently. The
   selection is one implementation (`pocketllm/protocol/templating.py`), so the checkpoint's
-  architecture decides it the same way whichever backend served the request — that module used to be
-  the C++ front end's sidecar, which is why a `cpp` request through `pocketllm serve` answered with
-  the call as prose while the same checkpoint through the native binary answered with `tool_calls`.
+  architecture decides it the same way whichever backend served the request. That module was the C++
+  front end's sidecar once, and a `cpp` request through `pocketllm serve` used to answer with the
+  call as prose while the same checkpoint through the binary answered with `tool_calls`; both front
+  ends are now one, and there is one answer.
 - **Streaming is not supported.** A streamed response carries the call syntax as content, exactly as
   it did before, and reports the engine's own `finish_reason`. Ask for a non-streaming response when
   you want `tool_calls`. The *reasoning* split is a different matter and does happen on a stream: a

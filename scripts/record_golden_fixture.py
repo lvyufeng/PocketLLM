@@ -10,18 +10,11 @@ Recording is a deliberate act rather than a side effect: a fixture is only worth
 looked at the answer and agreed it was right, because re-recording is how a real regression gets
 quietly blessed into the baseline of "correct".
 
-Examples::
+Example::
 
-    # a Python entry point
-    python scripts/record_golden_fixture.py --entry xing4 \\
-        --checkpoint /mnt/data2/Xing4.0-29B-A4B-GGUF/xing4_0-29b-IQ4_NL.gguf \\
+    python scripts/record_golden_fixture.py --entry xing4 \
+        --checkpoint /mnt/data2/Xing4.0-29B-A4B-GGUF/xing4_0-29b-IQ4_NL.gguf \
         --max-tokens 16 -- --max-model-len 4096
-
-    # the native binary: the flag after `--` is the binary's own
-    python scripts/record_golden_fixture.py --entry native \\
-        --checkpoint /mnt/data2/Qwen3.8-27B-FP8 \\
-        -- --binary cpp_engine/build-python/pocketllm_engine --devices 0,1,2,3 \\
-           --max-context 4096 --max-batch-size 1 --port 18291
 
 Everything after `--` goes to the entry point verbatim, and the parser needs the separator because
 an unknown `--flag` is otherwise an error rather than a pass-through. The prompt and the token budget
@@ -108,10 +101,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.requires_dev_shm_gib > 0
         else {}
     )
-    if args.entry == "native":
-        argv_list = ["--ckpt", args.checkpoint, *extra_flags(args.extra)]
-    else:
-        argv_list = ["serve", "--backend", args.entry, "--model", args.checkpoint, *extra_flags(args.extra)]
+    argv_list = [
+        "serve",
+        "--backend",
+        args.entry,
+        "--model",
+        args.checkpoint,
+        *extra_flags(args.extra),
+    ]
 
     fixture = golden.GoldenFixture(
         entry=args.entry,
