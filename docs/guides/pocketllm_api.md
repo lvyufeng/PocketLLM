@@ -192,6 +192,24 @@ Once the batch path is selected, the per-request sampling options the OpenAI sur
 (`top_p`, `top_k`, `min_p`, `stop`, `n`, `logprobs`) are honoured; the serialized session refuses
 them, because there is no per-request sampling in it to honour them with.
 
+### Backend options
+
+Every `--backend-option KEY=VALUE` a runtime accepts is *declared* by that runtime — its type, its
+default, its bounds and its accepted values — next to the code that reads it.
+`pocketllm/backends/options.py` is the single reader and each adapter's `OPTIONS` is the single
+list, so the three things a launch can get wrong are answered by one statement rather than by three
+that can disagree:
+
+| What a launch did | What happens |
+| --- | --- |
+| Named a key the runtime does not declare | `ConfigurationError` naming the key and listing the ones it does. A tuning option that silently does nothing is how a run ends up measured on the wrong lever. |
+| Gave a value the declared type cannot read | `ConfigurationError` naming the key: `prefill_chunk` is a whole number, `prefix_cache_bytes` takes a `k`/`m`/`g` suffix, `pin` is a flag and reads `true`/`yes`/`on` and their negatives as well as a JSON boolean. |
+| Named one option twice, once by an older spelling | `ConfigurationError`. `chunk_rows`/`expert_rows` and `deal`/`expert_deal` are each one option under two names, and which of the two was meant is not knowable from the values. |
+
+The keys the CLI fills in on every launch — `engine_kind`, `routed_experts_device`, `pd_mode`, and
+`nccl_id_path` for a sharded one — are accepted by every runtime and read by none of the model
+option parsers, so one launch command line works for every backend.
+
 The unified server provides:
 
 - `GET /health`

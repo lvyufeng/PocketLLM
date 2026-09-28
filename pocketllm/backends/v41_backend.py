@@ -60,8 +60,9 @@ from pocketllm.api import (
 )
 
 from ..work_bell import Bell, BellRinger, WorkerBell, bell_path
-from .base import BackendBase, byte_size, settled_text
+from .base import BackendBase, settled_text
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
+from .options import BackendOption, Kind, decode_options
 from .runtime_engine import RuntimeSpec, SchedulerHost, cancel_key, device_index
 
 
@@ -104,27 +105,135 @@ diverge before it. It costs the cold prefill one chunk boundary, since a positio
 observed at a forward boundary, and it is paid on a miss only: a resumed prefill skips it.
 """
 
-_KNOWN_OPTIONS = frozenset({
-    "cancel_collective",
-    "decode_graphs",
-    "device",
-    "expert_batched",
-    "expert_buffers",
-    "expert_cache",
-    "expert_deal",
-    "expert_device",
-    "expert_hot_rows",
-    "expert_pool_rows",
-    "expert_world",
-    "prefill_chunk",
-    "prefix_cache_bytes",
-    "prefix_cache_head_tokens",
-    "progress",
-    "resident_engram",
-    "resident_experts",
-    "skip_special_tokens",
-    "threads",
-})
+#: Every option this runtime reads, declared once. The order is the dataclass's, so the two read
+#: as one list; `tests/test_declared_options.py` holds them to each other.
+OPTIONS: tuple[BackendOption, ...] = (
+    BackendOption(
+        "device",
+        Kind.STRING,
+        None,
+        "the card this rank's tree runs on; the rank's own card when unset",
+    ),
+    BackendOption(
+        "expert_device",
+        Kind.STRING,
+        None,
+        "the card the expert arena lives on; the host when unset",
+    ),
+    BackendOption(
+        "expert_world",
+        Kind.INTEGER,
+        None,
+        "how many cards the arena is spread over; the network's own width when unset",
+        minimum=1,
+    ),
+    BackendOption(
+        "expert_cache",
+        Kind.INTEGER,
+        None,
+        "experts the loader may keep cached a rank; the loader's own default when unset",
+    ),
+    BackendOption(
+        "expert_hot_rows",
+        Kind.INTEGER,
+        0,
+        "experts of each routed layer this card keeps resident, refilled once a layer; needs "
+        "`expert_device`, since there is no arena to keep anything in otherwise",
+        minimum=0,
+    ),
+    BackendOption(
+        "expert_pool_rows",
+        Kind.INTEGER,
+        DEFAULT_EXPERT_POOL_ROWS,
+        "arena rows a card pools for the experts a step draws",
+        minimum=0,
+    ),
+    BackendOption(
+        "expert_buffers",
+        Kind.INTEGER,
+        DEFAULT_EXPERT_BUFFERS,
+        "arena buffers a rank keeps in flight",
+        minimum=0,
+    ),
+    BackendOption(
+        "expert_batched",
+        Kind.FLAG,
+        True,
+        "one batched expert GEMM a layer rather than one call an expert",
+    ),
+    BackendOption(
+        "expert_deal",
+        Kind.STRING,
+        None,
+        "which deal divides the experts: `sorted` balances them across ranks, `id` leaves them in "
+        "checkpoint order; the loader's own when unset",
+        choices=("sorted", "id"),
+    ),
+    BackendOption(
+        "resident_engram",
+        Kind.FLAG,
+        False,
+        "copy both Engram tables into RAM at load instead of gathering from the shards",
+    ),
+    BackendOption(
+        "resident_experts",
+        Kind.FLAG,
+        None,
+        "attach the resident expert bank; `DEEPSEEK_V41_RESIDENT_EXPERTS` answers for it when unset",
+    ),
+    BackendOption(
+        "prefill_chunk",
+        Kind.INTEGER,
+        None,
+        "tokens one prefill forward takes at once; `--prefill-chunk-tokens` when unset, and the "
+        "loader's own width when neither names one",
+        minimum=1,
+    ),
+    BackendOption(
+        "prefix_cache_bytes",
+        Kind.BYTES,
+        DEFAULT_PREFIX_CACHE_BYTES,
+        "host memory a rank's prefix store may hold",
+    ),
+    BackendOption(
+        "prefix_cache_head_tokens",
+        Kind.INTEGER,
+        DEFAULT_PREFIX_CACHE_HEAD_TOKENS,
+        "the fixed-length anchor a prefill also stores, or 0 for the prompt's end alone",
+        minimum=0,
+    ),
+    BackendOption(
+        "decode_graphs",
+        Kind.FLAG,
+        False,
+        "capture the decode block into a CUDA graph",
+    ),
+    BackendOption(
+        "cancel_collective",
+        Kind.FLAG,
+        True,
+        "check the cancel flag with a per-step collective, which is how a rank learns in time",
+    ),
+    BackendOption(
+        "threads",
+        Kind.INTEGER,
+        None,
+        "torch's intra-op thread count for this rank's host paths",
+        minimum=1,
+    ),
+    BackendOption(
+        "skip_special_tokens",
+        Kind.FLAG,
+        True,
+        "drop special tokens when decoding an answer for a client",
+    ),
+    BackendOption(
+        "progress",
+        Kind.FLAG,
+        True,
+        "print the load and per-request progress lines to stderr",
+    ),
+)
 
 _DTYPE_ALIASES = {"bf16": "bfloat16", "bfloat16": "bfloat16"}
 _STREAM_QUEUE_DEPTH = 64
@@ -229,51 +338,25 @@ class _Options:
     skip_special_tokens: bool = True
     progress: bool = True
 
-
-def _options_from(args: Any) -> _Options:
-    raw = dict(getattr(args, "backend_options", None) or {})
-    unknown = sorted(set(raw) - _KNOWN_OPTIONS - IGNORED_OPTIONS)
-    if unknown:
-        raise ConfigurationError(
-            f"backend='v41' does not recognise backend option(s) {unknown}; "
-            f"known options are {sorted(_KNOWN_OPTIONS)}"
+    @classmethod
+    def from_args(cls, args: Any) -> "_Options":
+        """The options one launch resolves to, decoded from ``OPTIONS``."""
+        options = cls(
+            **decode_options(
+                OPTIONS,
+                getattr(args, "backend_options", None),
+                runtime="v41",
+                ignored=IGNORED_OPTIONS,
+            )
         )
-    text = {name: raw[name] for name in _KNOWN_OPTIONS if name in raw}
-    for key in ("device", "expert_device"):
-        if text.get(key) is not None:
-            text[key] = str(text[key])
-    options = _Options(**text)
-    if options.expert_world is not None:
-        options.expert_world = int(options.expert_world)
-        if options.expert_world < 1:
-            raise ConfigurationError("backend option 'expert_world' must be >= 1")
-    for name in ("expert_hot_rows", "expert_pool_rows", "expert_buffers"):
-        value = int(getattr(options, name))
-        if value < 0:
-            raise ConfigurationError(f"backend option {name!r} must not be negative")
-        setattr(options, name, value)
-    if options.expert_deal is not None and str(options.expert_deal) not in {"sorted", "id"}:
-        raise ConfigurationError("backend option 'expert_deal' must be 'sorted' or 'id'")
-    if options.prefill_chunk is not None:
-        options.prefill_chunk = int(options.prefill_chunk)
-        if options.prefill_chunk < 1:
-            raise ConfigurationError("backend option 'prefill_chunk' must be >= 1")
-    if options.threads is not None:
-        options.threads = int(options.threads)
-        if options.threads < 1:
-            raise ConfigurationError("backend option 'threads' must be >= 1")
-    options.prefix_cache_bytes = byte_size(options.prefix_cache_bytes, "prefix_cache_bytes")
-    options.prefix_cache_head_tokens = int(options.prefix_cache_head_tokens)
-    if options.prefix_cache_head_tokens < 0:
-        raise ConfigurationError("backend option 'prefix_cache_head_tokens' must not be negative")
-    if not bool(getattr(args, "enable_prefix_caching", True)):
-        # ``--enable-prefix-caching`` is the CLI's switch and it was a no-op on this path until the
-        # store existed. The two options above are the *shape* of the store, not a second switch, so
-        # the CLI is what turns it off and a zero budget is how the rest of this file spells "off" --
-        # one representation, and `capabilities` reads it like any other run's.
-        options.prefix_cache_bytes = 0
-        options.prefix_cache_head_tokens = 0
-    return options
+        if not bool(getattr(args, "enable_prefix_caching", True)):
+            # ``--enable-prefix-caching`` is the CLI's switch and it was a no-op on this path until
+            # the store existed. The two options above are the *shape* of the store, not a second
+            # switch, so the CLI is what turns it off and a zero budget is how the rest of this file
+            # spells "off" -- one representation, and `capabilities` reads it like any other run's.
+            options.prefix_cache_bytes = 0
+            options.prefix_cache_head_tokens = 0
+        return options
 
 
 class V41Backend(SchedulerHost, BackendBase):
@@ -296,7 +379,7 @@ class V41Backend(SchedulerHost, BackendBase):
     ) -> None:
         super().__init__()
         self.args = args
-        self._options = _options_from(args)
+        self._options = _Options.from_args(args)
         self._backend = str(getattr(args, "backend", "v41")).lower()
         self._checkpoint = str(args.checkpoint_dir)
         self._config_path = getattr(args, "config_path", None)
@@ -551,6 +634,12 @@ class V41Backend(SchedulerHost, BackendBase):
             max_seq_len=self._max_seq_len,
             hasher=hasher,
             resident_engram=self._options.resident_engram,
+            # Declared, accepted and -- until the declaration was written down -- never passed: the
+            # loader's `resident_experts` defaults to asking `DEEPSEEK_V41_RESIDENT_EXPERTS`, so a
+            # launch that named this option got the environment's answer and no error. Passing it is
+            # one line and changes nothing for a launch that does not name it, because `None` is
+            # what the loader falls back on.
+            resident_experts=self._options.resident_experts,
             expert_cache=(
                 DEFAULT_EXPERT_CACHE
                 if self._options.expert_cache is None

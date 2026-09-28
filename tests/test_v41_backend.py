@@ -342,7 +342,7 @@ def test_the_launcher_options_this_backend_ignores_are_accepted(tmp_path):
 
 
 def test_an_unknown_backend_option_is_refused_with_the_known_set(tmp_path):
-    with pytest.raises(ConfigurationError, match="does not recognise backend option"):
+    with pytest.raises(ConfigurationError, match=r"has no option 'expert_pool_size'; it knows .*expert_pool_rows"):
         _build(_checkpoint(tmp_path), backend_options={"expert_pool_size": 288})
 
 
@@ -1470,7 +1470,7 @@ def test_the_scheduler_options_are_accepted_rather_than_refused(tmp_path):
 
     assert backend._poll_timeout_ms == 1000
 
-    with pytest.raises(ConfigurationError, match="does not recognise backend option"):
+    with pytest.raises(ConfigurationError, match="has no option 'scheduler_timeout_ms_typo'"):
         _build(_checkpoint(tmp_path), backend_options={"scheduler_timeout_ms_typo": 1})
 
 

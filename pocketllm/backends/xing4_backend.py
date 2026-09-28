@@ -59,8 +59,9 @@ from pocketllm.api import (
     Usage,
 )
 
-from .base import BackendBase, TokenStreamer, byte_size
+from .base import BackendBase, TokenStreamer
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
+from .options import BackendOption, Kind, decode_options
 from .runtime_engine import RuntimeSpec, SchedulerHost, cancel_key, device_index
 
 DEFAULT_MAX_SEQ_LEN = 32768
@@ -118,8 +119,46 @@ PREFILL_DEVICE_RESERVE = 768 << 20
 #: checkpoint resident.
 PREFILL_SCORE_BUDGET = 1 << 30
 
-_KNOWN_OPTIONS = frozenset(
-    {"device", "gguf", "prefill_chunk", "prefix_cache_bytes", "tokenizer", "use_kernel"}
+#: Host memory a rank's prefix store may hold, when prefix caching is on.
+DEFAULT_PREFIX_CACHE_BYTES = 2 << 30
+
+#: Every option this runtime reads, declared once.  ``prefill_chunk`` is the one
+#: whose real default is derived rather than declared: :func:`_chunk_for` picks it
+#: from the context and the card's free memory at load, so the declaration carries
+#: ``None`` and the adapter resolves it.
+OPTIONS: tuple[BackendOption, ...] = (
+    BackendOption("device", Kind.STRING, None, "the card this rank runs on"),
+    BackendOption(
+        "gguf",
+        Kind.STRING,
+        None,
+        "the -GGUF sibling to read the weights from, when --model does not name it",
+    ),
+    BackendOption(
+        "prefill_chunk",
+        Kind.INTEGER,
+        None,
+        "tokens one prefill forward takes; derived from the card's free memory when unset",
+        minimum=1,
+    ),
+    BackendOption(
+        "prefix_cache_bytes",
+        Kind.BYTES,
+        DEFAULT_PREFIX_CACHE_BYTES,
+        "host memory a rank's prefix store may hold",
+    ),
+    BackendOption(
+        "tokenizer",
+        Kind.STRING,
+        None,
+        "the directory holding the tokenizer and chat template, when --model does not",
+    ),
+    BackendOption(
+        "use_kernel",
+        Kind.FLAG,
+        True,
+        "run the fused kernels rather than the reference modules",
+    ),
 )
 
 
@@ -162,44 +201,34 @@ def _chunk_for(context: int, heads: int, room_bytes: int | None = None) -> int:
 
 @dataclass(slots=True)
 class _Options:
-    """The launcher's levers, resolved once at construction."""
+    """The launcher's levers, resolved once at construction.
+
+    A bare ``_Options()`` is what :meth:`from_args` produces for a launch that named
+    no option at all, which is the invariant ``tests/test_declared_options.py`` holds
+    the declarations to: the two cannot say different things about a default.
+    """
 
     device: str | None = None
     gguf: str | None = None
     prefill_chunk: int | None = None
-    prefix_cache_bytes: int = 0
+    prefix_cache_bytes: int = DEFAULT_PREFIX_CACHE_BYTES
     tokenizer: str | None = None
     use_kernel: bool = True
 
     @classmethod
     def from_args(cls, args: Any) -> "_Options":
-        values = dict(getattr(args, "backend_options", None) or {})
-        for name in IGNORED_OPTIONS:
-            values.pop(name, None)
-        unknown = sorted(set(values) - _KNOWN_OPTIONS)
-        if unknown:
-            raise ConfigurationError(
-                f"backend='xing4' has no option {unknown[0]!r}; it knows "
-                f"{', '.join(sorted(_KNOWN_OPTIONS))}"
-            )
-        named = values.pop("prefill_chunk", None)
-        chunk = None if named is None else int(named)
-        if chunk is not None and chunk < 1:
-            raise ConfigurationError(f"prefill_chunk is a token count and {chunk} is not one")
-        budget = byte_size(values.pop("prefix_cache_bytes", 2 << 30), "prefix_cache_bytes")
+        values = decode_options(
+            OPTIONS,
+            getattr(args, "backend_options", None),
+            runtime="xing4",
+            ignored=IGNORED_OPTIONS,
+        )
         if not bool(getattr(args, "enable_prefix_caching", True)):
             # `--enable-prefix-caching` is the CLI's switch and the budget is the store's shape, so
             # a zero budget is how the rest of this file spells "off" -- one representation, and
             # `capabilities` reads it like any other run's.
-            budget = 0
-        return cls(
-            device=values.pop("device", None),
-            gguf=values.pop("gguf", None),
-            prefill_chunk=chunk,
-            prefix_cache_bytes=budget,
-            tokenizer=values.pop("tokenizer", None),
-            use_kernel=bool(values.pop("use_kernel", True)),
-        )
+            values["prefix_cache_bytes"] = 0
+        return cls(**values)
 
 
 def resolve_paths(model: str, options: _Options, tokenizer_path: str | None) -> tuple[str, str]:
