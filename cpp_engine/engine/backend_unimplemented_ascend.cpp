@@ -207,6 +207,88 @@ void PersistentEngine::worker_command_shutdown() {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }
 
+// The speculative-decoding and DSpark surface, which the DeepSeek-V4 engine also
+// owns. Nothing on this backend calls any of it -- DeepSeek-V4 is a different
+// architecture and QwenEngine rejects a drafter checkpoint at construction -- but
+// python/bindings.cpp binds every one of them unconditionally, so the Python
+// module needs the definitions to load at all. Without them the module imports
+// with an undefined-symbol error rather than failing at the call, which is why
+// this group is spelled out rather than left to the linker.
+
+int PersistentEngine::layer_count() const {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+std::vector<int> PersistentEngine::verify_step(const std::vector<int>&, int,
+                                               const SamplingParams&) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+std::vector<int> PersistentEngine::batch_verify_step(const std::vector<int>&,
+                                                     int,
+                                                     const SamplingParams&) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+std::vector<int> PersistentEngine::speculative_step(int, int,
+                                                    const SamplingParams&) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+void PersistentEngine::load_dspark(const std::string&) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+bool PersistentEngine::dspark_loaded() const {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+const std::vector<float>& PersistentEngine::last_dspark_hidden() const {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+int PersistentEngine::last_dspark_hidden_positions() const {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+const std::vector<float>& PersistentEngine::last_verify_dspark_hidden() const {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+const std::vector<int>& PersistentEngine::last_topk_tokens(int) const {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+const std::vector<float>& PersistentEngine::last_topk_logits(int) const {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+void PersistentEngine::worker_command_verify(const std::vector<int>&, int32_t) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+void PersistentEngine::worker_command_batch_verify(const std::vector<int>&,
+                                                   int32_t) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+void PersistentEngine::worker_command_finalize_batch_verify(int32_t) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+void PersistentEngine::worker_command_draft(int32_t, int32_t) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+void PersistentEngine::worker_command_speculative_decode(int32_t, int32_t,
+                                                         bool) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+void PersistentEngine::worker_command_prime_draft_kv(int32_t, int32_t) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
 // --- Qwen external drafters -------------------------------------------------
 //
 // QwenEngine keeps the drafter members and their bookkeeping on every backend so
