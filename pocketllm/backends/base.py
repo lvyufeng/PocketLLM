@@ -306,9 +306,9 @@ class RuntimeAdapter(BackendBase):
     A subclass supplies its runtime's name through :attr:`_RUNTIME_LABEL`, and overrides whatever
     it does differently: ``_encode_chat`` where the checkpoint's format is not a jinja template,
     ``_budget`` and ``_tokenize`` where the arithmetic is not this one, ``_result`` where the answer
-    has a structure to read, ``_run_loop`` for the one line of a streamed request that names the
-    runtime's own loop.  What a subclass is left keeping is exactly that list, which is the
-    point of the base -- the parts that are left are the parts that differ.
+    has a structure to read, ``_loop`` for the runtime's own generation call, ``_batch_dispatch``
+    where a scheduler serves the request instead.  What a subclass is left keeping is exactly that
+    list, which is the point of the base -- the parts that are left are the parts that differ.
 
     The only state read here is ``_tokenizer`` and ``_max_seq_len``, which every adapter in this
     family has.
@@ -330,6 +330,102 @@ class RuntimeAdapter(BackendBase):
         """
         self._ensure_open()
         self._ensure_loaded()
+
+    def _batch_dispatch(
+        self, requests: Sequence[GenerationRequest]
+    ) -> list[GenerationResult] | None:
+        """Serve these requests through a scheduler, or ``None`` when there is not one to serve them.
+
+        ``None`` is the default because the scheduler is a property of a runtime that has one, and
+        the answer arrives as a value rather than as a second predicate so that the two decisions --
+        *is there a scheduler* and *serve the batch* -- cannot be read apart. An adapter whose
+        scheduler lives on another base answers by building it there: ``SchedulerHost`` returns
+        ``self._generate_batched(requests)`` on exactly the condition ``generate`` would have tested,
+        and the search for the first of two superclasses that has one stays there instead of here.
+        """
+        return None
+
+    def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
+        """Answer every request, through a scheduler if one serves this runtime and serially if not.
+
+        One body rather than a copy per adapter, because the choice and not the answering is what
+        this method is: the loop below is the same loop that stood in ``v41``, ``mimo`` and ``xing4``
+        -- a scheduler first, then one request at a time -- and the differences those three carried
+        are in :meth:`_run_serial` instead.
+        """
+        self._ensure_loaded()
+        batched = self._batch_dispatch(requests)
+        if batched is not None:
+            return batched
+        return [self._generate_one(request) for request in requests]
+
+    def _generate_one(self, request: GenerationRequest) -> GenerationResult:
+        """One request through this adapter's own loop, with its lifetime bracket around it.
+
+        The bracket is the whole of this method and is the same for every adapter that has run a
+        request: the request becomes visible to :meth:`cancel` before anything slow happens to it,
+        the cancellation is checked both before and *inside* the request lock -- a client that
+        disconnected while this thread waited for the lock is otherwise not noticed until it has
+        been let in -- and the request's id comes out of the cancelled set when it is over, so a
+        later request reusing the id is not born cancelled.
+
+        What sits between the two checks is the runtime's, and it is one call: whatever a request
+        has to become for that runtime, derived once, followed by the loop under the lock. Reading the
+        loop's answer is the same call's other half and moves with it -- see :meth:`_serial_result`.
+        """
+        self._begin_request(request.request_id)
+        try:
+            prompt_ids = self._tokenize(request)
+            prepared = self._prepare_serial(request, prompt_ids)
+            self._check_cancelled(request.request_id)
+            with self._request_lock:
+                self._check_cancelled(request.request_id)
+                generation = self._run_serial(prepared, request)
+            return self._serial_result(request, prompt_ids, generation)
+        finally:
+            self._clear_request(request.request_id)
+
+    def _serial_result(
+        self, request: GenerationRequest, prompt_ids: Sequence[int], generation: Any
+    ) -> GenerationResult:
+        """The loop's answer as the API's result, on the serial path.
+
+        The shared :meth:`_result` by default, which is where every adapter but one wants to end up.
+        The exception is the adapter whose loop hands back something that is not this family's
+        generation at all -- ``v41``, whose answer splits into reasoning, prose and tool calls and
+        whose builder therefore takes the pieces rather than the object -- and it is a hook rather
+        than an override of :meth:`_generate_one` because *reading the answer* is what differs there,
+        while the bracket around it is not.
+        """
+        return self._result(request, prompt_ids, generation, {"started": time.perf_counter()})
+
+    def _prepare_serial(self, request: GenerationRequest, prompt_ids: Sequence[int]) -> Any:
+        """What the loop is handed for a serial request, derived before the request lock is taken.
+
+        The prompt ids, by default: an adapter whose loop takes ids passes :meth:`_budget` next to
+        them, and ``v41`` -- whose loop takes a broadcast payload -- builds that here instead. Both
+        have to happen before the lock for the same reason: the budget refuses a request that does
+        not fit, and a refusal that arrived after the lock was taken would have held it for a request
+        that was never going to run.
+        """
+        return prompt_ids
+
+    def _run_serial(self, prepared: Any, request: GenerationRequest) -> Any:
+        """Run this runtime's loop for one serial request, and hand back what it produced.
+
+        The call this family makes for a request that has the runtime to itself, and the difference
+        between this and :meth:`_run_loop` is the whole of the streamed path: that one hands the loop
+        a streamer, this one hands it nothing to talk to. An adapter whose loop takes a budget beside
+        its prompt derives it here, and ``v41`` -- whose loop takes a broadcast payload -- writes
+        this out because it is the one runtime whose loop is reached that way.
+        """
+        return self._loop(
+            prepared,
+            self._budget(prepared, request),
+            request,
+            on_token=None,
+            stop=lambda: self._is_cancelled(request.request_id),
+        )
 
     def _skip_special_tokens(self) -> bool:
         """Whether a decode leaves the checkpoint's control tokens out, when the caller did not say.
@@ -470,7 +566,7 @@ class RuntimeAdapter(BackendBase):
         )
         with self._request_lock:
             marks = {"started": time.perf_counter()}
-            generation = self._run_loop(prompt_ids, budget, request, streamer, marks)
+            generation = self._run_loop(prompt_ids, budget, request, streamer)
         if generation.stopped == "cancel" and not streamer.hit:
             events.put(TokenEvent(request_id=request.request_id, finish_reason="cancelled"))
             return
@@ -496,14 +592,38 @@ class RuntimeAdapter(BackendBase):
         budget: int,
         request: GenerationRequest,
         streamer: TokenStreamer,
-        marks: dict[str, float],
     ) -> Any:
         """Run this runtime's loop for one streamed request, and hand back what it produced.
 
-        The one part of a streamed request that is the runtime's own: the loop's call shape, with
-        the streamer's two hooks passed under the names that loop expects. A runtime that must
-        also see the step boundary -- to broadcast a cancellation, say -- takes that from
-        ``streamer.reached`` and from the request's own cancellation, which the loop reads itself.
+        The one part of a streamed request that is a call rather than a shape: the loop, with the
+        streamer's two hooks passed under the names it takes them by. It is the same call a serial
+        request makes, with the stop string's check standing where the cancel flag stands -- which is
+        why the two ``_run_loop`` bodies in this family were byte-identical and neither survives.
+
+        What a stream adds is `stop`: without it a run whose marker was found keeps generating tokens
+        nobody reads, up to the whole budget the prompt left. The streamer also answers the step
+        boundary a runtime needs, through :attr:`TokenStreamer.reached`.
+        """
+        return self._loop(
+            prompt_ids, budget, request, on_token=streamer.accept, stop=streamer.reached
+        )
+
+    def _loop(
+        self,
+        prompt_ids: Sequence[int],
+        budget: int,
+        request: GenerationRequest,
+        *,
+        on_token: Callable[[int], None] | None,
+        stop: Callable[[], bool] | None = None,
+    ) -> Any:
+        """Run this runtime's generation loop. Not implemented here.
+
+        The whole of a runtime is this call, so the base cannot supply it: whose loop it is, what its
+        parameters are called, and whether it reads the request or a payload built from it are the
+        adapter's. What every runtime in this family shares is the *name* and the two hooks -- a
+        token at a time, and a predicate asked before each step -- and that is what the two methods
+        above are written against.
         """
         raise NotImplementedError
 
