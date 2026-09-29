@@ -72,6 +72,35 @@ and that the engine's own `model_load_seconds` — the summary line the CLI path
 record does not claim to have measured the model load. These are process-start-to-ready times, engine
 bring-up, shard reads and all, and they are the only numbers this record has for that cost.
 
+**Ready is not warm, and the first request pays for it.** A server that has just answered `/health`
+with `ready: true` serves its first non-streaming request at **4.81-4.86 output tok/s** against
+**21.96-24.93** for every request after it, and it pays the whole difference before the first token —
+4.81 tok/s with a 13.16 s mean E2EL is the request never getting going, not slow decode. It is the
+same in both directions and at two prompt shapes:
+
+| arm | input tokens | output tok/s | mean E2EL |
+| --- | ---: | ---: | ---: |
+| first request after ready | 256 | 4.86 | 13155 ms |
+| second request, same server | 256 | 22.25 → 23.70 → 24.91 | 2874 → 2697 → 2566 ms |
+| first request after ready | 128 | 4.81 | 13307 ms |
+| second request, same server | 128 | 23.20 | 2756 ms |
+
+The cost is **per process and not per shape**: a server already warm at 256 tokens takes a 512-token
+prompt at 20.82 and a 128-token one at 23.67, so no first-touch-per-shape effect survives. It is
+**~10.5 s**, and the reason it is visible here at all is a name — `QwenEngine::warmup_kernels`
+(`cpp_engine/engine/qwen_engine.cpp:5177`), whose own comment says it exists because "a one-token
+warmup would leave the prefill kernels to be loaded by that first request". The C++ CLI calls it
+before every generation arm (`cpp_engine/engine/main.cpp:1194`); **it is not bound in
+`cpp_engine/python/bindings.cpp`, so `pocketllm serve` cannot call it and pays it in the first
+request instead.** That is the mechanism this record measured to, and it is named rather than
+attributed: **no profile was taken**, so the ~10.5 s is consistent with a kernel-module load and is
+not proven to be one.
+
+This is the `--num-warmups` cost [the latency guide](../guides/latency_metrics.md) describes, and it
+matters for how §2-§5 were run: they carry `--num-warmups 1`, so the discarded round absorbs it. A
+deployment that turns warmups off, or a client whose first request is its only request, is served at
+4.8 tok/s.
+
 ## 2. The ladder
 
 One server, arms run serially, `--max-concurrency` the only thing that changes. `--num-prompts` is 16
@@ -304,9 +333,10 @@ python scripts/bench_serving.py --base-url http://127.0.0.1:8124 \
 `--no-stream` selects the non-streaming arm; `--max-concurrency` is the only thing that changes
 between arms; the arms were run serially against one server. **§5's table is the same command against
 a second server whose only difference is the flag `--max-batch-size 16`** — every arm above reproduced
-there at concurrency 1 and 8, which is the check that the two tables are one ladder. The scheduler
-columns in §3, §4 and §5 came from a sampler thread polling `/metrics` every second, not from the
-response bodies. The reference token sequence in §6 is one request:
+there at concurrency 1 and 8, which is the check that the two tables are one ladder. **`--num-warmups
+1` is load-bearing**: §1's first-request cost is ~10.5 s and the discarded round is what keeps it out
+of these columns. The scheduler columns in §3, §4 and §5 came from a sampler thread polling `/metrics`
+every second, not from the response bodies. The reference token sequence in §6 is one request:
 
 ```bash
 curl -s http://127.0.0.1:8124/v1/completions -H 'Content-Type: application/json' \
