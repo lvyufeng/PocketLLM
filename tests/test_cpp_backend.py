@@ -492,6 +492,39 @@ def test_cpp_engine_kind_is_detected_from_the_checkpoint() -> None:
     backend.close()
 
 
+def test_a_directory_holding_a_gguf_reaches_the_engine_as_the_file_it_holds(
+    tmp_path, monkeypatch
+) -> None:
+    """The native reader dispatches on the path's own suffix, so the file has to arrive as one.
+
+    The released ternary artifact is a bare GGUF in a directory and nothing else. Handed the
+    directory, the reader opens it as a safetensors index and fails on a ``config.json`` that is not
+    there -- which is what ``pocketllm serve`` did on that checkpoint, and it looked like a missing
+    model rather than a misnamed path. Detection is asked the same path, so an answer that named the
+    directory here would route and construct the checkpoint from two different things.
+    """
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    bundle = ckpt / "model.gguf"
+    bundle.write_bytes(b"GGUF")
+    monkeypatch.setattr(
+        "pocketllm.backends.cpp_backend.gguf_checkpoint_file", lambda path: str(bundle)
+    )
+
+    native = FakeNativeModule()
+    backend = CppBackend(
+        EngineArgs(model=str(ckpt), backend="cpp"),
+        native_module=native,
+        tokenizer=FakeTokenizer(),
+    )
+    try:
+        assert native.detected == [str(bundle)]
+        assert native.constructed is not None
+        assert native.constructed[0] == str(bundle)
+    finally:
+        backend.close()
+
+
 def test_cpp_unknown_architecture_is_reported_not_guessed() -> None:
     class UnknownArchModule(FakeNativeModule):
         def detect_architecture(self, checkpoint: str) -> str:
