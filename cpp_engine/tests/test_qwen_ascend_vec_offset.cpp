@@ -18,7 +18,7 @@
 // offset is a whole number of blocks, paying an element-level transpose that no
 // vector or copy instruction on this part can express.
 //
-// Measured on the 910A (2026-09-26): they are **not** honoured, and not by
+// Measured on the 910B (2026-09-26): they are **not** honoured, and not by
 // rounding either. Every offset from 1 to 7 elements raises an aicore exception --
 // `error code = 0x10`, `errorStr: Illegal instruction, which is usually caused by
 // unaligned UUB addresses` -- and the launch is lost; the eight-element offset, one

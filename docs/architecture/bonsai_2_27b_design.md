@@ -284,7 +284,7 @@ resumed request is the one at 0.023 s.
 
 ## The Ascend port
 
-Four first-generation 910A cards run the same file through the same engine and the same weight map.
+Four first-generation 910B cards run the same file through the same engine and the same weight map.
 The container, the transform and the tokenizer are backend-independent — the weight map decides what
 a tensor *is* before any backend sees it — so the port is three decisions and one bug.
 
@@ -337,7 +337,7 @@ tensor cut in segments rather than as one range so no rank receives part of a he
 
 ### What the port measures
 
-`scripts/run_qwen_ascend_tp4.sh`, four 910A cards, the released `PTQ1_0` file, greedy:
+`scripts/run_qwen_ascend_tp4.sh`, four 910B cards, the released `PTQ1_0` file, greedy:
 
 | | Result |
 | --- | ---: |

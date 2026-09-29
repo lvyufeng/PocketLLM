@@ -1,6 +1,6 @@
 # Ascend Attention Optimization
 
-Qwen3.8-27B, 4 x Ascend 910A first generation (`Short_SoC_version=Ascend910`), TP=4, CANN 9.0.0.
+Qwen3.8-27B, 4 x Ascend 910B first generation (`Short_SoC_version=Ascend910`), TP=4, CANN 9.0.0.
 
 This document records what was changed, what was measured, and what the measurements rule out.
 Every number below comes from a run on the machine described above; the command that produced it is

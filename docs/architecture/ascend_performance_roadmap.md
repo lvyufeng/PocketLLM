@@ -1,6 +1,6 @@
-# Ascend 910A Performance Roadmap
+# Ascend 910B Performance Roadmap
 
-Qwen3.8-27B, 4 x Ascend 910A first generation (`Short_SoC_version=Ascend910`, 30 AI cores, 32 MB L2,
+Qwen3.8-27B, 4 x Ascend 910B first generation (`Short_SoC_version=Ascend910`, 30 AI cores, 32 MB L2,
 FP16 only, no BF16), TP=4, CANN 9.0.0.
 
 Measured status and the ranked next steps. All figures and their commands are in

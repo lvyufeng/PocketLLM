@@ -123,7 +123,7 @@ python -m pytest tests/test_ptq1_0_layout.py -q
 | MTP, DSpark, DFlash2 speculative decoding | **Not validated on this checkpoint** |
 | `Ternary-Bonsai-2-27B-PQ2_0.gguf` (type 142, 2.13 bits) | Declared in the loader, **no kernel** — it is refused, not upcast |
 | TP > 1 on CUDA | Unmeasured for this artifact |
-| TP4 on the Ascend 910A | Supported, validated — see [On the Ascend 910A](#on-the-ascend-910a) |
+| TP4 on the Ascend 910B | Supported, validated — see [On the Ascend 910B](#on-the-ascend-910b) |
 | Vision | The chat template renders images; nothing reads them |
 
 ## Performance
@@ -201,9 +201,9 @@ prompt. It settles at **8,952 MiB** and stays there: eight cold 4,096-token prom
 produced 7,078 → 8,952 MiB, flat after the first. That is the workspace, it is one per thread, and it
 does not grow with how many prompts the server has answered.
 
-## On the Ascend 910A
+## On the Ascend 910B
 
-The same checkpoint runs on four first-generation 910A cards (32 GiB HBM each, CANN 9.0.0), through
+The same checkpoint runs on four first-generation 910B cards (32 GiB HBM each, CANN 9.0.0), through
 the same engine and the same weight map. The container, the transform and the tokenizer are
 backend-independent, so what changes is the arithmetic: the Ascend backend is **dense FP16 only**,
 and there is no ternary kernel for it.
@@ -212,7 +212,7 @@ and there is no ternary kernel for it.
 
 `PTQ1_0` is decoded to FP16 while the tensor is still on the host, so the card holds 27B parameters
 at two bytes each rather than 1.75 bits: **12.53 GiB resident**, against the 5.53 GiB the file
-occupies. On a 910A that is affordable — the card has 32 GiB where the 2080 Ti has 22 — and it is
+occupies. On a 910B that is affordable — the card has 32 GiB where the 2080 Ti has 22 — and it is
 the only option, because there is no kernel that could consume the blocks in place. The decoder is
 the same one the CUDA path uses; it just runs unconditionally instead of being skipped when the
 backend declares it reads packed ternary.
@@ -241,7 +241,7 @@ tensor cut in segments rather than as one range.
 
 ### What it measures
 
-`scripts/run_qwen_ascend_tp4.sh` on four 910A cards, the released `PTQ1_0` file, greedy:
+`scripts/run_qwen_ascend_tp4.sh` on four 910B cards, the released `PTQ1_0` file, greedy:
 
 | | Result |
 | --- | ---: |

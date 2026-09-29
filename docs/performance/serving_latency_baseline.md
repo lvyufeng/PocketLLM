@@ -172,7 +172,7 @@ the hand-written collective and its device-side wait — opt-in when that pair w
 measured, both the backend's defaults now — and **39.4–39.8 ms**
 (25.15–25.37 TPS) once the Cube's row replication is added on top — the fastest
 step measured anywhere on this checkpoint
-([Ascend 910A single-request decode](ascend_single_request_tps.md)).
+([Ascend 910B single-request decode](ascend_single_request_tps.md)).
 The smoke reports a step 2.5× faster than the fastest one ever recorded, while
 carrying four concurrent streams rather than one. A measurement that beats the
 platform's own floor by that margin is not measuring this platform's decode.

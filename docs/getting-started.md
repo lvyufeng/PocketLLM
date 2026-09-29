@@ -60,10 +60,12 @@ configure time and defaults to CUDA:
 cmake -S cpp_engine -B build/cpp_engine -DPOCKET_BACKEND=cuda
 ```
 
-`POCKET_BACKEND=ascend` configures but does not yet link; the ACL runtime,
-AscendC kernels and HCCL collectives under `cpp_engine/backends/ascend/` are not
-implemented. See [Ascend SoC generations](guides/ascend_soc_generations.md) before
-assuming two Ascend cards can share a kernel.
+`POCKET_BACKEND=ascend` builds the ACL runtime, the AscendC kernels and the HCCL
+collectives under `cpp_engine/backends/ascend/`; on the Ascend host the entry point
+is `scripts/build_ascend.sh` rather than the two commands above. See
+[Ascend SoC generations](guides/ascend_soc_generations.md) for the generation table,
+for the `Short_SoC_version` check that decides whether two cards can share a kernel,
+and for why the product name `npu-smi info` prints cannot answer that question.
 
 The layering that keeps a second backend possible is enforced, not just
 documented:

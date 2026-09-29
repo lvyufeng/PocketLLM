@@ -17,7 +17,7 @@
 // ten levels. If it faults, it faults. Either answer decides the kernel's shape,
 // which is why this exists as a kernel rather than as a reading of the docs.
 //
-// Measured on the 910A (2026-09-26): it faults. Offsets of 1 through 7 elements
+// Measured on the 910B (2026-09-26): it faults. Offsets of 1 through 7 elements
 // all raise an aicore exception -- `error code = 0x10`, `errorStr: Illegal
 // instruction, which is usually caused by unaligned UUB addresses` -- while the
 // eight-element offset, one whole block, returns the sum. The three sub-block

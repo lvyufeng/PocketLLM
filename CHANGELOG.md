@@ -104,7 +104,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The post-release step extracts this version's changelog section for the GitHub release. It passed
   `CHANGELOG.md` to `gh release create --notes-file`, which publishes the whole file — the v0.1.1
   notes would have been 216 lines, the 0.1.0 feature list and performance table included.
-- The `[0.1.0]` entry's FlashDecoding bullet now says what it is: an Ascend 910A measurement, with no
+- The `[0.1.0]` entry's FlashDecoding bullet now says what it is: an Ascend 910B measurement, with no
   CUDA implementation of a separate entry point behind it. As written it read as a shipped CUDA
   feature, and the defect above is the other half of the same confusion.
 
@@ -134,7 +134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Health check endpoints (`/ready`, `/alive`, `/health`)
 - Token streaming callbacks for async generation
 - Speculative decoding (DSpark, DFlash2, MTP)
-- FlashDecoding for long-context decode on Ascend (2.68× decode speedup, Ascend 910A, TP4, 4096-token
+- FlashDecoding for long-context decode on Ascend (2.68× decode speedup, Ascend 910B, TP4, 4096-token
   context). There is no separate CUDA FlashDecoding entry point; the CUDA path reaches split-partial
   decode through the fused `qwen_gqa_decode_attention_f16_fused_cuda` kernel instead.
 - Prefix caching

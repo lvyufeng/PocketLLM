@@ -11,7 +11,7 @@ This record measures the same workload as
 enabled: the hand-written IPC all-reduce and the device-side arrival wait, then
 selected with `POCKET_ASCEND_IPC_ALLREDUCE=1` and
 `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`. Both are documented in
-[Ascend 910A single-request decode](ascend_single_request_tps.md).
+[Ascend 910B single-request decode](ascend_single_request_tps.md).
 
 **Both switches have since become the shipped defaults, and neither prints
 anything at startup.** The run below was taken before either flip and is left as
@@ -173,7 +173,7 @@ therefore multiplied by 129.
 
 The engine-internal record measures the same two switches in the same session at
 rows=1, with the TP4 launcher and one process per rank
-([Ascend 910A single-request decode](ascend_single_request_tps.md), §6.3):
+([Ascend 910B single-request decode](ascend_single_request_tps.md), §6.3):
 
 | collective | `step_ms` | decode TPS |
 | --- | ---: | ---: |

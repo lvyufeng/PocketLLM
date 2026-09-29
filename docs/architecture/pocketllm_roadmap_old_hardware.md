@@ -1,6 +1,6 @@
 # PocketLLM 针对老硬件的功能规划
 
-**目标硬件**: 2080Ti (SM75, 22GB, PCIe), Ascend 910A (1st gen, 32GB HBM)  
+**目标硬件**: 2080Ti (SM75, 22GB, PCIe), Ascend 910B (1st gen, 32GB HBM)  
 **分析时间**: 2026-09-11  
 **当前状态**: Phase 3 (paged KV 已默认开启)
 
@@ -37,7 +37,7 @@
 - 调度约束基于 **KV cache 容量 + token 预算**，不是固定 batch size
 - Prefill 优先（短请求快速响应），decode 填充空闲 slot
 - 初期不做 preemption（简化实现），队列满时直接拒绝新请求
-- **老硬件特化**: 动态调整 `max_num_running_reqs`（2080Ti 建议 4-8，910A 建议 8-16）
+- **老硬件特化**: 动态调整 `max_num_running_reqs`（2080Ti 建议 4-8，910B 建议 8-16）
 
 **收益预估**：
 - 吞吐量 2-4× (多请求并发)
@@ -67,7 +67,7 @@
 - LRU 淘汰策略（KV cache 满时优先淘汰未命中的 block）
 - **老硬件特化**: 
   - 2080Ti 22GB 显存紧张，prefix cache 占比不宜超过 30%（~6.6GB）
-  - 910A 32GB 可以更激进，50% 给 prefix cache（~16GB）
+  - 910B 32GB 可以更激进，50% 给 prefix cache（~16GB）
 
 **收益预估**：
 - 多轮对话：首轮后的 prefill 时间降至 ~0（只计算新增部分）
@@ -116,7 +116,7 @@
 
 **为什么重要（老硬件视角）**：
 - **2080Ti 边缘场景**: 本地 OCR/图像理解，不依赖云服务
-- **Ascend 910A 有 32GB 显存**: 可以跑 Qwen2-VL-7B 的 vision encoder
+- **Ascend 910B 有 32GB 显存**: 可以跑 Qwen2-VL-7B 的 vision encoder
 
 **实现优先级**: **P2 (Phase 5-6)**
 
@@ -126,7 +126,7 @@
 - 图像 token 作为额外的 prompt 序列输入
 - **老硬件特化**: 
   - 2080Ti: 图像压缩到 256 tokens 以内（减少 prefill 开销）
-  - 910A: 可以更激进，512-1024 tokens
+  - 910B: 可以更激进，512-1024 tokens
 
 **收益预估**：
 - 打开本地多模态应用场景（截图问答/文档理解）
@@ -139,8 +139,8 @@
 
 **动机**：
 - **2080Ti 只有 22GB**: 跑 27B FP8 勉强够，70B 完全装不下
-- **Ascend 910A 32GB**: 跑 70B FP4 也装不下
-- **PCIe/HBM 带宽**: 2080Ti PCIe 3.0 x16 ~16 GB/s，910A HBM2 ~1.2 TB/s（片上）
+- **Ascend 910B 32GB**: 跑 70B FP4 也装不下
+- **PCIe/HBM 带宽**: 2080Ti PCIe 3.0 x16 ~16 GB/s，910B HBM2 ~1.2 TB/s（片上）
 
 **现有方案的问题**：
 - vLLM/SGLang 都假设权重常驻 GPU，不支持 CPU offloading
@@ -168,7 +168,7 @@
 - 2080Ti 跑 70B FP4: 前 16 层 GPU（~10GB）+ 后 64 层 CPU offload
   - Prefill: ~200 tok/s（受 H2D 带宽限制）
   - Decode: ~5 tok/s（每层 ~200ms，其中 H2D ~100ms + 计算 ~100ms）
-- 910A 跑 70B Q2: 前 24 层 GPU（~15GB）+ 后 56 层 CPU
+- 910B 跑 70B Q2: 前 24 层 GPU（~15GB）+ 后 56 层 CPU
   - HBM2 带宽更高，decode ~8-10 tok/s
 
 **现状**（2026-09-15 实测，PR #253）：
@@ -214,7 +214,7 @@ expert staging 的 decode 是 0.54–0.66 tok/s（[GLM-5.2 模型页](../models/
 
 **为什么仍然重要（老硬件视角）**：
 - **显存容量 > 速度**: 22GB 的 2080Ti 跑 70B 模型，只能靠 FP4/Q2
-- **Ascend 910A 没有 FP8**: CANN 原生不支持 FP8，FP4 是最接近的选项
+- **Ascend 910B 没有 FP8**: CANN 原生不支持 FP8，FP4 是最接近的选项
 
 **设计改进**：
 - **Hybrid quantization**: 
@@ -332,7 +332,7 @@ expert staging 的 decode 是 0.54–0.66 tok/s（[GLM-5.2 模型页](../models/
 
 ---
 
-### 2.6 Ascend 910A 专项优化
+### 2.6 Ascend 910B 专项优化
 
 **现状**：
 - ✅ 多后端架构已就绪
@@ -340,19 +340,20 @@ expert staging 的 decode 是 0.54–0.66 tok/s（[GLM-5.2 模型页](../models/
 
 **为什么重要**：
 - **国产化需求**: 很多场景必须用国产芯片
-- **910A 是老硬件**: 与 2080Ti 同时代（2019），面临类似问题
+- **910B 是老硬件**: 与 2080Ti 同时代（2019），面临类似问题
 - **PocketLLM 的差异化**: vLLM/SGLang 都不支持 Ascend
 
-**Ascend 910A 特点**：
-- 32 AI Core (vs 910B 的 24)
-- 32MB L2 (vs 910B 的 192MB) ← 这是最大区别
-- Cube freq 1000 MHz (vs 910B 的 1850 MHz)
+**Ascend 910B 特点**（第一代 `Short_SoC_version=Ascend910`；本机是 `Ascend910B.ini` profile，
+30 AI Core / 900 MHz；同一代的 `Ascend910A.ini` 是 32 Core / 1000 MHz）：
+- 30-32 AI Core（第二代 `Ascend910B1`-`B4` 为 24-20）
+- 32MB L2（第二代 192MB/96MB）← 这是最大区别
+- Cube freq 900-1100 MHz（第二代 1500-1850 MHz）
 - **No cube_vector_combine=split** (1st gen 限制)
 
 **设计要点**：
 - **L2 cache blocking**:
-  - 910A 只有 32MB L2，权重/KV 分块必须更细
-  - MoE expert 需要按 8 个一组 stage（vs 910B 的 24 个）
+  - 910B 只有 32MB L2，权重/KV 分块必须更细
+  - MoE expert 需要按 8 个一组 stage（第二代 192MB L2 下为 24 个）
 - **Cube + Vector 串行流水**:
   - 1st gen 的 Cube 和 Vector 不能并行，必须手动流水
 - **CANN 9.0 的 GQA kernel**:
@@ -361,7 +362,7 @@ expert staging 的 decode 是 0.54–0.66 tok/s（[GLM-5.2 模型页](../models/
 
 **实现优先级**: **P2 (Phase 5-6，取决于硬件可用性）**
 
-**Ascend 910A 收益**：
+**Ascend 910B 收益**：
 - 填补 vLLM/SGLang 的空白
 - 国产化场景的唯一高性能选择
 
@@ -380,7 +381,7 @@ expert staging 的 decode 是 0.54–0.66 tok/s（[GLM-5.2 模型页](../models/
 | **FlashAttention-1 (SM75)** | P2 | 中 | ⭐⭐⭐ | Batch prefill |
 | **Tiny Draft Model** | P2 | 中-高 | ⭐⭐⭐ | Decode 1.8-2.2× |
 | **Qwen-VL** | P2 | 高 | ⭐⭐⭐ | 多模态场景 |
-| **Ascend 910A Backend** | P2 | 高 | ⭐⭐⭐⭐ | 国产化 |
+| **Ascend 910B Backend** | P2 | 高 | ⭐⭐⭐⭐ | 国产化 |
 
 ---
 
@@ -413,13 +414,13 @@ expert staging 的 decode 是 0.54–0.66 tok/s（[GLM-5.2 模型页](../models/
 - Batch_size=4 的 prefill 激活显存 <2GB/rank
 
 ### Phase 6: 多后端与高级功能（3-4 个月）
-1. ✅ **Ascend 910A Backend**: CANN 后端完整实现
+1. ✅ **Ascend 910B Backend**: CANN 后端完整实现
 2. ✅ **结构化输出**: JSON mode + FSM filtering
 3. ✅ **LoRA Adapter**: 动态加载和切换
 4. ✅ **INT4 Tensor Core**: SM75 MMQ kernel 移植
 
 **验收标准**：
-- Ascend 910A 性能达到 vLLM CUDA 的 60-80%
+- Ascend 910B 性能达到 vLLM CUDA 的 60-80%
 - JSON mode 可用，与 SGLang 对比
 - LoRA 切换延迟 <100ms
 
@@ -437,7 +438,7 @@ expert staging 的 decode 是 0.54–0.66 tok/s（[GLM-5.2 模型页](../models/
 2. **CPU Offloading**: vLLM/SGLang 都不支持——但 2026-09-15 的实测（见 2.1）表明，
    在 2080Ti 上让 70B 装得下的是量化而不是逐层 offload：TP2/TP4 零 offload 即可，
    而 TP1 的实测上限是 0.83 tok/s
-3. **多后端**: Ascend 910A 是独家优势
+3. **多后端**: Ascend 910B 是独家优势
 4. **Qwen 推测解码**: MTP/DSpark/DFlash2 比通用 draft model 更高效
 5. **单请求延迟优化**: vLLM 为吞吐优化，PocketLLM 为个人/边缘场景优化
 
@@ -452,7 +453,7 @@ expert staging 的 decode 是 0.54–0.66 tok/s（[GLM-5.2 模型页](../models/
 
 - 个人开发者（2080Ti/3090/4090 在家跑大模型）
 - 边缘设备（Jetson/嵌入式 GPU）
-- 国产化场景（Ascend 910A）
+- 国产化场景（Ascend 910B）
 - 研究者（需要深度定制 kernel）
 
 ---
@@ -467,7 +468,7 @@ expert staging 的 decode 是 0.54–0.66 tok/s（[GLM-5.2 模型页](../models/
 
 **选做（P2）**：
 - Qwen-VL / Tiny Draft / FlashAttention-1（锦上添花）
-- Ascend 910A（取决于硬件可用性和市场需求）
+- Ascend 910B（取决于硬件可用性和市场需求）
 
 **长期**：
 - 与 vLLM/SGLang 错位竞争，聚焦老硬件和国产化

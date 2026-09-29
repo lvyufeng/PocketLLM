@@ -1,6 +1,6 @@
 # Ascend gated-delta value-axis slice
 
-Qwen3.8-27B, 4 x Ascend 910A first generation (`Short_SoC_version=Ascend910`), TP=4, CANN 9.0.0.
+Qwen3.8-27B, 4 x Ascend 910B first generation (`Short_SoC_version=Ascend910`), TP=4, CANN 9.0.0.
 
 The gated-delta recurrence is the largest single operator in a prefill layer on this backend: the
 in-engine phase profile attributes 2.47 s of an 8.86 s 4966-token prefill to `gated_delta` across its
@@ -130,7 +130,7 @@ region and the phase profile below is what separates the kernel time from them.
 **Prefill +9.4%; decode flat** (-0.6%, inside run-to-run spread, as expected — decode runs the same
 kernel with one token and is not where this cost lives). The decode column is at this commit, before
 the overlap-slice and batched-decode merges; the current decode figures are in
-[Ascend 910A attention](ascend_attention_optimization.md) section 6.
+[Ascend 910B attention](ascend_attention_optimization.md) section 6.
 
 The phase profile from the same two runs says where the difference is:
 
@@ -219,7 +219,7 @@ in this form — the branch binary that produced both arms lost its shape flags 
   is the state traffic itself.
 - **It does not close the decode gap.** Decode is measured here at 4.24-4.29 tokens/s, and its profile
   is dominated by dense fp16 weight bytes read per layer (`pr.mlp.gate_up`, `layer.swiglu`,
-  `pr.mlp.down`), not by this kernel. See [Ascend 910A attention](ascend_attention_optimization.md)
+  `pr.mlp.down`), not by this kernel. See [Ascend 910B attention](ascend_attention_optimization.md)
   section 6 for the arithmetic; weight quantization is the lever there, not kernel work.
 - **It does not revisit the four-way split on second-generation silicon.** On a 20- or 24-core part
   the geometry changes completely and the two-round argument above stops applying. It is why

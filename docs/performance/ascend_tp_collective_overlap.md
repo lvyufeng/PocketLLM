@@ -1,7 +1,7 @@
 # Ascend TP Collective Overlap
 
 Qwen3.8-27B (`hidden_size=5120`, 64 layers: 48 gated-delta linear attention, 16 full attention),
-4 x Ascend 910A first generation (`Short_SoC_version=Ascend910`), TP=4, CANN 9.0.0.
+4 x Ascend 910B first generation (`Short_SoC_version=Ascend910`), TP=4, CANN 9.0.0.
 
 The engine overlaps each row-parallel projection's TP all-reduce with the next slice's GEMM. This
 document records how many slices that split should use, and what the measurement says about the
