@@ -512,6 +512,27 @@ private:
     // stop_token_ids when set, otherwise the checkpoint's eos ids.
     bool is_stop_token(const BatchSamplingParams& sampling, int token) const;
 
+    // Point the calling thread at this engine's device.
+    //
+    // Both runtimes keep their current device per *thread*, not per process.
+    // ACL is the loud one: a thread that never bound a context cannot launch or
+    // copy at all, and answers the first device call with `rtStreamSynchronize
+    // execution failed, the context is a null pointer` -- from whichever call
+    // that happens to be, which is usually a memset on the recurrent state and
+    // never anything that names the thread. CUDA is the quiet one: a thread that
+    // never called `cudaSetDevice` is on device 0, so a server thread on a rank
+    // whose card is not 0 computes on the wrong device or fails on a pointer
+    // from another one.
+    //
+    // The engine owns the device, so the bind belongs here rather than in each
+    // front end that creates a thread. Every thread the engine's forward passes
+    // can run on -- the constructing thread, the batch scheduler's, an HTTP
+    // request thread -- enters through a public method, and those are where this
+    // is called. Idempotent and cheap: it installs the context this process
+    // already created for the device, and a thread-local check makes every call
+    // after the first on a thread a load and a compare.
+    void bind_thread_device() const;
+
     std::string ckpt_dir_;
     QwenEngineOptions options_;
     QwenConfig config_;
