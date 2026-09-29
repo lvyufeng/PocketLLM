@@ -71,6 +71,19 @@ source scripts/ascend_env.sh
 scripts/run_qwen_ascend_tp4.sh "The capital of France is" 8
 ```
 
+The same checkpoint behind the OpenAI-compatible server, on the same cards:
+
+```bash
+source scripts/ascend_env.sh
+python -m pocketllm serve \
+    --model /path/to/Qwen3.8-27B \
+    --backend cpp --device ascend --device-ids 4,5,6,7 \
+    --tensor-parallel-size 4 --served-model-name qwen3.8-27b-bf16 \
+    --host 127.0.0.1 --port 8124
+```
+
+[Qwen3.8-27B behind the server](../performance/ascend_qwen_bf16_served.md) is what that produced.
+
 ## What is supported
 
 | Capability | State |
@@ -82,7 +95,7 @@ scripts/run_qwen_ascend_tp4.sh "The capital of France is" 8
 | TP4 shard contract audit | Validated on the real checkpoint |
 | Full-model CUDA generation | **Not validated** — no TPS, no cross-rank determinism, no MTP behaviour measured |
 | Full-model Ascend generation, TP4 | **Validated and measured** — the six records under [Performance](../performance/index.md) and the [roadmap](../architecture/ascend_performance_roadmap.md) all run this checkpoint |
-| Native OpenAI-compatible serving | **Not validated** for this checkpoint on either backend |
+| Native OpenAI-compatible serving | **Served and measured on Ascend TP4** — one ladder, one workload, one shape: see [Qwen3.8-27B behind the server](../performance/ascend_qwen_bf16_served.md). **Not validated** on CUDA |
 | Vision tower, image and video inputs | **Not implemented** — never mapped or uploaded |
 
 ## Hardware and memory
@@ -97,8 +110,13 @@ scripts/run_qwen_ascend_tp4.sh "The capital of France is" 8
 
 This checkpoint is the one the Ascend backend runs. Four first-generation 910B cards (32 GiB HBM
 each, CANN 9.0.0), one process a rank, TP4 — the same four-card layout the CUDA path describes —
-driven by `scripts/run_qwen_ascend_tp4.sh` against the engine binary rather than by `pocketllm serve`,
-which has never been pointed at this weight source.
+driven by `scripts/run_qwen_ascend_tp4.sh` against the engine binary. The same checkpoint has since
+been put behind `pocketllm serve` on the same four cards — [Qwen3.8-27B behind the
+server](../performance/ascend_qwen_bf16_served.md) — where the HTTP path emitted the identical greedy
+token sequence at 22.18 output tok/s at concurrency one and 69.88 at concurrency eight on the default
+configuration. That default stops at `DEFAULT_BATCH_SLOTS = 8` rather than at anything about this
+checkpoint; passing `--max-batch-size 16` is worth 1.45×, reaching **101.56** output tok/s at
+concurrency 16, after which it is the engine's own 16-row plateau that binds.
 
 Residency is the number the table above reports, and it is not a coincidence. `qwen_device_dtype`
 narrows BF16 to FP16 for both backends and lives in `core/`, where it names both: RTX 2080 Ti has no
@@ -129,7 +147,9 @@ re-measured, and each page says which of its own figures survived.
 - **12.8 GiB of resident weights a rank at TP4**, well above the other two Qwen checkpoints.
 - **Text only.** The vision tower is never mapped or uploaded, though its tensors occupy 0.858 GiB of
   the 18 shards the loader reads.
-- **The Ascend path is the engine CLI, not the server.** Several of this backend's published figures
+- **The Ascend figures are the engine CLI, not the server.** The [serving
+  record](../performance/ascend_qwen_bf16_served.md) is the one that went through the HTTP path, and
+  it is the only one that should be read for serving. Several of this backend's published figures
   have been withdrawn and re-measured as artefacts rather than results, and the backend's defaults
   have moved under them — each record says which of its own numbers survived, so read the record a
   figure comes from before quoting it.
