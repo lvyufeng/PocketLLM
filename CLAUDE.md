@@ -136,11 +136,12 @@ be verified from here** — treat them as claims to re-check in place.
 
 ## Network access
 
-- **`origin` is SSH over port 443**: `git@github.com:lvyufeng/PocketLLM.git`, resolved by a
-  `~/.ssh/config` entry — the host is the alias `github.com`, so the remote reads exactly as it
-  would for the real one, but it points at `HostName ssh.github.com` `Port 443`. Port 22 is blocked
-  and `ssh -T git@github.com` is refused without that entry; `git@github.com` with it authenticates,
-  as the key `~/.ssh/id_ed25519_github` does. Pushes work.
+- **`origin` is HTTPS**: `https://github.com/lvyufeng/PocketLLM.git`. There is no SSH key this host
+  can authenticate to GitHub with — `~/.ssh/` holds `id_ed25519` and no `_github` key,
+  `~/.ssh/config` has no `github.com` entry, and `ssh -T git@github.com` is refused on port 22
+  (checked 2026-09-29). A refused handshake says this host has no accepted key, not that a keyed
+  route does not exist, so a host with the entry described in this bullet's earlier revision would
+  still push over SSH.
 - `gh` is authenticated separately, as the account `lvyufeng`. It uses `api.github.com`, which is a
   different path from git's — so a `gh` command can fail while a push succeeds.
 - `github.com` over HTTPS answers, including the API's own paths (checked 2026-09-29; it was
