@@ -132,10 +132,11 @@ process environment by the engine, `pocketllm serve` exports none of them, and t
 do not either. A pass with `POCKET_ASCEND_IPC_ALLREDUCE=1` and
 `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1` set around the parent — the configuration the
 [single-request record](ascend_single_request_tps.md) measures as worth 106.33 → 39.4 ms a step —
-produced c=1 = 22.18 tok/s and c=8 = 69.88, which is the default column to the digit. **The switch
-does not register at these prompt lengths**, which is a null result and the reason those two arms are
-not given a column: a table row labelled "with IPC" would misrepresent a run that measured the
-default.
+produced c=1 = 22.18 tok/s and c=8 = 69.88, against a default column of 21.99-22.18 and 69.88. **The
+switch does not register at these prompt lengths**, which is a null result and the reason those two
+arms are not given a column: a table row labelled "with IPC" would misrepresent a run that measured
+the default. The next paragraph is the arithmetic that makes "one number identical and one inside the
+spread" a null result rather than a near-miss.
 
 Three runs of the c=1 arm land in **21.19-22.18 tok/s** (21.99, 22.18, 21.19 — the last on the tree
 with [#495](https://github.com/lvyufeng/PocketLLM/pull/495), see §6) and two of the c=8 arm in
@@ -239,8 +240,11 @@ the end of the road.**
 | `--max-batch-size 16`, width 16 | 16 | 48 | 101.03 | 1.581 | 10037.9 ms |
 | `--max-batch-size 16`, width 16 | 32 | 32 | 93.17 | 1.456 | 14520.9 ms |
 
-Same server, same workload, only the flag and the client's concurrency changed, and the c=8 and c=1
-arms reproduce the §2 column to the digit — which is the check that the two tables are one ladder.
+Same server, same workload, only the flag and the client's concurrency changed. **The c=8 arm
+reproduces the §2 column exactly** — 69.88 both times, same req/s, same first-token time to the
+millisecond — and the c=1 arm agrees to **21.85 against 21.99**, inside the 21.19-22.18 spread §2
+records for that arm rather than equal to it. That is the check that the two tables are one ladder on
+one checkpoint rather than two measurements of two servers.
 **Raising the slot count is worth 1.45×**, 69.88 → 101.56, and the cap moves with it: a sampler through
 a 32-client wave reads `requests_running 16` with `slots_free 0` and `requests_waiting` 7, then 8, then
 9 — the same pinned-and-queuing shape §4 saw at 8, one width up. Concurrency 32 is past the width and
@@ -298,11 +302,12 @@ same checkpoint would do on a 2080 Ti.
 3. **The collective in use cannot be told from these numbers, and this record does not claim which
    one ran.** The engine reads the `POCKET_ASCEND_IPC_*` names from the process environment, so the
    server inherits whatever the shell has; nothing on the Python side exports them. A pass with the
-   two collected names set explicitly produced c=1 = 22.18 and c=8 = 69.88, which is the shipped
-   column to the digit, so **switching the collective on this checkpoint does not register at the
-   client at all** — at 244 tokens of prompt and 64 of output, the collective is not what this
-   workload is waiting on. That is a null result, stated as one. A record that needs to know *which*
-   collective ran needs the engine's own instrumentation rather than this client.
+   two collected names set explicitly produced c=1 = 22.18 and c=8 = 69.88, against a default column
+   of 21.99-22.18 and 69.88 — one number identical and one inside the default arm's own spread, at a
+   workload whose two ends differ by 3.18×. So **switching the collective on this checkpoint does not
+   register at the client at all**: at 244 tokens of prompt and 64 of output, the collective is not
+   what this workload is waiting on. That is a null result, stated as one. A record that needs to know
+   *which* collective ran needs the engine's own instrumentation rather than this client.
 4. **This is not a long-context result.** 244 prompt tokens says nothing about how `pocketllm serve`
    handles a streamed 4,966-token prefill, which is a different measurement on this backend.
 5. **The two widths are a two-point ladder, and the residency between them is one observation.** What
