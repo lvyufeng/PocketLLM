@@ -8,9 +8,11 @@ output tokens each. Tokenizer source: the checkpoint's own.
 
 Engine: the `pocketllm_cpp` module built on this host at 02:51:40 UTC on 2026-09-29, whose sources are
 identical to `b5f791c` in every file that is not a comment — the only later edits under `cpp_engine/`
-are the 910B renames in [the naming change](ascend_cpp_serving_ladder.md). Python tree: `master` at
-`5b29b8e`, and the correctness check in §6 was repeated on `1c8b586` ([#495](https://github.com/lvyufeng/PocketLLM/pull/495),
-the last commit to touch the adapter layer) to confirm the front end did not change the tokens.
+are four comments in test and bench sources renamed by
+[#498](https://github.com/lvyufeng/PocketLLM/pull/498), which moved no code. Python tree `master` at
+`5b29b8e`, where `pocketllm/backends/cpp_backend.py` — the file §3 and §4 are about — is identical to
+`1c8b586` ([#495](https://github.com/lvyufeng/PocketLLM/pull/495), the last commit to touch it), so
+the line numbers those sections cite hold at both.
 
 This is the first record of this checkpoint behind `pocketllm serve` on any hardware. The engine had
 already run it at TP4 through `scripts/run_qwen_ascend_tp4.sh` at `rows=1` and at a batch — that is
@@ -212,8 +214,10 @@ regime for this checkpoint**; it is the same one behind a different front end.
 A request whose prompt comes from the chat template is not the same request. The same question asked
 through `/v1/chat/completions` carries the template's tokens and answers in two of them — `Paris`,
 `finish_reason: stop` — which is a different prompt, so it is not evidence either way about the
-sequence above. The CLI's own gate is the batched one described in
-[the model guide](../models/qwen3.8-27b-bf16.md); nothing here replaces it.
+sequence above. The CLI's own gate is the batched one, `QWEN_BATCH_ROWS=16 QWEN_BATCH_VERIFY=3` — the
+harness compares the batched path against a single-row reference on both tokens and logits — described
+in [the single-request record](ascend_single_request_tps.md#552-the-gate-it-has-to-pass); nothing here
+replaces it.
 
 No CUDA arm was run. This record says what the server costs on the 910B and nothing about what the
 same checkpoint would do on a 2080 Ti.
