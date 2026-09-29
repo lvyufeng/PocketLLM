@@ -75,6 +75,21 @@ Two invariants the layout exists to protect:
 Quantized kernel dispatch on the Python side goes through `src/kernels/ops.py`
 (`_auto_impl` / `_resolve_impl`), with paired `*_torch` / `*_triton` implementations behind it.
 
+### What stays untracked
+
+Two directories at the repository root are **measurement artifacts, not sources**, and neither is in
+`.gitignore` — they show up as untracked on every `git status`, which is why they are listed here
+rather than left to be discovered:
+
+| Path | What it is |
+|---|---|
+| `sweep-rep-flip/`, `sweep-rep-flip2/` | Output of the `QWEN_ASCEND_REPLICATE_ROWS` sweeps — per-arm `.json`, `.metrics` and `.out` files, tens of MB, one directory a sweep session. |
+
+**Never commit either of them.** The sweeps in particular are cited by the records in
+`docs/performance/` under those file names, so keep the directories where they are rather than moving
+them into a build tree or deleting them after a write-up. A working tree whose only untracked entries
+are these two is clean.
+
 ## Hardware and toolchain
 
 Two development machines, one per backend. **Determine which one you are on before concluding
@@ -121,11 +136,17 @@ be verified from here** — treat them as claims to re-check in place.
 
 ## Network access
 
-- **`origin` is HTTPS**: `https://github.com/lvyufeng/PocketLLM.git`, with `gh` authenticated as
-  `lvyufeng`. There is no SSH remote, no `~/.ssh/config` entry for `github.com`, and no deploy key;
-  `ssh -T git@github.com` is refused on port 22. Use HTTPS.
-- `github.com` over 443 works (checked 2026-09-14). The SNI-filtering workaround documented here
-  previously no longer applies.
+- **`origin` is SSH over port 443**: `git@github.com:lvyufeng/PocketLLM.git`, resolved by a
+  `~/.ssh/config` entry — the host is the alias `github.com`, so the remote reads exactly as it
+  would for the real one, but it points at `HostName ssh.github.com` `Port 443`. Port 22 is blocked
+  and `ssh -T git@github.com` is refused without that entry; `git@github.com` with it authenticates,
+  as the key `~/.ssh/id_ed25519_github` does. Pushes work.
+- `gh` is authenticated separately, as the account `lvyufeng`. It uses `api.github.com`, which is a
+  different path from git's — so a `gh` command can fail while a push succeeds.
+- `github.com` over HTTPS answers, including the API's own paths (checked 2026-09-29; it was
+  unreachable at some point before that, and the earlier SNI-filtering workaround no longer
+  applies). **README badges and raw-file links over `raw.githubusercontent.com` and `camo.` have not
+  been checked** and are not covered by any of the above.
 - `api.github.com` is reachable but **intermittently times out**. `gh` commands — `gh pr list
   --json` in particular — may need a retry.
 - PyPI and Test PyPI are reachable over HTTPS. `docs/guides/pypi_release.md` documents the release flow and
@@ -160,7 +181,12 @@ end with `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
 
 Commits: a one-line summary under 72 characters, a blank line, then the explanation starting on line
 3. Every commit message must end with
-`Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`.
+`Co-Authored-By: Claude Code <noreply@anthropic.com>`.
+
+The commit trailer's address is `noreply@anthropic.com`, **not** the `anthropic.com` one this file
+used to spell — commits carrying the old address are attributed to the wrong identity. Do not
+"normalize" the two toward each other in either direction: the old address is still correct on the
+history that already has it, and rewriting it would be a force-push over other people's commits.
 
 Merged branches are **not** reliably deleted on `origin`, so delete yours yourself, locally and
 remotely.
