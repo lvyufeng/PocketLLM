@@ -852,8 +852,7 @@ class CppBackend(BackendBase):
     def _detect_engine_kind(self) -> str:
         """Ask the native registry which engine this checkpoint wants."""
         detect = getattr(self._native, "detect_architecture", None)
-        checkpoint = self.args.checkpoint_dir
-        if detect is None or not checkpoint:
+        if detect is None or not self.args.checkpoint_dir:
             # An older native module, or a caller that passed no checkpoint at
             # all (token-only tests).  Keep the previous default rather than
             # failing on a path that never needed detecting.
@@ -862,8 +861,7 @@ class CppBackend(BackendBase):
         # architecture in its own header instead -- so a directory holding one
         # names it through the file it holds, which is the same file the engine
         # will open.
-        if not checkpoint.endswith(".gguf"):
-            checkpoint = gguf_checkpoint_file(checkpoint) or checkpoint
+        checkpoint = self._native_checkpoint()
         try:
             architecture = str(detect(checkpoint))
         except Exception as exc:
@@ -883,7 +881,13 @@ class CppBackend(BackendBase):
         return kind
 
     def _construct_persistent_engine(self) -> Any:
-        """Construct PersistentEngine (supports TP worker loop)."""
+        """Construct PersistentEngine (supports TP worker loop).
+
+        Deliberately handed ``checkpoint_dir`` rather than ``_native_checkpoint()``: this engine has
+        no GGUF forward at all -- it refuses a ``.gguf`` path by name with "GGUF Q2 dense forward is
+        not yet wired up" -- so a directory holding one is not a layout it serves, and resolving it
+        here would only change which of the two errors a caller sees.
+        """
         cls = getattr(self._native, "PersistentEngine", None)
         options_cls = getattr(self._native, "ForwardSmokeOptions", None)
         if cls is None or options_cls is None:
@@ -955,13 +959,26 @@ class CppBackend(BackendBase):
         for name, value in _ENGINE_SAMPLING_DEFAULTS.items():
             if hasattr(options, name):
                 setattr(options, name, value)
-        engine = cls(self.args.checkpoint_dir, options, 0, self._context_tokens())
+        engine = cls(self._native_checkpoint(), options, 0, self._context_tokens())
         # warmup_tp() builds the command channel and forces the NCCL
         # communicator up.  Both ranks must do it before any rank issues a
         # collective, and a worker cannot enter run_worker_loop() without it.
         if self.args.tensor_parallel_size > 1:
             engine.warmup_tp()
         return engine
+
+    def _native_checkpoint(self) -> str:
+        """The checkpoint path the native reader opens, which is not always the one it was named by.
+
+        A checkpoint directory may hold a single GGUF rather than a safetensors index -- the released
+        ternary artifact is exactly that, one file and nothing else -- and the C++ reader dispatches
+        on the path's own ``.gguf`` suffix. Handing it the directory reads it as an index and fails
+        on the ``config.json`` it does not have, which is what ``pocketllm serve`` did on the ternary
+        checkpoint until this resolved. Ask this rather than ``checkpoint_dir`` anywhere a path goes
+        to the engine, so the file the engine opens is the file every other question was asked about.
+        """
+        checkpoint = self.args.checkpoint_dir or ""
+        return gguf_checkpoint_file(checkpoint) or checkpoint
 
     def _native_rank_device(self) -> int:
         """Resolve this rank's card index, which the native engine takes as one integer.
@@ -1158,11 +1175,8 @@ class CppBackend(BackendBase):
         """
         if self._constraint_tokenizer_cache is _READER_UNSET:
             tokenizer = None
-            path = self.args.checkpoint_dir
+            path = self._native_checkpoint()
             if path and self._native is not None:
-                # A directory may hold a GGUF rather than a `tokenizer.json`, and the C++ reader
-                # takes the container's own path: the file it holds is the one the engine opened.
-                path = gguf_checkpoint_file(path) or path
                 try:
                     tokenizer = self._native.Tokenizer(path)
                 except Exception as exc:
@@ -1354,7 +1368,7 @@ class CppBackend(BackendBase):
             reader = None
             if self._tokenizer is not None:
                 reader = build_templater(
-                    detect_architecture(self.args.checkpoint_dir or ""), self._tokenizer
+                    detect_architecture(self._native_checkpoint()), self._tokenizer
                 )
             self._answer_reader_cache = reader
         return self._answer_reader_cache
