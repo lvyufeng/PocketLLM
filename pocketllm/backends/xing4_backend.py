@@ -54,12 +54,10 @@ from pocketllm.api import (
     ConfigurationError,
     GenerationRequest,
     GenerationResult,
-    TimingMetrics,
     TokenEvent,
-    Usage,
 )
 
-from .base import BackendBase, TokenStreamer
+from .base import RuntimeAdapter, TokenStreamer
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
 from .options import BackendOption, Group, Kind, decode_args
 from .shared_options import PREFILL_CHUNK, PREFIX_CACHE_BYTES
@@ -314,8 +312,11 @@ def _is_xing4_release(directory: Path) -> bool:
     return str(config.get("model_type", "")).lower() == "xing4_0" 
 
 
-class Xing4Backend(SchedulerHost, BackendBase):
+class Xing4Backend(SchedulerHost, RuntimeAdapter):
     """One Xing4.0-29B-A4B checkpoint on one card, one request at a time."""
+
+    #: Read by `RuntimeAdapter._tokenize`, which is the only place a runtime's name is needed.
+    _RUNTIME_LABEL = "Xing4"
 
     name = "xing4"
 
@@ -456,11 +457,6 @@ class Xing4Backend(SchedulerHost, BackendBase):
             self._publish_cache_metrics()
 
     # ------------------------------------------------------------------ lifecycle
-
-    def prepare(self) -> None:
-        self._ensure_open()
-        self._ensure_loaded()
-        self._ensure_prefix_cache()
 
     def _ensure_loaded(self) -> None:
         if self._model is not None:
@@ -670,33 +666,6 @@ class Xing4Backend(SchedulerHost, BackendBase):
 
     # -------------------------------------------------------------------- requests
 
-    def _tokenize(self, request: GenerationRequest) -> list[int]:
-        if request.prompt_tokens is not None:
-            return [int(token) for token in request.prompt_tokens]
-        tokenizer = self._tokenizer
-        if tokenizer is None:
-            raise RuntimeError("the Xing4 tokenizer is not loaded")
-        messages = request.metadata.get("messages")
-        if messages:
-            return self._encode_chat(tokenizer, messages, request.metadata)
-        # A raw completion prompt is not chat and gets no header.
-        return [int(token) for token in tokenizer(request.prompt)["input_ids"]]
-
-    def _encode_chat(self, tokenizer: Any, messages: Any, metadata: Mapping[str, Any]) -> list[int]:
-        """Render a chat with the template the checkpoint ships."""
-        tools = metadata.get("tools")
-        kwargs: dict[str, Any] = {}
-        if tools:
-            kwargs["tools"] = tools
-        try:
-            text = tokenizer.apply_chat_template(
-                list(messages), tokenize=False, add_generation_prompt=True, **kwargs
-            )
-        except (ValueError, TypeError) as exc:
-            raise ConfigurationError(f"the chat template refused this conversation: {exc}") from exc
-        # The rendered prompt opens with its own control tokens, so nothing may be added here.
-        return [int(token) for token in tokenizer(text, add_special_tokens=False)["input_ids"]]
-
     def _eos_tokens(self) -> set[int]:
         """The ids that end a turn, from the config and the tokenizer's own end-of-text.
 
@@ -726,15 +695,6 @@ class Xing4Backend(SchedulerHost, BackendBase):
                 "budget; send a prompt_tokens request with an explicit max_tokens"
             )
         return found
-
-    def _budget(self, prompt_ids: Sequence[int], request: GenerationRequest) -> int:
-        room = self._max_seq_len - len(prompt_ids)
-        if room < 1:
-            raise ConfigurationError(
-                f"a prompt of {len(prompt_ids)} tokens fills the {self._max_seq_len} positions "
-                f"this run's cache was sized at; raise --max-model-len and restart"
-            )
-        return int(request.sampling_params.token_budget(room))
 
     def _loop(
         self,
@@ -774,48 +734,6 @@ class Xing4Backend(SchedulerHost, BackendBase):
             # Under the request lock, like the run itself, so the counters are the state of the
             # store between requests rather than of one mid-prefill.
             self._publish_cache_metrics()
-
-    def _decode(self, token_ids: Sequence[int], skip_special_tokens: bool | None = None) -> str:
-        if self._tokenizer is None:
-            return ""
-        skip = True if skip_special_tokens is None else bool(skip_special_tokens)
-        try:
-            return self._tokenizer.decode(list(token_ids), skip_special_tokens=skip)
-        except Exception:  # pragma: no cover - a tokenizer that cannot decode one token
-            return ""
-
-    def _result(
-        self,
-        request: GenerationRequest,
-        prompt_ids: Sequence[int],
-        generation: Any,
-        marks: Mapping[str, float],
-        *,
-        stopped: str | None = None,
-    ) -> GenerationResult:
-        text = self._decode(generation.tokens)
-        finish = {"eos": "stop", "length": "length", "stop": "stop", "cancel": "cancelled"}.get(
-            generation.stopped if stopped is None else stopped, "stop"
-        )
-        now = time.perf_counter()
-        return GenerationResult(
-            request_id=request.request_id,
-            token_ids=list(generation.tokens),
-            text=text,
-            finish_reason=finish,
-            usage=Usage(
-                prompt_tokens=len(prompt_ids),
-                completion_tokens=len(generation.tokens),
-                cached_tokens=int(getattr(generation, "cached_tokens", 0)),
-            ),
-            timings=TimingMetrics(
-                prefill_seconds=generation.prefill_seconds,
-                decode_seconds=generation.decode_seconds,
-                total_seconds=now - marks.get("started", now),
-                ttft_seconds=generation.ttft_seconds,
-                tpot_seconds=generation.step_seconds,
-            ),
-        )
 
     def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
         self._ensure_loaded()
