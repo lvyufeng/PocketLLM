@@ -60,7 +60,7 @@ from pocketllm.api import (
 )
 
 from ..work_bell import Bell, BellRinger, WorkerBell, bell_path
-from .base import BackendBase, settled_text
+from .base import RuntimeAdapter, settled_text
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
 from .options import BackendOption, Group, Kind, decode_args
 from .shared_options import (
@@ -355,7 +355,7 @@ class _Options:
         return options
 
 
-class V41Backend(SchedulerHost, BackendBase):
+class V41Backend(SchedulerHost, RuntimeAdapter):
     """Serve one DeepSeek-V4.1-Flash checkpoint, one request at a time.
 
     ``loader`` and ``front`` are injection points for tests: a unit test supplies a callable that
@@ -363,7 +363,19 @@ class V41Backend(SchedulerHost, BackendBase):
     path can be exercised without a 476 GiB checkpoint or four cards.
     """
 
+    #: Read by `RuntimeAdapter._tokenize`, which is the only place a runtime's name is needed.
+    _RUNTIME_LABEL = "V4.1"
+
     name = "v41"
+
+    def _skip_special_tokens(self) -> bool:
+        """This run's own answer, because this adapter has a flag for it.
+
+        The base's `True` is the right default for the three runtimes that cannot configure it;
+        this one can, and an operator who asked for the control tokens to be visible is asking for
+        the text every other part of the answer was built from.
+        """
+        return bool(self._options.skip_special_tokens)
 
     def __init__(
         self,
@@ -501,10 +513,6 @@ class V41Backend(SchedulerHost, BackendBase):
         return None
 
     # ------------------------------------------------------------------ lifecycle
-
-    def prepare(self) -> None:
-        self._ensure_open()
-        self._ensure_loaded()
 
     def _ensure_loaded(self) -> None:
         self._ensure_open()
@@ -870,19 +878,6 @@ class V41Backend(SchedulerHost, BackendBase):
             float(result.decode_seconds) or None,
             None,
         )
-
-    def _tokenize(self, request: GenerationRequest) -> list[int]:
-        if request.prompt_tokens is not None:
-            return list(request.prompt_tokens)
-        tokenizer = self._tokenizer
-        if tokenizer is None:
-            raise RuntimeError("the V4.1 tokenizer is not loaded")
-        messages = request.metadata.get("messages")
-        if messages:
-            return self._encode_chat(tokenizer, messages, request.metadata)
-        # A raw completion prompt is not chat and gets no header, which is also what the launcher
-        # does with ``--prompt``.
-        return [int(token) for token in tokenizer(request.prompt)["input_ids"]]
 
     def _encode_chat(
         self, tokenizer: Any, messages: Any, metadata: Mapping[str, Any]
@@ -1308,17 +1303,6 @@ class V41Backend(SchedulerHost, BackendBase):
     def _eos_token_id(self) -> int | None:
         tokenizer = self._tokenizer
         return None if tokenizer is None else getattr(tokenizer, "eos_token_id", None)
-
-    def _decode(self, token_ids: Sequence[int], skip_special_tokens: bool | None = None) -> str:
-        tokenizer = self._tokenizer
-        if tokenizer is None or not token_ids:
-            return ""
-        if skip_special_tokens is None:
-            skip_special_tokens = self._options.skip_special_tokens
-        try:
-            return tokenizer.decode(list(token_ids), skip_special_tokens=skip_special_tokens)
-        except TypeError:  # a tokenizer whose decode has no such keyword
-            return tokenizer.decode(list(token_ids))
 
     def _structured(
         self,
