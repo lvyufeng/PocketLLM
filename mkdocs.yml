@@ -194,6 +194,7 @@ nav:
       - vLLM and SGLang comparison (pre-Phase-1): architecture/vllm_sglang_comparison.md
       - The command-line surface against vLLM and SGLang: architecture/cli_surface_design_2026_09.md
       - Ascend 910B performance roadmap: architecture/ascend_performance_roadmap.md
+      - Per-method duplication across the five adapters: architecture/per_method_duplication_2026_09.md
   - Migration:
       - Overview: migration/index.md
       - "A max_tokens the context cannot hold is refused": migration/overlong-max-tokens-is-refused.md

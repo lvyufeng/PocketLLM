@@ -43,6 +43,7 @@ usually measured against. Three things are worth knowing before reading:
 | [cpp_engine vs vLLM/SGLang comparison](vllm_sglang_comparison.md) | The earlier comparison, retained as the pre-Phase-1 baseline. |
 | [The command-line surface against vLLM and SGLang](cli_surface_design_2026_09.md) | What both stacks put on the command line, read at their tip on 2026-09-28: why neither has a flag spelled twice while we have four, where a runtime's difference belongs (a resolved default, not a second flag), when a family prefix is right (`--dsv4-*`, `--kt-*`), and the flag-by-flag mapping that fixes U2b and U3. `scripts/upstream_cli_inventory.py` reprints the numbers against any checkout. |
 | [Ascend 910B performance roadmap](ascend_performance_roadmap.md) | Where the prefill and decode targets actually stand after measurement, and the ranked next steps — including why the decode target needs quantization rather than tuning. |
+| [Per-method duplication across the five adapters](per_method_duplication_2026_09.md) | The measurement #442's slices turn on: same-named methods across `pocketllm/backends/*.py`, ranked by `ast` + `difflib` similarity, with the current table and the two rows that turned out to be one parameter apart. `scripts/method_duplication.py` reprints it. |
 
 The invariants these designs exist to protect are stated in the repository's
 `CLAUDE.md`: kernels stay behind the C ABI, and backend selection happens at
