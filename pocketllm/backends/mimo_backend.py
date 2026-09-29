@@ -52,10 +52,9 @@ disconnect do anything at all.
 from __future__ import annotations
 
 import os
-import queue
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -65,11 +64,10 @@ from pocketllm.api import (
     GenerationRequest,
     GenerationResult,
     RequestCancelledError,
-    TokenEvent,
     UnsupportedFeatureError,
 )
 
-from .base import RuntimeAdapter, TokenStreamer, settled_text
+from .base import RuntimeAdapter, TokenStreamer
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
 from .options import BackendOption, Group, Kind, decode_args
 from .shared_options import (
@@ -854,80 +852,29 @@ class MimoBackend(SchedulerHost, RuntimeAdapter):
             return self._generate_batched(requests)
         return [self._generate_one(request) for request in requests]
 
-    def stream(self, request: GenerationRequest) -> Iterator[TokenEvent]:
-        """Yield one event a token, off a worker thread, with the stop strings held back.
+    def _run_loop(
+        self,
+        prompt_ids: Sequence[int],
+        budget: int,
+        request: GenerationRequest,
+        streamer: TokenStreamer,
+        marks: dict[str, float],
+    ) -> Any:
+        """This runtime's loop, with the streamer deciding both the token and the step.
 
-        The loop has to run somewhere and the events have to be yielded from here, and the two
-        cannot be the same frame. A thread a request is also what lets a client's disconnect --
-        which arrives on the HTTP thread as :meth:`cancel` -- reach the loop at all.
+        `marks` goes through with the request because this loop's signature takes it; what the loop
+        leaves there is read by `_result`, which `_produce` calls once the loop is over. The stop
+        string has to reach the *loop* and not only the stream, or a marker that ends the sending
+        leaves the run generating tokens past it that nobody reads -- see `_loop`.
         """
-        self._ensure_loaded()
-        self._begin_request(request.request_id)
-        events: queue.Queue[TokenEvent | None] = queue.Queue(maxsize=64)
-        box: dict[str, Any] = {}
-
-        def worker() -> None:
-            try:
-                prompt_ids = self._tokenize(request)
-                budget = self._budget(prompt_ids, request)
-                streamer = TokenStreamer(
-                    request_id=request.request_id,
-                    stops=tuple(request.sampling_params.stop or ()),
-                    events=events,
-                    decode=self._decode,
-                )
-                with self._request_lock:
-                    marks = {"started": time.perf_counter()}
-                    generation = self._loop(
-                        prompt_ids,
-                        budget,
-                        request,
-                        on_token=streamer.accept,
-                        marks=marks,
-                        stop=streamer.reached,
-                    )
-                if generation.stopped == "cancel" and not streamer.hit:
-                    events.put(
-                        TokenEvent(request_id=request.request_id, finish_reason="cancelled")
-                    )
-                    return
-                # Whatever the holdback was holding: the answer is over, so the tail is either
-                # text the model really wrote or the start of a stop string that never finished,
-                # and only the first of those may be sent.
-                streamer.flush(generation.tokens)
-                box["result"] = self._result(
-                    request,
-                    prompt_ids,
-                    generation,
-                    marks,
-                    stopped="stop" if streamer.hit else None,
-                )
-                events.put(
-                    TokenEvent(
-                        request_id=request.request_id,
-                        finish_reason=box["result"].finish_reason,
-                        usage=box["result"].usage,
-                        metadata={"timings": box["result"].timings.as_dict()},
-                    )
-                )
-            except BaseException as exc:  # a raise here must not leave the client hanging
-                box["error"] = exc
-            finally:
-                self._clear_request(request.request_id)
-                events.put(None)
-
-        thread = threading.Thread(target=worker, name=f"mimo-{request.request_id}", daemon=True)
-        thread.start()
-        try:
-            while True:
-                event = events.get()
-                if event is None:
-                    break
-                yield event
-        finally:
-            thread.join(timeout=1.0)
-        if "error" in box:
-            raise box["error"]
+        return self._loop(
+            prompt_ids,
+            budget,
+            request,
+            on_token=streamer.accept,
+            marks=marks,
+            stop=streamer.reached,
+        )
 
     # -------------------------------------------------------------------- ranks
 

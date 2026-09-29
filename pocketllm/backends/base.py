@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -305,7 +306,8 @@ class RuntimeAdapter(BackendBase):
     A subclass supplies its runtime's name through :attr:`_RUNTIME_LABEL`, and overrides whatever
     it does differently: ``_encode_chat`` where the checkpoint's format is not a jinja template,
     ``_budget`` and ``_tokenize`` where the arithmetic is not this one, ``_result`` where the answer
-    has a structure to read.  What a subclass is left keeping is exactly that list, which is the
+    has a structure to read, ``_run_loop`` for the one line of a streamed request that names the
+    runtime's own loop.  What a subclass is left keeping is exactly that list, which is the
     point of the base -- the parts that are left are the parts that differ.
 
     The only state read here is ``_tokenizer`` and ``_max_seq_len``, which every adapter in this
@@ -420,6 +422,91 @@ class RuntimeAdapter(BackendBase):
         except Exception:  # pragma: no cover - the same, without the keyword to blame
             return ""
 
+    def stream(self, request: GenerationRequest) -> Iterator[TokenEvent]:
+        """Yield one event a token, off a worker thread, with the stop strings held back.
+
+        The loop has to run somewhere and the events have to be yielded from here, and the two cannot
+        be the same frame: the runtime's loop is a call that ends with the whole generation, while a
+        stream is read out of it a token at a time. A thread a request is also what lets a client's
+        disconnect -- which arrives on the HTTP thread as :meth:`cancel` -- reach the loop at all.
+        The thread, the queue it hands events over on and the join are `_StreamRun`; what the thread
+        runs is :meth:`_produce`, and the one thing left to the runtime is :meth:`_run_loop`.
+
+        The body is deferred to the first ``next()``, as it has been for as long as there has been a
+        body to defer: a caller may build the iterator and never read it -- a client that is gone
+        before the response headers are written is exactly that -- and starting a generation for a
+        stream nobody drains would hold the request lock until the queue's depth ran out.
+        """
+        self._ensure_loaded()
+        self._begin_request(request.request_id)
+        run = _StreamRun(self, request, self._RUNTIME_LABEL)
+        run.start()
+        yield from run.drain()
+
+    def _produce(
+        self, request: GenerationRequest, events: Any, outcome: dict[str, Any]
+    ) -> None:
+        """One streamed generation, on `_StreamRun`'s thread.
+
+        The shape is the same for both runtimes that get here and is written once: tokenize, resolve
+        the budget, hand the loop a streamer that both forwards tokens and decides where the client's
+        stop string ends the run, then read the ending. What an ending *means* is where this family
+        could diverge, so it is spelled out rather than inferred: a cancellation under a stop string
+        is a stop string (the client asked for the cut and got it), a cancellation on its own is a
+        ``cancelled`` event with no result at all, and anything else is a result whose completion
+        count and usage are the loop's own.
+
+        A subclass that streams something that is not this shape overrides this rather than
+        :meth:`_run_loop`; ``v41`` does, because an answer there is a running decode to be diffed
+        rather than a token to be forwarded.
+        """
+        prompt_ids = self._tokenize(request)
+        budget = self._budget(prompt_ids, request)
+        streamer = TokenStreamer(
+            request_id=request.request_id,
+            stops=tuple(request.sampling_params.stop or ()),
+            events=events,
+            decode=self._decode,
+        )
+        with self._request_lock:
+            marks = {"started": time.perf_counter()}
+            generation = self._run_loop(prompt_ids, budget, request, streamer, marks)
+        if generation.stopped == "cancel" and not streamer.hit:
+            events.put(TokenEvent(request_id=request.request_id, finish_reason="cancelled"))
+            return
+        # Whatever the holdback was holding: the answer is over, so the tail is either text the
+        # model really wrote or the start of a stop string that never finished, and only the first
+        # of those may be sent.
+        streamer.flush(generation.tokens)
+        outcome["result"] = self._result(
+            request, prompt_ids, generation, marks, stopped="stop" if streamer.hit else None
+        )
+        events.put(
+            TokenEvent(
+                request_id=request.request_id,
+                finish_reason=outcome["result"].finish_reason,
+                usage=outcome["result"].usage,
+                metadata={"timings": outcome["result"].timings.as_dict()},
+            )
+        )
+
+    def _run_loop(
+        self,
+        prompt_ids: Sequence[int],
+        budget: int,
+        request: GenerationRequest,
+        streamer: TokenStreamer,
+        marks: dict[str, float],
+    ) -> Any:
+        """Run this runtime's loop for one streamed request, and hand back what it produced.
+
+        The one part of a streamed request that is the runtime's own: the loop's call shape, with
+        the streamer's two hooks passed under the names that loop expects. A runtime that must
+        also see the step boundary -- to broadcast a cancellation, say -- takes that from
+        ``streamer.reached`` and from the request's own cancellation, which the loop reads itself.
+        """
+        raise NotImplementedError
+
     def _finish_reason(self, stopped: str) -> str:
         """``stopped``, in the vocabulary the API reports.
 
@@ -460,6 +547,77 @@ class RuntimeAdapter(BackendBase):
                 tpot_seconds=generation.step_seconds,
             ),
         )
+
+
+#: How many events a stream may have in flight before its producer starts waiting.
+#:
+#: A slow reader is back-pressure on the producer rather than unbounded growth, and this is how much
+#: is handed over before the waiting starts. The producer is a loop holding the request lock while it
+#: emits, so a reader that never comes back parks it here rather than releasing it -- which is why
+#: the reader's own join in `_StreamRun.drain` is bounded, and why a producer's blocking ``put`` is
+#: not something this depth can be asked to fix. Both of the adapters that run a ``_loop`` under
+#: `_StreamRun` had the same 64 written out; V4.1 writes its own, because its producer puts with a
+#: timeout and reads a full queue as a cancellation.
+_STREAM_QUEUE_DEPTH = 64
+
+
+class _StreamRun:
+    """One streamed request's shape: the thread that loops, and the queue it hands tokens over on.
+
+    Written once because the two adapters that run a ``_loop`` are otherwise the same fifteen lines
+    of plumbing around the same call with the same two hooks: a queue, a worker thread that runs the
+    generation and puts its outcome in a box, a generator that yields what the thread put there, and
+    a join that re-raises the thread's failure on the client's own thread. Every part of that is
+    about a thread and a queue and nothing about a model.
+
+    What stays with the adapter is the loop itself -- *how* it is called, with the streamer's two
+    hooks under the names that loop uses -- and the adapter writes it in :meth:`_run_loop`. V4.1's
+    stream is a third shape again: it diffs a running decode rather than forwarding tokens, so it
+    has neither the streamer nor the budget here and keeps its own thread.
+    """
+
+    def __init__(self, adapter: Any, request: GenerationRequest, name: str) -> None:
+        self.adapter = adapter
+        self.request = request
+        self.events: queue.Queue[Any] = queue.Queue(maxsize=_STREAM_QUEUE_DEPTH)
+        #: What the loop produced, or the exception it raised; read once the thread has joined.
+        self.outcome: dict[str, Any] = {}
+        self.thread = threading.Thread(
+            target=self._run, name=f"{name}-{request.request_id}", daemon=True
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def _run(self) -> None:
+        try:
+            self.adapter._produce(self.request, self.events, self.outcome)
+        except BaseException as exc:  # a raise here must not leave the client hanging
+            self.outcome["error"] = exc
+        finally:
+            self.adapter._clear_request(self.request.request_id)
+            self.events.put(None)
+
+    def drain(self) -> Iterator[TokenEvent]:
+        """The events the producer put there, until it says it is done.
+
+        The join is in a ``finally`` because a client that stops reading mid-stream leaves the loop
+        running: the generator is being closed, and returning without joining would leave that
+        thread to finish on its own, which under the request lock is a closed connection holding the
+        next request out. It is bounded, because a producer parked on a full queue -- the one case
+        the join cannot resolve, since nothing is draining it any more -- must not also hang a
+        shutdown; a producer still running after the bound is one that is waiting for a reader.
+        """
+        try:
+            while True:
+                event = self.events.get()
+                if event is None:
+                    break
+                yield event
+        finally:
+            self.thread.join(timeout=1.0)
+        if "error" in self.outcome:
+            raise self.outcome["error"]
 
 
 class TokenStreamer:
