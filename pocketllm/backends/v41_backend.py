@@ -834,7 +834,6 @@ class V41Backend(SchedulerHost, RuntimeAdapter):
         # sent: the budget, the sampler, the seed and the thinking mode all come from the request
         # this row was submitted for rather than from a second derivation of them.
         payload = self._payload(context, prompt_ids)
-        self._validate_length(prompt_ids, payload)
 
         # The client's own id for this request, which is what `backend.cancel` is called with. The
         # scheduler's row id is not something a client ever sees, so keying the check on it would
@@ -910,21 +909,6 @@ class V41Backend(SchedulerHost, RuntimeAdapter):
         # the tokenizer add a second one.
         return [int(token) for token in tokenizer(text, add_special_tokens=False)["input_ids"]]
 
-    def _budget(self, prompt_ids: Sequence[int], request: GenerationRequest) -> int:
-        """How many tokens this request may generate, from the request and these caches.
-
-        An absent budget is resolved here and not at parse time, because the number of positions a
-        request may fill is a property of these caches: everything the prompt leaves of
-        `_max_seq_len`. The answer then ends at EOS or when the caches are full.
-
-        This is the only place the number is derived. `_payload` reads it for the serial path and
-        `SchedulerHost._generate_batched` reads it for the scheduler's own length check, and two
-        derivations of it would be a request whose budget the engine and the scheduler disagreed
-        about.
-        """
-        params = request.sampling_params
-        return int(params.token_budget(self._max_seq_len - len(prompt_ids)))
-
     def _payload(self, request: GenerationRequest, prompt_ids: Sequence[int]) -> dict[str, Any]:
         params = request.sampling_params
         return {
@@ -940,22 +924,6 @@ class V41Backend(SchedulerHost, RuntimeAdapter):
             "thinking_mode": str(request.metadata.get("thinking_mode") or "chat"),
         }
 
-    def _validate_length(self, prompt_ids: Sequence[int], payload: Mapping[str, Any]) -> None:
-        """Refuse a request this run's caches cannot hold, before any rank is told about it.
-
-        This is also what refuses a prompt that already fills the caches: the budget above is
-        derived from what the prompt leaves, and it is floored, so such a prompt arrives here with
-        a request that does not fit rather than with a budget of zero.
-        """
-        wanted = len(prompt_ids) + int(payload["max_new_tokens"])
-        if wanted <= self._max_seq_len:
-            return
-        raise ConfigurationError(
-            f"this request needs {wanted} positions ({len(prompt_ids)} prompt tokens and "
-            f"{payload['max_new_tokens']} new), and the attention caches were sized at "
-            f"{self._max_seq_len} at startup; raise --max-model-len and restart"
-        )
-
     def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
         self._ensure_loaded()
         if self._batching():
@@ -968,9 +936,9 @@ class V41Backend(SchedulerHost, RuntimeAdapter):
             prompt_ids = self._tokenize(request)
             payload = self._payload(request, prompt_ids)
             # Before the broadcast, never after: a rank 0 that refused here would leave every peer
-            # waiting on a broadcast that is not coming.
+            # waiting on a broadcast that is not coming. The length refusal already happened inside
+            # `_payload`: a budget this run cannot hold is refused where it is derived.
             self._check_cancelled(request.request_id)
-            self._validate_length(prompt_ids, payload)
             with self._request_lock:
                 self._check_cancelled(request.request_id)
                 result = self._run(payload, request, on_token=None)
@@ -1019,7 +987,6 @@ class V41Backend(SchedulerHost, RuntimeAdapter):
             prompt_ids = self._tokenize(request)
             payload = self._payload(request, prompt_ids)
             self._check_cancelled(request.request_id)
-            self._validate_length(prompt_ids, payload)
 
             events: queue.Queue = queue.Queue(maxsize=_STREAM_QUEUE_DEPTH)
             outcome: list[Any] = []

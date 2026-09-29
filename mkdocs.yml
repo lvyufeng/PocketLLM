@@ -195,6 +195,7 @@ nav:
       - Ascend 910A performance roadmap: architecture/ascend_performance_roadmap.md
   - Migration:
       - Overview: migration/index.md
+      - "A max_tokens the context cannot hold is refused": migration/overlong-max-tokens-is-refused.md
       - "A --max-batch-size that cannot be honoured is refused": migration/unhonourable-batch-width-is-refused.md
       - "The C++ binary's --serve front end is removed": migration/native-serve-front-end-removed.md
       - "--device splits into a platform and a card list": migration/device-splits-into-platform-and-cards.md

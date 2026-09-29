@@ -475,12 +475,33 @@ def test_a_prompt_that_does_not_fit_the_context_is_refused():
         loader=lambda _args, _options: ScriptedModel(),
         tokenizer=FakeTokenizer(),
     )
-    with pytest.raises(ConfigurationError, match="positions this run's cache was sized at"):
+    with pytest.raises(ConfigurationError, match="attention caches were sized at 16"):
         adapter.generate([request(prompt_ids=range(16), max_tokens=1)])
     # An absent budget is everything the prompt leaves, which is what an OpenAI client that sent
     # no max_tokens asked for.
     result = adapter.generate([request(prompt_ids=[5, 6], max_tokens=None)])[0]
     assert result.usage.completion_tokens <= 14
+
+
+def test_an_explicit_cap_the_context_cannot_hold_is_refused_too():
+    """A cap that fits is the caller's; a cap the caches cannot hold is this run's to refuse.
+
+    `SamplingParams.token_budget` hands an explicit `max_tokens` back **unchanged**, on the written
+    condition that the caller keeps a length check. This adapter had none: the budget was passed on
+    and the runtime sized its cache from it (`make_cache(len(ids) + budget + 8)`), so a cap of 100
+    against a 16-position context was not a refusal and not an error -- it was a silent allocation
+    for 118 positions. V4.1 refused that from the start; the refusal is now the family's.
+    """
+    adapter = MimoBackend(
+        EngineArgs(model="x", backend="mimo", max_model_len=16, backend_options={}),
+        loader=lambda _args, _options: ScriptedModel(),
+        tokenizer=FakeTokenizer(),
+    )
+    with pytest.raises(ConfigurationError, match=r"needs 20 positions \(10 prompt tokens and 10 new\)"):
+        adapter.generate([request(prompt_ids=range(10), max_tokens=10)])
+    # And one that fits is still answered.
+    result = adapter.generate([request(prompt_ids=range(10), max_tokens=6)])[0]
+    assert result.usage.prompt_tokens == 10
 
 
 def test_the_cache_is_the_context_the_launcher_asked_for():

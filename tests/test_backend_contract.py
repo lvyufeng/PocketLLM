@@ -12,6 +12,7 @@ from pocketllm.api import (
     ConfigurationError,
     GenerationRequest,
     GenerationResult,
+    SamplingParams,
     TokenEvent,
     UnsupportedFeatureError,
     Usage,
@@ -827,6 +828,34 @@ def test_the_shared_adapter_refuses_a_prompt_that_leaves_no_room():
 
     with pytest.raises(ConfigurationError, match="raise --max-model-len and restart"):
         adapter._budget([1, 2, 3, 4], request)
+
+
+def test_the_shared_adapter_refuses_a_cap_the_context_cannot_hold():
+    """The second half of `token_budget`'s contract, and the half that was missing on two adapters.
+
+    `SamplingParams.token_budget` hands an explicit `max_tokens` back **unchanged**, on the written
+    condition that "the caller's length check keeps the last word on it" (`api/types.py:339`). The
+    check is here because the number is derived here, and a caller that resolves a budget and never
+    compares it to the context is one that hands the runtime a cap its caches were not sized for.
+    """
+    adapter = _StubRuntimeAdapter(max_seq_len=8)
+
+    # Explicit and over the context: both numbers are named, so the caller can see which to change.
+    over = GenerationRequest(prompt_tokens=[1, 2, 3], sampling_params=SamplingParams(max_tokens=9), request_id="r")
+    with pytest.raises(ConfigurationError, match=r"needs 12 positions \(3 prompt tokens and 9 new\)"):
+        adapter._budget([1, 2, 3], over)
+
+    # Explicit and exactly filling it: the boundary is `<=`, so this is answered.
+    exact = GenerationRequest(prompt_tokens=[1, 2, 3], sampling_params=SamplingParams(max_tokens=5), request_id="r")
+    assert adapter._budget([1, 2, 3], exact) == 5
+
+    # Explicit and smaller than the room, which is the caller's to choose and not the check's to raise.
+    small = GenerationRequest(prompt_tokens=[1, 2, 3], sampling_params=SamplingParams(max_tokens=2), request_id="r")
+    assert adapter._budget([1, 2, 3], small) == 2
+
+    # Absent and derived: everything the prompt leaves.
+    derived = GenerationRequest(prompt_tokens=[1, 2, 3], request_id="r")
+    assert adapter._budget([1, 2, 3], derived) == 5
 
 
 def test_the_shared_adapter_answers_a_missing_tokenizer_with_its_runtime_name():
