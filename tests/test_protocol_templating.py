@@ -119,6 +119,24 @@ def test_two_ggufs_in_one_directory_name_no_architecture(tmp_path):
     assert detect_architecture(str(tmp_path)) == ""
 
 
+def test_the_gguf_spelling_of_qwen35_folds_onto_the_canonical_name(tmp_path):
+    """The released GGUF declares ``qwen35``, and either spelling selects one runtime.
+
+    This is not a naming preference: the answer picks the templater, and through it the tool-call
+    parser (``_tool_call_parsers``), so an unfolded ``qwen35`` leaves Qwen's own call syntax inside
+    the content instead of parsed out of it -- silently, because leaving it visible is what the
+    generic templater does for every architecture it has no parser for.  The registry folds it
+    (``canonical_qwen_architecture``), so the same checkpoint served by the native front end and by
+    the Python host has to read one answer.
+    """
+    gguf = tmp_path / "model.gguf"
+    _write_gguf(gguf, "qwen35")
+    assert detect_architecture(str(gguf)) == "qwen3_5"
+
+    templater = build_templater(detect_architecture(str(gguf)), RecordingTokenizer())
+    assert templater._tool_call_parser is not None
+
+
 def test_generic_sidecar_uses_checkpoint_chat_template_for_ids_and_text():
     tokenizer = RecordingTokenizer()
     templater = ChatTemplateTemplater(tokenizer)
