@@ -467,6 +467,40 @@ def test_a_stream_cuts_at_a_stop_string_and_holds_back_a_partial_one() -> None:
     assert events[-1].finish_reason == "stop"
 
 
+def test_a_stop_string_ends_the_run_and_not_only_the_sending() -> None:
+    """The marker stops the *loop*, which for a while it did not.
+
+    `_loop` took no stop predicate, so a stream found its marker, stopped sending, and let the
+    generation run on to the budget with every token past the marker forwarded and discarded.
+    Nothing about the response showed it: the text and the finish reason were right, and only the
+    two numbers that say what it cost were not -- the forwards, and `usage.completion_tokens`,
+    which counted them as tokens the model had produced for the caller. The budget is not small:
+    with no `max_tokens` on the request it is every position the prompt left of the context, which
+    on this runtime's 32K default is tens of thousands of decode steps for a stream that ended at
+    its first marker.
+
+    Asserted through the loop the adapter actually runs, with a scripted model that counts its own
+    forwards and with more tokens scripted than the request could ever be given, so that running on
+    is a number rather than an assumption. `BETA` completes at the second token and the check is
+    before the step, so a third is sampled and nothing after it is.
+    """
+    tokenizer = FakeTokenizer()
+    tokenizer.encoding["<|user|>hi<|assistant|>"] = [5]
+    tokenizer.pieces.update({11: "alpha ", 12: "BETA", 14: "x" * 8})
+    model = ScriptedModel(scripted=(11, 12, 13) + (14,) * 60)
+    adapter = backend(model=model, tokenizer=tokenizer)
+
+    events = list(adapter.stream(request(request_id="t", stop=["BETA"])))
+
+    assert "".join(event.text or "" for event in events) == "alpha "
+    assert events[-1].finish_reason == "stop"
+    # One forward for the prompt and one for each token up to and including the one that completed
+    # the marker -- three, against a budget of sixty. The third token is sampled because the check
+    # is before the step; nothing after it is.
+    assert len(model.forwards) == 3, "the loop ran past the marker"
+    assert events[-1].usage.completion_tokens == 2
+
+
 def test_a_cancelled_request_stops_and_does_not_leave_the_table() -> None:
     adapter = backend()
     adapter._begin_request("gone")
