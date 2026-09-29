@@ -70,7 +70,6 @@ from .shared_options import (
     PREFIX_CACHE_HEAD_TOKENS,
 )
 from .runtime_engine import (
-    RuntimeSpec,
     SchedulerHost,
     cancel_key,
     card_for_rank,
@@ -766,24 +765,6 @@ class V41Backend(SchedulerHost, RuntimeAdapter):
     # ------------------------------------------------------------------ requests
 
     # ------------------------------------------------------------------ the shared scheduler
-
-    def _runtime_spec(self) -> RuntimeSpec:
-        """What the bridge needs to know about this checkpoint.
-
-        `device` is a callable because the tree's card is a property of the launch rather than of
-        the object, and because the run thread binds it *before* it calls this adapter's generation
-        entry point -- that is, before `_ensure_loaded` has run. `_tree_device` answers from the
-        options and the rank, which are known at construction; reading the card off a loaded buffer
-        instead would answer `-1` on the first request and the right card on every one after it.
-        """
-        return RuntimeSpec(
-            name=self.name,
-            start=self._start_runtime,
-            eos_tokens=self._eos_tokens,
-            max_context=self._max_seq_len,
-            wants_request=True,
-            device=self._runtime_device,
-        )
 
     def _runtime_device(self) -> int:
         return device_index(self._tree_device())

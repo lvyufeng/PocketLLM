@@ -77,7 +77,6 @@ from .shared_options import (
     PREFIX_CACHE_HEAD_TOKENS,
 )
 from .runtime_engine import (
-    RuntimeSpec,
     SchedulerHost,
     card_for_rank,
     device_index,
@@ -690,16 +689,6 @@ class MimoBackend(SchedulerHost, RuntimeAdapter):
         return agreed
 
     # ------------------------------------------------------------------ the shared scheduler
-
-    def _runtime_spec(self) -> RuntimeSpec:
-        return RuntimeSpec(
-            name=self.name,
-            start=self._start_runtime,
-            eos_tokens=self._eos_tokens,
-            max_context=self._max_seq_len,
-            wants_request=True,
-            device=self._runtime_device,
-        )
 
     def _runtime_device(self) -> int:
         """The card this rank drives, read the way the model's own card is chosen.

@@ -17,7 +17,13 @@ import time
 
 import pytest
 
-from pocketllm.backends.runtime_engine import RuntimeRun, RuntimeSpec, device_index, engine_class
+from pocketllm.backends.runtime_engine import (
+    RuntimeRun,
+    RuntimeSpec,
+    SchedulerHost,
+    device_index,
+    engine_class,
+)
 
 
 class FakeLoop:
@@ -483,3 +489,56 @@ def test_forgetting_a_row_takes_it_out_of_the_mapping():
     engine.forget_row(7)
 
     assert engine.row_request(7, timeout=0.01) is None
+
+
+# ------------------------------------------------------------- the spec an adapter registers
+
+
+class _StubHost(SchedulerHost):
+    """An adapter's runtime half: the four facts a spec is made of, and nothing else.
+
+    The real hosts answer all four from a checkpoint, a launch and a card. What is under test here
+    is not those answers but the spec built out of them -- which is the same body for every runtime
+    in the family, and the reason there is one to test.
+    """
+
+    def __init__(self) -> None:
+        self.name = "stub"
+        self._max_seq_len = 4096
+        self.bound: list[int] = []
+
+    def _start_runtime(self, *, request_id=None, **kwargs) -> None:
+        """A runtime's generation entry point. Never run: the spec carries it and does not call it."""
+
+    def _eos_tokens(self) -> set[int]:
+        return {7}
+
+    def _runtime_device(self) -> int:
+        self.bound.append(3)
+        return 3
+
+
+def test_the_registered_spec_is_built_from_the_adapters_own_facts():
+    """The spec is the runtime's facts, and `device` stays a callable until a run thread asks.
+
+    Every one of these five fields was written out in three adapters before it was written here,
+    and three copies of a literal like `wants_request=True` is three chances to leave it out. So
+    this asserts the mapping rather than the values: name from the adapter's, `start` the adapter's
+    own entry point, context and end-of-sequence from what it already holds.
+
+    `device` is deliberately not read here -- the card is a property of the launch, and this spec is
+    built before the weights are loaded, so a spec that resolved it now would bind the run thread to
+    whatever card happened to be current at construction.
+    """
+    host = _StubHost()
+
+    spec = host._runtime_spec()
+
+    assert spec.name == "stub"
+    assert spec.start == host._start_runtime
+    assert spec.eos_tokens() == {7}
+    assert spec.max_context == 4096
+    assert spec.wants_request is True
+    assert host.bound == []
+    assert spec.device() == 3
+    assert host.bound == [3]
