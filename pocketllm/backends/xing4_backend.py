@@ -60,7 +60,6 @@ from .capabilities import IGNORED_OPTIONS, declared_capabilities
 from .options import BackendOption, Group, Kind, decode_args
 from .shared_options import PREFILL_CHUNK, PREFIX_CACHE_BYTES
 from .runtime_engine import (
-    RuntimeSpec,
     SchedulerHost,
     cancel_key,
     card_for_rank,
@@ -377,18 +376,6 @@ class Xing4Backend(SchedulerHost, RuntimeAdapter):
             getattr(args, "backend_options", {}).get("scheduler_timeout_ms", 600_000)
         )
         self._init_batch_scheduler()
-
-    def _runtime_spec(self) -> Any:
-        return RuntimeSpec(
-            name=self.name,
-            start=self._start_runtime,
-            eos_tokens=self._eos_tokens,
-            max_context=self._max_seq_len,
-            wants_request=True,
-            # A callable because the model is not loaded yet: this spec is built with the backend,
-            # and the card the weights ended up on is only known once they are.
-            device=self._runtime_device,
-        )
 
     def _runtime_device(self) -> int:
         """The card the runtime bound, read from the model rather than from the option.

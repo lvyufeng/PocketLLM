@@ -632,10 +632,13 @@ class SchedulerHost:
     `enable_batching` are three answers to the question `--enable-batching` asks, and only one of
     them is the backend's.
 
-    A subclass provides `_runtime_spec` and the pieces that method reaches for, and calls
-    `_init_batch_scheduler()` at the end of its `__init__`. Everything else it inherits: `self.args`,
-    `self.name`, `self._tokenize`, `self._budget`, `self._begin_request`, `self._clear_request` and
-    `self._decode` all come from the backend base class.
+    A subclass provides the pieces `_runtime_spec` reaches for -- its generation entry point, the
+    tokens that end a sequence, its context, and the card its forwards end up on -- and calls
+    `_init_batch_scheduler()` at the end of its `__init__`. The spec itself is built here, because
+    its shape is the same for every runtime in this family; only the facts inside it differ.
+    Everything else it inherits: `self.args`, `self.name`, `self._tokenize`, `self._budget`,
+    `self._begin_request`, `self._clear_request` and `self._decode` all come from the backend base
+    class.
     """
 
     #: The scheduler, when this runtime is driven by one, and the native module it came from. Both
@@ -731,8 +734,35 @@ class SchedulerHost:
             ) from None
 
     def _runtime_spec(self) -> RuntimeSpec:
-        """What the bridge needs to know about this model. The one method a subclass must write."""
-        raise NotImplementedError
+        """What the bridge needs to know about this model, for the shape every runtime here has.
+
+        Answering from the adapter rather than from a literal in each one: `start` is the adapter's
+        own generation entry point, `eos_tokens` and `max_context` are facts about the checkpoint it
+        already holds, and `device` is the card its forwards end up on. `name` is the runtime's, so a
+        wedged run names the right one.
+
+        `device` is the adapter's `_runtime_device` -- a callable, because the card is a property of
+        the launch rather than of the object. This spec is built before the weights are loaded, and
+        reading the card off a loaded buffer instead would answer `-1` on the first request and the
+        right card on every one after it. What `_runtime_device` answers from differs (a model, an
+        option and a rank, a tree), so each adapter keeps that; this method does not depend on which.
+
+        `wants_request` is True because these runtimes key their own cancellation on the id their
+        client knows the request by, and some render from a request field the scheduler has no column
+        for (`thinking_mode`).
+
+        Override where that shape is not the adapter's. `torch` does: its `max_context` has to be
+        checked against `--max-model-len` rather than defaulted, and its runtime places its own
+        tensors, so it declares `device=-1` and has no card for this side to bind.
+        """
+        return RuntimeSpec(
+            name=self.name,
+            start=self._start_runtime,
+            eos_tokens=self._eos_tokens,
+            max_context=self._max_seq_len,
+            wants_request=True,
+            device=self._runtime_device,
+        )
 
     # -- the scheduler-facing half of a request --------------------------------------------------
 
