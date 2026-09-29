@@ -278,11 +278,14 @@ class RuntimeAdapter(BackendBase):
     which ones the body fits: ``v41`` and ``torch`` keep their own copies until the differences
     they carry are resolved one at a time.
 
-    A subclass supplies its runtime's name through :attr:`_RUNTIME_LABEL` and keeps everything that
-    genuinely differs -- the load, the loop, ``_runtime_spec``, the capability declaration.  The
-    only state read here is ``_tokenizer`` and ``_max_seq_len``, which every adapter in this family
-    has, and ``_ensure_prefix_cache``, which :meth:`prepare` calls for the reason its own comment
-    gives.
+    A subclass supplies its runtime's name through :attr:`_RUNTIME_LABEL`, and overrides whatever
+    it does differently: ``_encode_chat`` where the checkpoint's format is not a jinja template,
+    ``_budget`` and ``_tokenize`` where the arithmetic is not this one, ``_result`` where the answer
+    has a structure to read.  What a subclass is left keeping is exactly that list, which is the
+    point of the base -- the parts that are left are the parts that differ.
+
+    The only state read here is ``_tokenizer`` and ``_max_seq_len``, which every adapter in this
+    family has.
     """
 
     #: How this adapter's own messages spell its runtime, as this family spells it in "the MiMo
@@ -291,15 +294,24 @@ class RuntimeAdapter(BackendBase):
     _RUNTIME_LABEL = ""
 
     def prepare(self) -> None:
-        """Load the model, and the prefix store it will be asked for before the first request.
+        """Open and load, which is every path that has to have happened before a request.
 
-        The store is built here rather than inside ``_load`` because every path that ends with a
-        loaded model passes through ``_ensure_loaded`` -- including the injected ones -- and a
-        store built in only one of them would be a switch that quietly does nothing on the others.
+        Deliberately *not* here: building a prefix store.  Three of the adapters have one and they
+        do not agree on where it belongs -- ``v41`` builds it inside ``_ensure_loaded``, under the
+        load lock, so that the injected loader paths reach it too; ``mimo`` and ``xing4`` build it
+        from this method.  That is a decision about the store, not about preparing, so each adapter
+        that has one says so itself.
         """
         self._ensure_open()
         self._ensure_loaded()
-        self._ensure_prefix_cache()
+
+    def _skip_special_tokens(self) -> bool:
+        """Whether a decode leaves the checkpoint's control tokens out, when the caller did not say.
+
+        ``True``, which is what every adapter in this family wanted before ``v41`` grew a CLI option
+        for it.  Overridden by an adapter that lets a run configure it.
+        """
+        return True
 
     def _tokenize(self, request: GenerationRequest) -> list[int]:
         if request.prompt_tokens is not None:
@@ -352,17 +364,28 @@ class RuntimeAdapter(BackendBase):
     def _decode(self, token_ids: Sequence[int], skip_special_tokens: bool | None = None) -> str:
         """The text of ``token_ids``, or ``""`` when there is nothing that can read them.
 
-        ``skip_special_tokens`` is asked for and the failure is absorbed: the keyword is on every
-        HF tokenizer but this adapter may be handed an object that is only duck-typed as one, and a
-        request that answered with no text at all would be a worse answer than the ids it did
-        produce. An absent argument means the usual answer, which is to skip them.
+        An absent argument means :meth:`_skip_special_tokens`, which is the usual answer and is a
+        run-configurable one on the adapter that has a flag for it.
+
+        Two things are absorbed rather than raised, and neither is this method's to report. A
+        tokenizer with no ``skip_special_tokens`` keyword is a duck-typed one, and it is asked
+        again without it: this repository hands ``_decode`` a real HF tokenizer in production and a
+        three-line stand-in in tests, and the stand-in is the case that has no keyword. Anything
+        else a tokenizer raises is dropped, because a request that answered with no text is still
+        an answer, and raising here would lose the ids that did decode.
         """
-        if self._tokenizer is None:
+        if self._tokenizer is None or not token_ids:
             return ""
-        skip = True if skip_special_tokens is None else bool(skip_special_tokens)
+        skip = self._skip_special_tokens() if skip_special_tokens is None else bool(skip_special_tokens)
         try:
             return self._tokenizer.decode(list(token_ids), skip_special_tokens=skip)
-        except Exception:  # pragma: no cover - a tokenizer that cannot decode one token
+        except TypeError:  # a tokenizer whose decode has no such keyword
+            pass
+        except Exception:  # pragma: no cover - a tokenizer that cannot decode these ids
+            return ""
+        try:
+            return self._tokenizer.decode(list(token_ids))
+        except Exception:  # pragma: no cover - the same, without the keyword to blame
             return ""
 
     def _result(

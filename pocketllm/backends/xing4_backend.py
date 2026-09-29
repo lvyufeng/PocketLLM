@@ -458,6 +458,16 @@ class Xing4Backend(SchedulerHost, RuntimeAdapter):
 
     # ------------------------------------------------------------------ lifecycle
 
+    def prepare(self) -> None:
+        self._ensure_open()
+        self._ensure_loaded()
+        # Three of the four adapters in this family have a prefix store and the fourth does not, so
+        # building one is not part of the base's `prepare`. It is here rather than inside `_load`
+        # for the reason the V4.1 adapter gives: every path that ends with a loaded model passes
+        # through `_ensure_loaded`, including the injected ones, and a store built in only one of
+        # them would be a switch that quietly does nothing on the others.
+        self._ensure_prefix_cache()
+
     def _ensure_loaded(self) -> None:
         if self._model is not None:
             return

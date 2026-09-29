@@ -836,3 +836,78 @@ def test_the_shared_adapter_answers_a_missing_tokenizer_with_its_runtime_name():
 
     with pytest.raises(RuntimeError, match="the Stub tokenizer is not loaded"):
         adapter._tokenize(request)
+
+
+class _KeywordlessTokenizer:
+    """A decode with no ``skip_special_tokens`` keyword, and a log of what it was asked."""
+
+    def __init__(self, text: str = "hi") -> None:
+        self.text = text
+        self.calls: list[tuple] = []
+
+    def decode(self, ids, **kwargs):
+        self.calls.append((tuple(ids), tuple(sorted(kwargs))))
+        if kwargs:
+            raise TypeError("decode() got an unexpected keyword argument 'skip_special_tokens'")
+        return self.text
+
+
+class _RecordingTokenizer:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def decode(self, ids, skip_special_tokens=True):
+        self.calls.append((tuple(ids), skip_special_tokens))
+        return "|".join(str(token) for token in ids)
+
+
+def test_a_decode_asks_a_tokenizer_with_no_keyword_again_without_it():
+    """A duck-typed tokenizer is asked twice rather than answered with nothing.
+
+    The repository hands a real HF tokenizer here in production and a three-line stand-in in tests,
+    and the stand-in is the case that has no keyword. Returning "" instead of asking again would
+    turn a stand-in that decodes perfectly well into an answer with no text in it.
+    """
+    adapter = _StubRuntimeAdapter()
+    tokenizer = _KeywordlessTokenizer("hi")
+    adapter._tokenizer = tokenizer
+
+    assert adapter._decode([7, 8]) == "hi"
+    assert tokenizer.calls == [((7, 8), ("skip_special_tokens",)), ((7, 8), ())]
+
+
+def test_a_decode_of_no_tokens_reads_no_tokenizer():
+    """Nothing to decode is answered here, rather than by whatever the tokenizer makes of an empty
+    list -- which for a byte-level one is a byte stream with nothing in it, and for a stand-in may
+    be a lookup that misses."""
+    adapter = _StubRuntimeAdapter()
+    tokenizer = _RecordingTokenizer()
+    adapter._tokenizer = tokenizer
+
+    assert adapter._decode([]) == ""
+    assert adapter._decode([], skip_special_tokens=False) == ""
+    assert tokenizer.calls == []
+
+
+def test_an_unreadable_answer_is_empty_rather_than_an_exception():
+    """The ids decoded, even when the text did not: raising here would lose them."""
+
+    class Broken:
+        def decode(self, ids, skip_special_tokens=True):
+            raise RuntimeError("this tokenizer cannot read those ids")
+
+    adapter = _StubRuntimeAdapter()
+    adapter._tokenizer = Broken()
+
+    assert adapter._decode([7]) == ""
+
+
+def test_the_shared_default_is_to_skip_special_tokens():
+    """The answer a run's control tokens are dropped from, unless the adapter says otherwise."""
+    adapter = _StubRuntimeAdapter()
+    tokenizer = _RecordingTokenizer()
+    adapter._tokenizer = tokenizer
+
+    assert adapter._skip_special_tokens() is True
+    adapter._decode([7])
+    assert tokenizer.calls == [((7,), True)]

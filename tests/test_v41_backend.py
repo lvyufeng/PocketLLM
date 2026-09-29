@@ -1593,3 +1593,25 @@ def test_a_request_the_scheduler_refuses_names_the_request(tmp_path, loop, sched
         backend.generate([request])
 
     assert backend.active_request_count() == 0
+
+
+def test_the_decode_follows_this_runs_own_skip_special_tokens_option(tmp_path):
+    """The one member of this family that can configure the answer's control tokens.
+
+    The other three adapters ask for them to be dropped and have no way to say otherwise; this run
+    has ``--backend-option skip_special_tokens=false``, and an operator who asked for the control
+    tokens to be visible is asking for the text every other part of the answer was built from. The
+    shared body reads it through `_skip_special_tokens`, so this is what that hook is for.
+    """
+    default, _ = _build(tmp_path, tokenizer=FakeTokenizer(pieces={7: "hi"}))
+    visible, _ = _build(
+        tmp_path,
+        tokenizer=FakeTokenizer(pieces={7: "hi"}),
+        backend_options={"skip_special_tokens": False},
+    )
+
+    assert default._decode([0, 7]) == "hi"
+    assert visible._decode([0, 7]) == "<s>hi"
+    # And the argument still wins over the run's own answer, which is what reads a tool call out of
+    # the finished tokens: the parser wants the end-of-sentence token the client never sees.
+    assert visible._decode([0, 7], skip_special_tokens=True) == "hi"
