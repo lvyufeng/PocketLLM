@@ -26,6 +26,7 @@ from pocketllm.api import (
     EngineArgs,
     GenerationRequest,
     SamplingParams,
+    TokenEvent,
     UnsupportedFeatureError,
 )
 from pocketllm.backends import factory
@@ -499,6 +500,52 @@ def test_a_stop_string_ends_the_run_and_not_only_the_sending() -> None:
     # is before the step; nothing after it is.
     assert len(model.forwards) == 3, "the loop ran past the marker"
     assert events[-1].usage.completion_tokens == 2
+
+
+def test_a_stream_nobody_reads_starts_nothing() -> None:
+    """The loop is entered on the first ``next()``, not on the call that builds the iterator.
+
+    Worth a test because the refactor that moved this body onto a shared runner could have dropped
+    it without any other test noticing: `stream` is a generator function and the body sits behind a
+    ``yield from``, so what a client that asks for a stream and then never reads it costs is that
+    ``yield`` and nothing else. Eager would not be wrong so much as spend a generation -- the
+    request table entry, the loop under the request lock, and up to a queue's depth of tokens -- on
+    a stream that has no reader, which is exactly the case a client that lost its connection is in.
+    """
+    model = ScriptedModel(scripted=(11, 12, 13, 14))
+    adapter = backend(model=model)
+    stream = adapter.stream(request(request_id="never-read"))
+    assert model.forwards == []  # nothing has run yet
+    assert adapter.active_request_count() == 0
+    stream.close()
+
+
+def test_a_failure_inside_the_loop_reaches_the_client_after_what_was_sent() -> None:
+    """A runtime that falls over mid-decode is raised here, on the thread that is reading.
+
+    The loop runs on the producer's thread, where a raise would only end that thread and leave the
+    reader waiting for an event that will never come -- the queue gets its ``None`` and the client a
+    truncated stream that looks like a short answer. The failure is therefore carried out and raised
+    again on the consumer's own thread, after the events already produced, which is what makes this
+    an error a caller can see rather than a quiet ending.
+    """
+
+    class BrokenModel(ScriptedModel):
+        def forward(self, input_ids, *, cache=None, start_pos=0, absorbed=True):
+            if len(self.forwards) >= 2:  # the prompt, then one token
+                raise RuntimeError("the trunk fell over mid-decode")
+            return super().forward(input_ids, cache=cache, start_pos=start_pos, absorbed=absorbed)
+
+    adapter = backend(model=BrokenModel())
+    stream = adapter.stream(request(request_id="boom"))
+    sent: list[TokenEvent] = []
+    with pytest.raises(RuntimeError, match="fell over mid-decode"):
+        for event in stream:
+            sent.append(event)
+    # Two tokens were read before the third forward raised: the prefill's own row and the one
+    # decode step after it. Both went out, and the raise comes after them rather than instead.
+    assert [event.text for event in sent] == ["a", "b"]
+    assert adapter.active_request_count() == 0  # and the request left the table on the way out
 
 
 def test_a_cancelled_request_stops_and_does_not_leave_the_table() -> None:
