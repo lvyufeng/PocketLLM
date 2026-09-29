@@ -32,8 +32,9 @@ def detect_architecture(ckpt: str) -> str:
     Same rule as ``pocket::detect_architecture`` in ``core/model_registry.cpp``: a safetensors
     checkpoint declares ``model_type`` in ``config.json``, a GGUF declares
     ``general.architecture`` in its own metadata, and ``qwen3_5_text`` -- where the multimodal
-    wrapper hides the text model's type -- folds onto ``qwen3_5``.  Returns ``""`` when nothing is
-    declared, which selects the generic templater.
+    wrapper hides the text model's type -- and ``qwen35`` -- the GGUF export's spelling -- both
+    fold onto ``qwen3_5``.  Returns ``""`` when nothing is declared, which selects the generic
+    templater.
 
     One difference from the C++ rule, in the Python host's direction: a directory *containing* a
     GGUF is accepted as well as the file itself, because that is how this side resolves a model
@@ -90,7 +91,15 @@ def _canonical(model_type: Any, text_config: Any) -> str:
     if not model_type and isinstance(text_config, dict):
         model_type = text_config.get("model_type")
     model_type = str(model_type or "").lower()
-    return "qwen3_5" if model_type == "qwen3_5_text" else model_type
+    # Three spellings of one runtime, and ``qwen35`` is not a typo of the other two: it is what
+    # the GGUF export declares, the way ``qwen3_5_text`` is what the multimodal wrapper declares.
+    # ``canonical_qwen_architecture`` folds the same three (``core/qwen_config.cpp``), and the two
+    # have to agree: this answer selects the tool-call parser, so a checkpoint reaching the Python
+    # host under the GGUF's spelling would otherwise read a tool call differently from the same
+    # checkpoint reached through the native registry.
+    if model_type in ("qwen3_5_text", "qwen35"):
+        return "qwen3_5"
+    return model_type
 
 
 def splice_tools(messages: list[dict[str, Any]], tools: Any) -> list[dict[str, Any]]:
