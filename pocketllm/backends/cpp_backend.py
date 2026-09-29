@@ -1089,14 +1089,19 @@ class CppBackend(BackendBase):
         which is the opposite of where the fan-out lives. What this file must not do is answer ``n``
         choices with one, and it cannot: it is handed one request per choice.
 
-        ``logprobs`` is asked of the scheduler rather than stated, because it is one: the per-token
-        ranking is produced by the scheduler's per-row sampler and arrives on the scheduler's result
-        object. A build whose scheduler was not created -- ``batching=false`` selects the serialized
-        compatibility session -- has no ranking anywhere in the call, so the field is refused by
-        name there rather than answered with an empty array. Streaming logprobs stay ``False`` for
-        the reason the native front end refused them: a streamed chunk carries the text of its token
-        with no ranking beside it, and one ranking per chunk would have to come off the same result
-        object the stream is draining.
+        ``logprobs`` is asked in two parts, and the second one is easy to leave out. The ranking
+        arrives on the scheduler's result object, so a build whose scheduler was not created --
+        ``batching=false`` selects the serialized compatibility session -- has no ranking anywhere
+        in the call, and the field is refused by name there rather than answered with an empty
+        array. But the scheduler only carries what the engine produced: the probability itself comes
+        off the engine's per-row sampler, and a build without one reports ``caps().logprobs`` false
+        and hands the scheduler nothing to carry. Asking the scheduler alone is what turns that into
+        a 500 -- the field is declared served, the request is admitted, and the answer comes back
+        ranking fewer positions than it has tokens. ``structured_outputs`` below asks the same second
+        question, of the same declaration, for the same reason. Streaming logprobs stay ``False``
+        for the reason the native front end refused them: a streamed chunk carries the text of its
+        token with no ranking beside it, and one ranking per chunk would have to come off the same
+        result object the stream is draining.
 
         ``structured_outputs`` is the same question as ``logprobs`` -- asked of the engine rather
         than of this file -- and it is asked in two parts. The constraint travels on the scheduler
@@ -1109,9 +1114,40 @@ class CppBackend(BackendBase):
         return ServedFields(
             choices=True,
             stop=True,
-            logprobs=self._batching_enabled and self._scheduler is not None,
+            logprobs=self._rankings_available(),
             structured_outputs=self._constraints_available(),
         )
+
+    def _rankings_available(self) -> bool:
+        """Whether a request for log probabilities can be answered with them.
+
+        See :meth:`_served_fields`. Two things have to hold and neither implies the other: a
+        scheduler has to exist to carry the ranking, and the engine behind it has to rank. The
+        Ascend build is why the second one is here -- its sampler produces no per-position
+        probability, its ``caps()`` says so, and this adapter published ``True`` anyway off the
+        scheduler alone, so ``"logprobs": true`` was admitted and answered with a 500 rather than
+        refused by name.
+
+        The engine's half is read off the scheduler rather than off ``caps()`` on the engine, for
+        the reason :meth:`_constraints_available` reads it there: the scheduler is what will carry
+        the value, and the two answers cannot be allowed to differ.
+
+        A scheduler with no binding to ask is read as ``False`` rather than raising, for the reason
+        :meth:`_engine_capabilities` swallows the same absence: a capability report and a field
+        audit are not the places to propagate "this extension is older than the caller". The
+        direction is the safe one -- a runtime that has not said it ranks a position is refused by
+        name, which is where every other undeclared capability points.
+        """
+        if not (self._batching_enabled and self._scheduler is not None):
+            return False
+        getter = getattr(self._scheduler, "engine_caps", None)
+        if not callable(getter):
+            return False
+        try:
+            caps = getter()
+        except Exception:
+            return False
+        return bool(getattr(caps, "logprobs", False))
 
     def _constraints_available(self) -> bool:
         """Whether a request naming a schema can actually be held to it on this path.

@@ -164,14 +164,19 @@ def make_backend(engine: FakeEngine | None = None) -> tuple[CppBackend, FakeEngi
     return backend, fake_engine
 
 
-def scripted_caps(*, structured_outputs: bool = True) -> object:
+def scripted_caps(*, structured_outputs: bool = True, logprobs: bool = True) -> object:
     """The engine's own declaration, as a scheduler double reports it through `engine_caps`.
 
     One helper rather than one per double because it is one fact: the capability is the engine's, the
     scheduler is only the thing the adapter can reach it through, and a double that disagreed with
     the others about it would be a double whose structured-output tests were about something else.
+
+    The defaults are a CUDA build's answers, which is what most of these tests are describing. Each
+    is parameterized rather than fixed because the audit is supposed to *follow* the declaration, and
+    the Ascend build is the case where it has to: no per-row sampler, so no ranking, so a request for
+    log probabilities is refused by name instead of admitted and answered with a 500.
     """
-    return SimpleNamespace(structured_outputs=structured_outputs)
+    return SimpleNamespace(structured_outputs=structured_outputs, logprobs=logprobs)
 
 
 def test_cpp_chat_prompt_uses_tokenizer_owned_template() -> None:
@@ -902,14 +907,15 @@ class ScriptedScheduler:
     which is where the structured-output capability is read from.
     """
 
-    def __init__(self, result, *, structured_outputs: bool = True) -> None:
+    def __init__(self, result, *, structured_outputs: bool = True, logprobs: bool = True) -> None:
         self.result = result
         self.submitted: list[object] = []
         self.constraints: list[object | None] = []
         self.structured_outputs = structured_outputs
+        self.logprobs = logprobs
 
     def engine_caps(self) -> object:
-        return scripted_caps(structured_outputs=self.structured_outputs)
+        return scripted_caps(structured_outputs=self.structured_outputs, logprobs=self.logprobs)
 
     def submit_request(
         self, prompt_ids, sampling, callback, on_token=None, constraint=None
@@ -959,10 +965,14 @@ class ScriptedNativeModule:
         return ScriptedNativeModule._Constraint("schema", schema_json)
 
 
-def batched_backend_with(result, *, structured_outputs: bool = True) -> CppBackend:
+def batched_backend_with(
+    result, *, structured_outputs: bool = True, logprobs: bool = True
+) -> CppBackend:
     backend, _ = make_backend()
     backend._native = ScriptedNativeModule()
-    backend._scheduler = ScriptedScheduler(result, structured_outputs=structured_outputs)
+    backend._scheduler = ScriptedScheduler(
+        result, structured_outputs=structured_outputs, logprobs=logprobs
+    )
     backend._batching_enabled = True
     return backend
 
@@ -1638,6 +1648,27 @@ def test_logprobs_is_refused_where_there_is_no_scheduler_to_rank() -> None:
     """
     backend = _ranking_backend({1: "a"}, [1], [])
     backend._batching_enabled = False
+    try:
+        refusal = backend.audit_request({"logprobs": True})
+        assert refusal is not None
+        assert refusal.field == "logprobs"
+        assert "per-token log probabilities" in refusal.message
+        assert backend.audit_request({"logprobs": False}) is None
+    finally:
+        backend.close()
+
+
+def test_logprobs_is_refused_where_the_engine_does_not_rank() -> None:
+    """A scheduler is necessary and not sufficient: the ranking is produced by the engine's sampler.
+
+    The Ascend build is the case. It has no per-row device sampler, so its ``caps()`` reports
+    ``logprobs`` false and its results carry no ranking -- and asking the scheduler alone declared
+    the field served anyway, admitted the request, and answered it with a 500 that said the ranking
+    described fewer tokens than the text. The refusal belongs at the audit, where every other
+    undeclared capability is refused by name.
+    """
+    backend = _ranking_backend({1: "a"}, [1], [])
+    backend._scheduler.logprobs = False
     try:
         refusal = backend.audit_request({"logprobs": True})
         assert refusal is not None
