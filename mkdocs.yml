@@ -160,6 +160,7 @@ nav:
       - Serving latency with IPC all-reduce: performance/serving_latency_optimized.md
       - Serving concurrency and throughput: performance/serving_throughput_scaling.md
       - Ascend 910B serving ladder: performance/ascend_cpp_serving_ladder.md
+      - Qwen3.8-27B BF16 behind the server: performance/ascend_qwen_bf16_served.md
       - Xing4.0-29B-A4B MLA attention on sm_75: performance/xing4_0_attention_sm75.md
       - Xing4.0-29B-A4B hyper-connection on sm_75: performance/xing4_0_hyper_connection_sm75.md
       - Xing4.0-29B-A4B decode launch gap: performance/xing4_0_decode_launch_gap.md
