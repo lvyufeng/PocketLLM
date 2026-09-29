@@ -168,9 +168,13 @@ running=0 waiting=0     ← 1
 
 `requests_running` pins at exactly 8 and `requests_waiting` goes as high as 12 while the client holds
 16 in flight. The client is queuing against a scheduler that is running 8 rows and no more. That is
-`DEFAULT_BATCH_SLOTS = 8` (`pocketllm/backends/cpp_backend.py:70`), reached because `--max-batch-size`
-was left at its default of 1, which the CLI maps onto the slot count rather than onto a width the
-engine honours.
+`DEFAULT_BATCH_SLOTS = 8` (`pocketllm/backends/cpp_backend.py:70`), and it is reached because
+`--max-batch-size` was never passed at all: the flag's default of 1 is the sentinel for *unspecified*
+(`_requested_batch_width`, `pocketllm/backends/cpp_backend.py:641`), so the width falls through to the
+slot count. **The trap is that the sentinel is spelled the same way as a width.** Passing
+`--max-batch-size 1` explicitly does not ask for one row; it is indistinguishable from silence and
+gets 8. The one-row path is `--no-enable-batching`, which is also what the CLI refuses to combine with
+a width above 1.
 
 The client-side numbers agree with it and are the cleaner evidence, because they do not depend on the
 sampler's 1 s grid: at 16 and at 32 concurrency the throughput is the same as at 8 (70.13 and 69.13
