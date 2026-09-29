@@ -348,18 +348,26 @@ class RuntimeAdapter(BackendBase):
     def _budget(self, prompt_ids: Sequence[int], request: GenerationRequest) -> int:
         """How many tokens this request may generate, from the request and this run's context.
 
-        A prompt that already fills the context is refused rather than clamped to zero: the answer
-        to it is not an empty generation, it is that this run's cache is too small for the request,
-        and a zero budget would report that as a request that generated nothing.
+        The number is derived and then checked, and the check is the second half of
+        :meth:`SamplingParams.token_budget`'s contract: an explicit ``max_tokens`` is handed back
+        unchanged by that method *because* the caller is the one that gets to refuse it. This is
+        that refusal, and it is here rather than at the three call sites because a budget that came
+        back from a context this run cannot hold is wrong wherever it was asked for.
+
+        This is also what refuses a prompt that already fills the context: the derived budget is
+        floored at one, so such a prompt arrives at the check as a request that does not fit rather
+        than as a budget of zero.
         """
         params = request.sampling_params
-        room = self._max_seq_len - len(prompt_ids)
-        if room < 1:
-            raise ConfigurationError(
-                f"a prompt of {len(prompt_ids)} tokens fills the {self._max_seq_len} positions "
-                f"this run's cache was sized at; raise --max-model-len and restart"
-            )
-        return int(params.token_budget(room))
+        budget = int(params.token_budget(self._max_seq_len - len(prompt_ids)))
+        wanted = len(prompt_ids) + budget
+        if wanted <= self._max_seq_len:
+            return budget
+        raise ConfigurationError(
+            f"this request needs {wanted} positions ({len(prompt_ids)} prompt tokens and "
+            f"{budget} new), and the attention caches were sized at "
+            f"{self._max_seq_len} at startup; raise --max-model-len and restart"
+        )
 
     def _decode(self, token_ids: Sequence[int], skip_special_tokens: bool | None = None) -> str:
         """The text of ``token_ids``, or ``""`` when there is nothing that can read them.
