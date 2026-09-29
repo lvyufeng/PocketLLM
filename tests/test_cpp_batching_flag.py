@@ -20,7 +20,7 @@ import pytest
 
 from typing import Any
 
-from pocketllm.api import ConfigurationError, EngineArgs, GenerationRequest
+from pocketllm.api import ConfigurationError, EngineArgs, GenerationRequest, UnsupportedFeatureError
 from pocketllm.backends.cpp_backend import DEFAULT_BATCH_SLOTS, CppBackend
 from pocketllm.cli import _args, build_parser
 
@@ -60,11 +60,65 @@ class FakeNativeWithoutScheduler:
         return ["qwen3_5"]
 
 
-def make_backend(*, native=None, **engine_args) -> CppBackend:
+class FakeNativeRejectingEngine:
+    """A build that has the scheduler, over an engine it will not take.
+
+    The real case is a DeepSeek-V4 checkpoint: `PersistentEngine` is not an
+    `InferenceEngine` in the binding, so `QwenBatchScheduler(engine, width)` is a
+    `TypeError` -- pybind rejects the argument before the constructor body runs.
+    `FakeEngine` below stands in for it exactly as well as any other object that
+    is not a scheduler-acceptable engine, which is the property that decides this.
+    """
+
+    def registered_architectures(self) -> list[str]:
+        return ["deepseek_v4", "qwen3_5"]
+
+    @staticmethod
+    def QwenBatchScheduler(engine: object, width: int) -> object:
+        raise TypeError(
+            "__init__(): incompatible constructor arguments. The following argument types are "
+            "supported:\n    1. pocketllm_cpp.QwenBatchScheduler(engine: "
+            "pocketllm_cpp.InferenceEngine, max_batch_size: typing.SupportsInt)"
+        )
+
+
+class FakeNativeWithEngineClasses:
+    """A build whose class hierarchy is the real one's, for the pre-load check.
+
+    `PersistentEngine` is not an `InferenceEngine` in this module, which is true of the real
+    binding: `PersistentEngine.__bases__` is `(pybind11_object,)` and `QwenEngine.__bases__` is
+    `(InferenceEngine,)`. That difference is the whole of the pre-load check's input.
+    """
+
+    class InferenceEngine:  # noqa: D106 -- a stand-in for the pybind trampoline base
+        pass
+
+    class QwenEngine(InferenceEngine):
+        pass
+
+    class PersistentEngine:
+        pass
+
+    QwenBatchScheduler = FakeScheduler
+
+    def registered_architectures(self) -> list[str]:
+        return ["deepseek_v4", "qwen3_5"]
+
+    @staticmethod
+    def detect_architecture(checkpoint: str) -> str:
+        return "deepseek_v4"
+
+
+_CONSTRUCT = object()
+"""Sentinel for `make_backend(engine=...)`: `None` is a real value and means "let the backend
+construct its engine", which is the path the pre-load check lives on."""
+
+
+def make_backend(*, native=None, engine=_CONSTRUCT, **engine_args) -> CppBackend:
     return CppBackend(
         EngineArgs(model="model", backend="cpp", **engine_args),
         native_module=native if native is not None else FakeNativeWithScheduler(),
-        engine=FakeEngine(),
+        engine=FakeEngine() if engine is _CONSTRUCT else engine,
         tokenizer=FakeTokenizer(),
     )
 
@@ -190,22 +244,43 @@ def test_a_width_that_is_not_a_number_is_refused() -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# a build that has no scheduler
+# a scheduler that cannot be built
+#
+# Two ways for that to happen, and both are the same answer to a caller who asked for a width:
+# refusing. A width reaches the engine through the scheduler's slot allocation, so "the scheduler
+# could not be built" and "the width cannot be honoured" are one fact. Accepting the flag and
+# serving the serialized session anyway is the third state these tests exist to remove.
 # --------------------------------------------------------------------------------------------------
 
 
-def test_a_build_without_a_scheduler_says_so_when_batching_was_asked_for() -> None:
-    with pytest.warns(UserWarning, match="does not expose QwenBatchScheduler"):
-        backend = make_backend(native=FakeNativeWithoutScheduler(), enable_batching=True)
+def test_a_build_without_a_scheduler_refuses_a_width_it_was_asked_for() -> None:
+    with pytest.raises(UnsupportedFeatureError, match="does not expose QwenBatchScheduler"):
+        make_backend(native=FakeNativeWithoutScheduler(), enable_batching=True)
 
-    assert backend._batching_enabled is False
-    assert backend.capabilities.supports_batch is False
+
+def test_a_build_without_a_scheduler_refuses_a_width_as_a_width() -> None:
+    """`--max-batch-size 8` is the spelling an operator types, and it is a request like any other.
+
+    Before this it produced a warning and a serialized session, which is what #437 records as the
+    third state: the flag was parsed, reached `EngineArgs`, and changed nothing.
+    """
+    with pytest.raises(UnsupportedFeatureError, match="from --max-batch-size 8"):
+        make_backend(native=FakeNativeWithoutScheduler(), max_batch_size=8)
+
+
+def test_the_refusal_names_the_flag_the_build_and_the_way_out() -> None:
+    with pytest.raises(UnsupportedFeatureError) as caught:
+        make_backend(native=FakeNativeWithoutScheduler(), max_batch_size=4)
+
+    message = str(caught.value)
+    assert "from --max-batch-size 4" in message
+    assert "POCKET_BUILD_PYTHON" in message
 
 
 def test_a_build_without_a_scheduler_is_quiet_when_nobody_asked() -> None:
     """The default is this backend's assumption about the build, and `details["scheduler"]` reports
     the answer on every construction. A warning per process for an assumption nobody made is noise;
-    a warning for an explicit request that cannot be honoured is the point."""
+    a refusal for an explicit request that cannot be honoured is the answer."""
     import warnings
 
     with warnings.catch_warnings():
@@ -214,6 +289,72 @@ def test_a_build_without_a_scheduler_is_quiet_when_nobody_asked() -> None:
 
     assert backend._batching_enabled is False
     assert backend.capabilities.details["scheduler"] == "serialized compatibility session"
+
+
+def test_an_engine_the_scheduler_rejects_refuses_a_width_it_was_asked_for() -> None:
+    """The DeepSeek-V4 case, and the one #437 was opened for.
+
+    `PersistentEngine` is not an `InferenceEngine` in the binding, so the scheduler's constructor
+    rejects it. The capability declaration this clamps on was never reached: there is no scheduler
+    to read it, because the engine is offered to the scheduler first.
+    """
+    with pytest.raises(UnsupportedFeatureError, match="could not be built over this engine"):
+        make_backend(native=FakeNativeRejectingEngine(), max_batch_size=8)
+
+
+def test_an_engine_the_scheduler_rejects_still_warns_when_nobody_asked() -> None:
+    """Silence is only for the build fact. An engine that actively rejected the scheduler is new
+    information -- no capability field says it -- so the default path reports it once."""
+    with pytest.warns(UserWarning, match="could not be built over this engine"):
+        backend = make_backend(native=FakeNativeRejectingEngine())
+
+    assert backend._batching_enabled is False
+    assert backend.capabilities.supports_batch is False
+
+
+# --------------------------------------------------------------------------------------------------
+# the same refusal, moved ahead of the model load
+# --------------------------------------------------------------------------------------------------
+
+
+def test_the_engine_class_the_checkpoint_selects_decides_the_pre_load_refusal() -> None:
+    """Both directions, so the test fails if the predicate stops reading the hierarchy.
+
+    A false negative here would refuse a build that works, which is the direction this must not err
+    in; the `persistent` arm is the one #437 is about.
+    """
+    backend = make_backend(native=FakeNativeWithEngineClasses(), max_batch_size=2)
+
+    backend._refuse_unschedulable_engine_before_loading("qwen")  # does not raise
+
+    with pytest.raises(UnsupportedFeatureError, match="is not an InferenceEngine"):
+        backend._refuse_unschedulable_engine_before_loading("persistent")
+
+
+def test_a_deepseek_checkpoint_refuses_a_width_before_it_is_loaded() -> None:
+    """The end-to-end shape of it: construction is refused, so no checkpoint was read.
+
+    A real DeepSeek-V4 checkpoint takes minutes to open, and the whole reason this check exists
+    ahead of `_init_batch_scheduler` is that learning it afterwards costs that load. `engine=None`
+    is what makes the backend take the construction path at all.
+    """
+    with pytest.raises(UnsupportedFeatureError, match="is not an InferenceEngine"):
+        make_backend(native=FakeNativeWithEngineClasses(), engine=None, max_batch_size=8)
+
+
+def test_the_pre_load_check_is_silent_when_nobody_asked() -> None:
+    """Nobody asked, so the load proceeds and the late check reports it once -- not twice.
+
+    The early check is refusal-only by construction: it has nothing to say on the path that does
+    not refuse, which is what keeps one unbuildable scheduler from producing two warnings.
+    """
+    import warnings
+
+    backend = make_backend(native=FakeNativeWithEngineClasses())
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        backend._refuse_unschedulable_engine_before_loading("persistent")
 
 
 # --------------------------------------------------------------------------------------------------
