@@ -26,6 +26,30 @@ from pocketllm.protocol.contract import CHAT, FieldRefusal
 #: What a byte-level tokenizer's decode puts where a token ended inside a character.
 _REPLACEMENT = "�"
 
+#: How each vocabulary this tree produces spells "why the loop ended", folded onto the API's.
+#:
+#: Six words for four outcomes, and the two groups do not overlap. A runtime's own loop reports
+#: ``eos`` / ``length`` / ``cancel`` (``src/models/mimo_v2/generate.py:160``) or ``eos`` /
+#: ``length`` / ``max_seq_len`` (``src/models/deepseek_v4_1/generate.py:273``), and
+#: ``BatchScheduler`` reports ``stop`` / ``length`` / ``cancelled``
+#: (``batch_scheduler.cpp:854``). So a mapping written for one family is silently wrong for the
+#: other's spelling -- which is what this table exists to make impossible: it covers every word
+#: either route emits, and its answer does not depend on which one produced the word.
+#:
+#: ``error`` is deliberately absent. It is not a stop at all: the scheduler keeps it in a separate
+#: field precisely so that callers report it as a failure rather than as a finish reason
+#: (``batch_scheduler.hpp:111``), and the scheduler host raises on that field before any result is
+#: built (``pocketllm/backends/runtime_engine.py:789``). Mapping it here would give it a place to be
+#: quietly absorbed.
+_STOPPED_FINISH_REASONS = {
+    "eos": "stop",
+    "stop": "stop",
+    "length": "length",
+    "max_seq_len": "length",
+    "cancel": "cancelled",
+    "cancelled": "cancelled",
+}
+
 
 def settled_text(decoded: str) -> str:
     r"""``decoded`` without the trailing run of replacement characters.
@@ -396,6 +420,15 @@ class RuntimeAdapter(BackendBase):
         except Exception:  # pragma: no cover - the same, without the keyword to blame
             return ""
 
+    def _finish_reason(self, stopped: str) -> str:
+        """``stopped``, in the vocabulary the API reports.
+
+        One table for the whole tree (``_STOPPED_FINISH_REASONS``) rather than one per route, because
+        the words a route produces are a property of the loop or the scheduler that produced them and
+        not of the adapter that read them.
+        """
+        return _STOPPED_FINISH_REASONS.get(str(stopped), "stop")
+
     def _result(
         self,
         request: GenerationRequest,
@@ -407,12 +440,7 @@ class RuntimeAdapter(BackendBase):
     ) -> GenerationResult:
         """The finished generation as the API's result, with this run's timings on it."""
         text = self._decode(generation.tokens)
-        finish = {
-            "eos": "stop",
-            "length": "length",
-            "stop": "stop",
-            "cancel": "cancelled",
-        }.get(generation.stopped if stopped is None else stopped, "stop")
+        finish = self._finish_reason(generation.stopped if stopped is None else stopped)
         now = time.perf_counter()
         return GenerationResult(
             request_id=request.request_id,

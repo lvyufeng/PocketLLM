@@ -1615,3 +1615,44 @@ def test_the_decode_follows_this_runs_own_skip_special_tokens_option(tmp_path):
     # And the argument still wins over the run's own answer, which is what reads a tool call out of
     # the finished tokens: the parser wants the end-of-sentence token the client never sees.
     assert visible._decode([0, 7], skip_special_tokens=True) == "hi"
+
+
+# ------------------------------------------------------- the scheduler route's finish reason
+
+
+class _SchedulerResult:
+    """A ``BatchScheduler`` result, with only the fields `_batched_result` reads."""
+
+    def __init__(self, finish_reason: str, tokens=(11, 22)) -> None:
+        self.generated_tokens = list(tokens)
+        self.finish_reason = finish_reason
+        self.decode_seconds = 0.5
+        self.prompt_tokens = 3
+        self.completion_tokens = len(tokens)
+        self.prefill_seconds = 0.1
+        self.total_seconds = 0.6
+        self.ttft_seconds = 0.1
+        self.error = ""
+
+
+@pytest.mark.parametrize("word", ["stop", "length", "cancelled"])
+def test_the_scheduler_route_reports_the_schedulers_own_word(tmp_path, word):
+    """`_batched_result` used to read ``finish_reason`` by negation, and lost a word doing it.
+
+    It was ``"length" if str(result.finish_reason) == "length" else "eos"``, so every word that was
+    not ``length`` became ``eos`` and then ``stop``. `BatchScheduler` produces three
+    (`batch_scheduler.cpp:854-856`), which makes ``cancelled`` -- a generation the scheduler
+    abandoned -- indistinguishable from one that ran to its stop token. The inherited builder hands
+    the scheduler's word straight to the API, so the same scheduler produced two different answers
+    depending on which backend stood in front of it.
+
+    ``error`` is not in the list: it is not a stop, the scheduler keeps it in a separate field for
+    exactly that reason, and `SchedulerHost._generate_batched` raises on it before any result is
+    built.
+    """
+    backend, _ = _build(_checkpoint(tmp_path), max_model_len=64)
+
+    result = backend._batched_result(_request(), _SchedulerResult(word))
+
+    assert result.finish_reason == word
+    assert result.token_ids == [11, 22]

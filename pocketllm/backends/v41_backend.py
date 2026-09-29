@@ -866,6 +866,12 @@ class V41Backend(SchedulerHost, RuntimeAdapter):
         One field is not the same on the two routes: `usage.cached_tokens`, which the prefix store
         reports to the serial path and which the scheduler has no way to carry back. The token ids,
         the text and the finish reason are the same, which is what the two routes are compared on.
+
+        The scheduler's stop word is passed through as it stands rather than translated here. It is
+        one of `stop` / `length` / `cancelled` (`batch_scheduler.cpp:854-856`), and `_finish_reason`
+        knows all three; the hand-written mapping that stood here named only the words its author had
+        in mind, which is how `cancelled` arrived as `stop` -- this backend reporting a generation
+        the scheduler had abandoned as one that finished.
         """
         prompt_ids = self._tokenize(request)
         return self._result(
@@ -873,7 +879,7 @@ class V41Backend(SchedulerHost, RuntimeAdapter):
             self._payload(request, prompt_ids),
             list(result.generated_tokens),
             self._decode(list(result.generated_tokens)),
-            "length" if str(result.finish_reason) == "length" else "eos",
+            str(result.finish_reason),
             float(result.decode_seconds) or None,
             None,
         )
@@ -1372,9 +1378,7 @@ class V41Backend(SchedulerHost, RuntimeAdapter):
         # client that keys on the reason rather than reading the field would otherwise see "stop" on
         # a response that carries a call. Only "stop" is rewritten -- a generation cut by
         # ``max_tokens`` never reached its end-of-sentence token for the parser to read a call from.
-        finish_reason = {"eos": "stop", "length": "length", "max_seq_len": "length"}.get(
-            stopped, "stop"
-        )
+        finish_reason = self._finish_reason(stopped)
         if tool_calls and finish_reason == "stop":
             finish_reason = "tool_calls"
         return GenerationResult(
