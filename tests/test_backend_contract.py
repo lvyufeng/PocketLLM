@@ -16,7 +16,12 @@ from pocketllm.api import (
     UnsupportedFeatureError,
     Usage,
 )
-from pocketllm.backends.base import BackendBase, RuntimeAdapter, settled_text
+from pocketllm.backends.base import (
+    _STOPPED_FINISH_REASONS,
+    BackendBase,
+    RuntimeAdapter,
+    settled_text,
+)
 from pocketllm.server.metrics import HISTOGRAMS, Metrics
 from pocketllm.server.openai import OpenAIHandler, PocketLLMHTTPServer
 
@@ -911,3 +916,48 @@ def test_the_shared_default_is_to_skip_special_tokens():
     assert adapter._skip_special_tokens() is True
     adapter._decode([7])
     assert tokenizer.calls == [((7,), True)]
+
+
+def test_every_stop_word_this_tree_emits_maps_to_the_same_finish_reason():
+    """One table, covering every word the runtimes and the scheduler produce.
+
+    The words come from two places and they do not overlap: a runtime's own loop reports ``eos`` /
+    ``length`` / ``cancel`` (``src/models/mimo_v2/generate.py:160``) or ``eos`` / ``length`` /
+    ``max_seq_len`` (``src/models/deepseek_v4_1/generate.py:273``), and `BatchScheduler` reports
+    ``stop`` / ``length`` / ``cancelled`` (``batch_scheduler.cpp:854-856``). A map written for one
+    family is silently wrong for the other's spelling -- which is what this pins: whichever route
+    produced the word, the answer is the same.
+
+    Both halves are asserted. The mapping alone is not enough: dropping ``eos`` from the table would
+    leave this passing, because the default it would then land on is also ``stop``. The key set is
+    what says the word is *known* rather than merely landing somewhere harmless.
+    """
+    adapter = _StubRuntimeAdapter()
+
+    expected = {
+        "eos": "stop",
+        "stop": "stop",
+        "length": "length",
+        "max_seq_len": "length",
+        "cancel": "cancelled",
+        "cancelled": "cancelled",
+    }
+    assert set(_STOPPED_FINISH_REASONS) == set(expected)
+    for word, reason in expected.items():
+        assert adapter._finish_reason(word) == reason, word
+
+
+def test_a_word_that_is_not_a_stop_reports_the_safe_default():
+    """``error`` is deliberately not in the table, and anything unknown lands on ``stop``.
+
+    The scheduler keeps a terminal failure in its own field rather than in ``finish_reason``
+    (``batch_scheduler.hpp:111``), and the scheduler host raises on it before a result is built, so
+    neither reaches this method in practice. Leaving it out is what keeps that true: a table entry
+    would be a place for it to be quietly absorbed.
+    """
+    adapter = _StubRuntimeAdapter()
+
+    assert "error" not in _STOPPED_FINISH_REASONS
+    assert adapter._finish_reason("error") == "stop"
+    assert adapter._finish_reason("") == "stop"
+    assert adapter._finish_reason(None) == "stop"
