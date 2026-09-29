@@ -5070,6 +5070,24 @@ QwenEngine::~QwenEngine() {
     impl_ = nullptr;
 }
 
+namespace {
+// The device this thread last bound, or -1. Keyed on the device alone and not on
+// the engine: a device has one context per process, shared by every engine that
+// opens it, so a second engine on the same card is already bound by the first.
+thread_local int g_thread_device = -1;
+}  // namespace
+
+void QwenEngine::bind_thread_device() const {
+    if (g_thread_device == options_.device) return;
+    if (!device_set(options_.device)) {
+        throw std::runtime_error(
+            std::string("failed to bind this thread to the Qwen ") +
+            device_backend_name() + " device " +
+            std::to_string(options_.device));
+    }
+    g_thread_device = options_.device;
+}
+
 uint64_t QwenEngine::verify_weight_bytes() const {
     return impl_->verify_weight_bytes;
 }
@@ -5132,6 +5150,7 @@ ForwardResult QwenEngine::debug_prefill_dflash2(
 }
 
 void QwenEngine::warmup_tp() {
+    bind_thread_device();
     std::optional<Impl::RangeScope> range;
     if (impl_->range_profile) range.emplace("qwen.warmup_tp");
     if (options_.tp_world == 1) return;
@@ -5156,6 +5175,7 @@ void QwenEngine::warmup_tp() {
 }
 
 void QwenEngine::warmup_kernels(bool workers_in_loop) {
+    bind_thread_device();
     if (kernels_warmed_) return;
     // Only rank 0 drives a group; a worker reaches this function through
     // run_worker_loop(), which would consume the commands this call sends.
@@ -5223,6 +5243,7 @@ void QwenEngine::reset() {
 }
 
 void QwenEngine::clear_prefix_cache() {
+    bind_thread_device();
     position_ = 0;
     prefix_stats_ = QwenPrefixCacheStats{};
     impl_->clear_global_prefix_cache();
@@ -5310,6 +5331,7 @@ bool QwenEngine::supports_batching() const {
 }
 
 void QwenEngine::allocate_batch_slots(int max_batch_size) {
+    bind_thread_device();
     if (max_batch_size < 1) {
         throw std::runtime_error("QwenEngine::allocate_batch_slots: max_batch_size must be >= 1");
     }
@@ -5364,6 +5386,7 @@ int QwenEngine::kv_cache_pinned_blocks() const {
 }
 
 int QwenEngine::kv_evict_cache_blocks(int count) {
+    bind_thread_device();
     return impl_->global_prefix_enabled()
         ? impl_->evict_global_prefix_blocks(count) : 0;
 }
@@ -5395,6 +5418,7 @@ int QwenEngine::allocate_slot(uint64_t request_id) {
 }
 
 void QwenEngine::free_slot(uint64_t request_id) {
+    bind_thread_device();
     auto it = impl_->request_to_slot.find(request_id);
     if (it == impl_->request_to_slot.end()) {
         return;  // Request not found
@@ -5420,6 +5444,7 @@ void QwenEngine::free_slot(uint64_t request_id) {
 
 BatchPrefillResult QwenEngine::batch_prefill(
     const std::vector<BatchedRequest*>& requests, int token_budget) {
+    bind_thread_device();
 
     // Requests still run one at a time. The saturation sweep
     // (bench_qwen_prefill_saturation) measured 1890 tok/s at a 4096-token chunk
@@ -5544,6 +5569,7 @@ std::vector<ForwardResult> QwenEngine::batch_decode_tokens(
     const std::vector<int>& tokens, const std::vector<int>& slot_ids,
     const std::vector<BatchSamplingParams>* per_row_params,
     int logprobs_n) {
+    bind_thread_device();
     if (tokens.size() != slot_ids.size()) {
         throw std::runtime_error(
             "QwenEngine::batch_decode_tokens: token and slot extents differ");
@@ -5637,6 +5663,7 @@ std::vector<ForwardResult> QwenEngine::batch_decode_tokens(
 std::vector<ForwardResult> QwenEngine::batch_speculative_tokens(
     const std::vector<int>& tokens, const std::vector<int>& slot_ids,
     const std::vector<int>& draft_counts) {
+    bind_thread_device();
     if (tokens.size() != slot_ids.size() ||
         tokens.size() != draft_counts.size()) {
         throw std::runtime_error(
@@ -5676,6 +5703,7 @@ bool QwenEngine::is_stop_token(const BatchSamplingParams& sampling,
 
 BatchDecodeResult QwenEngine::batch_decode_step(
     const std::vector<BatchedRequest*>& requests) {
+    bind_thread_device();
 
     BatchDecodeResult result;
     result.next_tokens.reserve(requests.size());
@@ -5905,6 +5933,7 @@ PartialPrefillResult QwenEngine::prefill_partial(
 PartialPrefillResult QwenEngine::prefill_bounded(
     const std::vector<int>& token_ids, int slot_id, int max_tokens,
     const BatchSamplingParams* sampling, int logprobs_n) {
+    bind_thread_device();
     std::optional<Impl::RangeScope> range;
     if (impl_->range_profile) range.emplace("qwen.prefill");
     if (token_ids.empty()) {
@@ -6223,6 +6252,7 @@ PartialPrefillResult QwenEngine::prefill_bounded(
 }
 
 ForwardResult QwenEngine::decode_step(int token_id, int slot_id) {
+    bind_thread_device();
     std::optional<Impl::RangeScope> range;
     if (impl_->range_profile) range.emplace("qwen.decode_step");
 
@@ -6262,6 +6292,7 @@ ForwardResult QwenEngine::decode_step(int token_id, int slot_id) {
 
 std::vector<ForwardResult> QwenEngine::generate(
     const std::vector<int>& prompt_ids, int max_new_tokens, bool stop_at_eos) {
+    bind_thread_device();
     // Checked against config_.eos_token_ids directly: this path has no
     // per-request sampling params, and an empty list makes this always false.
     const auto is_eos = [&](int token) {
@@ -6415,6 +6446,7 @@ std::vector<ForwardResult> QwenEngine::generate(
 
 // TP worker loop implementation
 void QwenEngine::run_worker_loop() {
+    bind_thread_device();
     if (options_.tp_world <= 1) return;
     if (options_.tp_rank == 0) {
         throw std::runtime_error("run_worker_loop: rank 0 must not enter worker loop");
