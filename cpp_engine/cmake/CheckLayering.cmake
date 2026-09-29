@@ -15,7 +15,9 @@
 # catch a stray cudaMalloc that compiles only because some other header pulled the
 # SDK in transitively, and that is exactly the regression this seam exists to
 # prevent. Kernel launches still live in backends/<vendor>/kernels, which is not
-# checked.
+# checked. Headers count as sources here: a vendor type in `engine/*.hpp` reaches
+# every translation unit that includes it, so scanning only the .cpp files would
+# leave the one place a leak is cheapest to hide unread.
 #
 # Run with: cmake --build <dir> --target check_layering
 
@@ -44,8 +46,10 @@ file(GLOB_RECURSE guarded_files
     "${POCKET_ENGINE_DIR}/include/*.hpp"
     "${POCKET_ENGINE_DIR}/include/*.h"
     "${POCKET_ENGINE_DIR}/core/*.cpp"
+    "${POCKET_ENGINE_DIR}/core/*.hpp"
     "${POCKET_ENGINE_DIR}/backends/api/*.hpp"
     "${POCKET_ENGINE_DIR}/engine/*.cpp"
+    "${POCKET_ENGINE_DIR}/engine/*.hpp"
 )
 
 foreach(file ${guarded_files})
