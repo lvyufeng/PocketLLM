@@ -714,6 +714,7 @@ class Xing4Backend(SchedulerHost, RuntimeAdapter):
         *,
         on_token: Callable[[int], None] | None,
         on_step: Callable[[], bool] | None = None,
+        stop: Callable[[], bool] | None = None,
     ) -> Any:
         from src.models.xing4_0.generate import generate
 
@@ -734,11 +735,23 @@ class Xing4Backend(SchedulerHost, RuntimeAdapter):
                 cache=self._cache,
                 prefix_cache=self._prefix_cache,
                 on_token=None if on_token is None else (lambda token, _logits: on_token(token)),
-                # Two reasons to stop, and the earlier one wins: this adapter's own cancel set,
-                # which a disconnecting client fills, and whatever the caller's seam says -- the
-                # scheduler's step boundary when this loop is driven by one.
+                # Three reasons to stop and the earliest one wins: this adapter's own cancel set,
+                # which a disconnecting client fills; `on_step`, the scheduler's step boundary when
+                # this loop is driven by one; and `stop`, which is where the *stream's* stop-string
+                # check belongs.
+                #
+                # That last one is the whole reason this keyword exists, and leaving it out was a
+                # silent cost rather than a visible one: a stream found its marker, stopped sending,
+                # and let the loop run on to the budget with every token past the marker forwarded
+                # and thrown away. The budget is not small -- with no `max_tokens` on the request it
+                # is every position the prompt left of the context, so on this runtime's 32K default
+                # a stream that stopped at its first marker could pay for thirty thousand decode
+                # steps nobody would read, and `usage.completion_tokens` reported them as tokens the
+                # model had produced for the caller. `MimoBackend._loop` has taken this predicate
+                # since its stream was written.
                 on_step=lambda: self._is_cancelled(request.request_id)
-                or (on_step is not None and on_step()),
+                or (on_step is not None and on_step())
+                or (stop is not None and stop()),
             )
         finally:
             # Under the request lock, like the run itself, so the counters are the state of the
@@ -791,7 +804,11 @@ class Xing4Backend(SchedulerHost, RuntimeAdapter):
                 with self._request_lock:
                     marks = {"started": time.perf_counter()}
                     generation = self._loop(
-                        prompt_ids, budget, request, on_token=streamer.accept
+                        prompt_ids,
+                        budget,
+                        request,
+                        on_token=streamer.accept,
+                        stop=streamer.reached,
                     )
                 if generation.stopped == "cancel" and not streamer.hit:
                     events.put(TokenEvent(request_id=request.request_id, finish_reason="cancelled"))
