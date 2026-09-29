@@ -48,10 +48,10 @@ by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script
 - [Qwen drafter acceptance](https://lvyufeng.github.io/PocketLLM/performance/qwen_drafter_acceptance/)
 - [OpenAI API concurrency validation](https://lvyufeng.github.io/PocketLLM/performance/cpp_openai_concurrency_validation/)
 - [OpenAI API tool-calling acceptance](https://lvyufeng.github.io/PocketLLM/performance/cpp_openai_tool_acceptance/)
-- [Ascend 910A attention](https://lvyufeng.github.io/PocketLLM/performance/ascend_attention_optimization/)
-- [Ascend 910A TP collective overlap](https://lvyufeng.github.io/PocketLLM/performance/ascend_tp_collective_overlap/)
+- [Ascend 910B attention](https://lvyufeng.github.io/PocketLLM/performance/ascend_attention_optimization/)
+- [Ascend 910B TP collective overlap](https://lvyufeng.github.io/PocketLLM/performance/ascend_tp_collective_overlap/)
 - [Ascend decode collectives and batch scaling](https://lvyufeng.github.io/PocketLLM/performance/ascend_decode_collective_ab/)
-- [Ascend 910A single-request decode](https://lvyufeng.github.io/PocketLLM/performance/ascend_single_request_tps/)
+- [Ascend 910B single-request decode](https://lvyufeng.github.io/PocketLLM/performance/ascend_single_request_tps/)
 - [Ascend gated-delta value-axis slice](https://lvyufeng.github.io/PocketLLM/performance/ascend_gated_delta_slice/)
 - [Ascend RoPE table workspace slot](https://lvyufeng.github.io/PocketLLM/performance/ascend_rope_table_workspace_aliasing/)
 - [DeepSeek-V4 PersistentEngine baseline](https://lvyufeng.github.io/PocketLLM/performance/deepseek_v4_serial_baseline/)
@@ -106,7 +106,7 @@ by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script
 - [Multi-backend and multi-model (vLLM 0.30, SGLang 0.5.20)](https://lvyufeng.github.io/PocketLLM/architecture/multi_backend_multi_model_2026_09/)
 - [vLLM and SGLang comparison (pre-Phase-1)](https://lvyufeng.github.io/PocketLLM/architecture/vllm_sglang_comparison/)
 - [The command-line surface against vLLM and SGLang](https://lvyufeng.github.io/PocketLLM/architecture/cli_surface_design_2026_09/)
-- [Ascend 910A performance roadmap](https://lvyufeng.github.io/PocketLLM/architecture/ascend_performance_roadmap/)
+- [Ascend 910B performance roadmap](https://lvyufeng.github.io/PocketLLM/architecture/ascend_performance_roadmap/)
 
 ## Migration
 

@@ -22,7 +22,7 @@
 // rises. `--block-sweep` is that comparison, reported per element so the
 // different widths stay comparable.
 //
-// What it measured (910A, 30 cores, 2026-09-26):
+// What it measured (910B, 30 cores, 2026-09-26):
 //
 //   The scalar stage does not dominate. Cost per element falls from 2.83 ns at
 //   block 16 to 0.89 ns at block 4096, monotonically, so the kernel is not

@@ -1,4 +1,4 @@
-# Ascend 910A Single-Request Decode: What The 104 ms Step Is Made Of
+# Ascend 910B Single-Request Decode: What The 104 ms Step Is Made Of
 
 Qwen3.8-27B, 4 x Ascend 910 first generation (`Short_SoC_version=Ascend910`), TP=4, CANN 9.0.0,
 checkpoint `/mnt/data1/modelscope/Qwen/Qwen3.8-27B`, TP4 ranks on devices 0-3. Every number below is

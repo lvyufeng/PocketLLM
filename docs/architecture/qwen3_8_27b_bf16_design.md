@@ -64,7 +64,7 @@ The vision tower ships inside the same 18 shards as the text model, so every sha
 - Root/nested config parsing that reads through the multimodal root keys (`vision_config`, `image_token_id`, `language_model_only`) to the nested `text_config`.
 - Dense BF16 linear mapping with no scale tensors: all 505 mapped linears per rank classify as `DenseF16`, and the FP8-block/FP8-channel/NVFP4 counts are zero.
 - Explicit coverage accounting. Every index entry must be either mapped by the text map, recognized as a vision tensor, or reported as unexpected. Strict mode throws on any unexpected entry, so an unrecognized checkpoint variant fails instead of loading a partial model.
-- BF16 storage to FP16 device residency. RTX 2080 Ti has no native BF16 arithmetic, so every BF16 tensor is converted at materialization. FP8 and NVFP4 checkpoints keep their existing compressed paths untouched.
+- BF16 storage to FP16 device residency. Every BF16 tensor is converted at materialization, on both backends that run this checkpoint: RTX 2080 Ti has no native BF16 arithmetic, and the first-generation 910 has no BF16 at all. FP8 and NVFP4 checkpoints keep their existing compressed paths untouched.
 - Host/device split of the loader. The mapping, coverage and host materialization live in `cpp_engine/core/qwen_weight_map.cpp` and link only `pocket_core`; device residency and uploads stay in `cpp_engine/engine/qwen_weights.cpp`.
 - Plain rotary positions, not MRoPE. The checkpoint declares `mrope_section [11, 11, 10]` and `mrope_interleaved: true` inside `rope_parameters`, and `cpp_engine/core/qwen_config.cpp` reads only `rope_theta` and `partial_rotary_factor` out of that object. Dropping the other two is exact rather than an approximation: PocketLLM executes text only, and in text-only input the three MRoPE position axes carry the same positions, so the interleave is a numerical no-op — `src/models/qwen4_exp/layers.py` says so where it builds `MRoPE`, and keeps the general path for image and video position ids later.
 
@@ -132,12 +132,12 @@ Generation follows the FP8 page's four-rank NCCL procedure with this checkpoint 
 
 ## Known limitations
 
-- No on-device validation yet. Generation, TPS, determinism across ranks, and MTP on/off behavior have not been measured for this checkpoint.
-- BF16 weights are materialized as FP16 for RTX 2080 Ti. This is a precision-narrowing conversion at load time, not a lossless path, and it is specific to Turing. An accelerator with native BF16 must supply its own dtype policy rather than reusing `qwen_device_dtype`.
+- No on-device validation on CUDA yet. Generation, TPS, determinism across ranks, and MTP on/off behavior have not been measured for this checkpoint on a GPU.
+- BF16 weights are materialized as FP16 on both backends that run this checkpoint, for two unrelated reasons: RTX 2080 Ti has no native BF16 arithmetic, and the first-generation 910 has no BF16 at all. This is a precision-narrowing conversion at load time, not a lossless path. An accelerator with native BF16 must supply its own dtype policy rather than reusing `qwen_device_dtype`.
 - Resident BF16 weights are 12.8 GiB per rank at TP4, well above the FP8 and NVFP4 checkpoints. Long-context headroom on 22 GiB cards is correspondingly smaller.
 - Text-only: no image or video preprocessing, and the vision tower is never mapped or uploaded.
-- Native OpenAI-compatible serving is not validated for this checkpoint because full-model CUDA generation is not validated yet.
-- The Ascend backend configures but does not link; no kernels exist yet.
+- Native OpenAI-compatible serving is not validated for this checkpoint on either backend, and on CUDA full-model generation is not validated yet.
+- The Ascend backend is not an audit target: it runs this checkpoint on device at TP4, and those measurements are under [performance](../performance/index.md). Nothing on this page was taken there.
 
 ## Evidence and related notes
 

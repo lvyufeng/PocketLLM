@@ -1,5 +1,5 @@
 // The activation side of the ternary checkpoint's incoherence transform, on the
-// 910A.
+// 910B.
 //
 // The weights in the file are in a rotated frame -- each matrix was multiplied by
 // `R^-1` before it was quantized to three values, which is what spreads the
