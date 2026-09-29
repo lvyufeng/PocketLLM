@@ -25,11 +25,13 @@ at commit `b5f791c`, whose loader decodes 1.75-bit blocks on the host and ships 
 rank. This checkpoint ships 12.8 GiB of FP16 a rank and takes a different arm of the same weight
 map, so the earlier record's ladder is not this one's.
 
-The result is three sentences. **The server path costs nothing measurable** — 22.18 output tok/s at
+The result is four sentences. **The server path costs nothing measurable** — 22.18 output tok/s at
 concurrency one, against 21.99-22.18 for the same workload measured three ways. **It emits the
 sequence this backend already publishes** as the reference's own
-([the RoPE workspace record](ascend_rope_table_workspace_aliasing.md)). And **its width stops at 8**,
-which is `DEFAULT_BATCH_SLOTS` rather than a capacity limit of this checkpoint.
+([the RoPE workspace record](ascend_rope_table_workspace_aliasing.md)). **A default deployment stops at
+8 slots**, which is `DEFAULT_BATCH_SLOTS` and not a capacity limit of this checkpoint. And **passing
+`--max-batch-size 16` is worth 1.45×**, 69.88 → 101.56 output tok/s, at which point the server's width
+and the engine's own plateau arrive at the same number from two different harnesses.
 
 ## 1. The bring-up
 
@@ -182,21 +184,46 @@ against 69.88), and running the concurrency-8 arm on **32** prompts instead of 1
 with a time-to-first-token of 7.3 s — the same figure the 16-prompt arm gave, two waves either way.
 The plateau is a policy boundary at 8, not the arena filling.
 
-## 5. The plan's decode target is reached, and this is not the record that establishes it
+## 5. How to read 101.56 against the roadmap's 100 TPS target
 
-[The roadmap](../architecture/ascend_performance_roadmap.md) sets decode at **≥ 100 TPS** and records
-it at **9.2 TPS** on this checkpoint. The batched decode measured here — 70 TPS of output at a client
-concurrency of 8, with the first token excluded from each request by the client's own accounting — is
-a different measurement of a different thing: a scheduler row group rather than the engine's internal
-batched path, over HTTP, with the prefill of each row inside the same wall clock. It does not revise
-the roadmap's figure and should not be read as meeting its target.
+The width-16 ladder crosses the number [the roadmap](../architecture/ascend_performance_roadmap.md)
+sets as its target — decode at **≥ 100 TPS**, recorded there at **9.2 TPS** on this checkpoint — and
+**that is not this record's claim to make.** 101.56 is a client-side aggregate: each row's prefill is
+inside the same wall clock as its decode, the first token is excluded by the client's own accounting
+rather than by the engine's, and the quantity is a scheduler row group over HTTP rather than the
+engine's own decode rate. It is a serving number, and the roadmap's target is an engine number. Read
+the roadmap against the engine-side record that speaks to it and not against this one.
 
 What it does say is where the target's shortfall sits. The engine-side record puts the batched path
 itself at **114.5 TPS at 16 rows** with TP4's 129 all-reduces a decode step, and the roadmap's own
 arithmetic puts a TP4 100 TPS target 2.7× beyond what the recurrence and the collectives will give.
-This ladder adds one bound to that arithmetic: **the server's slot count is 8**, so a deployment that
-never passes `--max-batch-size` cannot present the engine-side 16-row figure to a client at all, no
-matter what the engine can do with it.
+This ladder adds one bound to that arithmetic that the §2 table cannot show, because §2's server was
+left at the default. **The slot count is the bound at 8, and passing the flag moves it to 16 — which is
+the end of the road.**
+
+| arm | concurrency | prompts | output tok/s | req/s | TTFT |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `--max-batch-size 16`, width 16 | 1 | 16 | 21.85 | 0.341 | 2928.6 ms |
+| `--max-batch-size 16`, width 16 | 8 | 16 | 69.88 | 1.092 | 7293.0 ms |
+| `--max-batch-size 16`, width 16 | 16 | 32 | **101.56** | 1.587 | 10006.9 ms |
+| `--max-batch-size 16`, width 16 | 16 | 32 (repeat) | 101.69 | 1.589 | 9994.3 ms |
+| `--max-batch-size 16`, width 16 | 16 | 48 | 101.03 | 1.581 | 10037.9 ms |
+| `--max-batch-size 16`, width 16 | 32 | 32 | 93.17 | 1.456 | 14520.9 ms |
+
+Same server, same workload, only the flag and the client's concurrency changed, and the c=8 and c=1
+arms reproduce the §2 column to the digit — which is the check that the two tables are one ladder.
+**Raising the slot count is worth 1.45×**, 69.88 → 101.56, and the cap moves with it: a sampler through
+a 32-client wave reads `requests_running 16` with `slots_free 0` and `requests_waiting` 7, then 8, then
+9 — the same pinned-and-queuing shape §4 saw at 8, one width up. Concurrency 32 is past the width and
+reads 93.17 while its mean first-token time climbs to 14.5 s.
+
+The plateau above 16 is the engine, not the server. **16 rows is where the engine-side record already
+put the batched path** — its `114.5 TPS at 16 rows` — so the two agree on where the curve turns, from
+two different harnesses, and the second width is the last one worth asking the server for.
+
+The residency difference between the two widths is **170 MB a rank** — 21744 MB at `--max-batch-size
+16` against 21574 MB at the default 8, `kv_paged` off — and this record does not attribute it to the KV
+reservation rather than to allocator slack, because it is one observation and not a sweep.
 
 ## 6. Correctness
 
@@ -234,10 +261,11 @@ same checkpoint would do on a 2080 Ti.
    18.6, which is why §5 and §1 do not lean on it. A same-session A/B against the CLI at `rows=1`
    would need the CLI and the server on the same cards at the same time, which is not what was run.
 2. **Nothing here was repeated often enough for error bars.** The repeat arms that do exist agree
-   closely — concurrency 8 gives 69.88 and 70.01, streaming gives 21.76 and 21.77, and three of the
-   four bring-ups land in 45-67 s — but each arm is two samples and the bring-ups are four, and the
-   differences that matter here (a 3.18× ladder, a flat streaming column, a flat plateau above 8) are
-   far outside anything this backend has shown run to run.
+   closely — concurrency 8 gives 69.88 and 70.01, concurrency 16 gives 101.56, 101.69 and 101.03,
+   streaming gives 21.76 and 21.77, three of the four bring-ups land in 45-67 s, and the c=1 and c=8
+   arms reproduce across two servers — but each arm is two or three samples and the bring-ups are
+   four. The differences that matter here (a 3.18× ladder, a flat streaming column, a flat plateau
+   above 8) are far outside anything this backend has shown run to run.
 3. **The collective in use cannot be told from these numbers, and this record does not claim which
    one ran.** The engine reads the `POCKET_ASCEND_IPC_*` names from the process environment, so the
    server inherits whatever the shell has; nothing on the Python side exports them. A pass with the
@@ -248,7 +276,11 @@ same checkpoint would do on a 2080 Ti.
    collective ran needs the engine's own instrumentation rather than this client.
 4. **This is not a long-context result.** 244 prompt tokens says nothing about how `pocketllm serve`
    handles a streamed 4,966-token prefill, which is a different measurement on this backend.
-5. **One wave, one shape.** Every request generates exactly 64 tokens, so continuous refill and static
+5. **The two widths are a two-point ladder, and the residency between them is one observation.** What
+   a third width below 16 would give is unmeasured, and the 170 MB a rank that separates the two runs
+   — 21574 MB at the default 8 against 21744 MB at 16 — is not attributed here to the KV reservation
+   rather than to allocator slack.
+6. **One wave, one shape.** Every request generates exactly 64 tokens, so continuous refill and static
    batching are indistinguishable here, and no arm reports what happens when a wave's rows would not
    fit the arena — the scheduler never had to evict.
 
@@ -270,9 +302,11 @@ python scripts/bench_serving.py --base-url http://127.0.0.1:8124 \
 ```
 
 `--no-stream` selects the non-streaming arm; `--max-concurrency` is the only thing that changes
-between arms; the arms were run serially against one server. The scheduler columns in §3 and §4 came
-from a sampler thread polling `/metrics` every second, not from the response bodies. The reference
-token sequence in §6 is one request:
+between arms; the arms were run serially against one server. **§5's table is the same command against
+a second server whose only difference is the flag `--max-batch-size 16`** — every arm above reproduced
+there at concurrency 1 and 8, which is the check that the two tables are one ladder. The scheduler
+columns in §3, §4 and §5 came from a sampler thread polling `/metrics` every second, not from the
+response bodies. The reference token sequence in §6 is one request:
 
 ```bash
 curl -s http://127.0.0.1:8124/v1/completions -H 'Content-Type: application/json' \

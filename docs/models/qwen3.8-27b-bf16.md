@@ -113,8 +113,10 @@ each, CANN 9.0.0), one process a rank, TP4 — the same four-card layout the CUD
 driven by `scripts/run_qwen_ascend_tp4.sh` against the engine binary. The same checkpoint has since
 been put behind `pocketllm serve` on the same four cards — [Qwen3.8-27B behind the
 server](../performance/ascend_qwen_bf16_served.md) — where the HTTP path emitted the identical greedy
-token sequence at 22.18 output tok/s at concurrency one and 69.88 at concurrency eight, and where the
-ladder stops at `DEFAULT_BATCH_SLOTS = 8` rather than at anything about this checkpoint.
+token sequence at 22.18 output tok/s at concurrency one and 69.88 at concurrency eight on the default
+configuration. That default stops at `DEFAULT_BATCH_SLOTS = 8` rather than at anything about this
+checkpoint; passing `--max-batch-size 16` is worth 1.45×, reaching **101.56** output tok/s at
+concurrency 16, after which it is the engine's own 16-row plateau that binds.
 
 Residency is the number the table above reports, and it is not a coincidence. `qwen_device_dtype`
 narrows BF16 to FP16 for both backends and lives in `core/`, where it names both: RTX 2080 Ti has no
