@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
@@ -14,7 +15,9 @@ from pocketllm.api import (
     HealthStatus,
     RequestCancelledError,
     TensorParallelSupervisorError,
+    TimingMetrics,
     TokenEvent,
+    Usage,
 )
 from pocketllm.choices import CHOICE_MARK
 from pocketllm.protocol.contract import CHAT, FieldRefusal
@@ -255,6 +258,149 @@ class BackendBase:
     @staticmethod
     def _metadata_copy(value: Any) -> dict[str, Any]:
         return dict(value) if isinstance(value, dict) else {}
+
+
+class RuntimeAdapter(BackendBase):
+    """The request-lifecycle half that the torch-runtime adapters share.
+
+    The adapters in this family -- ``v41``, ``mimo``, ``xing4``, ``torch`` -- serve a request the
+    same way: turn a prompt into ids, resolve a budget against the context this run was configured
+    with, loop a runtime, and read the finished generation back into a :class:`GenerationResult`.
+    They differ in what the runtime *is*, not in that shape.
+
+    What is here is the part of the shape whose body says nothing about its runtime once the
+    runtime has a name.  Between ``mimo`` and ``xing4``, ``_encode_chat`` and ``_result`` were
+    byte-identical and ``prepare``, ``_tokenize``, ``_budget`` and ``_decode`` differed by the
+    runtime's name inside one error message -- and two copies of a body like that are two places
+    for the next fix to miss.
+
+    Which adapters are on this base is a fact about how far the convergence has got, not about
+    which ones the body fits: ``v41`` and ``torch`` keep their own copies until the differences
+    they carry are resolved one at a time.
+
+    A subclass supplies its runtime's name through :attr:`_RUNTIME_LABEL` and keeps everything that
+    genuinely differs -- the load, the loop, ``_runtime_spec``, the capability declaration.  The
+    only state read here is ``_tokenizer`` and ``_max_seq_len``, which every adapter in this family
+    has, and ``_ensure_prefix_cache``, which :meth:`prepare` calls for the reason its own comment
+    gives.
+    """
+
+    #: How this adapter's own messages spell its runtime, as this family spells it in "the MiMo
+    #: tokenizer is not loaded".  Read by :meth:`_tokenize` alone: nothing else here needs to know
+    #: which runtime it is.
+    _RUNTIME_LABEL = ""
+
+    def prepare(self) -> None:
+        """Load the model, and the prefix store it will be asked for before the first request.
+
+        The store is built here rather than inside ``_load`` because every path that ends with a
+        loaded model passes through ``_ensure_loaded`` -- including the injected ones -- and a
+        store built in only one of them would be a switch that quietly does nothing on the others.
+        """
+        self._ensure_open()
+        self._ensure_loaded()
+        self._ensure_prefix_cache()
+
+    def _tokenize(self, request: GenerationRequest) -> list[int]:
+        if request.prompt_tokens is not None:
+            # A copy, and only a copy: the request already coerced these in its own
+            # ``__post_init__``, so the only thing left to decide here is that the ids this
+            # adapter reports back are not the caller's own list.
+            return list(request.prompt_tokens)
+        tokenizer = self._tokenizer
+        if tokenizer is None:
+            raise RuntimeError(f"the {self._RUNTIME_LABEL} tokenizer is not loaded")
+        messages = request.metadata.get("messages")
+        if messages:
+            return self._encode_chat(tokenizer, messages, request.metadata)
+        # A raw completion prompt is not chat and gets no header.
+        return [int(token) for token in tokenizer(request.prompt)["input_ids"]]
+
+    def _encode_chat(
+        self, tokenizer: Any, messages: Any, metadata: Mapping[str, Any]
+    ) -> list[int]:
+        """Render a chat with the template the checkpoint ships."""
+        tools = metadata.get("tools")
+        kwargs: dict[str, Any] = {}
+        if tools:
+            kwargs["tools"] = tools
+        try:
+            text = tokenizer.apply_chat_template(
+                list(messages), tokenize=False, add_generation_prompt=True, **kwargs
+            )
+        except (ValueError, TypeError) as exc:
+            raise ConfigurationError(f"the chat template refused this conversation: {exc}") from exc
+        # The rendered prompt opens with its own control tokens, so nothing may be added here.
+        return [int(token) for token in tokenizer(text, add_special_tokens=False)["input_ids"]]
+
+    def _budget(self, prompt_ids: Sequence[int], request: GenerationRequest) -> int:
+        """How many tokens this request may generate, from the request and this run's context.
+
+        A prompt that already fills the context is refused rather than clamped to zero: the answer
+        to it is not an empty generation, it is that this run's cache is too small for the request,
+        and a zero budget would report that as a request that generated nothing.
+        """
+        params = request.sampling_params
+        room = self._max_seq_len - len(prompt_ids)
+        if room < 1:
+            raise ConfigurationError(
+                f"a prompt of {len(prompt_ids)} tokens fills the {self._max_seq_len} positions "
+                f"this run's cache was sized at; raise --max-model-len and restart"
+            )
+        return int(params.token_budget(room))
+
+    def _decode(self, token_ids: Sequence[int], skip_special_tokens: bool | None = None) -> str:
+        """The text of ``token_ids``, or ``""`` when there is nothing that can read them.
+
+        ``skip_special_tokens`` is asked for and the failure is absorbed: the keyword is on every
+        HF tokenizer but this adapter may be handed an object that is only duck-typed as one, and a
+        request that answered with no text at all would be a worse answer than the ids it did
+        produce. An absent argument means the usual answer, which is to skip them.
+        """
+        if self._tokenizer is None:
+            return ""
+        skip = True if skip_special_tokens is None else bool(skip_special_tokens)
+        try:
+            return self._tokenizer.decode(list(token_ids), skip_special_tokens=skip)
+        except Exception:  # pragma: no cover - a tokenizer that cannot decode one token
+            return ""
+
+    def _result(
+        self,
+        request: GenerationRequest,
+        prompt_ids: Sequence[int],
+        generation: Any,
+        marks: Mapping[str, float],
+        *,
+        stopped: str | None = None,
+    ) -> GenerationResult:
+        """The finished generation as the API's result, with this run's timings on it."""
+        text = self._decode(generation.tokens)
+        finish = {
+            "eos": "stop",
+            "length": "length",
+            "stop": "stop",
+            "cancel": "cancelled",
+        }.get(generation.stopped if stopped is None else stopped, "stop")
+        now = time.perf_counter()
+        return GenerationResult(
+            request_id=request.request_id,
+            token_ids=list(generation.tokens),
+            text=text,
+            finish_reason=finish,
+            usage=Usage(
+                prompt_tokens=len(prompt_ids),
+                completion_tokens=len(generation.tokens),
+                cached_tokens=int(getattr(generation, "cached_tokens", 0)),
+            ),
+            timings=TimingMetrics(
+                prefill_seconds=generation.prefill_seconds,
+                decode_seconds=generation.decode_seconds,
+                total_seconds=now - marks.get("started", now),
+                ttft_seconds=generation.ttft_seconds,
+                tpot_seconds=generation.step_seconds,
+            ),
+        )
 
 
 class TokenStreamer:

@@ -9,12 +9,14 @@ import pytest
 
 from pocketllm.api import (
     BackendCapabilities,
+    ConfigurationError,
+    GenerationRequest,
     GenerationResult,
     TokenEvent,
     UnsupportedFeatureError,
     Usage,
 )
-from pocketllm.backends.base import BackendBase, settled_text
+from pocketllm.backends.base import BackendBase, RuntimeAdapter, settled_text
 from pocketllm.server.metrics import HISTOGRAMS, Metrics
 from pocketllm.server.openai import OpenAIHandler, PocketLLMHTTPServer
 
@@ -782,3 +784,55 @@ def test_the_exporter_prefixes_the_family_not_the_selector():
     assert line.split(" ")[0] == 'pocketllm_kv_blocks{state="free"}'
     # The native host's spelling of the same series, for the substitution to be visible.
     assert line == 'pocketllm_kv_blocks{state="free"} 7'
+
+
+# --------------------------------------------------------------- the shared runtime adapter
+
+
+class _StubRuntimeAdapter(RuntimeAdapter):
+    """The shared half of a torch-runtime adapter, with a runtime's name and nothing else."""
+
+    _RUNTIME_LABEL = "Stub"
+
+    def __init__(self, *, max_seq_len: int = 8) -> None:
+        super().__init__()
+        self._max_seq_len = max_seq_len
+        self._tokenizer = None
+
+
+def test_the_shared_adapter_copies_the_prompt_ids_it_was_handed():
+    """The ids a result reports are this adapter's, not the caller's list.
+
+    ``GenerationRequest`` coerces ``prompt_tokens`` to ints itself, so the only decision left here
+    is the copy -- and it has to be a copy, because these ids travel on into
+    ``GenerationResult.token_ids`` and a caller that reused its own list afterwards would be
+    editing a finished result.
+    """
+    adapter = _StubRuntimeAdapter()
+    prompt = [3, 4, 5]
+    request = GenerationRequest(prompt_tokens=prompt, request_id="r")
+
+    ids = adapter._tokenize(request)
+
+    assert ids == [3, 4, 5]
+    assert ids is not prompt
+    ids.append(6)
+    assert request.prompt_tokens == [3, 4, 5]
+
+
+def test_the_shared_adapter_refuses_a_prompt_that_leaves_no_room():
+    """A prompt filling the context is an error about the context, not an empty generation."""
+    adapter = _StubRuntimeAdapter(max_seq_len=4)
+    request = GenerationRequest(prompt_tokens=[1, 2, 3, 4], request_id="r")
+
+    with pytest.raises(ConfigurationError, match="raise --max-model-len and restart"):
+        adapter._budget([1, 2, 3, 4], request)
+
+
+def test_the_shared_adapter_answers_a_missing_tokenizer_with_its_runtime_name():
+    """The one thing the shared body needs a runtime to supply, and it is the label."""
+    adapter = _StubRuntimeAdapter()
+    request = GenerationRequest(prompt="hello", request_id="r")
+
+    with pytest.raises(RuntimeError, match="the Stub tokenizer is not loaded"):
+        adapter._tokenize(request)
