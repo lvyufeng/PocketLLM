@@ -597,29 +597,42 @@ class CppBackend(BackendBase):
         return True if explicit is None else bool(explicit)
 
     def _batching_source(self) -> str:
-        """Which of the three places the batch decision came from, for a message about it."""
+        """Which place the batch decision came from, for a message about it.
+
+        The width is a decision too, and often the one an operator actually typed:
+        ``--max-batch-size`` with no ``--enable-batching`` is how the flag is spelled in every script
+        under ``scripts/``, and ``--max-batch-size 8`` alone is a request the backend treats as one.
+        A message naming only the backend's default would send that caller looking for a flag they
+        never used.
+        """
         if self.args.backend_options.get("enable_batching") is not None:
             return "from --backend-option enable_batching"
         if self.args.enable_batching is not None:
             return "from --enable-batching" if self.args.enable_batching else "from --no-enable-batching"
+        if "max_batch_size" in self.args.backend_options:
+            return "from --backend-option max_batch_size"
+        if self.args.max_batch_size != 1:
+            return f"from --max-batch-size {self.args.max_batch_size}"
         return "from this backend's default"
 
     def _batching_was_asked_for(self) -> bool:
         """Whether a *person or caller* asked, as opposed to this backend assuming it.
 
-        The difference decides whether a build without a scheduler is worth a warning. An explicit
-        request that cannot be honoured is the case a warning is for. The assumption is not: it is a
-        claim about the build, `capabilities.details['scheduler']` answers it on every construction,
-        and a warning on the default path would be one line of noise per process for a fact the
-        capability report already carries -- the same declaration R2 exists to make uniform.
+        The difference decides what an unbuildable scheduler is worth. A request that cannot be
+        honoured is refused, because the caller has nowhere else for it to be answered -- that is
+        #437, where `--max-batch-size 8` was accepted, clamped and silently dropped to one row. The
+        backend's own assumption is not a promise to anybody: it is a claim about the build,
+        `capabilities.details['scheduler']` answers it on every construction, and refusing the
+        default path would make this backend unusable on a build without a scheduler -- the same
+        declaration R2 exists to make uniform.
         """
         if self.args.backend_options.get("enable_batching"):
             return True
         if self.args.enable_batching:
             return True
-        # A width can be refused for being unreadable, but this decides whether to *warn* about it, so
-        # it must not be the thing that raises: a build with no scheduler and a nonsense width would
-        # otherwise report the ValueError in place of the ConfigurationError that names the width.
+        # A width can be refused for being unreadable, but this decides only whether somebody asked,
+        # so it must not be the thing that raises: a build with no scheduler and a nonsense width
+        # would otherwise report the ValueError in place of the ConfigurationError naming the width.
         try:
             return int(self._requested_batch_width() or 1) > 1
         except (TypeError, ValueError):
@@ -634,15 +647,23 @@ class CppBackend(BackendBase):
         return None
 
     def _init_batch_scheduler(self) -> bool:
-        """Initialize the batch scheduler if available."""
+        """Build the batch scheduler, or refuse the width that needs it.
+
+        A width reaches the engine through the scheduler's own slot allocation
+        and not through the engine, so a width that was asked for and a scheduler
+        that could not be built are one fact and not two. Answering the request
+        with the serialized session would accept the flag and serve one request
+        at a time, which is the state :meth:`_unavailable_scheduler` exists to
+        remove.
+        """
         if not hasattr(self._native, "QwenBatchScheduler"):
-            if self._batching_was_asked_for():
-                import warnings
-                warnings.warn(
-                    f"the batch path was asked for ({self._batching_source()}) but this native module "
-                    f"does not expose QwenBatchScheduler; falling back to serial execution, which "
-                    f"serves one request at a time"
-                )
+            self._unavailable_scheduler(
+                "this native module does not expose QwenBatchScheduler",
+                "Rebuild cpp_engine with -DPOCKET_BUILD_PYTHON=ON.",
+                # A missing class is a fact about the build, and the capability report carries it
+                # on every construction; one warning per process for it would be noise.
+                warn_when_unasked=False,
+            )
             return False
 
         max_batch_size = self._configured_max_batch_size()
@@ -653,9 +674,37 @@ class CppBackend(BackendBase):
             self._scheduler = self._native.QwenBatchScheduler(self._engine, max_batch_size)
             return True
         except Exception as e:
-            import warnings
-            warnings.warn(f"Failed to create QwenBatchScheduler: {e}; falling back to serial execution")
+            # Whoever asked for the width needs to hear that this engine cannot take it. The
+            # failure is not always a type error: a `PersistentEngine` is not an `InferenceEngine`
+            # in the binding, so a DeepSeek-V4 checkpoint lands here, and so would any engine the
+            # scheduler's constructor rejects for its own reasons.
+            self._unavailable_scheduler(
+                f"the batch scheduler could not be built over this engine: {e}",
+                "Drop --max-batch-size and --enable-batching, or serve a model whose engine the "
+                "scheduler takes.",
+                warn_when_unasked=True,
+            )
             return False
+
+    def _unavailable_scheduler(self, reason: str, remedy: str, *, warn_when_unasked: bool) -> None:
+        """Report a scheduler that could not be built: refusal, warning, or silence.
+
+        The line between the three is who asked. A person or a caller who named a
+        width gets a refusal, because there is nowhere else for that request to
+        be answered. This backend's own default -- which is to batch -- gets the
+        answer the capability set already carries, plus one warning when the
+        engine actively rejected the scheduler rather than the build lacking one.
+        """
+        if self._batching_was_asked_for():
+            raise UnsupportedFeatureError(
+                f"{reason}. The batch path was asked for {self._batching_source()}, and a width is "
+                f"delivered by the scheduler rather than by the engine, so refusing is the only "
+                f"honest answer. {remedy}"
+            )
+        if warn_when_unasked:
+            import warnings
+
+            warnings.warn(f"{reason}; running the serialized session, one request at a time")
 
     @staticmethod
     def native_available() -> bool:
@@ -830,6 +879,8 @@ class CppBackend(BackendBase):
         if kind == "auto":
             kind = self._detect_engine_kind()
 
+        self._refuse_unschedulable_engine_before_loading(kind)
+
         if kind == "persistent":
             return self._construct_persistent_engine()
         elif kind == "qwen":
@@ -838,6 +889,40 @@ class CppBackend(BackendBase):
             raise UnsupportedFeatureError(
                 f"unsupported engine_kind: {kind}; use 'auto', 'persistent' or 'qwen'"
             )
+
+    def _refuse_unschedulable_engine_before_loading(self, kind: str) -> None:
+        """Refuse a width this engine could not honour, before the checkpoint is read.
+
+        The same refusal :meth:`_init_batch_scheduler` makes, moved ahead of the
+        model load it would otherwise land after: a DeepSeek-V4 checkpoint takes
+        minutes to open, and learning at the end of that that the width was never
+        going to be honoured is the cost `factory.py` refuses at parse time for
+        the runtimes that declare `supports_batch=False`.
+
+        It answers from the binding's own class objects rather than by trying, so
+        it is positive evidence only: a module that does not expose both the class
+        and `InferenceEngine` is left to the real attempt below. A false negative
+        would refuse a working build, which is the direction this must not err in.
+        """
+        class_name = {"qwen": "QwenEngine", "persistent": "PersistentEngine"}.get(kind)
+        if class_name is None:
+            return
+        cls = getattr(self._native, class_name, None)
+        base = getattr(self._native, "InferenceEngine", None)
+        if not isinstance(cls, type) or not isinstance(base, type):
+            return
+        if issubclass(cls, base):
+            return
+        # Silent when nobody asked: the load is going to happen anyway, and it ends in the late
+        # check's warning. This one exists only to move the refusal ahead of the load, so it has
+        # nothing to say on the path that does not refuse.
+        self._unavailable_scheduler(
+            f"{class_name} is not an InferenceEngine in this native module, so the batch "
+            f"scheduler cannot be built over the engine this checkpoint selects",
+            "Drop --max-batch-size and --enable-batching, or serve a model whose engine the "
+            "scheduler takes.",
+            warn_when_unasked=False,
+        )
 
     # Architectures the registry knows, mapped to the native engine class this
     # backend constructs for them.  The backend builds the concrete classes
