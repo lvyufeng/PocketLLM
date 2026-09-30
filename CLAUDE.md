@@ -136,18 +136,22 @@ be verified from here** — treat them as claims to re-check in place.
 
 ## Network access
 
-- **`origin` is HTTPS**: `https://github.com/lvyufeng/PocketLLM.git`. There is no SSH key this host
-  can authenticate to GitHub with — `~/.ssh/` holds `id_ed25519` and no `_github` key,
-  `~/.ssh/config` has no `github.com` entry, and `ssh -T git@github.com` is refused on port 22
-  (checked 2026-09-29). A refused handshake says this host has no accepted key, not that a keyed
-  route does not exist, so a host with the entry described in this bullet's earlier revision would
-  still push over SSH.
+- **`origin` is SSH to `github.com`, tunnelled to `ssh.github.com:443`.** The remote is
+  `git@github.com:lvyufeng/PocketLLM.git`, and that hostname is an alias rather than the real one:
+  `~/.ssh/config` holds a `Host github.com` entry with `HostName ssh.github.com`, `Port 443`,
+  `IdentityFile ~/.ssh/id_ed25519_github` and `IdentitiesOnly yes`, and that key exists. So a plain
+  `ssh -T git@github.com` with the config in place authenticates, while the same command with the
+  entry removed is refused on port 22 — `ssh -T git@github.com` on its own therefore proves nothing
+  about whether a keyed route exists, only that whatever route it took did not work. Read
+  `git remote -v` and the `Host github.com` block together before concluding which path is live;
+  this section has now been wrong about it in both directions. (Checked 2026-09-30.)
 - `gh` is authenticated separately, as the account `lvyufeng`. It uses `api.github.com`, which is a
   different path from git's — so a `gh` command can fail while a push succeeds.
-- `github.com` over HTTPS answers, including the API's own paths (checked 2026-09-29; it was
+- `github.com` over HTTPS answers, including the API's own paths (checked 2026-09-30; it was
   unreachable at some point before that, and the earlier SNI-filtering workaround no longer
-  applies). **README badges and raw-file links over `raw.githubusercontent.com` and `camo.` have not
-  been checked** and are not covered by any of the above.
+  applies). `raw.githubusercontent.com` answers too (200 on a raw README, checked 2026-09-30), so
+  README badges and raw-file links are reachable; the `camo.` cache in front of image badges has
+  still not been checked.
 - `api.github.com` is reachable but **intermittently times out**. `gh` commands — `gh pr list
   --json` in particular — may need a retry.
 - PyPI and Test PyPI are reachable over HTTPS. `docs/guides/pypi_release.md` documents the release flow and
