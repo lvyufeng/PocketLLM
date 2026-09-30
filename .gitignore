@@ -259,3 +259,11 @@ outputs/
 checkpoints/
 *.gguf
 gguf_hfd/
+
+# CANN's kernel build cache. Written by the Ascend engine on every run, under
+# `kernel_meta_<hash>/` and `kernel_meta_temp_<hash>/`, plus a `buildPidInfo.json`
+# mapping pids to them. Nothing in it is written by hand; deleting it only costs a
+# recompile. `sweep-rep-flip/` and `sweep-rep-flip2/` are deliberately *not*
+# listed here -- docs/performance/ records cite those two by file name, so they
+# stay visible on `git status` rather than hidden. See CLAUDE.md.
+kernel_meta/
