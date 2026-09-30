@@ -53,7 +53,6 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
@@ -62,12 +61,11 @@ from pocketllm.api import (
     BackendCapabilities,
     ConfigurationError,
     GenerationRequest,
-    GenerationResult,
     RequestCancelledError,
     UnsupportedFeatureError,
 )
 
-from .base import RuntimeAdapter, TokenStreamer
+from .base import RuntimeAdapter
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
 from .options import BackendOption, Group, Kind, decode_args
 from .shared_options import (
@@ -737,25 +735,8 @@ class MimoBackend(SchedulerHost, RuntimeAdapter):
             int(sampling.max_new_tokens),
             context,
             on_token=on_token,
-            marks={"started": time.perf_counter()},
             stop=on_step,
         )
-
-    def _generate_one(self, request: GenerationRequest) -> GenerationResult:
-        self._begin_request(request.request_id)
-        try:
-            prompt_ids = self._tokenize(request)
-            budget = self._budget(prompt_ids, request)
-            self._check_cancelled(request.request_id)
-            with self._request_lock:
-                self._check_cancelled(request.request_id)
-                marks = {"started": time.perf_counter()}
-                generation = self._loop(
-                    prompt_ids, budget, request, on_token=None, marks=marks
-                )
-            return self._result(request, prompt_ids, generation, marks)
-        finally:
-            self._clear_request(request.request_id)
 
     def _loop(
         self,
@@ -764,9 +745,16 @@ class MimoBackend(SchedulerHost, RuntimeAdapter):
         request: GenerationRequest,
         *,
         on_token: Callable[[int], None] | None,
-        marks: dict[str, float],
         stop: Callable[[], bool] | None = None,
     ) -> Any:
+        """This runtime's loop, with the cancellation seam the routed layers demand.
+
+        No ``marks`` parameter, and there never was a use for one: the wall clock an answer's total
+        is measured from is written by whichever caller put the loop under its own lock, and the
+        streamed and serial paths both do. What this method does own is the step boundary --
+        ``_step_sync`` is a collective on this runtime, not a local flag -- and that is why a
+        serial request passes a ``stop`` as well.
+        """
         from src.models.mimo_v2.generate import generate
 
         self._ensure_loaded()
@@ -834,36 +822,6 @@ class MimoBackend(SchedulerHost, RuntimeAdapter):
             "seed": params.seed,
         }
         torch.distributed.broadcast_object_list([payload], src=0)
-
-    def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
-        self._ensure_loaded()
-        if self._batching():
-            return self._generate_batched(requests)
-        return [self._generate_one(request) for request in requests]
-
-    def _run_loop(
-        self,
-        prompt_ids: Sequence[int],
-        budget: int,
-        request: GenerationRequest,
-        streamer: TokenStreamer,
-        marks: dict[str, float],
-    ) -> Any:
-        """This runtime's loop, with the streamer deciding both the token and the step.
-
-        `marks` goes through with the request because this loop's signature takes it; what the loop
-        leaves there is read by `_result`, which `_produce` calls once the loop is over. The stop
-        string has to reach the *loop* and not only the stream, or a marker that ends the sending
-        leaves the run generating tokens past it that nobody reads -- see `_loop`.
-        """
-        return self._loop(
-            prompt_ids,
-            budget,
-            request,
-            on_token=streamer.accept,
-            marks=marks,
-            stop=streamer.reached,
-        )
 
     # -------------------------------------------------------------------- ranks
 

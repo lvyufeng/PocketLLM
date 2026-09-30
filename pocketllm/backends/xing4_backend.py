@@ -42,8 +42,7 @@ from __future__ import annotations
 
 import os
 import threading
-import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -52,10 +51,9 @@ from pocketllm.api import (
     BackendCapabilities,
     ConfigurationError,
     GenerationRequest,
-    GenerationResult,
 )
 
-from .base import RuntimeAdapter, TokenStreamer
+from .base import RuntimeAdapter
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
 from .options import BackendOption, Group, Kind, decode_args
 from .shared_options import PREFILL_CHUNK, PREFIX_CACHE_BYTES
@@ -408,11 +406,13 @@ class Xing4Backend(SchedulerHost, RuntimeAdapter):
         """One generation, driven a step at a time by the scheduler.
 
         The sampling parameters come from the scheduler's request rather than from a
-        `GenerationRequest`, so this is the point where the two vocabularies meet. Everything else
-        is the same call `_loop` makes, minus its own cancellation flag, which is folded into the
-        scheduler's step boundary: a client that disconnects calls `backend.cancel()`, and the
-        request has to stop at the same seam whether the cancel came from there or from the
-        scheduler retiring the request.
+        `GenerationRequest`, so this is the point where the two vocabularies meet, and three things
+        follow from it rather than from this adapter: the budget is the scheduler's
+        ``max_new_tokens``, the ``ignore_eos`` the scheduler resolved is what empties the eos set --
+        nowhere else in this adapter reaches that flag -- and the step boundary is the scheduler's
+        ``on_step``. A client that disconnects calls `backend.cancel()`, and the request has to stop
+        at the same seam whether the cancel came from there or from the scheduler retiring the
+        request, so the two are asked together.
         """
         from src.models.xing4_0.generate import generate
 
@@ -435,7 +435,10 @@ class Xing4Backend(SchedulerHost, RuntimeAdapter):
                 on_token=lambda token, _logits: on_token(token),
                 # Two cancellations meet at the same seam: the runtime's own, which is called with
                 # the id the client's request carries, and the scheduler's, which arrives as
-                # `on_step` returning true.
+                # `on_step` returning true. The budget and the eos set are the scheduler's own --
+                # `sampling` is what it derived for this row, and `ignore_eos` reaches this route
+                # and nowhere else in the adapter -- which is why this is a second `generate` call
+                # rather than a call into `_loop`.
                 on_step=lambda: self._is_cancelled(cancel_key(context, request_id)) or on_step(),
             )
         finally:
@@ -698,9 +701,29 @@ class Xing4Backend(SchedulerHost, RuntimeAdapter):
         request: GenerationRequest,
         *,
         on_token: Callable[[int], None] | None,
-        on_step: Callable[[], bool] | None = None,
         stop: Callable[[], bool] | None = None,
     ) -> Any:
+        """This runtime's loop, with the one predicate that ends it.
+
+        Two reasons to stop arrive here and the earliest one wins: this adapter's own cancel set,
+        which a disconnecting client fills, and `stop`, which is where the *stream's* stop-string
+        check belongs.
+
+        That second one is the whole reason this keyword exists, and leaving it out was a silent
+        cost rather than a visible one: a stream found its marker, stopped sending, and let the loop
+        run on to the budget with every token past the marker forwarded and thrown away. The budget
+        is not small -- with no `max_tokens` on the request it is every position the prompt left of
+        the context, so on this runtime's 32K default a stream that stopped at its first marker could
+        pay for thirty thousand decode steps nobody would read, and `usage.completion_tokens`
+        reported them as tokens the model had produced for the caller. `MimoBackend._loop` has taken
+        this predicate since its stream was written.
+
+        The scheduler's own step boundary is not a third reason and never was. A row the scheduler
+        admitted is served through :meth:`_start_runtime`, which builds its predicate around
+        ``generate`` itself; a serial request is served from here and passes its cancel as ``stop``,
+        correctly, because the two routes never overlap. An ``on_step`` parameter that every caller
+        left as ``None`` was a parameter with no caller, so it is gone.
+        """
         from src.models.xing4_0.generate import generate
 
         self._ensure_loaded()
@@ -720,71 +743,13 @@ class Xing4Backend(SchedulerHost, RuntimeAdapter):
                 cache=self._cache,
                 prefix_cache=self._prefix_cache,
                 on_token=None if on_token is None else (lambda token, _logits: on_token(token)),
-                # Three reasons to stop and the earliest one wins: this adapter's own cancel set,
-                # which a disconnecting client fills; `on_step`, the scheduler's step boundary when
-                # this loop is driven by one; and `stop`, which is where the *stream's* stop-string
-                # check belongs.
-                #
-                # That last one is the whole reason this keyword exists, and leaving it out was a
-                # silent cost rather than a visible one: a stream found its marker, stopped sending,
-                # and let the loop run on to the budget with every token past the marker forwarded
-                # and thrown away. The budget is not small -- with no `max_tokens` on the request it
-                # is every position the prompt left of the context, so on this runtime's 32K default
-                # a stream that stopped at its first marker could pay for thirty thousand decode
-                # steps nobody would read, and `usage.completion_tokens` reported them as tokens the
-                # model had produced for the caller. `MimoBackend._loop` has taken this predicate
-                # since its stream was written.
                 on_step=lambda: self._is_cancelled(request.request_id)
-                or (on_step is not None and on_step())
                 or (stop is not None and stop()),
             )
         finally:
             # Under the request lock, like the run itself, so the counters are the state of the
             # store between requests rather than of one mid-prefill.
             self._publish_cache_metrics()
-
-    def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
-        self._ensure_loaded()
-        if self._batching():
-            return self._generate_batched(requests)
-        results = []
-        for request in requests:
-            self._begin_request(request.request_id)
-            try:
-                prompt_ids = self._tokenize(request)
-                budget = self._budget(prompt_ids, request)
-                self._check_cancelled(request.request_id)
-                with self._request_lock:
-                    self._check_cancelled(request.request_id)
-                    marks = {"started": time.perf_counter()}
-                    generation = self._loop(prompt_ids, budget, request, on_token=None)
-                results.append(self._result(request, prompt_ids, generation, marks))
-            finally:
-                self._clear_request(request.request_id)
-        return results
-
-    def _run_loop(
-        self,
-        prompt_ids: Sequence[int],
-        budget: int,
-        request: GenerationRequest,
-        streamer: TokenStreamer,
-        marks: dict[str, float],
-    ) -> Any:
-        """This runtime's loop, with the streamer deciding both the token and the step.
-
-        `marks` is not passed on: this loop keeps no timings of its own, and `_result` reads the one
-        `_produce` put there. The stop string has to reach the *loop* and not only the stream, or a
-        marker that ends the sending leaves the run generating tokens past it that nobody reads --
-        see `_loop`.
-        """
-        return self._loop(
-            prompt_ids,
-            budget,
-            request,
-            on_token=streamer.accept,
-            stop=streamer.reached,
-        )
 
     def close(self) -> None:
         # Before the rest: the scheduler's thread runs this runtime's generation, so it has to be

@@ -773,6 +773,18 @@ class SchedulerHost:
     def _batching(self) -> bool:
         return self._scheduler is not None
 
+    def _batch_dispatch(self, requests: Sequence[Any]) -> list[Any] | None:
+        """Answer :meth:`RuntimeAdapter._batch_dispatch` for every runtime that has a scheduler.
+
+        The scheduler belongs to this base, so the condition that decides whether a batch is served
+        by one belongs here too, in the same place the scheduler is built and torn down. An adapter
+        that mixes this in inherits both halves of the answer -- *is there a scheduler* and *serve
+        the batch* -- and writes neither, which is why ``generate`` has one body and not three.
+        """
+        if self._batching():
+            return self._generate_batched(requests)
+        return None
+
     def _generate_batched(self, requests: Sequence[Any]) -> list[Any]:
         """The same generation, submitted to the shared `BatchScheduler`.
 

@@ -17,6 +17,8 @@ import time
 
 import pytest
 
+from pocketllm.api import GenerationRequest, RequestCancelledError, SamplingParams
+from pocketllm.backends.base import RuntimeAdapter
 from pocketllm.backends.runtime_engine import (
     RuntimeRun,
     RuntimeSpec,
@@ -542,3 +544,119 @@ def test_the_registered_spec_is_built_from_the_adapters_own_facts():
     assert host.bound == []
     assert spec.device() == 3
     assert host.bound == [3]
+
+
+class _SerialHost(RuntimeAdapter):
+    """The shared serial shape with a runtime stubbed out underneath it.
+
+    Only the three things the base does not supply: an id, a place for the answers, and a loop. The
+    loop records what it was handed, so a test can assert *when* each piece of the shape happened --
+    which is the whole content of the bracket around it.
+    """
+
+    def __init__(self, *, dispatched: list | None = None) -> None:
+        self.name = "serial"
+        self._max_seq_len = 64
+        self.events: list[str] = []
+        self.handed: list[tuple] = []
+        self.dispatched = dispatched
+        # The state a real adapter inherits from BackendBase rather than writing itself.
+        self._closed = False
+        self._request_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._active_requests: set[str] = set()
+        self._cancelled: set[str] = set()
+
+    # -- the hooks the base does not supply ---
+    def _tokenize(self, request):
+        self.events.append("tokenize")
+        return list(request.prompt_tokens or [])
+
+    def _prepare_serial(self, request, prompt_ids):
+        self.events.append("prepare")
+        return prompt_ids
+
+    def _result(self, request, prompt_ids, generation, marks, *, stopped=None):
+        self.events.append("result")
+        return generation
+
+    def _ensure_loaded(self):
+        self.events.append("loaded")
+
+    def _ensure_open(self):
+        pass
+
+    # -- the hook the test is about ---
+    def _run_serial(self, prepared, request):
+        self.events.append("loop")
+        self.handed.append((prepared, request))
+        return f"answer:{prepared}"
+
+    def _batch_dispatch(self, requests):
+        # Only a scheduler that actually served the batch is an event; a runtime with no scheduler
+        # is the serial path, and the base's default would not have been reached at all.
+        if self.dispatched is not None:
+            self.events.append("dispatch")
+        return self.dispatched
+
+
+def test_generate_runs_the_shared_bracket_in_order():
+    """The serial shape is one sequence, and the sequence is the point of folding it.
+
+    Every adapter carried these steps in its own `generate`, so the order of them was asserted three
+    times by inspection and never once by a test. The loop is called inside the request lock and after
+    the cancellation check the lock makes possible, which is the ordering the bracket exists to keep:
+    a request that reached the lock is re-checked there, and the loop does not run for a client that
+    is already gone.
+    """
+    host = _SerialHost()
+    request = GenerationRequest(
+        request_id="r1", prompt_tokens=[1, 2], sampling_params=SamplingParams(max_tokens=3)
+    )
+
+    assert host.generate([request]) == ["answer:[1, 2]"]
+
+    assert host.events == ["loaded", "tokenize", "prepare", "loop", "result"]
+    prepared, handed_back = host.handed[0]
+    assert prepared == [1, 2]
+    assert handed_back is request
+    # The bracket closed: a request that ended is neither active nor cancelled.
+    assert host._active_requests == set()
+    assert host._cancelled == set()
+
+
+def test_a_scheduler_answer_answers_the_whole_batch_without_a_serial_loop():
+    """`_batch_dispatch` short-circuits `generate`, and the serial bracket never runs for it.
+
+    One body for the choice rather than a predicate repeated per adapter: the answer is a value, so a
+    scheduler that served the batch is not also a runtime that then loops over it.
+    """
+    served = ["batched"]
+    host = _SerialHost(dispatched=served)
+
+    assert host.generate([GenerationRequest(request_id="r1", prompt_tokens=[1])]) is served
+
+    assert host.events == ["loaded", "dispatch"]
+    assert host.handed == []
+
+
+def test_a_cancel_between_the_lock_and_the_loop_is_noticed():
+    """The second check is the one the first cannot make, which is why both are there.
+
+    A client that disconnected while this thread waited for the request lock has its id in the
+    cancelled set by the time the lock is taken, and a shape that only checked before the lock would
+    run the whole generation anyway.
+    """
+    host = _SerialHost()
+
+    def checked(_request_id: str) -> None:
+        # Cancelled, and only after the tokenizer and the budget have had their say.
+        host._cancelled.add("r1")
+        raise RequestCancelledError("request r1 was cancelled")
+
+    host._check_cancelled = checked
+
+    with pytest.raises(RequestCancelledError):
+        host.generate([GenerationRequest(request_id="r1", prompt_tokens=[1])])
+
+    assert "loop" not in host.events

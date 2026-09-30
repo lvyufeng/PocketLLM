@@ -897,6 +897,14 @@ class V41Backend(SchedulerHost, RuntimeAdapter):
         return [int(token) for token in tokenizer(text, add_special_tokens=False)["input_ids"]]
 
     def _payload(self, request: GenerationRequest, prompt_ids: Sequence[int]) -> dict[str, Any]:
+        """The one description of a request both this adapter's routes send.
+
+        The budget is derived here rather than handed in, which is the one place in the family where
+        that is true: this is the derivation the adaptive routes share, and deriving it anywhere else
+        would be a second answer to the same question. It is also why the shared ``generate`` does
+        not derive one -- a budget this run cannot hold is refused inside this method, which both the
+        serial and the streamed route reach before they take the request lock.
+        """
         params = request.sampling_params
         return {
             "op": "generate",
@@ -911,28 +919,47 @@ class V41Backend(SchedulerHost, RuntimeAdapter):
             "thinking_mode": str(request.metadata.get("thinking_mode") or "chat"),
         }
 
-    def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
-        self._ensure_loaded()
-        if self._batching():
-            return self._generate_batched(requests)
-        return [self._generate_one(request) for request in requests]
+    def _prepare_serial(
+        self, request: GenerationRequest, prompt_ids: Sequence[int]
+    ) -> dict[str, Any]:
+        """The broadcast payload, which is what this runtime's loop takes instead of ids.
 
-    def _generate_one(self, request: GenerationRequest) -> GenerationResult:
-        self._begin_request(request.request_id)
-        try:
-            prompt_ids = self._tokenize(request)
-            payload = self._payload(request, prompt_ids)
-            # Before the broadcast, never after: a rank 0 that refused here would leave every peer
-            # waiting on a broadcast that is not coming. The length refusal already happened inside
-            # `_payload`: a budget this run cannot hold is refused where it is derived.
-            self._check_cancelled(request.request_id)
-            with self._request_lock:
-                self._check_cancelled(request.request_id)
-                result = self._run(payload, request, on_token=None)
-            self._check_cancelled(request.request_id)
-            return result
-        finally:
-            self._clear_request(request.request_id)
+        The same derivation the streamed route makes, and it happens here rather than inside
+        :meth:`_run_serial` because it has to happen before the request lock is taken -- which is also
+        where its refusal belongs, since a budget this run cannot hold is refused inside
+        :meth:`_payload` rather than at the call site.
+        """
+        return self._payload(request, prompt_ids)
+
+    def _run_serial(self, prepared: Any, request: GenerationRequest) -> GenerationResult:
+        """This runtime's loop, into the request's broadcast payload and back out as a result.
+
+        The base's version calls :meth:`_loop`; this one cannot, because this runtime's loop takes a
+        broadcast payload rather than a prompt and a budget, and returns a finished
+        :class:`GenerationResult` rather than a generation. What it does share with the base is the
+        step boundary: a serial request reaches `cancel` twice before the lock, and `_step_hook`
+        folds the client's cancel id into the loop's own predicate and raises `_AbortGeneration`
+        there, so there is no outer keyword to pass.
+        """
+        return self._run(prepared, request, on_token=None)
+
+    def _serial_result(
+        self, request: GenerationRequest, prompt_ids: Sequence[int], generation: Any
+    ) -> GenerationResult:
+        """Read the loop's own result, then notice a cancel that landed after it finished.
+
+        `_run` builds a full :class:`GenerationResult` rather than a generation -- the answer here is
+        a decode to be split, not tokens to be counted -- so there is nothing for the shared builder
+        to do with it, and this is the one adapter that has to say so.
+
+        The second check is the reason this is a hook and not a rename of the shared one. A request
+        cancelled in the window between the loop returning and the request leaving the active set has
+        already produced its answer, and reporting it as a result would hand a client tokens it asked
+        to stop: the cancellation is raised instead, which is what the pre-lock check does for the
+        same reason one window earlier.
+        """
+        self._check_cancelled(request.request_id)
+        return generation
 
     def stream(self, request: GenerationRequest) -> Iterator[TokenEvent]:
         """Yield one event a token, off a worker thread.
