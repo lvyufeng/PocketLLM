@@ -34,6 +34,25 @@ python scripts/method_duplication.py
 Everything the six slices removed is absent from that table: `stream`, `_encode_chat`, `_result`,
 `_tokenize`, `_budget`, `_decode`, `_runtime_spec` and the worker program are each one body now.
 
+### Slice 8 (master `839ca6c`): `run_worker`
+
+The one row from that table a later slice opened was `run_worker` (0.67, 24/27, `v41` ~ `mimo`) —
+the highest ratio left, and the only item in #442's problem list besides `CppBackend._stream_native`
+that a slice could still close. It is now `RankedWorker.run_worker` in
+`pocketllm/backends/runtime_engine.py`, with `v41` supplying `_recv_worker_message` (its doorbell,
+so the wait happens on the host) and `_WORKER_ABORTS`, and `mimo` supplying `_run_worker_request`
+(its payload runner takes one argument, not three) and `_worker_drained` (the barrier that keeps
+rank 0 from reaping the group under a worker). The three names `run_worker` resolves to are now
+`CppBackend`, `TorchBackend` and the mixin, and the best pair among them is 0.38 — two adapters
+with a native worker entry each, which is a different method that shares a name.
+
+The row was worth about a third of what the ratio suggested, and the reason is the general one this
+page exists to state: **a ratio counts the statements that matched, not the ones that had to be
+invented.** The loop was 28 lines and identical; the four things around it that differed became four
+hooks, so the fold is ~20 net lines rather than ~28. What it buys is that the invariants — the two
+rank guards, one message shape, `_ensure_loaded` running after the guards, and which exceptions mean
+"the group unwound together" — are stated once instead of twice.
+
 ## What a ratio does and does not mean
 
 A high ratio is where to look, not a verdict; the two rows that were opened and turned out to be

@@ -17,9 +17,15 @@ import time
 
 import pytest
 
-from pocketllm.api import GenerationRequest, RequestCancelledError, SamplingParams
+from pocketllm.api import (
+    GenerationRequest,
+    RequestCancelledError,
+    SamplingParams,
+    UnsupportedFeatureError,
+)
 from pocketllm.backends.base import RuntimeAdapter
 from pocketllm.backends.runtime_engine import (
+    RankedWorker,
     RuntimeRun,
     RuntimeSpec,
     SchedulerHost,
@@ -660,3 +666,124 @@ def test_a_cancel_between_the_lock_and_the_loop_is_noticed():
         host.generate([GenerationRequest(request_id="r1", prompt_tokens=[1])])
 
     assert "loop" not in host.events
+
+
+# --------------------------------------------------------------- the worker rank's loop
+
+
+class _WorkerHost(RankedWorker):
+    """A worker rank with the group stubbed out around it.
+
+    What is under test is the loop the base owns -- the two guards, the one message shape, and which
+    exceptions mean "the group unwound together" -- so the group is a list this pops from and the
+    payload runner is a recorder. `v41`'s two facts (its doorbell, its abort) and `mimo`'s two (its
+    one-argument payload runner, its closing barrier) are the hooks, and each is asserted in its own
+    test below.
+    """
+
+    def __init__(self, mailbox, *, world=4, rank=1) -> None:
+        self.name = "worker"
+        self._world = world
+        self._rank = rank
+        self._closed = False
+        self._mailbox = list(mailbox)
+        self.served: list = []
+        self.loaded = 0
+        self.joined = 0
+
+    # -- the group, stubbed ---
+    def _ensure_open(self):
+        pass
+
+    def _init_distributed(self):
+        self.joined += 1
+
+    def _ensure_loaded(self):
+        self.loaded += 1
+
+    def _recv_worker_message(self):
+        return self._mailbox.pop(0)
+
+    # -- the request hook, recording its arity ---
+    def _run_worker_request(self, payload):
+        self.served.append(payload)
+
+
+def test_the_worker_loop_serves_the_messages_rank_zero_sends_until_it_says_stop():
+    """A request is served, a non-request message keeps the loop alive, and a shutdown ends it."""
+    payload = {"op": "generate", "request_id": "r1", "prompt_ids": [4]}
+    host = _WorkerHost([payload, {"op": "other"}, {"op": "shutdown"}])
+    announced: list = []
+
+    host.run_worker(on_ready=lambda: announced.append(True))
+
+    assert announced == [True]
+    assert host.served == [payload]
+    assert host.loaded == 1
+    assert host.joined == 1
+    # The shutdown is consumed and the loop is over, but the rank is not closed by it: closing the
+    # group is rank 0's `close`, and a worker that closed itself here would tear down under a peer.
+    assert host._closed is False
+
+
+def test_the_worker_loop_refuses_the_two_shapes_the_base_docstring_names():
+    """A single process has no group and rank 0 is not a worker, so neither may enter the loop.
+
+    Both are refused *before* the load, which is the part worth pinning: joining the group and
+    loading is the expensive half of being a rank, and a guard that ran after it would have made a
+    launch mistake cost a checkpoint.
+    """
+    with pytest.raises(UnsupportedFeatureError, match="single-process"):
+        _WorkerHost([], world=1).run_worker()
+
+    host = _WorkerHost([], rank=0)
+    with pytest.raises(UnsupportedFeatureError, match="must not be called on rank 0"):
+        host.run_worker()
+
+    assert host.loaded == 0
+    assert host.joined == 1
+
+
+def test_an_unwind_that_every_rank_took_together_is_not_a_desynchronized_group():
+    """A cancel is a stop the ranks agreed on, so it ends the request and not the loop.
+
+    Every rank reaches the loop's per-step predicate, so a cancelled request is one they all unwind
+    from at the same token. Treating it as an error on a worker would turn an ordinary disconnect
+    into a dead rank.
+    """
+    host = _WorkerHost([{"op": "generate", "request_id": "r1"}, {"op": "shutdown"}])
+
+    def cancelled(payload):
+        raise RequestCancelledError("r1 was cancelled")
+
+    host._run_worker_request = cancelled
+
+    host.run_worker()
+
+    assert host._mailbox == []
+
+
+def test_a_runtime_narrows_the_abort_set_and_has_to_say_so():
+    """The base swallows a cancel; a runtime with a second way to unwind declares it beside it.
+
+    This is the hook `v41` uses for `_AbortGeneration`, and the reason it is a hook and not a wider
+    base: a runtime that did *not* unwind together would be a desynchronized group, and this set is
+    the only place that distinction is written down.
+    """
+
+    class _Unwinds(Exception):
+        pass
+
+    class _Narrow(_WorkerHost):
+        _WORKER_ABORTS = (RequestCancelledError, _Unwinds)
+
+    host = _Narrow([{"op": "generate"}, {"op": "shutdown"}])
+
+    def unwound(payload):
+        raise _Unwinds("stop")
+
+    host._run_worker_request = unwound
+
+    host.run_worker()
+
+    assert host._mailbox == []

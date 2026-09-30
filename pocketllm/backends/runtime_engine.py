@@ -39,9 +39,16 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
-from pocketllm.api import ConfigurationError, GenerationResult, TimingMetrics, Usage
+from pocketllm.api import (
+    ConfigurationError,
+    GenerationResult,
+    RequestCancelledError,
+    TimingMetrics,
+    UnsupportedFeatureError,
+    Usage,
+)
 
 #: How long the scheduler's side waits for a runtime to hand back a token before failing the
 #: request. It is a backstop against a wedged runtime, not a deadline: a 64K prefill on one of
@@ -617,7 +624,111 @@ def card_for_rank(
     return rank
 
 
-class SchedulerHost:
+class RankedWorker:
+    """The worker-rank half of a Python runtime adapter: rebuild, announce, serve, unwind.
+
+    One body for two runtimes, and the reason it is one is that the loop is the same program on
+    both: refuse the two shapes that cannot work, load the checkpoint, announce readiness *after*
+    the load's closing barrier, then take one message at a time off the broadcast until rank 0
+    says to stop. ``v41`` and ``mimo`` each wrote that out, and each wrote it around its own four
+    details rather than in terms of them -- so a change to any of the invariants below was a change
+    in two places that had to agree.
+
+    The four details, which are hooks rather than branches because they are facts about a runtime
+    and not about being a worker rank:
+
+    - **How a message arrives.** ``v41`` receives through its doorbell-plus-collective
+      (:meth:`_recv_worker_message` defaults to the plain collective), which is what keeps an idle
+      worker parked on the host instead of inside an NCCL poll kernel.
+    - **What "this request is over" means.** A cancel and an abort unwind every rank together and
+      are swallowed; a runtime with a second such exception declares it in :attr:`_WORKER_ABORTS`.
+    - **What serving one message takes.** ``v41`` hands its payload runner the payload *and* the two
+      request-scoped arguments it may be called with from the serial path; ``mimo``'s takes the
+      payload alone. See :meth:`_run_worker_request`, whose base body is ``v41``'s arity because
+      that arity is the union of the two call shapes.
+    - **What has to happen before the group is torn down.** ``mimo`` closes with a barrier so rank 0
+      cannot reap the ranks under a worker still finishing its last request;
+      :meth:`_worker_drained` is that, and a no-op otherwise.
+
+    Two guards in this body are worth stating because they are the reason it exists at all. The
+    rank comes from the group and not from the arguments -- a supervised launch sets both, a
+    ``torchrun`` one only sets the environment, and rank 0 must never enter this loop. And
+    ``_ensure_loaded`` runs *here*, after the guards, because these runtimes join the group and load
+    inside this method: "constructed" is not a state worth announcing, and announcing before the
+    load's barrier would tell the parent a rank is up while it is still inside a collective.
+    """
+
+    #: What rank 0 broadcasts to end the loop. One spelling, because the payload that ends the loop
+    #: is the same message on both runtimes and was two literals that only happened to agree.
+    _WORKER_SHUTDOWN = "shutdown"
+
+    #: The exceptions a worker rank swallows as "the loop unwound on every rank together".
+    #:
+    #: Not an error on a worker: the ranks agree per step, so a cancelled or stopped request reaches
+    #: every rank at the same token. A runtime whose loop has a second way to unwind declares it
+    #: here -- ``v41`` has ``_AbortGeneration`` beside the cancel -- and one that narrows this is a
+    #: runtime whose other exceptions really are desynchronizations.
+    _WORKER_ABORTS: ClassVar[tuple[type[BaseException], ...]] = (RequestCancelledError,)
+
+    def run_worker(self, on_ready: Callable[[], None] | None = None) -> None:
+        """Load, announce, then serve rank 0's requests until it says to stop."""
+        self._ensure_open()
+        self._init_distributed()
+        if self._world <= 1:
+            raise UnsupportedFeatureError(
+                "run_worker serves rank 0's requests over a process group; a single-process run "
+                "serves them through the HTTP server instead"
+            )
+        if self._rank == 0:
+            raise UnsupportedFeatureError("run_worker must not be called on rank 0")
+        self._ensure_loaded()
+        if on_ready is not None:
+            on_ready()
+        while not self._closed:
+            payload = self._recv_worker_message()
+            if not isinstance(payload, Mapping) or payload.get("op") == self._WORKER_SHUTDOWN:
+                break
+            if payload.get("op") != "generate":
+                continue
+            try:
+                self._run_worker_request(payload)
+            except self._WORKER_ABORTS:
+                # Every rank unwinds together, so a cancelled request is not a desynchronized group.
+                pass
+        self._worker_drained()
+
+    def _recv_worker_message(self) -> Any:
+        """The next message rank 0 sent, blocking until it arrives.
+
+        The plain collective, which is what a runtime without a doorbell waits in. ``v41``
+        overrides it: its bell lets the wait happen on the host, so an idle worker costs a sleeping
+        ``recv`` rather than a device-side poll kernel holding a core at 100%.
+        """
+        import torch.distributed as dist
+
+        box: list[Any] = [None]
+        dist.broadcast_object_list(box, src=0)
+        return box[0]
+
+    def _run_worker_request(self, payload: Mapping[str, Any]) -> None:
+        """Serve one request for the collective's sake and not for its answer.
+
+        The base body is ``v41``'s call shape, and that is deliberate: ``_run_payload`` is the one
+        method both the serial path and the worker loop reach, ``v41`` calls it with the surface the
+        serial path passes, and ``mimo``'s takes the payload alone. A runtime in the second case
+        overrides this rather than widening its payload runner for a caller that never passes them.
+        """
+        self._run_payload(payload, None, None)
+
+    def _worker_drained(self) -> None:
+        """What has to happen before the group is torn down, once the loop has ended.
+
+        A no-op by default. ``mimo`` overrides it with the barrier that keeps rank 0 from reaping
+        the group under a worker still finishing its last request.
+        """
+
+
+class SchedulerHost(RankedWorker):
     """The serving half of a Python runtime adapter: join the scheduler, submit to it, publish it.
 
     A runtime adapter is two things stacked. One is about the model -- which entry point generates,
@@ -639,6 +750,10 @@ class SchedulerHost:
     Everything else it inherits: `self.args`, `self.name`, `self._tokenize`, `self._budget`,
     `self._begin_request`, `self._clear_request` and `self._decode` all come from the backend base
     class.
+
+    It is also where a worker rank's loop comes from. That half is about the group rather than about
+    the scheduler, so it lives in [`RankedWorker`] and this class inherits it: the two are the two
+    ways a Python runtime is driven, and both are things an adapter gets rather than writes.
     """
 
     #: The scheduler, when this runtime is driven by one, and the native module it came from. Both
@@ -931,6 +1046,7 @@ __all__ = [
     "DEFAULT_POLL_TIMEOUT_MS",
     "DEFAULT_ROW_TIMEOUT",
     "DEFAULT_STEP_TIMEOUT",
+    "RankedWorker",
     "RuntimeRun",
     "RuntimeSpec",
     "SchedulerHost",

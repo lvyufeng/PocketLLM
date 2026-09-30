@@ -275,6 +275,11 @@ class BackendBase:
         ``on_ready`` is called exactly once after the worker has initialized and
         is ready to participate in collectives, immediately before entering the
         blocking worker loop.
+
+        The Python runtimes do not implement this; ``RankedWorker`` in
+        :mod:`pocketllm.backends.runtime_engine` does, and this is the body every adapter
+        outside that family inherits -- ``torch`` and ``cpp`` have their own worker entries and
+        a backend that has none has to say so rather than return.
         """
         raise TensorParallelSupervisorError(
             "backend does not implement a supervised TP worker entry point"
