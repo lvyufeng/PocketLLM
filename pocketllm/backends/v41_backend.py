@@ -70,6 +70,7 @@ from .shared_options import (
     PREFIX_CACHE_HEAD_TOKENS,
 )
 from .runtime_engine import (
+    RankedWorker,
     SchedulerHost,
     cancel_key,
     card_for_rank,
@@ -239,8 +240,10 @@ OPTIONS: tuple[BackendOption, ...] = (
 _DTYPE_ALIASES = {"bf16": "bfloat16", "bfloat16": "bfloat16"}
 _STREAM_QUEUE_DEPTH = 64
 
-#: What rank 0 broadcasts to end the workers' loop.
-_SHUTDOWN = "shutdown"
+#: What rank 0 broadcasts to end the workers' loop, which is the string `RankedWorker` reads.
+#: Spelled as a reference to it rather than as a second literal: this file's only use is the
+#: shutdown `close` sends, and the loop that receives it is the base's.
+_SHUTDOWN = RankedWorker._WORKER_SHUTDOWN
 
 
 def _split_running(text: str, thinking: bool) -> tuple[str, str]:
@@ -1444,34 +1447,20 @@ class V41Backend(SchedulerHost, RuntimeAdapter):
         dist.broadcast_object_list(box, src=0)
         return box[0]
 
-    def run_worker(self, on_ready: Callable[[], None] | None = None) -> None:
-        """Load, announce, then serve rank 0's requests until it broadcasts a shutdown."""
-        self._ensure_open()
-        # The rank has to come from the group and not from the arguments: a supervised launch sets
-        # both, but a torchrun one only sets the environment, and rank 0 must not enter this loop.
-        self._init_distributed()
-        if self._world <= 1:
-            raise UnsupportedFeatureError(
-                "run_worker serves rank 0's requests over a process group; a single-process v41 run "
-                "serves them through the HTTP server instead"
-            )
-        if self._rank == 0:
-            raise UnsupportedFeatureError("run_worker must not be called on rank 0")
-        self._ensure_loaded()
-        if on_ready is not None:
-            on_ready()
-        while not self._closed:
-            payload = self._broadcast(None)
-            if not isinstance(payload, Mapping) or payload.get("op") == _SHUTDOWN:
-                break
-            if payload.get("op") != "generate":
-                continue
-            try:
-                self._run_payload(payload, None, None)
-            except (RequestCancelledError, _AbortGeneration):
-                # Every rank unwinds together, so a cancelled or stopped request is not a
-                # desynchronized group.
-                pass
+    #: The worker loop is ``RankedWorker``'s, which is the body this adapter and ``mimo`` both wrote
+    #: out. What is left here is the two hooks the loop cannot work out for itself.
+    _WORKER_ABORTS = (RequestCancelledError, _AbortGeneration)
+
+    def _recv_worker_message(self) -> Any:
+        """Receive through the doorbell, so the wait happens on the host rather than on the device.
+
+        This is the whole reason ``v41`` has a bell and ``mimo`` does not: a non-root
+        ``broadcast_object_list`` waits *inside* a device-side NCCL poll kernel, which holds a core
+        and keeps the card's SMs busy for every second the service has nothing to do. Ringing first
+        parks the worker in a host-side ``recv`` instead, and the collective is entered only once
+        rank 0 has something to put in it.
+        """
+        return self._broadcast(None)
 
     def close(self) -> None:
         already_closed = self._closed

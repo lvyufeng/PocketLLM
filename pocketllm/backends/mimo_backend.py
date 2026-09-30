@@ -61,8 +61,6 @@ from pocketllm.api import (
     BackendCapabilities,
     ConfigurationError,
     GenerationRequest,
-    RequestCancelledError,
-    UnsupportedFeatureError,
 )
 
 from .base import RuntimeAdapter
@@ -75,6 +73,7 @@ from .shared_options import (
     PREFIX_CACHE_HEAD_TOKENS,
 )
 from .runtime_engine import (
+    RankedWorker,
     SchedulerHost,
     card_for_rank,
     device_index,
@@ -825,34 +824,28 @@ class MimoBackend(SchedulerHost, RuntimeAdapter):
 
     # -------------------------------------------------------------------- ranks
 
-    def run_worker(self, on_ready: Callable[[], None] | None = None) -> None:
-        """Load, announce, then serve rank 0's requests until it says to stop."""
-        self._ensure_open()
-        self._init_distributed()
-        if self._world <= 1:
-            raise UnsupportedFeatureError(
-                "run_worker serves rank 0's requests over a process group; a single-rank MiMo run "
-                "serves them through the HTTP server instead"
-            )
-        if self._rank == 0:
-            raise UnsupportedFeatureError("run_worker must not be called on rank 0")
-        self._ensure_loaded()
-        if on_ready is not None:
-            on_ready()
+    #: The worker loop is ``RankedWorker``'s. What is left is the two hooks it cannot work out
+    #: for itself: what serving one message takes, and what has to happen before the group goes.
+    def _run_worker_request(self, payload: Mapping[str, Any]) -> None:
+        """Serve one request, which here takes the payload and nothing else.
+
+        The base's body is ``v41``'s call shape -- ``_run_payload(payload, request, on_token)`` --
+        because that method's surface is the union of the serial path's and the worker loop's. This
+        runtime's runs a payload alone: nothing here has a per-request hook a worker rank could
+        pass, and the two arguments it does not take are not ones it should grow to ignore.
+        """
+        self._run_payload(payload)
+
+    def _worker_drained(self) -> None:
+        """Barrier before rank 0 tears the group down.
+
+        A worker that reaches the end of the loop is done serving, but its last request's
+        collectives may still be in flight on the device; the barrier is what makes "the loop has
+        ended" on a worker mean "rank 0 may now destroy the group" rather than a race the NCCL
+        teardown usually wins.
+        """
         import torch.distributed as dist
 
-        while not self._closed:
-            payload: list[Any] = [None]
-            dist.broadcast_object_list(payload, src=0)
-            if not isinstance(payload[0], Mapping) or payload[0].get("op") == "shutdown":
-                break
-            if payload[0].get("op") != "generate":
-                continue
-            try:
-                self._run_payload(payload[0])
-            except RequestCancelledError:
-                # Every rank unwinds together, so a cancelled request is not a desynchronized group.
-                pass
         dist.barrier()
 
     def _run_payload(self, payload: Mapping[str, Any]) -> None:
@@ -893,7 +886,7 @@ class MimoBackend(SchedulerHost, RuntimeAdapter):
             try:
                 import torch.distributed as dist
 
-                dist.broadcast_object_list([{"op": "shutdown"}], src=0)
+                dist.broadcast_object_list([{"op": RankedWorker._WORKER_SHUTDOWN}], src=0)
             except Exception:
                 # A peer that already left is not this rank's problem, and close() must not raise.
                 pass
