@@ -20,14 +20,14 @@ worth repeating here because they shape the code:
   `test_every_entry_point_has_a_fixture` test in `test_served_path_golden.py` is what keeps the
   *set of recorded fixtures* complete, and it needs no weights at all.
 
-Every entry point is a Python one: the C++ binary's own HTTP front end was removed, and the `cpp`
-entry point now goes through `pocketllm serve` like the rest. A fixture carries whichever answer its
-entry can produce -- token ids exactly, text at least -- and the test compares what is there.
+Every entry point is a Python one, driven through `pocketllm serve`. A fixture carries whichever
+answer its entry can produce -- token ids exactly, text at least -- and the test compares what is
+there. There is one entry point left, because one runtime is left.
 
 **One entry point is one process**, which is why `run_isolated` spawns a child rather than calling
-`run` here. Five engines in one interpreter is a configuration nothing else in this repository uses,
-and the failures it produces are not about the fixtures; the docstring on `run_isolated` records the
-two that were observed and why they pass alone.
+`run` here. Loading more than one engine in one interpreter is a configuration nothing else in this
+repository uses, and the failures it produces are not about the fixtures; the docstring on
+`run_isolated` records the two that were observed and why they pass alone.
 """
 
 from __future__ import annotations
@@ -56,9 +56,8 @@ GOLDEN_MODULE = pathlib.Path(__file__).resolve()
 #: be parsed out of whatever they say next.
 CHILD_RESULT_ENV = "POCKETLLM_GOLDEN_RESULT"
 
-#: How long a child may run. Generous on purpose: the `v41` fixture pins a 457.8 GiB expert bank and
-#: takes forty minutes on a cold segment, and a suite that killed it at ten would report a timeout
-#: where it meant to report a fixture.
+#: How long a child may run. Generous on purpose: a fixture loads a real checkpoint, and a suite that
+#: killed a cold load would report a timeout where it meant to report a fixture.
 CHILD_TIMEOUT_SECONDS = 5400.0
 
 #: How much of a failed child's output to keep for the parent's error message.
@@ -66,7 +65,11 @@ CHILD_TAIL_LINES = 40
 
 #: Every entry point `tests/README.md` promises a fixture for. The set is asserted by a test, so a
 #: new backend cannot be added without recording one.
-ENTRY_POINTS = ("cpp", "v41", "mimo", "xing4", "torch")
+#:
+#: One entry, because one runtime is left: the `cpp`, `v41`, `mimo` and `torch` backends left with
+#: the multi-card cut-down, and their recorded fixtures were deleted with them rather than left to
+#: skip forever -- a fixture for an entry point this build cannot start is a claim nothing can re-run.
+ENTRY_POINTS = ("xing4",)
 
 #: The opt-in gate for *running* a fixture. The completeness tests need no weights and always run;
 #: this one covers the runs, because the cost across the six spans seconds to the better part of an
@@ -273,18 +276,11 @@ def _with_repo_root_on_the_path() -> str:
 def run_isolated(fixture: GoldenFixture, *, verbose: bool = False) -> Outcome:
     """Run one fixture in a child interpreter and return what it produced.
 
-    **One entry point is one process.** Running all six in whatever process pytest happens to be in
-    does not work, and the way it fails is not about the fixtures:
-
-    - `xing4` after `mimo` dies inside the CUDA runtime with `resource already mapped`, because the
-      previous entry point's host mappings are still registered in this context;
-    - `torch` after `mimo` loads its checkpoint with `WORLD_SIZE` read as 1 while the four-way
-      sharded model it built expects the shard, and refuses it with a `q8_0 block shape mismatch`.
-
-    Both pass alone, and neither says anything about the checkpoint. A shared CUDA context and a
-    shared environment are not what any entry point here is built for -- `docs/guides/benchmarking.md`
-    already states the rule as *one process per rank per GPU*, and the operator's own entry point is
-    `pocketllm serve`, started once per configuration. So the child is the unit of execution and the
+    **One entry point is one process.** Loading the model into whatever process pytest happens to be
+    in is not what any entry point here is built for -- `docs/guides/benchmarking.md` states the rule
+    as *one process per rank per GPU*, and the operator's own entry point is `pocketllm serve`,
+    started once per configuration. It also keeps the child's CUDA context and environment out of the
+    interpreter running the rest of the suite. So the child is the unit of execution and the
     comparison stays in the parent, where a failure can name the fixture.
 
     The child's output is streamed when `verbose`, and its last lines are kept either way so that a

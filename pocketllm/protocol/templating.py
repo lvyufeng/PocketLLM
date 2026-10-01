@@ -1,22 +1,16 @@
 """Which chat template an architecture uses, and how its answer reads back.
 
-A checkpoint declares a ``model_type`` and that selects a templater.  DeepSeek-V4 has its own
-encoder in :mod:`src.encoding.deepseek_v4`, which renders DSML tool-call syntax and the reasoning
-controls; every other architecture goes through the checkpoint's own Hugging Face chat template,
-which is what lets a runtime serve a model this repository has no bespoke encoder for.
+A checkpoint declares a ``model_type`` and that selects a templater.  Every architecture this build
+serves goes through the checkpoint's own Hugging Face chat template, which is what lets a runtime
+serve a model this repository has no bespoke encoder for; the bespoke encoders that used to live
+beside the Qwen and DeepSeek runtimes left with them.
 
-That selection was written for the C++ front end's sidecar, where the C++ engine had no Python
-templating of its own, and it was the *only* place in the tree where a generated text was read back
-into ``content`` / ``reasoning_content`` / ``tool_calls``.  The Python host had no counterpart, so a
-request served through ``pocketllm serve --backend cpp`` came back as one undifferentiated
-``content`` string while the same checkpoint served by the C++ front end came back split.  It lives
-here, in the shared protocol plane, so both hosts reach one implementation -- and so that deleting
-the C++ front end is not the same thing as deleting the reading.
-
-The classes carry both directions because the two hosts want different halves: the sidecar needs
-``encode`` (it is the only templating the C++ engine has), while the Python host already encodes
-through :func:`pocketllm.protocol.encode_chat_prompt` and reads only the answer back -- by ``parse``
-when a generation is finished, and by ``split_reasoning`` while one is still arriving.
+The classes carry both directions.  A host may encode through
+:func:`pocketllm.protocol.encode_chat_prompt`, or through the templater itself when it wants the
+rendered text alongside the ids, and reads the answer back -- by ``parse`` when a generation is
+finished, and by ``split_reasoning`` while one is still arriving.  That reading was once the only
+place in the tree a generated text was split into ``content`` / ``reasoning_content`` /
+``tool_calls``, so it lives in the shared protocol plane rather than in any one front end.
 """
 
 from __future__ import annotations
@@ -79,9 +73,9 @@ def _gguf_architecture(path: str) -> str:
     if not path:
         return ""
     try:
-        from src.encoding.gguf_tokenizer import read_gguf_metadata
+        from src.loader.gguf.bundle import read_gguf_bundle
 
-        metadata = read_gguf_metadata(path)
+        metadata = read_gguf_bundle(path).metadata
     except Exception:
         return ""
     return _canonical(metadata.get("general.architecture"), None)
@@ -164,55 +158,6 @@ class Templater(Protocol):
     def parse(self, text: str, thinking_mode: str, tools: Any = None) -> dict[str, Any]: ...
 
 
-class DeepSeekV4Templater:
-    """DSML chat template, thinking modes and tool-call parsing for DeepSeek-V4."""
-
-    def __init__(self, tokenizer) -> None:
-        from src.encoding.deepseek_v4 import (
-            encode_messages,
-            eos_token,
-            parse_message_from_completion_text,
-        )
-
-        self._tokenizer = tokenizer
-        self._encode_messages = encode_messages
-        self._eos_token = eos_token
-        self._parse = parse_message_from_completion_text
-
-    def encode(self, req: dict[str, Any]) -> tuple[str, list[int]]:
-        messages = list(req.get("messages") or [])
-        tools = req.get("tools")
-        if isinstance(tools, list) and tools:
-            messages = splice_tools(messages, tools)
-        prompt_text = self._encode_messages(
-            messages,
-            thinking_mode=req.get("thinking_mode", "chat"),
-            context=req.get("context"),
-            drop_thinking=bool(req.get("drop_thinking", True)),
-            add_default_bos_token=bool(req.get("add_generation_prompt", True)),
-            reasoning_effort=req.get("reasoning_effort"),
-        )
-        return prompt_text, list(self._tokenizer.encode(prompt_text))
-
-    def split_reasoning(self, text: str, thinking_mode: str) -> tuple[str, str]:
-        # DeepSeek's thinking block opens and closes on the same two markers the generic templates
-        # use, so the split is the same one. `parse` below reads the whole DSML grammar and is
-        # unforgiving about a generation that has not finished arriving; this is the lenient reading
-        # a stream needs, and it is what the C++ front end applied to a DeepSeek answer too -- it
-        # switched fields on the closing token id and never invoked the DSML parser mid-stream.
-        return split_reasoning(text, thinking_mode)
-
-    def parse(self, text: str, thinking_mode: str, tools: Any = None) -> dict[str, Any]:
-        # `tools` is accepted and unused here: DSML marks every parameter as a string or not inside
-        # the syntax itself, so the schema adds nothing.
-        # parse_message_from_completion_text requires the EOS token to be present.  The engine emits
-        # raw decoded text without re-inserting the EOS string (it stops on the EOS token id), so
-        # append it if missing.
-        if not text.endswith(self._eos_token):
-            text = text + self._eos_token
-        return self._parse(text, thinking_mode)
-
-
 def _tool_call_parsers() -> dict[str, Any]:
     """Which tool-call syntax each architecture emits, by registry name.
 
@@ -221,15 +166,12 @@ def _tool_call_parsers() -> dict[str, Any]:
     inventing a parse for a model whose syntax has not been read would drop or corrupt calls
     silently.
 
-    Imported here rather than at module scope so this module stays importable without the model
-    encoders, the way the rest of :mod:`pocketllm.protocol` does.
+    Empty, and deliberately so: the only entry this table ever held was Qwen's, read by
+    ``src.encoding.qwen_tool_calls``, and that encoder left with the Qwen runtimes.  The single
+    architecture this build serves declares no tool-call syntax, so its calls stay in the content
+    rather than being parsed by an encoder that is no longer here.
     """
-    from src.encoding import qwen_tool_calls
-
-    return {
-        # Qwen's own chat template, the one every Qwen3.5 checkpoint ships.
-        "qwen3_5": qwen_tool_calls.parse,
-    }
+    return {}
 
 
 class ChatTemplateTemplater:
@@ -297,8 +239,6 @@ class ChatTemplateTemplater:
         return {"content": content, "reasoning_content": reasoning, "tool_calls": tool_calls}
 
 
-def build_templater(architecture: str, tokenizer) -> ChatTemplateTemplater | DeepSeekV4Templater:
+def build_templater(architecture: str, tokenizer) -> ChatTemplateTemplater:
     """The templater an architecture name selects."""
-    if architecture == "deepseek_v4":
-        return DeepSeekV4Templater(tokenizer)
     return ChatTemplateTemplater(tokenizer, _tool_call_parsers().get(architecture))

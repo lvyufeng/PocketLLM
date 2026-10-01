@@ -794,36 +794,15 @@ class SchedulerHost(RankedWorker):
         self._poll_timeout_ms = self._configured_timeout()
         if not self._batching_requested():
             return
-        try:
-            from .cpp_backend import load_native_module
-
-            self._native = load_native_module()
-        except Exception as exc:
-            self._warn_scheduler(
-                f"--enable-batching needs the native pocketllm_cpp module for its scheduler "
-                f"({exc})"
-            )
-            return
-        if not hasattr(self._native, "QwenBatchScheduler"):
-            self._warn_scheduler(
-                "--enable-batching was asked for but this native module does not expose "
-                "QwenBatchScheduler"
-            )
-            return
-        try:
-            engine = make_runtime_engine(self._runtime_spec(), self._native)
-            # Held because the row-to-request mapping lives on the engine, and this is the only
-            # object that knows which of its requests a row is for.
-            self._engine = engine
-            # The width is the scheduler's to clamp: these runtimes declare one slot, so a command
-            # line naming eight is answered with one rather than refused. Refusing would make the
-            # width a property of the launch script instead of of the runtime.
-            self._scheduler = self._native.QwenBatchScheduler(
-                engine, max(1, int(self.args.max_batch_size or 1))
-            )
-        except Exception as exc:
-            self._scheduler = None
-            self._warn_scheduler(f"could not build the batch scheduler: {exc}")
+        # The scheduler lives in `pocketllm_cpp`, the native engine's Python module, and that engine
+        # is no longer part of this repository -- it is archived in relic-engine, and the multi-card
+        # runtimes that drove the scheduler moved to RelicLLM with it. There is therefore nothing to
+        # import here. The declaration is what keeps this honest: every runtime left in this build
+        # declares `supports_batch=False`, so `--enable-batching` is refused in the factory before
+        # it ever reaches this method.
+        self._warn_scheduler(
+            "--enable-batching needs the native scheduler, which is not part of this build"
+        )
 
     @staticmethod
     def _warn_scheduler(reason: str) -> None:

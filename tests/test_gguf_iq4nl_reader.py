@@ -46,7 +46,9 @@ from tests.gguf_test_utils import GGML_F32, GGML_IQ4_NL, write_gguf
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-GGML_COMMON = REPO_ROOT / "src" / "csrc" / "llama_mmq" / "ggml-common.h"
+# The vendored header travels with the kernels in relic-core, so it is reached
+# through the same resolver `iq4_nl` uses rather than a path relative to this tree.
+GGML_COMMON = iq4_nl._GGML_COMMON
 
 CHECKPOINT_DIR_ENV = "POCKETLLM_XING4_DIR"
 CHECKPOINT_DIR_DEFAULT = "/mnt/data2"
@@ -367,54 +369,6 @@ def test_an_unknown_id_still_raises(tmp_path: Path) -> None:
     with GGUFQuantizedTensorLoader(str(path), device="cpu") as loader:
         with pytest.raises((NotImplementedError, ValueError)):
             loader.read_quant("blk.0.ffn_gate.weight", "iq4_nl")
-
-
-# --------------------------------------------------------------------------- #
-# inspect_gguf reports the type
-# --------------------------------------------------------------------------- #
-
-
-def test_inspect_gguf_reports_iq4_nl(tmp_path: Path) -> None:
-    """The report names the type, and does not file it under "unknown".
-
-    ``unknown_*`` is the entry a reader without the format produces, so its
-    absence is the assertion: a type that shows up in both places would look
-    reported while being undecoded.
-    """
-    path = tmp_path / "iq4_nl-inspect.gguf"
-    write_gguf(
-        path,
-        metadata={"general.architecture": "xing4_0", "xing4_0.block_count": 1},
-        tensors=[
-            ("blk.0.ffn_gate.weight", (64, 2), GGML_IQ4_NL),
-            ("blk.0.ffn_gate_exps.weight", (64, 2, 4), GGML_IQ4_NL),
-            ("blk.0.attn_norm.weight", (64,), GGML_F32),
-        ],
-        payloads={
-            "blk.0.ffn_gate.weight": _marker_payload(2, 2),
-            "blk.0.ffn_gate_exps.weight": _marker_payload(2, 2) * 4,
-            "blk.0.attn_norm.weight": np.zeros(64, dtype="<f4").tobytes(),
-        },
-    )
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(REPO_ROOT)
-    result = subprocess.run(
-        [sys.executable, "-m", "src.cli.inspect_gguf", "--gguf-path", str(path)],
-        cwd=REPO_ROOT,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr + result.stdout
-    types = result.stdout.split("tensor types:")[1].split("\n\n")[0]
-    assert "iq4_nl" in types
-    assert "unknown tensor types:" not in result.stdout
-    assert "unknown_20" not in result.stdout
-    # The byte count in the report is the block geometry's, so a wrong geometry
-    # shows up here before it shows up in a decode.
-    assert "iq4_nl            2" in types
 
 
 # --------------------------------------------------------------------------- #

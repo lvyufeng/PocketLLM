@@ -2,6 +2,11 @@
 
 PocketLLM uses model-specific runtimes rather than treating every checkpoint as the same Transformer. The table below describes the current repository state.
 
+**One checkpoint has a runtime in this build.** The multi-card runtimes left with the cut, and so did
+the single-card ones that were driven by the C++ front end. Their pages remain as measurement
+records and are marked **Stale** in the table; a stale row is a claim about a checkpoint, not an
+instruction for running it here.
+
 ## Status definitions
 
 A status is a claim about evidence, so each one names the evidence it stands on rather than
@@ -14,6 +19,7 @@ document it is under [performance](https://github.com/lvyufeng/RelicLLM/blob/mas
 | **Text, CLI only** | Full-model text-in/text-out generation is covered through a CLI or benchmark entrypoint. There is no OpenAI adapter for it. |
 | **Experimental** | Functionality exists with an explicit caveat on performance, determinism or output parity. The caveat is the `## Known limitations` entry that carries it. |
 | **Inspect only** | Metadata and tensor validation exist without a complete generation runtime: the audit is the evidence, not generated text. |
+| **Stale (record only)** | The runtime this row's numbers came from is no longer in this repository — it left with the multi-card cut, or it was driven by the retired C++ front end. The page is kept for the measurement, and it says at the top that nothing on it runs here. |
 
 ## Support matrix
 
@@ -28,7 +34,7 @@ This table is the runtime status and nothing else, so a row stays scannable.
 | [Qwen3.8-27B-FP8](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/qwen3.8-27b-fp8.md) | 48 Gated DeltaNet + 16 GQA | Safetensors FP8 E4M3 | C++/CUDA, TP4 | Text + server | [Design](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/qwen3_8_27b_fp8_design.md) |
 | [Qwen3.8-27B-NVFP4](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/qwen3.8-27b-nvfp4.md) | Same text architecture | Safetensors NVFP4 + FP8 | C++/CUDA, TP2 | Text, CLI only | [Design](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/qwen3_8_27b_nvfp4_design.md) |
 | [Qwen3.8-27B (official BF16)](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/qwen3.8-27b-bf16.md) | Same text architecture | Safetensors BF16, vision tower | C++/CUDA, **audit only**; C++/Ascend TP4 | Text + server on Ascend TP4 | [Design](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/qwen3_8_27b_bf16_design.md) |
-| [Ternary-Bonsai-2-27B](ternary-bonsai-2-27b.md) | Same text architecture | GGUF `PTQ1_0`, 1.75 bits a weight | C++/CUDA, **one card**, no flag; C++/Ascend TP4 | Text + server | [Design](../architecture/bonsai_2_27b_design.md) |
+| [Ternary-Bonsai-2-27B](ternary-bonsai-2-27b.md) | Same text architecture | GGUF `PTQ1_0`, 1.75 bits a weight | **Stale** — was C++/CUDA, one card, no flag | Stale (record only) | [Design](../architecture/bonsai_2_27b_design.md) |
 | [DeepSeek-V4.1-Flash](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/deepseek-v4.1-flash.md) | Encoder-decoder, CSA2 shared-KV, MoE | Safetensors FP8 + FP4 | `--backend v41`, host PyTorch, TP4 | Text + server | [Design](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/deepseek_v4_1_flash_design.md) |
 | [MiMo-V2.6-Flash](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/mimo-v2.6-flash.md) | 9 global + 39 sliding-window, MoE | Safetensors FP8 + MXFP4 | `--backend mimo`, host expert bank, TP4 | Text + server | [Design](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/mimo_v2_6_flash_design.md) |
 | [Xing4.0-29B-A4B](xing4.0-29b-a4b.md) | MLA + matrix hyper-connection, 64-expert MoE | GGUF `IQ4_NL` | `--backend xing4`, **one card**, experts resident | Text + server | [Design](../architecture/xing4_0_29b_a4b_design.md) |

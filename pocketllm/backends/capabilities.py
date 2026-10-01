@@ -43,9 +43,6 @@ from pocketllm.api import BackendCapabilities, EngineArgs
 # routing question and the refusal question drift apart -- which is the defect this module exists
 # to remove.
 
-_QWEN35_TYPES = {"qwen3_5", "qwen3_5_text"}
-_V41_TYPES = {"deepseek_v41", "deepseek_v41_text"}
-_MIMO_TYPES = {"mimo_v2", "mimo_v2_text"}
 _XING4_TYPES = {"xing4_0", "xing4_0_text"}
 
 
@@ -89,32 +86,6 @@ def _names_model(config: Mapping[str, Any], types: set[str], architectures: str)
             return True
     nested = config.get("text_config")
     return isinstance(nested, dict) and _names_model(nested, types, architectures)
-
-
-def is_qwen35_config(config: Mapping[str, Any]) -> bool:
-    return _names_model(config, _QWEN35_TYPES, "qwen3_5")
-
-
-def is_v41_config(config: Mapping[str, Any]) -> bool:
-    return _names_model(config, _V41_TYPES, "deepseekv41")
-
-
-def is_mimo_config(config: Mapping[str, Any]) -> bool:
-    """Whether a config describes MiMo-V2.6-Flash.
-
-    Unlike V4.1's, this checkpoint's text stack is not nested: ``model_type`` and ``architectures``
-    are at the root and describe the language model, with the vision and audio towers under their
-    own keys. The nested walk happens anyway because a MiMo release under someone else's multimodal
-    wrapper should not stop being a MiMo release -- and it walks ``text_config`` as well as
-    ``text_encoder_config``, which is the pair the dispatcher accepted before this was moved here.
-    """
-    if _names_model(config, _MIMO_TYPES, "mimov2"):
-        return True
-    for key in ("text_encoder_config", "text_config"):
-        nested = config.get(key)
-        if isinstance(nested, dict) and is_mimo_config(nested):
-            return True
-    return False
 
 
 def is_xing4_config(config: Mapping[str, Any]) -> bool:
@@ -278,64 +249,6 @@ class RuntimeCapabilities:
 # ---------------------------------------------------------------------------------------------
 
 
-def _is_gguf_only(args: EngineArgs, runtime: str) -> Identification | None:
-    """The shared first rule for the safetensors-only runtimes.
-
-    Returns the refusal when the checkpoint is a GGUF, ``None`` when it is not -- so a caller can
-    chain it ahead of the architecture rule and read the two causes apart, which is what makes the
-    refusal name the thing that actually refused.
-    """
-    if requested_gguf(args):
-        return refused(
-            f"backend={runtime!r} reads the checkpoint's safetensors shards only; "
-            f"a GGUF checkpoint must use backend='torch'"
-        )
-    return None
-
-
-def _identify_v41_or_mimo(
-    args: EngineArgs, runtime: str, predicate: Callable[[Mapping[str, Any]], bool], name: str
-) -> Identification:
-    gguf = _is_gguf_only(args, runtime)
-    if gguf is not None:
-        return gguf
-    config = read_config(args.checkpoint_dir, args.config_path)
-    if config is None:
-        return UNKNOWN
-    if not predicate(config):
-        return refused(f"backend={runtime!r} serves {name} checkpoints only")
-    return READ
-
-
-def _identify_cpp(args: EngineArgs) -> Identification:
-    if requested_gguf(args):
-        # The native reader opens one GGUF file and the registry routes it to the Qwen3.5 engine,
-        # so a GGUF is servable when both hold: one file, and an architecture that engine claims.
-        # Anything else -- shards, a directory of two models, another architecture -- is refused
-        # here rather than at the loader, because the reason is about the checkpoint format and
-        # the refusal is what tells the caller which backend to ask for instead.
-        #
-        # Imported here rather than at the top of the module: `gguf_is_servable` lives beside the
-        # adapter it belongs to, and that adapter imports *this* module for its declaration, so a
-        # module-level import would be a cycle. The dispatcher's `native_available()` gate still
-        # covers the availability half, which is why this is the last place it is needed.
-        from .cpp_backend import gguf_is_servable
-
-        if not gguf_is_servable(args.checkpoint_dir):
-            return refused(
-                "the native C++ adapter serves the Qwen3.5 GGUF export, as a single .gguf file "
-                "declaring general.architecture=qwen35; other GGUF checkpoints must use "
-                "backend='torch'"
-            )
-        return READ
-    config = read_config(args.checkpoint_dir, args.config_path)
-    if config is None:
-        return UNKNOWN
-    if not is_qwen35_config(config):
-        return refused("the native C++ adapter supports Qwen3.5 checkpoints only")
-    return READ
-
-
 _XING4_ONLY = (
     "backend='xing4' serves Xing4.0-29B-A4B checkpoints only: a directory whose "
     "config.json says model_type=xing4_0, or a .gguf whose general.architecture is xing4_0"
@@ -378,79 +291,7 @@ def _identify_xing4(args: EngineArgs) -> Identification:
     return refused(f"{_XING4_ONLY} (this one declares general.architecture={architecture!r})")
 
 
-def _identify_torch(_args: EngineArgs) -> Identification:
-    """The generic runtime reads everything, so it is never refused and never preferred.
-
-    It is last in :data:`AUTO_ORDER` and its verdict is :attr:`Verdict.READ`, which is the same
-    thing as saying the loop's fallback and its last candidate are the same answer.
-    """
-    return READ
-
-
 RUNTIMES: dict[str, RuntimeCapabilities] = {
-    "cpp": RuntimeCapabilities(
-        name="cpp",
-        models=("qwen3_5", "qwen3_5_moe_vl"),
-        model_formats=("safetensors", "gguf"),
-        devices=("cuda", "ascend"),
-        # The one runtime with a batch scheduler. Which path it runs -- and therefore whether this
-        # instance really holds more than one request -- is the instance's answer, reported through
-        # `supports_batch` in `declared_capabilities`.
-        supports_batch=True,
-        supports_cancellation=True,
-        supports_speculative_decoding=("mtp", "dspark", "dflash2"),
-        reads_prefix_cache=True,
-        identifies=_identify_cpp,
-        details={
-            "execution": "native C++",
-            "cancellation": "safe boundary only",
-        },
-    ),
-    "torch": RuntimeCapabilities(
-        name="torch",
-        model_formats=("safetensors", "gguf"),
-        devices=("cuda", "cpu"),
-        supports_batch=False,
-        supports_cancellation=True,
-        supports_logprobs=True,
-        reads_prefix_cache=True,
-        identifies=_identify_torch,
-        details={
-            "execution": "existing src/ runtime",
-            "scheduler": "legacy serving queue",
-            "cancellation": "safe boundary only",
-        },
-    ),
-    "v41": RuntimeCapabilities(
-        name="v41",
-        models=("deepseek_v4_1", "deepseek_v41"),
-        model_formats=("safetensors",),
-        devices=("cpu", "cuda"),
-        supports_cancellation=True,
-        reads_prefix_cache=True,
-        identifies=lambda args: _identify_v41_or_mimo(
-            args, "v41", is_v41_config, "DeepSeek-V4.1-Flash"
-        ),
-        details={
-            "execution": "src/models/deepseek_v4_1 PyTorch runtime",
-            "scheduler": "one mutable KV state, serialized at the backend boundary",
-            "cancellation": "per-step collective; not inside the prompt's forward",
-        },
-    ),
-    "mimo": RuntimeCapabilities(
-        name="mimo",
-        models=("mimo_v2", "mimo_v2_6"),
-        model_formats=("safetensors",),
-        devices=("cuda",),
-        supports_cancellation=True,
-        reads_prefix_cache=True,
-        identifies=lambda args: _identify_v41_or_mimo(
-            args, "mimo", is_mimo_config, "MiMo-V2.6-Flash"
-        ),
-        # No static prose: this runtime's description is entirely about the run -- the deal, the
-        # arena a slot, the resident bands -- so the adapter supplies all of it.
-        details={},
-    ),
     "xing4": RuntimeCapabilities(
         name="xing4",
         models=("xing4_0",),
@@ -459,16 +300,17 @@ RUNTIMES: dict[str, RuntimeCapabilities] = {
         supports_cancellation=True,
         reads_prefix_cache=True,
         identifies=_identify_xing4,
-        # No static prose, for the reason `mimo` has none.
+        # No static prose: this runtime's description is entirely about the run, so the adapter
+        # supplies all of it.
         details={},
     ),
 }
 
 
-#: The order ``auto`` asks them in: the architecture-specific readers before the native one, and
-#: the native one before the generic runtime, which is the specificity of the reader. ``torch`` is
-#: last and identifies everything, so the loop's fallback and its last candidate are one answer.
-AUTO_ORDER: tuple[str, ...] = ("v41", "mimo", "xing4", "cpp", "torch")
+#: The order ``auto`` asks the runtimes in. With one runtime this is the whole list; it stays a
+#: tuple rather than a scalar because the loop below is what "auto" means, and a second checkpoint
+#: family is an entry here plus a declaration.
+AUTO_ORDER: tuple[str, ...] = ("xing4",)
 
 
 def runtime_capabilities(name: str) -> RuntimeCapabilities:
@@ -529,11 +371,11 @@ def identify(name: str, args: EngineArgs) -> Identification:
 
 
 def route(args: EngineArgs) -> str:
-    """The runtime ``auto`` selects, or ``torch`` when nothing identifies the checkpoint."""
+    """The runtime ``auto`` selects, or the empty string when nothing identifies the checkpoint."""
     for name in AUTO_ORDER:
         if runtime_capabilities(name).identifies(args).routes_here:
             return name
-    raise AssertionError("AUTO_ORDER has no fallback; torch identifies every checkpoint")
+    return ""
 
 
 def refusal(name: str, args: EngineArgs) -> str:

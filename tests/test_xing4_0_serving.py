@@ -13,7 +13,6 @@ belong: the parity tests in `tests/test_xing4_0_moe.py` and
 
 from __future__ import annotations
 
-import importlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -682,138 +681,6 @@ def test_the_options_a_native_launch_always_carries_are_accepted() -> None:
     assert options.prefix_cache_bytes > 0
 
 
-# ------------------------------------------------------------------- the shared scheduler
-
-
-@pytest.fixture(scope="module")
-def native_module():
-    """The C++ extension, which is what carries the scheduler binding."""
-    try:
-        return importlib.import_module("pocketllm_cpp")
-    except ImportError as exc:
-        pytest.skip(f"native pocketllm_cpp module is not built: {exc}")
-
-
-def batched_backend(**options) -> Xing4Backend:
-    """This runtime serving through the scheduler `cpp` uses.
-
-    `--device cpu` because the model is the file's stand-in and there is no card in the path: the
-    runtime then binds nothing, and what is under test is the route rather than a kernel. It is a
-    platform and not a card, which since U3 is the field it belongs in -- a card would be
-    `device_ids`, and naming one here would ask the stand-in to be placed on it. The rest of the
-    wiring is the real one -- a real `BatchScheduler` driving the real adapter, with the bridge in
-    between.
-    """
-    args = EngineArgs(
-        model="a-xing4-checkpoint",
-        backend="xing4",
-        device="cpu",
-        max_model_len=64,
-        backend_options={
-            "gguf": "/nowhere/xing4_0-29b-IQ4_NL.gguf",
-            "enable_batching": True,
-            **options,
-        },
-    )
-    instance = Xing4Backend(
-        args, loader=lambda _path, _options: ScriptedModel(), tokenizer=FakeTokenizer()
-    )
-    instance.prepare()
-    return instance
-
-
-def test_the_batched_path_answers_what_the_serial_path_answers(native_module) -> None:
-    """Turning the scheduler on changes the route, not the answer.
-
-    The two arms are the same scripted model and the same request, so the only thing that can
-    differ is which code path ran. That is the claim a migration like this has to earn: the same
-    tokens, the same finish reason, and a `usage` a client can still read.
-    """
-    serial = backend()
-    batched = batched_backend()
-    assert serial.capabilities.supports_batch is False
-    assert batched.capabilities.supports_batch is True
-    assert "BatchScheduler" in batched.capabilities.details["scheduler"]
-    assert "serialized" in serial.capabilities.details["scheduler"]
-
-    one = serial.generate([request(request_id="r1")])[0]
-    two = batched.generate([request(request_id="r1")])[0]
-
-    assert two.token_ids == one.token_ids == [11, 12, 13, 14]
-    assert two.text == one.text
-    assert two.finish_reason == one.finish_reason
-    assert two.usage.prompt_tokens == one.usage.prompt_tokens
-    assert two.usage.completion_tokens == one.usage.completion_tokens
-    # The split the scheduler keeps for its own gauges reaches the client too, rather than being
-    # zeroed on the way through a result type this runtime did not build.
-    assert two.timings.total_seconds > 0
-    batched.close()
-
-
-def test_the_scheduler_gauges_are_published_only_where_a_scheduler_is(native_module) -> None:
-    """The reading that separates a scheduler from a lock, and it has to be absent on the lock.
-
-    Both paths answer the same tokens, so this series is the only in-process evidence that a
-    request went through the scheduler rather than through a queue. The serialized path exports
-    none of it -- not as zero, which would read as "the scheduler is here and idle" about a process
-    that has none.
-    """
-    serial = backend()
-    batched = batched_backend()
-    try:
-        assert "requests_running" not in serial.metrics()
-        assert "requests_waiting" not in serial.metrics()
-
-        gauges = batched.metrics()
-        # Idle rather than absent: this runtime has a scheduler and nothing in it.
-        assert gauges["requests_running"] == 0.0
-        assert gauges["requests_waiting"] == 0.0
-        assert gauges["slots_free"] == 1.0
-        # No block pool on this runtime, so the pool gauges are not published at all.
-        assert not [key for key in gauges if key.startswith("kv_blocks")]
-    finally:
-        batched.close()
-
-
-def test_the_scheduler_reads_the_runtime_s_own_declaration(native_module) -> None:
-    """The width the engine was built with and the width it declares are different things.
-
-    A launch script that names eight rows gets one, and it gets one because the runtime said so --
-    not because a constant somewhere kept them apart.
-    """
-    batched = batched_backend()
-    try:
-        caps = batched._scheduler.engine_caps()
-        assert caps.max_slots == 1
-        assert caps.continuous_batching is False
-        assert caps.chunked_prefill is False
-        assert caps.paged_kv is False
-    finally:
-        batched.close()
-
-
-def test_a_second_request_after_a_failure_still_serves(native_module) -> None:
-    """The scheduler is a long-lived object, so one request's failure must not wedge it.
-
-    The failure here is the runtime's own: `_eos_tokens` raises for a checkpoint that names no
-    end-of-turn token, and it is reached inside the run rather than before submission.
-    """
-    batched = batched_backend()
-    tokenizer = FakeTokenizer(eos_token_id=None)
-    batched._tokenizer = tokenizer
-    batched._model.params = SimpleNamespace(n_heads=32)
-    try:
-        with pytest.raises(Exception):
-            batched.generate([request(request_id="bad")])
-
-        # And the next one, with the checkpoint's own end-of-turn token back, is answered.
-        tokenizer.eos_token_id = 2
-        result = batched.generate([request(request_id="good")])[0]
-        assert result.token_ids == [11, 12, 13, 14]
-    finally:
-        batched.close()
-
-
 # ---------------------------------------------------------------------------- selection
 
 
@@ -846,11 +713,17 @@ def test_the_factory_claims_the_quantized_dir_beside_a_release(tmp_path: Path) -
 def test_a_directory_named_like_a_gguf_but_holding_another_architecture_is_not_claimed(
     tmp_path: Path,
 ) -> None:
+    """xing4 declines it, and with no other runtime to claim it the selection refuses.
+
+    The intent is unchanged -- this GGUF is not xing4's -- but the answer it produces is no longer
+    "some other backend": xing4 is the only runtime in this build, so `auto` has nothing to fall
+    through to and says so, naming the path, rather than returning a runtime that cannot serve it.
+    """
     quantized = tmp_path / "other-GGUF"
     quantized.mkdir()
     _fake_gguf(quantized / "other.gguf", architecture="llama")
-    selected = factory.select_backend(EngineArgs(model=str(quantized)))
-    assert selected != "xing4"
+    with pytest.raises(UnsupportedFeatureError):
+        factory.select_backend(EngineArgs(model=str(quantized)))
 
 
 def test_an_explicit_xing4_backend_refuses_another_checkpoint(tmp_path: Path) -> None:

@@ -70,13 +70,13 @@ class FakeBackend(BackendBase):
 
 class InjectedLLM(LLM):
     def __init__(self):
-        self.args = EngineArgs(model="fake", backend="torch")
+        self.args = EngineArgs(model="fake", backend="xing4")
         self._backend = FakeBackend()
         self._closed = False
 
 
 def test_engine_args_and_sampling_aliases():
-    args = EngineArgs(model="model", backend="torch", tensor_parallel_size=2, tensor_parallel_rank=1)
+    args = EngineArgs(model="model", backend="xing4", tensor_parallel_size=2, tensor_parallel_rank=1)
     assert args.checkpoint_dir == "model"
     params = SamplingParams.from_openai({"max_completion_tokens": 7, "stop": "END", "n": 2})
     assert params.max_tokens == 7

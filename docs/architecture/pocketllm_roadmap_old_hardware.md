@@ -1,5 +1,15 @@
 # PocketLLM 针对老硬件的功能规划
 
+> **Repository scope note.** This is a historical planning document, written when PocketLLM carried
+> the whole multi-GPU stack. The repository has since been cut to single-card, edge-and-mobile scope:
+> the C++ engine it plans against is archived in
+> [relic-engine](https://github.com/lvyufeng/relic-engine), the multi-card runtimes and their
+> scheduler moved to [RelicLLM](https://github.com/lvyufeng/RelicLLM), and the native kernels to
+> [relic-core](https://github.com/lvyufeng/relic-core). Entries below that name the C++ engine, the
+> Ascend backend, the `BatchScheduler`, CPU offload or the Qwen model family therefore describe work
+> that is no longer in this tree. It is kept as the planning record, not as a description of the
+> current checkout.
+
 **目标硬件**: 2080Ti (SM75, 22GB, PCIe), Ascend 910B (1st gen, 32GB HBM)  
 **分析时间**: 2026-09-11  
 **当前状态**: Phase 3 (paged KV 已默认开启)
@@ -251,7 +261,8 @@ expert staging 的 decode 是 0.54–0.66 tok/s（[GLM-5.2 模型页](https://gi
 - **但可以用 FlashAttention-1**: FA1 支持 SM75，PyTorch 2.x 已内置
 
 **设计方案**：
-- 在 `cpp_engine` 中增加 **FA1 kernel 调用**（通过 cuDNN 或 PyTorch C++ API）
+- 在 C++ engine 中增加 **FA1 kernel 调用**（通过 cuDNN 或 PyTorch C++ API）——该 engine 现已归档到
+  [relic-engine](https://github.com/lvyufeng/relic-engine)
 - 优先级：
   1. Prefill batch_size >= 2 时强制用 FA1（节省激活显存）
   2. 单请求长上下文（>32K）时可选 FA1（减少 HBM 读写）

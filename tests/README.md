@@ -91,15 +91,15 @@ to reproduce it:
 
 | Field | What it is |
 | --- | --- |
-| `entry` | the entry point: `cpp`, `v41`, `mimo`, `xing4` or `torch` |
+| `entry` | the entry point: `xing4` — the only runtime this build has |
 | `checkpoint` | the checkpoint directory or GGUF, as an absolute path |
-| `env` | the environment variables the run needs (`POCKETLLM_CPP_BATCHED_DECODE`, `CUDA_VISIBLE_DEVICES`, …) |
+| `env` | the environment variables the run needs (`CUDA_VISIBLE_DEVICES`, …) |
 | `argv` | the command line, **as an operator types it**, minus `--prompt` |
 | `prompt` | the prompt **as text** |
 | `sampling` | greedy is `temperature: 0.0`; a fixture that samples is a fixture that fails one run in ten |
 | `requires` | a resource the run needs from this host, currently `dev_shm_bytes` |
 | `expected.prompt_tokens` | how many tokens the prompt rendered to for this checkpoint's tokenizer |
-| `expected.token_ids` | what came out (empty for `torch`, whose runtime does not report ids) |
+| `expected.token_ids` | what came out |
 | `expected.text` | what came out |
 | `commit`, `taken_at` | the revision and the day it was recorded |
 
@@ -117,37 +117,15 @@ means the model was asked a different question, and comparing only the answer wo
 for it.
 
 **Each fixture runs in its own process.** The test spawns `tests/golden_fixtures.py --entry <name>`
-and compares what the child hands back, rather than running five engines inside pytest's interpreter.
-That is not tidiness — five engines in one process is a configuration nothing else in this repository
-uses, and it fails in ways that have nothing to do with the fixtures:
-
-| Order | What happens | Alone |
-| --- | --- | --- |
-| `mimo` then `xing4` | `CUDA error: resource already mapped`, inside the load | passes |
-| `mimo` then `torch` | `WORLD_SIZE` read as 1 against a four-way sharded model → `q8_0 block shape mismatch` | passes |
-
-The rule is already in [`docs/guides/benchmarking.md`](../docs/guides/benchmarking.md) — one process
-per rank per GPU — and the operator's own entry point is `pocketllm serve`, started once per
-configuration. So the child is the unit of execution and the comparison stays in the parent, where a
-failure can name the fixture.
+and compares what the child hands back, rather than loading the engine inside pytest's interpreter.
+That is not tidiness — a model loaded into the pytest process is a configuration nothing else in this
+repository uses, and one process per rank per GPU is the rule in
+[`docs/guides/benchmarking.md`](../docs/guides/benchmarking.md). So the child is the unit of
+execution and the comparison stays in the parent, where a failure can name the fixture.
 
 **`requires` is how a fixture states what it needs from the host**, and it is why a missing resource
-is a skip and not a failure. The two bank-pinning entries need a lot of `/dev/shm` — 458 GiB for
-`v41` and 150 for `mimo` — and **they do not fit together in the 504 GiB tmpfs this box has**:
-
-```bash
-rm -rf /dev/shm/pocketllm_*_experts*     # drop both banks, then run whichever you need
-```
-
-Without the field the second one would die partway through a fill with an error that reads like a
-model bug. With it, the fixture that cannot fit skips and names the size it wanted. The banks are
-worth knowing about for a second reason: they persist, so a *warm* `v41` run is 3 minutes against 41
-cold, and `mimo` is 75 seconds against 12 minutes.
-
-The two consequences of that: a full `POCKETLLM_GOLDEN=1` run covers four of the five fixtures and
-skips whichever of the pair the resident bank crowds out, and *which* one is skipped depends on what
-was already in `/dev/shm` when the run started rather than on the order in the file. Clear the banks
-before a run that is meant to cover both, and expect the first one to pay the cold cost.
+is a skip and not a failure: a fixture that cannot fit skips and names the size it wanted, rather
+than dying partway through a load with an error that reads like a model bug.
 
 A fixture is a smoke test, not a benchmark: it answers "does this checkpoint still produce this
 answer through this entry point", which is the question a refactor of the request lifecycle must not
@@ -165,12 +143,11 @@ python scripts/record_golden_fixture.py --entry xing4 \
 
 ### Running them is opt-in
 
-The fixtures load real checkpoints, and their cost spans three orders of magnitude: the `xing4` one
-answers in 18 seconds, while `v41` pins a 457.8 GiB resident expert bank and takes forty minutes on a
-cold segment. So the *runs* are gated:
+The fixture loads a real checkpoint, so it is not free: the `xing4` entry answers in 18 seconds on a
+loaded model. The *runs* are gated:
 
 ```bash
-python -m pytest tests/test_served_path_golden.py -q                    # 5 skips, one a fixture
+python -m pytest tests/test_served_path_golden.py -q                    # skips, one per fixture
 POCKETLLM_GOLDEN=1 python -m pytest tests/test_served_path_golden.py -q # now they run
 ```
 

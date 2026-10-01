@@ -136,56 +136,21 @@ prefix store is on by default.
 | `--backend-option prefix_cache_bytes=N` | 2 GiB | The store's host-side budget. |
 | `--backend-option tokenizer=DIR` | — | The tokenizer directory, same as `--tokenizer-path`. |
 | `--backend-option use_kernel=false` | `true` | Runs the hyper-connection in PyTorch instead of the fused kernel. **2.17× slower at decode**; it exists so the two can be compared. |
-| `--enable-batching` | off | Serves requests through the shared `BatchScheduler` instead of this adapter's own serialized session. See below. |
-| `--tensor-parallel-size` | 1 | Not implemented for this checkpoint; a value above 1 is refused rather than silently ignored. |
+| `--enable-batching` | — | **Not available in this build.** It routed requests through the native `BatchScheduler`, and that scheduler — a C++ library the `cpp` backend drove — left the repository with the engine (archived in [relic-engine](https://github.com/lvyufeng/relic-engine)). This runtime declares `supports_batch=False`, so the flag is refused rather than accepted and ignored. |
+| `--tensor-parallel-size` | — | **Not available in this build.** There is no tensor-parallel path for this checkpoint: the trunk's forward flattens its input to a single token axis, and every expert is already resident on one card. The flag left the CLI with the multi-card runtimes. |
 
-### Through the shared scheduler
+### Requests serialize
 
-`--enable-batching` routes requests through the same `BatchScheduler` the `cpp` backend drives. It is
-off by default, and the reason is a dependency rather than a doubt: the scheduler is the C++ library,
-so this route needs `pocketllm_cpp` built, and this runtime otherwise serves without it.
+One request runs at a time, through the adapter's own serialized session. There is no batch path in
+this build: the shared `BatchScheduler` was a C++ library, and it moved out with the C++ engine (see
+[the design record](../architecture/xing4_0_29b_a4b_design.md#7-serving)). A previous revision of this
+page measured a `--enable-batching` route alongside the serialized one — at width 1, on the same
+tokens — but that route needs the native module this build does not carry, so it is not something a
+launch here can select.
 
-It is not a claim of concurrency. The runtime declares `max_slots = 1` and
-`continuous_batching = False`, and the scheduler takes the smaller of the requested width and the
-declaration — so what joins the shared lifecycle is this runtime as it is, one request at a time,
-with admission, cancellation, per-request timings and the `/metrics` gauges coming from the one
-library instead of from a second implementation of them. The bridge's own account is in
-`pocketllm/backends/runtime_engine.py`; what it costs and what it buys is below.
-
-Measured on one RTX 2080 Ti, `cuda:0` through `scripts/bench_runtime_scheduler_path.py`: the released
-`xing4_0-29b-IQ4_NL.gguf`, `--max-model-len 8192`, 32 greedy tokens, one warmup request and four
-measured ones per arm, **one arm per process** (a second engine in the same process runs about 10%
-slower than the first, which would be the order the arms were built in rather than the thing being
-compared). Two process pairs in each order, because a difference this size is exactly the size of a
-first-run artifact:
-
-| Arm | Process pair | Wall, median of 4 | Prefill | Decode |
-| --- | --- | ---: | ---: | ---: |
-| serialized session | A-B-A-B | 4.631 s | 0.247 s | 4.492 s |
-| `--enable-batching` | A-B-A-B | 4.383 s | 0.251 s | 4.231 s |
-| serialized session | B-A-B-A | 4.783 s | 0.251 s | 4.684 s |
-| `--enable-batching` | B-A-B-A | 4.460 s | 0.253 s | 4.432 s |
-
-**Every one of the four runs in both arms returned the same 32 token ids**, which is the claim that
-matters: a runtime that joins the scheduler and answers something else has been replaced, not routed.
-The scheduler path is at the faster end by about 5% in both orders, and this page does not claim it
-as a speedup — a host-bound decode loop at ~11,500 launches a step has a spread that size, and the
-mechanism for it has not been established.
-
-The first measurement of this pair — no warmup, one request an arm, the serial arm first — read the
-scheduler path as **27% faster** (4.94 s against 6.48 s), which it is not. The first request through
-a freshly loaded checkpoint pays the kernel-module load and the allocator growth, and it landed
-entirely on whichever arm ran first. That is why the table above has a warmup round, four measured
-runs and a spread instead of two numbers, and why the two arms are run in both orders.
-
-**The routed path is visible from outside the process.** `scripts/bench_cpp_scheduler_metrics.py`
-serves this backend and samples `/metrics` while two clients are in flight. With `--enable-batching`
-the exposition carries `pocketllm_requests_running` and `pocketllm_requests_waiting` — the same
-`BatchScheduler::Stats` fields the `cpp` host publishes as `pocket_…`, at this runtime's declared
-width of one — and the peak over the group is **1 running and 1 waiting**: the scheduler is holding
-the second request rather than the second request never having arrived. Without the flag the series
-is **absent**, not zero, because there is no scheduler in that process to ask. A peak of zero would
-be the ambiguous reading; an absent series is not.
+A served deployment that wants more than one request at a time runs **one process a card**, not a
+batch: the checkpoint uses 85% of a 22 GiB card, so the batching headroom is 3.4 GiB, and neither the
+card nor the host submission path is shared between two processes. See **On two cards** below.
 
 ### Without a server
 
@@ -196,12 +161,13 @@ python -m pytest tests/test_xing4_0_hyper_connection.py -q
 # the grouped MoE kernel against a dense evaluation of the same route table
 python -m pytest tests/test_xing4_0_moe.py -q
 
-# the prefill rate and the decode rate on real prose, one card
-python scripts/bench_xing4_0_e2e.py --device cuda:2 --lengths 512,4096,32768
-
-# the kernel's own cost, priced by in-process A-B-A-B interleaving
-python scripts/bench_xing4_0_hyper_connection.py --device cuda:2 --steps 8
+# the served path end to end against a recorded fixture
+python -m pytest tests/test_served_path_golden.py -q
 ```
+
+The rate benchmarks (`bench_xing4_0_e2e.py`, `bench_xing4_0_hyper_connection.py`) that produced the
+**Performance** numbers are not in this tree; the numbers and the conditions they were taken under
+are recorded here and in [the design record](../architecture/xing4_0_29b_a4b_design.md#9-evidence).
 
 ## What is supported
 
@@ -216,8 +182,8 @@ python scripts/bench_xing4_0_hyper_connection.py --device cuda:2 --steps 8
 | Cross-request prefix reuse | Supported, on by default |
 | Sampling (`temperature`, `top_k`, `top_p`) | Supported; greedy by default |
 | Memory-fitted context, up to the card's ceiling | Supported; measured at about 40,960 tokens |
-| Concurrent requests | **Not implemented** — requests serialize, one at a time, through the adapter's own session and through the shared scheduler alike |
-| The shared `BatchScheduler` (`--enable-batching`) | Supported at the width this runtime declares, which is 1. Same lifecycle and same gauges as the `cpp` backend, same answers as the serialized path |
+| Concurrent requests | **Not implemented** — requests serialize, one at a time, through the adapter's own session |
+| The shared `BatchScheduler` (`--enable-batching`) | **Not available in this build** — the scheduler was a C++ library and left with the engine; `supports_batch=False` refuses the flag rather than accepting it silently |
 | Tensor parallelism | **Not implemented** — the checkpoint fits one card whole |
 | The NextN/MTP block (`blk.40`, 0.93 GiB) | **Not executed** — it is not loaded and there is no speculative path for it |
 | LoRA, adapters, logprobs, tool calling | **Not implemented** |
@@ -293,8 +259,10 @@ rows were re-measured alongside the corrected table and moved the way that corre
 ### Against the Qwen3.8-27B paths at comparable size
 
 This is the only checkpoint here that is smaller than the card it runs on, so the comparison is
-two-sided: what one card buys, and what this runtime gives up against the engines it shares a
-repository with.
+two-sided: what one card buys, and what this runtime gives up against the engines that used to share
+its repository — both non-`xing4` rows moved to [RelicLLM](https://github.com/lvyufeng/RelicLLM)
+(Ternary-Bonsai-2-27B's runtime to the [relic-engine](https://github.com/lvyufeng/relic-engine)
+archive), and the table is kept as the comparison that was measured.
 
 | | Xing4.0-29B-A4B, 1 card, IQ4_NL | Ternary-Bonsai-2-27B, 1 card, 1.75 bit | Qwen3.8-27B-FP8, 4 cards, TP4 |
 | --- | ---: | ---: | ---: |
@@ -304,11 +272,13 @@ repository with.
 | Architecture | MLA + 64-expert MoE, 4 streams | hybrid GQA, dense FFN | full GQA, dense FFN |
 | Runtime | PyTorch eager + raw-block kernels | C++ engine | C++ engine |
 
-**The gap is the runtime, not the checkpoint.** Bonsai runs a smaller model faster because its native
-C++ engine submits a step's work as a handful of launches where this one submits 11,536; the two
-checkpoints' byte counts per token differ by less than the two runtimes' launch counts do. Moving this
-path into the C++ engine is the obvious next step and it is not in this stage's scope — what the stage
-establishes is the checkpoint's shape, its parity, and its numbers in the runtime it has.
+**The gap is the runtime, not the checkpoint.** Bonsai ran a smaller model faster because its native
+C++ engine submitted a step's work as a handful of launches where this one submits 11,536; the two
+checkpoints' byte counts per token differ by less than the two runtimes' launch counts do. That C++
+engine is now archived in [relic-engine](https://github.com/lvyufeng/relic-engine) and is not a path
+this build can take, so the launch-count gap is the binding constraint on this runtime rather than a
+handoff waiting to happen — what the stage establishes is the checkpoint's shape, its parity, and its
+numbers in the runtime it has.
 
 ## Hardware and memory
 
@@ -348,7 +318,8 @@ questions — what the runtime will promise, and what the card can just barely d
   that needs concurrency wants one process a card, not batching — which is also what the memory
   budget suggests, since the checkpoint uses 85% of a card and its batching headroom is 3.4 GiB.
 - **There is no tensor-parallel path, and two cards were measured as two processes rather than as
-  TP2.** `--tensor-parallel-size 2` is refused: `ep_size = 1`, every expert is already on the card,
+  TP2.** There is no `--tensor-parallel-size` flag in this build at all; the reason the sharding was
+  never a path is the checkpoint's: `ep_size = 1`, every expert is already on the card,
   and a per-layer collective would add to the host cost that decode is bound by instead of subtracting
   from it. What a second card is for here is **aggregate throughput and context**, and both were
   measured. Two server processes, one a card, prefill the same 512-token prompt concurrently at

@@ -155,7 +155,8 @@ hidden[d]  = post[d] * sublayer_out + Σ_s comb[d, s] * hidden[s]
 **Why it is one kernel.** 20 iterations × 2 gates × 40 blocks is **1,600 serial dependent small-matrix
 steps a token**, and the tensors are 4×4: the cost is the dependency chain, not the arithmetic, and a
 chain cannot be shortened by giving each step more work. Anything that dispatches per step pays
-1,600 launches for it. So `src/csrc/xing4_hyper_connection.cu` runs one block a row: 256 threads in
+1,600 launches for it. So `src/csrc/xing4_hyper_connection.cu` (now part of the
+[relic-core](https://github.com/lvyufeng/relic-core) operator library) runs one block a row: 256 threads in
 8 warps, the 24-wide gate split three ways across the warps (the three 24/8-wide dots), thread 0 doing
 the sigmoid, the clamp, the exponential and the Sinkhorn in **shared** memory, and the `pre`-weighted
 collapse at the end. One launch replaces 300.
@@ -458,8 +459,10 @@ checkpoint's own renderings does.
 
 ## 8. What was rejected
 
-**Tensor parallelism.** Refused rather than unimplemented: `--tensor-parallel-size 2` raises.
-`ep_size = 1`, nothing spills, and a per-layer collective would add to the host submission that
+**Tensor parallelism.** Refused rather than unimplemented: `--tensor-parallel-size 2` raised.
+That flag has since left the CLI with the multi-card runtimes, so there is no tensor-parallel path to
+name here at all; the reason it was never one is the checkpoint's. `ep_size = 1`, nothing spills, and
+a per-layer collective would add to the host submission that
 already bounds decode (§6) rather than subtract from it. The measurement that stands in for it is two
 *processes*, one a card, on the same prompt: **82.81 and 84.29 tok/s prefill against 83.94 alone, and
 7.27 and 7.09 tok/s decode against 7.10 alone** — 2× aggregate at no cost to either. (Both columns
@@ -490,7 +493,12 @@ submission cost to save device time that is not the bottleneck.
 ## 9. Evidence
 
 Every number above is a measurement on one x86_64 box with 4×RTX 2080 Ti, on the released
-`xing4_0-29b-IQ4_NL.gguf` and the `Xing4.0-29B-A4B` release beside it, 2026-09-26. The commands:
+`xing4_0-29b-IQ4_NL.gguf` and the `Xing4.0-29B-A4B` release beside it, 2026-09-26. Some of the
+commands below were run from the tree as it was at that time and are not in this checkout: the two
+`bench_xing4_0_*` scripts left with the multi-card cut, and the `graph`, `decode_launch_gap` and
+`rate_clock_split` records now live in
+[RelicLLM](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/xing4_0_rate_clock_split.md).
+The table is kept as the record of how each number was produced.
 
 | Claim | Command |
 | --- | --- |

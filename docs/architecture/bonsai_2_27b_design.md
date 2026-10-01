@@ -1,5 +1,13 @@
 # Ternary-Bonsai-2-27B: design and measurements
 
+> **Repository scope note.** The runtime this page measures is no longer in this tree. Ternary-Bonsai
+> was wired through `pocketllm serve --backend cpp`, and the C++ engine and its Python adapter were
+> deleted with the multi-card cut — the engine is archived in
+> [relic-engine](https://github.com/lvyufeng/relic-engine). What follows is the engineering record of
+> how it was measured, kept because the measurements are still evidence; the [model
+> guide](../models/ternary-bonsai-2-27b.md) carries the shorter version and says the same thing at
+> the top. Re-porting this checkpoint onto relic-core is on the [roadmap](https://github.com/lvyufeng/PocketLLM#roadmap).
+
 This is task 6 of 6 in [stage 1 of the checkpoint roadmap](pocketllm_new_model_roadmap.md#stage-1--ternary-bonsai-2-27b)
 ([#387](https://github.com/lvyufeng/PocketLLM/issues/387) under [#381](https://github.com/lvyufeng/PocketLLM/issues/381)),
 the last one: wire the checkpoint to `pocketllm serve`, measure it there, and write it down. The five

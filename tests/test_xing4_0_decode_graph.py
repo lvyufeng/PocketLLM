@@ -44,7 +44,7 @@ CHECKPOINT_DIR_ENV = "POCKETLLM_XING4_DIR"
 CHECKPOINT_DIR_DEFAULT = "/mnt/data2"
 GGUF_NAME = "Xing4.0-29B-A4B-GGUF/xing4_0-29b-IQ4_NL.gguf"
 HF_DIR = "Xing4.0-29B-A4B"
-CORPUS = Path(__file__).resolve().parent.parent / "docs" / "models" / "qwen3.8-27b-fp8.md"
+CORPUS = Path(__file__).resolve().parent.parent / "docs" / "models" / "xing4.0-29b-a4b.md"
 
 #: The prefix of the checkpoint these tests load.  See the module docstring.
 BLOCKS = 4

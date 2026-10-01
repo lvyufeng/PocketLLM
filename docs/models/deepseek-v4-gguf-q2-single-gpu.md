@@ -1,5 +1,12 @@
 # DeepSeek-V4 GGUF Q2 on one GPU
 
+> **Stale: this repository no longer has a runtime for this checkpoint.** The path below ran on the
+> DeepSeek-V4 backend, which was deleted with the multi-card cut, and `scripts/run_gguf_q2_tp_resident.sh`
+> is not in this tree any more either. The page is kept because its conclusion is a finding rather
+> than a runbook: a single-card MoE with the routed experts in host memory is not a serving
+> configuration, and the numbers below are why. For a DeepSeek-V4 that actually runs, see
+> [RelicLLM's page](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/deepseek-v4.md).
+
 The single-card path for the DeepSeek-V4 GGUF IQ2_XXS/Q2_K checkpoint, with the routed experts kept in
 host memory. It works, and it is not a serving configuration: this page is the measurement record
 behind that conclusion.

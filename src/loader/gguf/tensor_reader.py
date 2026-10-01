@@ -6,7 +6,6 @@ import os
 import re
 import time
 from functools import lru_cache
-from pathlib import Path
 from typing import Iterable
 
 import numpy as np
@@ -184,8 +183,12 @@ def _get_scale_min_k4(scales: np.ndarray, idx: int) -> tuple[np.ndarray, np.ndar
 
 
 def _extract_ggml_table(table_name: str, *, dtype: str, expected: int) -> np.ndarray:
-    """Parse a vendored llama.cpp IQ lookup table without duplicating constants."""
-    header = Path(__file__).parents[2] / "csrc" / "llama_mmq" / "ggml-common.h"
+    """Parse a vendored llama.cpp IQ lookup table without duplicating constants.
+
+    The header ships with the kernels in relic-core, so the path comes from
+    :mod:`src.loader.gguf.iq4_nl`, which resolves it against that installed package.
+    """
+    header = iq4_nl._GGML_COMMON
     text = header.read_text(encoding="utf-8")
     match = re.search(
         rf"GGML_TABLE_BEGIN\([^,]+,\s*{re.escape(table_name)},\s*{expected}\)(.*?)GGML_TABLE_END\(\)",

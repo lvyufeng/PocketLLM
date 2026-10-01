@@ -17,6 +17,18 @@ architectural:
 
 So this page compares on those two axes, against what vLLM and SGLang actually are in September 2026.
 
+> **Repository state.** This page compares `master` at `8162937`, when PocketLLM still carried the
+> whole multi-backend and multi-model stack. That code has since been cut down to the single-card,
+> edge-and-mobile scope: one runtime survives here, the `xing4` backend, and the C++ engine
+> (`cpp_engine/`), the native sources (`src/csrc/`), the multi-card runtimes (`v41`, `mimo`, `torch`)
+> and the `BatchScheduler` moved to sibling repositories — the C++ engine to the
+> [relic-engine](https://github.com/lvyufeng/relic-engine) archive, the multi-card runtimes to
+> [RelicLLM](https://github.com/lvyufeng/RelicLLM), and the native kernels to
+> [relic-core](https://github.com/lvyufeng/relic-core). The comparison below is kept as a snapshot of
+> that state, and the references it makes to `cpp_engine/…`, `pocketllm_cpp` and the five adapters
+> describe the archived engine and the RelicLLM runtimes rather than this checkout. §8's decision —
+> one request lifecycle, one scheduler — now describes RelicLLM's architecture, not this one.
+
 **Evidence standard.** Every claim about this repository is a source citation against `8162937` and is
 reproducible with the grep or test named beside it. Every claim about vLLM or SGLang is a read of the
 `v0.30.0` / `v0.5.20` tags or their release notes, cited by path or issue number, and **not** measured
@@ -42,10 +54,10 @@ Both designs pay for their choice on exactly the axis the other one optimizes:
   maintaining it independently… ~8000 lines", and **#45133** records that vLLM Ascend "now has
   rewritten over 55 Triton kernels… the current approach uses monkey-patching". A vendor cannot be a
   backend without forking a runner and patching kernels.
-- PocketLLM's per-model planes duplicate. `mimo_backend.py` and `xing4_backend.py` share a
-  byte-identical `_decode` (`difflib` ratio 1.00), three worker scripts in
-  `pocketllm/backends/factory.py` are the same ~45-line program three times, and there are four
-  independent prefix-cache implementations in the tree. Adding a model means writing a sixth stack.
+- PocketLLM's per-model planes duplicated. `mimo_backend.py` (now in RelicLLM) and `xing4_backend.py`
+  shared a byte-identical `_decode` (`difflib` ratio 1.00), three worker scripts in the backend
+  factory were the same ~45-line program three times, and there were four independent prefix-cache
+  implementations in the tree. Adding a model meant writing a sixth stack.
 
 The 2026 counter-current matters here: vLLM **#42770** ("Changes in vLLM Model Development") is vLLM
 arguing that "we pursued the unrealistic ideal of a single model definition that works well on every
@@ -57,9 +69,14 @@ defensible; what PocketLLM lacks is not the bet but the **seams**.
 
 **§8 is the decision this page records, and it splits the two axes.** Model computation stays
 per-model — that is the part both competitors are moving back toward. The request lifecycle and the
-scheduler become one implementation over the narrow `InferenceEngine` contract that already exists in
-`cpp_engine/include/inference_engine.hpp`, driving every runtime, C++ or Python. The short version is:
-**N architecture families over one lifecycle**, not one runtime for twenty checkpoints.
+scheduler become one implementation over the narrow `InferenceEngine` contract that existed in
+`cpp_engine/include/inference_engine.hpp` (now in the [relic-engine](https://github.com/lvyufeng/relic-engine)
+archive), driving every runtime, C++ or Python. The short version is: **N architecture families over
+one lifecycle**, not one runtime for twenty checkpoints.
+
+The cut to single-card scope happened before that decision was implemented, so what §8 describes as
+the plan is now RelicLLM's architecture rather than this repository's: the five lifecycles and the
+three schedulers moved out with the runtimes they served.
 
 ---
 
@@ -67,16 +84,16 @@ scheduler become one implementation over the narrow `InferenceEngine` contract t
 
 | Layer | PocketLLM `8162937` | vLLM v0.30.0 | SGLang v0.5.20 |
 |---|---|---|---|
-| Control plane | `pocketllm/` (8.9k lines): `EngineArgs`, `LLM`/`AsyncLLM`, HTTP server, supervisor, 5 backend adapters | `vllm/v1/engine` + `EngineCoreClient` (`Inproc`/`MP`/`DP`), API server and engine core in **separate processes over ZMQ** | `TokenizerManager` → `Scheduler` → `TpModelWorker` → `DetokenizerManager`, all over ZMQ; optional Rust front end |
-| Scheduler | one `BatchScheduler` for the native server; `pocketllm serve --backend cpp` bypasses it by default (see §6.1) | token-budget scheduler, no prefill/decode phase machine, chunked prefill always on, recompute-only preemption, `--watermark` | `Scheduler` + `PrefillAdder`, overlap scheduler **on by default**, retract-then-recompute preemption, LPM/HRRN/priority policies |
+| Control plane | `pocketllm/`: `EngineArgs`, `LLM`/`AsyncLLM`, HTTP server, supervisor, 5 backend adapters (the 5 have since moved: 4 to RelicLLM, 1 — `cpp` — to the archive) | `vllm/v1/engine` + `EngineCoreClient` (`Inproc`/`MP`/`DP`), API server and engine core in **separate processes over ZMQ** | `TokenizerManager` → `Scheduler` → `TpModelWorker` → `DetokenizerManager`, all over ZMQ; optional Rust front end |
+| Scheduler | one `BatchScheduler` for the native server; `pocketllm serve --backend cpp` bypasses it by default (see §6.1) — the C++ engine and its scheduler are now in the [relic-engine](https://github.com/lvyufeng/relic-engine) archive | token-budget scheduler, no prefill/decode phase machine, chunked prefill always on, recompute-only preemption, `--watermark` | `Scheduler` + `PrefillAdder`, overlap scheduler **on by default**, retract-then-recompute preemption, LPM/HRRN/priority policies |
 | KV | 16-token blocks in a pool; cross-request sharing only in `QwenEngine`, block-aligned; per-model layouts differ (paged GQA vs ring+compressed vs recurrent state) | `KVCacheManager` → coordinator → per-type manager → `BlockPool`; several cache groups with one page size; Mamba/SWA/CrossAttention/Sink managers; pluggable `KVCacheSpecRegistry` | one **unified radix tree** for all models since 0.5.19, per-component tombstones and cascading eviction (`Full > SWA > Mamba`) |
 | Prefix cache | **four** implementations: `src/models/prefix_cache.py` (v41+MiMo), `src/models/xing4_0/prefix_cache.py`, `src/runtime/prefix_snapshot.py`, and `QwenEngine`'s global store | one, in the block pool: chained `sha256`, `--prefix-match-unit`, deterministic `NONE_HASH` since 0.29, on by default incl. Mamba since 0.28 | one radix tree, with 0.5.20's SWA branching-point caching |
-| Execution | per-model hand-written loops in C++ and Python; no IR | Model Runner V2 (default since 0.29; MRV1 removal targeted v0.32): persistent rows decoupled from input tensors, no CPU sync in the loop, Triton-native input prep, UVA | `ModelRunner` with `eager` / `decode_cuda_graph` / `prefill_cuda_graph` runners |
-| CUDA graphs | **zero in `cpp_engine`** (`grep -rn cudaGraph cpp_engine` → 0 hits); one Python path (`src/models/xing4_0/graphs.py`), measured 3.84× | `FULL_AND_PIECEWISE` by default at `-O2`, `BatchExecutionDescriptor` bucketing, per-backend `AttentionCGSupport`, GC frozen during capture | per-phase config; breakable graphs are the CUDA prefill default; decode stays full |
-| Collectives | 2 all-reduces/layer, serial with compute except Qwen prefill; CUDA = stock NCCL only; Ascend has a hand-written IPC all-reduce **and** a device-side arrival wait, both default | NCCL symm-mem → FlashInfer → CustomAllreduce (IPC) → PyNCCL → torch; FlashInfer AR default for TP but **gated to sm90+** | `custom_all_reduce_v2` (one-shot push/pull, two-shot, multicall) with NCCL fallback; MSCCL++ |
-| Op surface | 86 + 148 CUDA ops declared in headers, **371 launch sites, all of them under `backends/cuda/kernels/`**; engine/ and core/ contain zero launches; Ascend mirrors 45 | `CustomOp` / `PluggableLayer` / `direct_register_custom_op`; `csrc/` ~107k lines | `BaseFusedOp` with `forward_<kernel backend>` × `forward_<platform>`; AOT kernels in `python/sglang/kernels/aot` |
-| Model layer | 7 hand-written runtimes under `src/models/` + 2 in C++, registered by architecture string | registry (368 archs) for the tail, `vllm/models/<model>/<vendor>/` for the newest, plus a `transformers` backend that reached native speed (#47187) | registry + a ~200-line `if/elif` in `configs/model_config.py`; ~240 model modules |
-| Second hardware backend | `POCKET_BACKEND=cuda\|ascend` at configure time; four CUDA-only TUs excluded on Ascend behind throwing stubs | out-of-tree plugin package (5 entry-point groups, one platform per process); Ascend, Gaudi, TPU, Metal, OpenVINO all OOT | out-of-tree platform plugin with an explicit [Active]/[Planned] contract; **NPU in-tree** with Codeowners and a separate kernel library |
+| Execution | per-model hand-written loops in C++ and Python; no IR (the C++ half is now the archived engine) | Model Runner V2 (default since 0.29; MRV1 removal targeted v0.32): persistent rows decoupled from input tensors, no CPU sync in the loop, Triton-native input prep, UVA | `ModelRunner` with `eager` / `decode_cuda_graph` / `prefill_cuda_graph` runners |
+| CUDA graphs | **zero in the archived C++ engine** (`grep -rn cudaGraph cpp_engine` → 0 hits); one Python path (`src/models/xing4_0/graphs.py`), measured 3.84× — the Python path is the one that survives here | `FULL_AND_PIECEWISE` by default at `-O2`, `BatchExecutionDescriptor` bucketing, per-backend `AttentionCGSupport`, GC frozen during capture | per-phase config; breakable graphs are the CUDA prefill default; decode stays full |
+| Collectives | 2 all-reduces/layer, serial with compute except Qwen prefill; CUDA = stock NCCL only; Ascend has a hand-written IPC all-reduce **and** a device-side arrival wait, both default (the single-card runtime here has no collective) | NCCL symm-mem → FlashInfer → CustomAllreduce (IPC) → PyNCCL → torch; FlashInfer AR default for TP but **gated to sm90+** | `custom_all_reduce_v2` (one-shot push/pull, two-shot, multicall) with NCCL fallback; MSCCL++ |
+| Op surface | 86 + 148 CUDA ops declared in headers, **371 launch sites, all of them under `backends/cuda/kernels/`**; engine/ and core/ contain zero launches; Ascend mirrors 45 — all of it now in [relic-core](https://github.com/lvyufeng/relic-core) and the archive | `CustomOp` / `PluggableLayer` / `direct_register_custom_op`; `csrc/` ~107k lines | `BaseFusedOp` with `forward_<kernel backend>` × `forward_<platform>`; AOT kernels in `python/sglang/kernels/aot` |
+| Model layer | 7 hand-written runtimes under `src/models/` + 2 in C++, registered by architecture string (one runtime — `src/models/xing4_0/` — survives here; the rest moved out) | registry (368 archs) for the tail, `vllm/models/<model>/<vendor>/` for the newest, plus a `transformers` backend that reached native speed (#47187) | registry + a ~200-line `if/elif` in `configs/model_config.py`; ~240 model modules |
+| Second hardware backend | `POCKET_BACKEND=cuda\|ascend` at configure time; four CUDA-only TUs excluded on Ascend behind throwing stubs (the build lives in the archived engine) | out-of-tree plugin package (5 entry-point groups, one platform per process); Ascend, Gaudi, TPU, Metal, OpenVINO all OOT | out-of-tree platform plugin with an explicit [Active]/[Planned] contract; **NPU in-tree** with Codeowners and a separate kernel library |
 | Second model | a new run-time stack per checkpoint family | a model file + one registry line (dense), or a per-vendor subtree (frontier) | a model file + two registry edits; a dense PR was measured at +881/−6 lines |
 
 ---
@@ -85,9 +102,10 @@ scheduler become one implementation over the narrow `InferenceEngine` contract t
 
 ### 3.1 What PocketLLM has that the others do not
 
-The `core/` / `engine/` / `backends/` split is enforced, not aspirational: `check_layering` in
-`cpp_engine/CMakeLists.txt` fails the build if `include/`, `core/`, `engine/` or `backends/api/`
-pulls in a vendor SDK header — and for `engine/` it applies a second test, failing on a vendor
+The `core/` / `engine/` / `backends/` split was enforced, not aspirational — in the C++ engine, now
+in the [relic-engine](https://github.com/lvyufeng/relic-engine) archive: `check_layering` in
+`cpp_engine/CMakeLists.txt` failed the build if `include/`, `core/`, `engine/` or `backends/api/`
+pulled in a vendor SDK header — and for `engine/` it applies a second test, failing on a vendor
 runtime *entry point* too, because an include check alone would miss a stray `cudaMalloc` that
 compiles only because some other header pulled the SDK in transitively. The invariant holds
 empirically — **zero `<<<` launch sites in `engine/`, `core/` and `include/`**, all 371 of them under
@@ -106,15 +124,18 @@ Two consequences worth stating plainly, because they are the *reason* the Ascend
 
 ### 3.2 Where the seam stops
 
-Build-time backend selection is the documented decision (route A: "a single engine plus a device
-runtime abstraction, not per-backend engine forks") and this page does not argue against it. The
-problem is that the abstraction's *coverage* stops well short of "a second backend is a port":
+This subsection and §3.3 describe the C++ engine as it was at `8162937`; that engine is now archived
+in [relic-engine](https://github.com/lvyufeng/relic-engine), and its build (backend selection,
+`check_layering`, the Ascend stubs) is documented there. Build-time backend selection is the
+documented decision (route A: "a single engine plus a device runtime abstraction, not per-backend
+engine forks") and this page does not argue against it. The problem is that the abstraction's
+*coverage* stops well short of "a second backend is a port":
 
 | | CUDA | Ascend | Gap |
 |---|---|---|---|
 | Ops declared for the Qwen FP16 path | 148 | 45 | **103 ops missing** |
 | Engines buildable | 2 (`QwenEngine`, `PersistentEngineAdapter`) + 2 drafters | 1 (`QwenEngine`) | `deepseek_v4_engine.cpp`, `dspark_engine.cpp`, `qwen_dspark.cpp`, `qwen_dflash2.cpp` excluded |
-| Tenants of those engines | the whole model set | Qwen FP16 only, and only in the C++ engine | the Python plane (`--backend v41/mimo/xing4/torch`) has **no** NPU path at all |
+| Tenants of those engines | the whole model set | Qwen FP16 only, and only in the C++ engine | the Python plane (`--backend v41/mimo/xing4/torch`, four of which are now in RelicLLM) has **no** NPU path at all |
 | Collective | stock NCCL (`ncclAllReduce`) | hand-written IPC all-reduce + device-side arrival wait | the CUDA side has no equivalent optimization |
 | Layering check | all four guarded directories enforced, `engine/` with a symbol test too | same | — |
 
@@ -213,26 +234,34 @@ pipepair from the counts above, and what makes the shipped `cpp` backend a *clie
 rather than a second server in front of it. Rows 1–5 are now the whole list, and they are one
 command with one front end.
 
-The duplication is measurable at file granularity:
+**And then the cut removed rows 1–4 as well.** Only row 5, `--backend xing4`, is left in this
+repository: `torch`, `cpp`, `v41` and `mimo` are gone from the tree, the four adapters with them, so
+the duplication counted below is now a record of what was removed rather than a description of the
+checkout. What remains is one adapter — `pocketllm/backends/xing4_backend.py` — and one runtime under
+`src/models/`.
 
-- `mimo_backend.py` (1,006 lines) vs `xing4_backend.py` (776): a method-level diff finds ~288 lines of
-  same-named methods at ≥0.5 similarity, and **`_decode` is byte-identical** (`difflib` ratio 1.00,
+The duplication was measurable at file granularity (all of it now moved out with the runtimes it was
+between):
+
+- `mimo_backend.py` (1,006 lines) vs `xing4_backend.py` (776): a method-level diff found ~288 lines of
+  same-named methods at ≥0.5 similarity, and **`_decode` was byte-identical** (`difflib` ratio 1.00,
   verified). `stream` is a ~65-line clone differing in a thread name.
-- `_publish_cache_metrics` exists three times (v41, mimo, xing4) with the same nine keys. *Now one
+- `_publish_cache_metrics` existed three times (v41, mimo, xing4) with the same nine keys. *Now one
   body in `BackendBase` — see §8.3.*
-- The three `run_worker` scripts in `factory.py` (lines 571, 620, 675) are the same program three
-  times. *Now one program plus a `WorkerSpec` registry — see §8.3.*
-- `_IGNORED_OPTIONS` is written out three times.
-- OpenAI request parsing/validation exists twice, in two languages: `pocketllm/protocol/` (575 lines)
+- The three `run_worker` scripts in the factory were the same program three times. *Now one program
+  plus a `WorkerSpec` registry — see §8.3.*
+- `_IGNORED_OPTIONS` was written out three times.
+- OpenAI request parsing/validation existed twice, in two languages: `pocketllm/protocol/` (575 lines)
   and `cpp_engine/core/openai_request_fields.cpp` + `openai_stop_strings.cpp` + `json_constraint.cpp`
-  (1,296 lines).
+  (1,296 lines) — the second copy is in the archived engine.
 
 ### 4.3 Three copies of "what does this backend support"
 
-`BackendCapabilities` is declared once but computed by hand per adapter, and the *rejection* logic is
-duplicated: `_reject_unsupported_*` appears four times in `factory.py` (lines 189/225/262/291), each
-adapter keeps its own `_IGNORED_OPTIONS` frozenset, and `supports_prefix_caching` is set to "the store
-exists" rather than "the flag is on" (xing4:495, v41:653). vLLM's equivalent is the `AttentionBackend`
+`BackendCapabilities` was declared once but computed by hand per adapter, and the *rejection* logic
+was duplicated: `_reject_unsupported_*` appeared four times in the factory, each adapter kept its own
+`_IGNORED_OPTIONS` frozenset, and `supports_prefix_caching` was set to "the store exists" rather than
+"the flag is on" (xing4 back then, and v41). The cut collapsed this to one declaration in
+`pocketllm/backends/capabilities.py`, consumed by the dispatcher — the shape this paragraph asks for. vLLM's equivalent is the `AttentionBackend`
 capability set (`supports_head_size/dtype/kv_cache_dtype/block_size`, `is_mla/is_sparse/is_ssm`,
 `supports_sink/sliding_window/batch_invariance`, and — new in 0.30 — `supports_dcp()/supports_pcp()`),
 where an implementation that does not declare a capability **fails at backend selection instead of
@@ -246,21 +275,19 @@ does not enforce it:
 
 - **CI runs no tests.** The two workflows build a wheel and a docs site. Everything below is a local
   convention only.
-- `tests/test_cpp_backend_batching.py` is not a pytest test — it inserts a path, takes `sys.argv`, and
-  prints `SKIP` and returns when under-specified. **Under pytest it is a silent false pass.**
-- The only real concurrency test (`tests/test_cpp_scheduler_streaming.py`) needs a GPU *and* a fixture
-  binary written by a C++ test into `/tmp`; without it, it skips.
-- There is **no golden end-to-end output for any served model**. Parity coverage exists per op
-  (`test_*_parity.cpp`, 87 targets) and per feature (78 prefix-cache tests, two of which run on CPU),
-  but nothing pins "this checkpoint served through this entry point produces these tokens".
-- The suite's baseline failure set (9 failures + 5 errors, with the collection-time failure in
-  `tests/test_gguf_q2_precision.py`) is a known quantity — a *set diff*, not a count, is what detects
-  a regression.
+- The false-passing `tests/test_cpp_backend_batching.py` and the fixture-binary concurrency test it
+  sat beside were C++-engine tests and went with the engine to the
+  [relic-engine](https://github.com/lvyufeng/relic-engine) archive. What replaced the gap it left is
+  `tests/test_served_path_golden.py`, which pins "this checkpoint served through this entry point
+  produces these tokens" against a recorded fixture.
+- The suite's baseline failure set is now **empty** (`tests/baseline_failures.txt`): every test this
+  host collects and runs passes, and the set is diffed rather than counted so a new failure shows up
+  even when another is fixed.
 
-For a repository whose model pages make per-model claims at four levels of evidence, the absence of a
-served-path fixture is the largest process gap in this document. vLLM and SGLang both gate on
-generation tests registered into CI suites; PocketLLM's equivalent is a `bench_*` script that a human
-reads.
+For a repository whose model pages make per-model claims at four levels of evidence, the served-path
+fixture is the load-bearing one, and it is the piece that landed after this page was written. vLLM
+and SGLang gate on generation tests registered into CI suites; PocketLLM's equivalent is
+`tests/test_served_path_golden.py` plus a `bench_*` script a human reads.
 
 ---
 
@@ -285,22 +312,29 @@ argument applied to the newer evidence.
 3. **The C++ engine as a latency product.** Two engines behind one Python face is unusual, but the
    measured head-to-head against the local vLLM fork (1.019–1.093× decode, 0.957–1.023× prefill at
    TG=128, TP4) and the concurrency scaling (2.14×/3.61×/4.68× at 2/4/8 against vLLM's
-   1.52×/2.64×/3.82×) are the *reason* the C++ path exists.
+   1.52×/2.64×/3.82×) are the *reason* the C++ path exists. That engine is now archived in
+   [relic-engine](https://github.com/lvyufeng/relic-engine).
 4. **Build-time backend selection.** A runtime vtable in the decode hot path on a card whose decode is
    already close to bandwidth-bound is a cost with no benefit at two backends. Keep route A.
 5. **Resident-vs-offload decisions per checkpoint.** The 2026 SGLang SSD Expert Pack work (Q2_K/Q3_K
    GGML expert-major packs, O_DIRECT, VRAM LFU/LRU cache; 6.92× decode over Ollama on
-   DeepSeek-V4-Flash) is the same problem this repository has been solving by hand in
-   `deepseek_v4_1/device_experts.py` and `components/moe/placement.py`. Independent arrival at the same
+   DeepSeek-V4-Flash) is the same problem this repository solved by hand in
+   `deepseek_v4_1/device_experts.py` and `components/moe/placement.py` — both now in
+   [RelicLLM](https://github.com/lvyufeng/RelicLLM). Independent arrival at the same
    design is confirmation, not redundancy.
 
 ---
 
 ## 6. Where PocketLLM is behind, ranked by what it costs
 
+Sections 6.1 through 6.6 are about the multi-card stack and the C++ engine as of `8162937`; those
+runtimes have since moved to RelicLLM and the engine to the
+[relic-engine](https://github.com/lvyufeng/relic-engine) archive. The gap they record was real and
+was one of the reasons for the split, but it is no longer a gap in this checkout.
+
 ### 6.1 The validated fast path is not the default path
 
-`pocketllm serve --backend cpp` drives `QwenEngine` **token by token from Python** and is serial:
+`pocketllm serve --backend cpp` drove `QwenEngine` **token by token from Python** and was serial:
 `BackendBase` holds a request lock, `supports_batch` is `False` unless `enable_batching` is set, and
 `enable_batching` is reachable **only** as `--backend-option`, not as a CLI flag — `--max-batch-size`
 alone does nothing because it is read only when batching is already on. The native `--serve` binary, by
@@ -401,19 +435,21 @@ is believed.
 
 ### 6.6 Structured output and the OpenAI surface
 
-PocketLLM has JSON mode and JSON-Schema constraints in the C++ engine (`core/json_constraint.cpp`,
-743 lines) but **no grammar or regex (GBNF) constraints**, and request-level token constraints are
-explicitly rejected on the TP>1 path. Both competitors converged on **xgrammar** as the default
+PocketLLM's C++ engine (now archived in [relic-engine](https://github.com/lvyufeng/relic-engine)) had
+JSON mode and JSON-Schema constraints in `core/json_constraint.cpp` (743 lines) but **no grammar or
+regex (GBNF) constraints**, and request-level token constraints were explicitly rejected on the TP>1
+path. The surviving single-card runtime has neither JSON mode nor grammar constraints. Both competitors converged on **xgrammar** as the default
 (one backend per engine, not per request) and both keep the FSM work integrated with speculative
 verification — vLLM applies a grammar bitmask inside `sample_tokens()`, SGLang has spent 2026 on
 "grammar × spec verify" specifically. If the roadmap's goal of dropping into Cursor/Continue/Open WebUI
 is taken seriously, grammar-constrained decoding is the missing piece, and it is bounded work because
 `json_constraint.cpp` is already an FSM-shaped constraint over the sampler.
 
-Two smaller protocol gaps with named evidence: the native and Python paths disagree about semantics
-(`cached_tokens` behaviour and TTFT definitions differ for the same checkpoint depending on which
-server you started), and two servers can be run against the same checkpoint in one namespace with
-different `supports_batch` answers.
+Two smaller protocol gaps with named evidence, both of them about having had two servers: the native
+and Python paths disagreed about semantics (`cached_tokens` behaviour and TTFT definitions differed
+for the same checkpoint depending on which server you started), and two servers could be run against
+the same checkpoint in one namespace with different `supports_batch` answers. With the C++ front end
+archived and one runtime left here, neither disagreement is reachable in this checkout.
 
 ### 6.7 The version problem in the existing comparison
 
@@ -441,7 +477,8 @@ Things in that document that no longer describe upstream:
 The honest framing for the head-to-head table is therefore "**against the 2080 Ti fork of vLLM 0.21.0**",
 and it should stay that way until someone ports the comparison forward. Also stale on that page: it says
 PocketLLM has no cross-request prefix caching, which stopped being true when V4.1 (#342), MiMo (#379)
-and the C++ `QwenEngine` global cache landed.
+and the C++ `QwenEngine` global cache landed — the first two moved to RelicLLM with their runtimes, and
+the third is in the archived engine, while the surviving `xing4` runtime keeps its own store.
 
 ---
 
@@ -455,6 +492,12 @@ where the difference is small.
 of the refactor project); Tier 3 is the per-model and per-backend work that follows it. Read §8 first if
 the split between "one lifecycle" and "per-model implementations" is the question.
 
+**This sequence addresses the pre-cut repository.** Items 1, 4, 5, 6, 8, 9 and 11 are about the C++
+engine, the scheduler and the four non-`xing4` runtimes, all of which have since left this tree — for
+the [relic-engine](https://github.com/lvyufeng/relic-engine) archive and
+[RelicLLM](https://github.com/lvyufeng/RelicLLM) respectively. They are kept as the reasoning that was
+made at the time; the surviving single-card runtime keeps the scheduler-free shape its guide describes.
+
 ### Tier 1 — make what exists reachable
 
 1. **Default `pocketllm serve --backend cpp` to the batch path.** Expose `enable_batching` as a CLI
@@ -463,7 +506,9 @@ the split between "one lifecycle" and "per-model implementations" is the questio
    `POCKETLLM_CPP_BATCHED_DECODE=1` on the DeepSeek adapter, or turn the clamp into a startup error.
 2. **Fix the false-passing test** and add one served-path golden fixture per entry point: prompt,
    environment, and the token ids that come out. `docs/models/README.md`'s status ladder currently
-   rests on run records a human read; a fixture is what makes it checkable.
+   rests on run records a human read; a fixture is what makes it checkable. *Landed:
+   `tests/test_served_path_golden.py` records one real request through the one real entry point
+   against recorded token ids.*
 3. **Report capabilities from one place.** One `RuntimeCapabilities` per model runtime — attention
    kinds, cache kinds, prefix-cache support, graph-ability, TP rule, batch support — consumed by
    `factory.py`, replacing the four `_reject_unsupported_*` bodies and three `_IGNORED_OPTIONS` sets.
@@ -527,8 +572,8 @@ the split between "one lifecycle" and "per-model implementations" is the questio
   latency claim.
 - **Do not add multi-model-in-one-process.** vLLM closed that request as not-planned (#21481), SGLang
   answers it with a router, and the 2026 infrastructure answer is below the engine (kvcached's KV
-  virtualisation, SGLang's `ExpertPack`). PocketLLM's supervisor + host expert bank already is that
-  answer for this hardware.
+  virtualisation, SGLang's `ExpertPack`). The old supervisor + host expert bank was that answer for
+  this hardware; both moved to RelicLLM with the multi-card runtimes.
 
 ---
 
@@ -538,6 +583,14 @@ This section is the decision this page exists to record. It is stated as a bound
 direction, because the failure mode on both sides is real: a generic data plane costs the per-model
 kernels that are this engine's measured advantage (§5), and five per-model serving stacks cost five
 copies of the same correctness risk (§4.2).
+
+**It is now RelicLLM's decision, not this repository's.** The five serving stacks, the C++
+`BatchScheduler` and the `InferenceEngine` contract discussed below have all left this tree — the
+scheduler and the contract to the [relic-engine](https://github.com/lvyufeng/relic-engine) archive,
+the runtimes to [RelicLLM](https://github.com/lvyufeng/RelicLLM). What is left here is one runtime, so
+there is no lifecycle to unify: `xing4` serves one request at a time through its own adapter and
+declares `supports_batch=False`. The subsections below are retained as the design record of that
+decision.
 
 **The decision has two halves, and they point the same way.**
 
@@ -551,7 +604,8 @@ copies of the same correctness risk (§4.2).
 
 ### 8.1 The interface already exists, and its design intent is already written down
 
-`cpp_engine/include/inference_engine.hpp:200` is the contract, and it argues for itself:
+`cpp_engine/include/inference_engine.hpp:200` was the contract (the header is now in the
+[relic-engine](https://github.com/lvyufeng/relic-engine) archive), and it argued for itself:
 
 > This is deliberately the smallest set that `BatchScheduler` actually calls, **not a general model
 > API**: slot lifecycle, paged-KV accounting for admission, the two batched forward entry points, and a
@@ -699,7 +753,8 @@ Three reasons, in order:
 2. **It is already exposed to Python.** `cpp_engine/python/bindings.cpp:591` binds it as
    `QwenBatchScheduler` with `submit_request` / `poll_result`, and `pocketllm/backends/cpp_backend.py:800`
    is already its client. The path is open; it is bound to `QwenEngine*` and needs to be bound to
-   `InferenceEngine*` instead.
+   `InferenceEngine*` instead. Both files are now in the
+   [relic-engine](https://github.com/lvyufeng/relic-engine) archive.
 3. **Moving it to Python would rewrite the `Capabilities` lessons and add a layer to the C++ decode
    path** — and that path is the entire reason the C++ engine exists.
 
@@ -766,7 +821,9 @@ The order matters and the first item is not negotiable.
    collection-time failure. Unifying the lifecycle while regressions are invisible means trading the
    only working acceptance mechanism for an abstraction with no evidence behind it. Fix the test, add
    one served-path golden fixture per entry point, and record the baseline as a *set*, because a falling
-   count hides a new failure.
+   count hides a new failure. *Since landed: the C++ tests went with the engine, the served-path
+   fixture is `tests/test_served_path_golden.py`, and the baseline set in `tests/baseline_failures.txt`
+   is now empty.*
 2. **Make the existing scheduler reachable** (§6.1): `enable_batching` becomes a CLI flag and defaults
    on for the cpp backend, `--max-batch-size` implies it, and the DeepSeek clamp either defaults on or
    fails loudly. No runtime changes.
@@ -798,14 +855,21 @@ Items 1–3 are scheduled as Stage R1, 4–6 as R2, and 7–8 as R3 in the refac
   which is a different runtime with a different step composition. The local fact is that capture is
   worth 3.84× *there*, and that 22,155 dispatches a step is what it removes.
 - Line-count comparisons between engines measure different things (vLLM counts a framework that hosts
-  368 architectures; PocketLLM counts seven hand-written runtimes). They are used here only to compare
-  *within* an engine — cost per added model, duplication between siblings — never to rank engines.
+  368 architectures; PocketLLM, at this snapshot, counted seven hand-written runtimes). They are used
+  here only to compare *within* an engine — cost per added model, duplication between siblings — never
+  to rank engines.
 - vLLM #42770, #44219 and #45470 are **open RFCs**, not policy. They are cited as evidence of direction,
   not as statements of what vLLM does today.
 
 ## Evidence
 
-Repository reads at `8162937`:
+Repository reads at `8162937`. The paths below are of that snapshot: most of them have since left this
+tree (see the note at the top of the page). Of what is named here, only `xing4_backend.py`,
+`pocketllm/api/`, `pocketllm/server/openai.py` and `src/models/xing4_0/` are still in this checkout;
+`cpp_engine/…` is in the [relic-engine](https://github.com/lvyufeng/relic-engine) archive, the
+`v41/blmimo/torch` adapters and their `src/models/deepseek_v4*`, `src/models/mimo_v2` modules are in
+[RelicLLM](https://github.com/lvyufeng/RelicLLM), and the native sources are in
+[relic-core](https://github.com/lvyufeng/relic-core).
 
 - `cpp_engine/CMakeLists.txt` (backend selection, `POCKET_CORE_SOURCES`, `POCKET_CUDA_ONLY_ENGINE_SOURCES`,
   `check_layering`), `cpp_engine/engine/backend_unimplemented_ascend.cpp`,

@@ -93,8 +93,12 @@ def test_a_fixture_whose_checkpoint_exists_is_not_skipped(tmp_path: pathlib.Path
 
 
 def test_the_entry_point_set_is_the_one_the_readme_promises() -> None:
-    """A new backend cannot be added without either recording a fixture or failing this test."""
-    assert ENTRY_POINTS == ("cpp", "v41", "mimo", "xing4", "torch")
+    """A new backend cannot be added without either recording a fixture or failing this test.
+
+    One runtime is left, so the set has one member; the assertion is what keeps the set and the
+    recorded fixtures from drifting apart in either direction.
+    """
+    assert ENTRY_POINTS == ("xing4",)
 
 
 def test_the_default_sampling_is_greedy() -> None:
@@ -105,8 +109,8 @@ def test_the_default_sampling_is_greedy() -> None:
 def test_a_recorded_fixture_names_its_own_entry_point() -> None:
     """The file name and the `entry` field have to agree, or the completeness test lies.
 
-    `load_fixture("mimo")` reads `mimo.json`; a file whose contents say `xing4` would satisfy the
-    completeness check for a backend that has no fixture at all.
+    `load_fixture("xing4")` reads `xing4.json`; a file whose contents named another entry point
+    would satisfy the completeness check for a backend that has no fixture at all.
     """
     for entry in ENTRY_POINTS:
         fixture = load_fixture(entry)
@@ -127,8 +131,8 @@ def test_the_outcome_survives_the_trip_through_the_child() -> None:
     """The parent reads the child's answer off disk, so every field has to round trip exactly.
 
     `None` is the interesting case: an entry point that produces no token ids is a fact about the
-    entry point, not a missing field, and a round trip that turned it into `[]` would make `torch`'s
-    fixture look like it had been compared when it had not.
+    entry point, not a missing field, and a round trip that turned it into `[]` would make an
+    uncompared fixture look like it had been compared.
     """
     for outcome in (
         Outcome(token_ids=[35, 48972], text="\ngolden fixture", prompt_tokens=9, elapsed_seconds=1.5),
