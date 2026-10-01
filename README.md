@@ -44,6 +44,7 @@ this page is the design those pieces are being built toward.
 | `pocketllm.tokenizer` — GGUF-vocabulary BPE | **Skeleton.** Whitespace works; BPE raises |
 | `pocketllm.protocol` / `pocketllm.server` — OpenAI-compatible HTTP | **Ported.** Importable and testable; needs a backend to serve |
 | `pocketllm.cli` | **Done** for `devices` / `backends` / `architectures` / `ops` |
+| `src/` — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B.** GGUF read, BPE tokenize, dense forward, greedy decode; checked token-for-token against llama.cpp on `cpu` and `cuda` |
 
 There is no `main`-branch history before the seed commit: this tree was rebuilt on an orphan branch
 and the previous one is preserved as `legacy`. See [Where the code lives now](#where-the-code-lives-now).

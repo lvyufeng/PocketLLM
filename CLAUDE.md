@@ -142,10 +142,15 @@ Ascend machine at all, and neither machine can run a model from this tree today.
 - **CPU / RAM**: 2 x Xeon E5-2696 v4, 22 cores each (88 hardware threads), ~1 TiB RAM.
 - **OS / Python**: Ubuntu 22.04.5, x86_64, kernel 5.15. Python 3.10.10 (conda).
 - **CUDA**: `nvcc` on `PATH` is **13.0** while `CUDA_HOME` points at **`/usr/local/cuda-12.4`**;
-  11.8, 12.4 and 13.0 are installed.
-  - **Trap**: a pip-installed torch is built against CUDA 12.4, and `torch.utils.cpp_extension`
-    hard-fails on the mismatch (`The detected CUDA version (13.0) mismatches the version that was
-    used to compile PyTorch (12.4)`). This tree no longer compiles anything, but relic-core does.
+  11.8, 12.4 and 13.0 are installed. `/usr/local/cuda` resolves through
+  `/etc/alternatives/cuda` to `cuda-13.0`, which is what CMake's search finds, so the CUDA backend
+  builds against 13.0 without any path being pinned. Do not pin one anyway: the mismatch between
+  `CUDA_HOME` and `nvcc` is a fact about this host, not about the next one.
+  - **Historical trap, now resolved**: a pip-installed torch used to be built against CUDA 12.4
+    while `nvcc` was 13.0, and `torch.utils.cpp_extension` hard-fails on that mismatch
+    (`The detected CUDA version (13.0) mismatches the version that was used to compile PyTorch
+    (12.4)`). Torch is now `2.13.0+cu130` and the two agree. relic-core still compiles CUDA and
+    would still hit this if torch were ever downgraded.
 - **No NPU here**: no `/dev/davinci*` and no CANN.
 - One relevant `git` note: `origin` is HTTP**S** (`https://github.com/lvyufeng/PocketLLM.git`) and
   there is no SSH key this host can authenticate to GitHub with. `gh` is authenticated separately as
