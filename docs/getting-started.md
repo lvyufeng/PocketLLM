@@ -1,36 +1,31 @@
 # Getting started
 
-This page is the short route from a checkout to a running model. The repository
-[`README.md`](https://github.com/lvyufeng/PocketLLM#installation) is the
-authoritative install text — it carries the caveats about `--no-build-isolation`
-and about which prerequisites a fresh virtualenv does not have. What follows is
-the same route with the detours removed.
+This page is the short route from a checkout to a running model. PocketLLM now runs a checkpoint on
+**one accelerator** — a single card, or an edge or mobile target — and the runtime it ships is the
+`xing4` backend for [Xing4.0-29B-A4B](models/xing4.0-29b-a4b.md). The repository
+[`README.md`](https://github.com/lvyufeng/PocketLLM#installation) is the authoritative install text.
 
 ## Requirements
 
 - Python >= 3.10
-- PyTorch >= 2.0, < 2.7 — installed *before* PocketLLM, and matching your CUDA toolkit
+- PyTorch >= 2.0, < 2.7
 - CUDA toolkit 11.8+ for GPU execution
-- CMake >= 3.18, pybind11 >= 2.10, Ninja >= 1.11, `setuptools >= 68`, `wheel`
-- NCCL for tensor parallelism with `TP > 1`
-- 16 GB+ system RAM to compile
+- The `relic-core` package — the shared operator library that carries the native kernels — installed
+  from its checkout before PocketLLM (see Install)
+- 16 GB+ system RAM
 
 ## Install
 
-```bash
-pip install "torch>=2.0,<2.7" "setuptools>=68" wheel ninja cmake pybind11
-pip install pocketllm --no-build-isolation
-```
-
-The build compiles both CUDA extensions and the native C++ engine, which takes
-5–15 minutes. `--no-build-isolation` is what makes the build use the Torch you
-just installed, and it also means pip fetches none of the prerequisites above —
-they must already be present.
-
-If you only need the PyTorch plane, or lack the C++ toolchain:
+The package is pure Python: nothing here compiles and there is no CMake configure step. The native
+kernels live in the separate `relic-core` operator library, which is not on PyPI yet, so install it
+from its checkout first.
 
 ```bash
-POCKETLLM_BUILD_CPP=0 pip install pocketllm --no-build-isolation
+# The operator library first; it does compile, against your CUDA toolkit.
+pip install -e ../relic-core --no-build-isolation
+
+# Then PocketLLM itself; no build isolation is needed.
+pip install -e .
 ```
 
 For a working copy:
@@ -38,52 +33,23 @@ For a working copy:
 ```bash
 git clone https://github.com/lvyufeng/PocketLLM.git
 cd PocketLLM
-pip install "torch>=2.0,<2.7" "setuptools>=68" wheel ninja cmake pybind11
-pip install -e . --no-build-isolation
+pip install -e ../relic-core --no-build-isolation
+pip install -e .
 ```
 
-## Build the C++/CUDA engine
-
-The Python install already builds the `pocketllm_cpp` module. To build the
-standalone engine — the executable the C++ Qwen and DeepSeek-V4 server paths
-launch. The `v41` backend is a Python runtime and does not use it:
-
-```bash
-cmake -S cpp_engine -B build/cpp_engine -DCMAKE_BUILD_TYPE=Release
-cmake --build build/cpp_engine -j
-```
-
-The result is `build/cpp_engine/pocketllm_engine`. The backend is chosen at
-configure time and defaults to CUDA:
-
-```bash
-cmake -S cpp_engine -B build/cpp_engine -DPOCKET_BACKEND=cuda
-```
-
-`POCKET_BACKEND=ascend` builds the ACL runtime, the AscendC kernels and the HCCL
-collectives under `cpp_engine/backends/ascend/`; on the Ascend host the entry point
-is `scripts/build_ascend.sh` rather than the two commands above. See
-[Ascend SoC generations](https://github.com/lvyufeng/relic-core/blob/master/docs/guides/ascend_soc_generations.md) for the generation table,
-for the `Short_SoC_version` check that decides whether two cards can share a kernel,
-and for why the product name `npu-smi info` prints cannot answer that question.
-
-The layering that keeps a second backend possible is enforced, not just
-documented:
-
-```bash
-cmake --build build/cpp_engine --target check_layering
-```
+The kernels that used to be built here as `src/csrc/` now live in
+[relic-core](https://github.com/lvyufeng/relic-core), and the C++ engine that used to sit in
+`cpp_engine/` is archived in [relic-engine](https://github.com/lvyufeng/relic-engine). Neither is
+built from this repository any more.
 
 ## Verify the install
 
 ```bash
-python -m pytest tests/ -q --continue-on-collection-errors
+python -m pytest tests/ -q
 ```
 
-`tests/test_gguf_q2_precision.py` fails at collection because it still imports the
-pre-move `src.gguf.reader` path, which is why `--continue-on-collection-errors` is
-there. Modules that need a GPU, a real checkpoint or a built `pocketllm_cpp` skip
-themselves — a skip is not a pass.
+Modules that need a GPU, a real checkpoint or an extension this build has not got skip themselves —
+a skip is not a pass.
 
 ## Run something
 
@@ -92,15 +58,21 @@ Python API:
 ```python
 from pocketllm import LLM
 
-llm = LLM(model="/path/to/checkpoint", backend="auto", tensor_parallel_size=4)
+llm = LLM(model="/path/to/xing4_0-29b-IQ4_NL.gguf", backend="auto")
 print(llm.generate("What is artificial intelligence?").text)
 ```
 
 OpenAI-compatible server:
 
 ```bash
-pocketllm serve --model /path/to/checkpoint --backend cpp --tensor-parallel-size 4
+pocketllm serve \
+  --model /path/to/xing4_0-29b-IQ4_NL.gguf \
+  --tokenizer-path /path/to/Xing4.0-29B-A4B \
+  --backend auto
 ```
+
+The weights are a `.gguf` and the tokenizer, chat template and clamp bounds are a directory, so the
+checkpoint is two things — see the [model page](models/xing4.0-29b-a4b.md).
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -108,79 +80,27 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model": "pocketllm", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
-DeepSeek-V4.1-Flash runs on the host-PyTorch `v41` backend instead, over a
-checkpoint far larger than the aggregate VRAM. Startup pins a 457.8 GiB expert
-bank in host memory and takes roughly four minutes before the server answers:
+`--backend` defaults to `auto`, which reads the checkpoint's own `general.architecture` out of the
+GGUF header and selects the runtime that claims that name. The only runtime in this build is
+`xing4`; `--backend xing4` names it by hand. There is no `--tensor-parallel-size`, no `--backend
+cpp`, and no `--backend torch`: this repository no longer carries those paths.
 
-```bash
-DEEPSEEK_V41_RESIDENT_EXPERTS=1 python -m pocketllm serve \
-  --model /path/to/DeepSeek-V4.1-Flash \
-  --backend v41 \
-  --tensor-parallel-size 4 \
-  --max-model-len 32768 \
-  --port 8000 \
-  --expert-pool-rows 148 \
-  --prefill-chunk-tokens 4096 \
-  --decode-graphs \
-  --threads 22
-```
+## Where the other models went
 
-Raise `--max-model-len` to `262144` for the longest context the runtime accepts.
-The adapter takes one request lock, so requests are served one at a time.
+PocketLLM used to describe the whole multi-GPU stack. The code for it has moved out:
 
-MiMo-V2.6-Flash is the other four-rank heterogeneous path. Its routed experts live in a host bank
-rather than in device memory, and the first start fills that bank — 149.81 GiB, about 12 minutes;
-later starts attach to the existing segment:
-
-```bash
-python -m pocketllm serve \
-  --backend mimo \
-  --model /path/to/MiMo-V2.6-Flash \
-  --tensor-parallel-size 4 \
-  --max-model-len 262144 \
-  --port 8000 \
-  --prefill-chunk-tokens 2048 \
-  --chunk-rows 16
-```
-
-It is one request at a time too, and for a firmer reason: every routed layer closes with an
-all-reduce that every rank has to reach, so the ranks run the request as a symmetric group and rank
-0 broadcasts the whole request before it starts generating. See the
-[MiMo-V2.6-Flash model page](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/mimo-v2.6-flash.md) for the numbers and the memory that bank
-takes.
-
-**Ternary-Bonsai-2-27B** is the one that fits on a single card, and the only thing you have to pass
-is the file. It is a GGUF whose weights are 1.75 bits each, so a 27B model is 5.53 GiB and the same
-card still has room for a 245,760-token KV cache:
-
-```bash
-python -m pocketllm serve \
-  --model /path/to/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
-  --served-model-name bonsai \
-  --max-model-len 245760 \
-  --port 8000
-```
-
-No `--backend` and no `--tensor-parallel-size`: the adapter reads
-`general.architecture=qwen35` out of the container's own header and selects the native engine that
-claims that name, and the tokenizer, the special-token ids and the chat template come from the same
-header. `--max-model-len` is a memory decision here as much as a context one, at **64 KiB a token**;
-`--kv-cache-dtype fp8` halves the KV cache and is what makes the checkpoint's own 262,144 fit.
-[Model page](models/ternary-bonsai-2-27b.md) for the measured numbers and the one limitation worth
-reading before you benchmark it.
-
-## Pick your path
-
-| If you are running | Start here |
+| What | Where it lives now |
 | --- | --- |
-| DeepSeek-V4 | [DeepSeek-V4](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/deepseek-v4.md), or [GGUF Q2 on one GPU](models/deepseek-v4-gguf-q2-single-gpu.md) |
-| DeepSeek-V4.1-Flash | [DeepSeek-V4.1-Flash](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/deepseek-v4.1-flash.md), then [serving it behind the OpenAI server](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/deepseek_v4_1_flash_served_gate.md) |
-| MiMo-V2.6-Flash | [MiMo-V2.6-Flash](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/mimo-v2.6-flash.md) |
-| Ternary-Bonsai-2-27B (**one card**) | [Ternary-Bonsai-2-27B](models/ternary-bonsai-2-27b.md) |
-| MiniMax-M2.7 | [MiniMax-M2.7](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/minimax-m2.7.md) |
-| GLM-5.2 | [GLM-5.2](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/glm-5.2.md) |
-| Qwen3.8-27B (FP8 / NVFP4 / BF16) | [Qwen3.8-27B-FP8](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/qwen3.8-27b-fp8.md) |
-| A model not listed above | [Model support matrix](models/README.md) first |
+| Tensor and expert parallelism, host expert banks, multi-card serving (DeepSeek-V4.1-Flash, MiMo-V2.6-Flash, Qwen3.8-27B, MiniMax-M2.7) | [RelicLLM](https://github.com/lvyufeng/RelicLLM) |
+| The native C++/CUDA engine | the [relic-engine](https://github.com/lvyufeng/relic-engine) archive |
+| The operator library and kernel build documentation | [relic-core](https://github.com/lvyufeng/relic-core) |
+
+Two single-card pages stay here even though their runtime left: [Ternary-Bonsai-2-27B](models/ternary-bonsai-2-27b.md)
+and [DeepSeek-V4 on GGUF Q2](models/deepseek-v4-gguf-q2-single-gpu.md). Both ran on the C++ front
+end, both are marked **Stale** at the top of the page and in the matrix, and neither can be run from
+this tree. They are kept because the measurements are still evidence about the checkpoints.
+
+The [model support matrix](models/README.md) in this repository covers what is single-card only.
 
 Before quoting any number you measure or read here, read
 [Benchmarking and reporting rules](https://github.com/lvyufeng/RelicLLM/blob/master/docs/guides/benchmarking.md).

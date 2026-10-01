@@ -43,6 +43,10 @@ chmod 600 ~/.pypirc
 pip install --upgrade build twine
 ```
 
+This release is pure Python, so there is no CUDA toolkit requirement for the build itself. The
+runtime depends on `relic-core`, which is not on PyPI yet and is installed from its checkout:
+`pip install -e ../relic-core --no-build-isolation`.
+
 ### 4. Clean working directory
 
 ```bash
@@ -55,8 +59,11 @@ git pull origin master
 - [ ] Bump the version in **both** `pyproject.toml` and `pocketllm/__init__.py`
 - [ ] Update `CHANGELOG.md` with the release notes
 - [ ] Update `README.md` if the release changes installation or requirements
-- [ ] Run the tests: `python -m pytest tests/test_install_smoke.py tests/test_native_build_preflight.py tests/test_sdist_native_sources.py`
-      `test_sdist_native_sources.py` is the one that guards the packaging step rather than the code: it checks that every source `cpp_engine/CMakeLists.txt` declares is in the sdist.
+- [ ] Run the tests: `python -m pytest tests/test_install_smoke.py`
+      The sdist is pure Python now, so there is no native-source packaging check to run: the
+      `cpp_engine` CMake sources and the `src/csrc/` sources this project used to ship are in
+      [relic-engine](https://github.com/lvyufeng/relic-engine) and
+      [relic-core](https://github.com/lvyufeng/relic-core) respectively.
 - [ ] Confirm the two version strings agree:
       `python -c "import re, pathlib, pocketllm; print(pocketllm.__version__, re.search(r'^version = \"(.+)\"', pathlib.Path('pyproject.toml').read_text(), re.M).group(1))"`
       The regular expression is not stylistic: `tomllib` is 3.11+, while this package supports 3.10, so a checklist step that imports it cannot be run on the oldest supported interpreter. The publish workflow reads the version the same way.
@@ -79,9 +86,10 @@ python -m build --sdist --no-isolation
 ```
 
 **`--no-isolation` is required:**
-- `setup.py` needs the active environment's PyTorch
-- CUDA extensions must compile against the host's CUDA toolkit
-- An isolated build environment resolves a Torch that may not match that toolkit
+- `setup.py` needs the active environment's PyTorch (it is a runtime dependency, declared in
+  `pyproject.toml`)
+- An isolated build environment would resolve its own setuptools and wheel rather than using the
+  ones the release environment already has
 
 ### 3. Check the package
 
@@ -105,27 +113,35 @@ source /tmp/test-pocketllm/bin/activate
 # venv has to already have what the build imports. A new venv has none of these,
 # and the two ways that shows up are under Troubleshooting.
 python -m pip install --upgrade pip
-python -m pip install "torch>=2.0,<2.7" "setuptools>=68" wheel ninja cmake pybind11
+python -m pip install "torch>=2.0,<2.7" "setuptools>=68" wheel
+
+# The runtime's native operator library, not on PyPI: install it from its
+# checkout first, or resolving the dependency below cannot fetch it.
+pip install -e "$REPO/../relic-core" --no-build-isolation
 
 pip install dist/pocketllm-0.x.x.tar.gz --no-build-isolation
 
 cd /tmp
 python -c "import pocketllm; print(pocketllm.__version__, pocketllm.__file__)"
-python -c "import pocketllm_cpp; print('C++ engine: OK', pocketllm_cpp.__file__)"
 python "$REPO/tests/test_install_smoke.py"
 
 deactivate
 ```
 
+This is the step that catches an sdist that is missing files. The archive is pure Python, so the
+failure mode is an import error rather than a compile error, and the install no longer needs a CUDA
+toolkit.
+
 `cd /tmp` is not incidental. `python -c` puts the working directory on `sys.path`, so run from the
 checkout the first line imports `pocketllm/` from the source tree and prints the version the tree
 has — which is what the release is bumping, so it agrees with the artifact by construction and proves
-nothing. Both lines print the module path for the same reason: it has to be under the virtualenv.
+nothing. The line prints the module path for the same reason: it has to be under the virtualenv.
 The smoke test is run by path rather than by name, which puts the test's own directory, not the
 checkout, on `sys.path`.
 
-This is the only step that proves the artifact installs. It compiles CUDA extensions and the native
-C++ engine, so it needs a machine with a CUDA toolkit — a CI runner without one cannot do it.
+This is the only step that proves the artifact installs. The build is pure Python now — the CUDA
+kernels compile in relic-core, its own package — so a machine with a CUDA toolkit is needed for the
+`relic-core` install, not for this one.
 
 ## Upload
 
@@ -171,7 +187,10 @@ source /tmp/test-pocketllm/bin/activate
 # Test PyPI does not carry Torch; range as declared in pyproject.toml. These are
 # the build imports as well -- see step 4 for why the venv needs them first.
 python -m pip install --upgrade pip
-python -m pip install "torch>=2.0,<2.7" "setuptools>=68" wheel ninja cmake pybind11
+python -m pip install "torch>=2.0,<2.7" "setuptools>=68" wheel
+# relic-core is not on PyPI; install it from its checkout so the dependency below
+# can resolve. See step 4.
+pip install -e "$REPO/../relic-core" --no-build-isolation
 
 # Pin the exact version under test. Unpinned, both indexes are searched and pip
 # takes the highest version it can see, so this can quietly install a different
@@ -182,14 +201,13 @@ pip install --index-url https://test.pypi.org/simple/ \
 
 cd /tmp   # otherwise the checkout shadows the installed package; see step 4
 python -c "import pocketllm; print(pocketllm.__version__, pocketllm.__file__)"
-python -c "import pocketllm_cpp; print('C++ engine: OK', pocketllm_cpp.__file__)"
 python "$REPO/tests/test_install_smoke.py"
 
 deactivate
 ```
 
-This is the step that catches an sdist that is missing files it needs to compile — the archive
-resolves, downloads and installs, and the failure is at build time.
+This is the step that catches an sdist that is missing files it needs — the archive resolves,
+downloads and installs, and the failure is at import time.
 
 The version is pinned for a reason. `--extra-index-url` does not scope the requirement to Test PyPI:
 pip searches both indexes and takes the highest version it can see, so a listing that does not
@@ -227,8 +245,8 @@ Repository secrets the workflow needs:
 | `PYPI_API_TOKEN` | Upload to production PyPI |
 
 Until both exist the workflow fails at its upload step. The workflow cannot install-test the
-artifact: GitHub-hosted runners have no CUDA toolkit, and the sdist compiles CUDA extensions, so
-installation verification stays a local step.
+artifact end to end: `relic-core` is not on PyPI and a runner would have to build it from source,
+so installation verification stays a local step.
 
 ## Post-release
 
@@ -291,25 +309,24 @@ python -m pip install "setuptools>=68" wheel
 `[project].dependencies`, but pip builds the wheel before installing the project's runtime
 dependencies, so those declarations cannot supply the build that needs them.
 
-### The install verification stops at "pybind11 is not importable"
+### The install verification cannot resolve `relic-core`
 
-Same cause, one step later: `cmake`, `pybind11` and `ninja` are also build imports, and the venv has
-none of them. The message comes from this package's own preflight, which is reporting the venv's
-toolchain rather than anything about the archive — it is not a sign that the artifact is broken.
-Install them and retry:
+The venv does not have the operator library, which is a runtime dependency and is not on PyPI.
+Install it from its checkout before installing the archive:
 
 ```bash
-python -m pip install ninja cmake pybind11
+pip install -e ../relic-core --no-build-isolation
 ```
 
-A venv created with `--system-site-packages` hides both of these failures, because it inherits the
-base interpreter's `setuptools` and toolchain. That makes it useless for this check: it will report
-success for an artifact the documented procedure cannot install.
+A venv created with `--system-site-packages` hides this failure, because it inherits the base
+interpreter's installed `relic-core`. That makes it useless for this check: it will report success
+for an artifact the documented procedure cannot install.
 
 ### The install verification builds an older release than the one just uploaded
 
-The step fails somewhere that has nothing to do with this release — CMake configuration, a source
-file no target names — or installs successfully and then reports the previous version.
+The step fails somewhere that has nothing to do with this release — a missing file, or an installed
+distribution that is not the one just uploaded — or installs successfully and then reports the
+previous version.
 
 pip caches the simple-index page. If `https://test.pypi.org/simple/pocketllm/` was fetched before
 this release was uploaded, pip reuses that listing; it has no link for the new version, so the
@@ -349,28 +366,20 @@ Use `--no-build-isolation`:
 python -m build --sdist --no-isolation
 ```
 
-### CUDA extension compilation fails during `pip install`
+### The `relic-core` kernel build fails during its install
+
+`pocketllm` itself does not compile, but its operator library does, so the toolkit matters for that
+step:
 
 1. Check the toolkit: `nvcc --version`
 2. Install PyTorch first: `pip install torch`
-3. Install with `pip install pocketllm --no-build-isolation`
-
-### Native C++ engine build fails
-
-The build stops deliberately rather than continuing without `pocketllm_cpp`, because a silently
-missing native module lets `backend="auto"` fall back to Torch kernels with no error to explain the
-change in behaviour. The failure message names the missing prerequisite.
-
-To install the PyTorch backend only:
-
-```bash
-POCKETLLM_BUILD_CPP=0 pip install pocketllm --no-build-isolation
-```
+3. Install relic-core with `pip install -e ../relic-core --no-build-isolation`
 
 ### Build takes too long
 
-The full build (CUDA extensions plus C++ engine) takes 5-15 minutes on a first install. Subsequent
-installs reuse cached builds where possible.
+`pocketllm` itself is pure Python and installs in seconds. The only long step is `relic-core`, which
+compiles the native kernels and takes several minutes on a first install; subsequent installs reuse
+cached builds where possible.
 
 ## Version numbering
 
@@ -385,10 +394,10 @@ Pre-releases: `0.1.0a1` (alpha), `0.1.0b1` (beta), `0.1.0rc1` (release candidate
 
 ## Known limitations of the published artifacts
 
-- **No pre-built wheels.** Users compile extensions during installation, so they need a CUDA toolkit
-  and 5-15 minutes.
-- **CUDA versions.** Extensions compile against the user's toolkit. 11.8, 12.1, and 12.4 are
-  exercised; anything else is untested.
+- **No pre-built wheels.** The sdist is pure Python, but its `relic-core` dependency is not on PyPI:
+  users build it from its checkout, so they need a CUDA toolkit and the time that compile takes.
+- **CUDA versions.** The `relic-core` kernels compile against the user's toolkit. 11.8, 12.1, and
+  12.4 are exercised; anything else is untested.
 - **Platform.** Linux only (Ubuntu 22.04 tested). Windows and macOS are untested.
 
 Future improvements:

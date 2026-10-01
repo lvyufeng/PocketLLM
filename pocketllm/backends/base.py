@@ -276,10 +276,9 @@ class BackendBase:
         is ready to participate in collectives, immediately before entering the
         blocking worker loop.
 
-        The Python runtimes do not implement this; ``RankedWorker`` in
-        :mod:`pocketllm.backends.runtime_engine` does, and this is the body every adapter
-        outside that family inherits -- ``torch`` and ``cpp`` have their own worker entries and
-        a backend that has none has to say so rather than return.
+        No runtime in this build spans more than one process, so nothing calls this: a backend
+        that has no worker entry point says so rather than returning, which is what a caller
+        wiring up supervision would need to hear.
         """
         raise TensorParallelSupervisorError(
             "backend does not implement a supervised TP worker entry point"

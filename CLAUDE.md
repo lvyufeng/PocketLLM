@@ -1,7 +1,17 @@
 # PocketLLM
 
-Multi-backend inference engine for DeepSeek-V4, MiniMax, GLM, and Qwen checkpoints. One repository,
-two engines: a device-agnostic core shared by both, and a per-vendor kernel layer.
+Single-card inference engine: run a large model on **one accelerator**, edge and mobile. The rule
+the scope reduces to is *if it does not fit, quantize it* — never offload, never split across cards.
+The width ladder is Q4 → Q2 → IQ2 → IQ1 → ternary.
+
+This repository is one of four:
+
+| Repository | What it is |
+|---|---|
+| **PocketLLM** (this tree) | Single-card / edge runtime. One process owns one card. |
+| [RelicLLM](https://github.com/lvyufeng/RelicLLM) | Multi-GPU PyTorch runtime and serving shell. |
+| [relic-core](https://github.com/lvyufeng/relic-core) | The shared torch operator library (CUDA sm_75 + CPU host ops), installed here as the `relic_core` package. |
+| relic-engine | The retired `cpp_engine` tree, kept only as a frozen archive. Nothing here builds against it. |
 
 `docs/README.md` indexes the documentation — model support status, benchmarking rules, and the
 release procedure are documented there.
@@ -30,23 +40,26 @@ level nobody writes by hand. Regenerate it with `scripts/gen_llms_txt.py` whenev
 changes, in the same commit. `mkdocs build --strict` fails when it is stale
 (`hooks/llms_txt_staleness.py`), and that build is the only check CI runs on a documentation change.
 
+Three directories survive the multi-card cut. The topics that left with it — `performance/`,
+`migration/` and `archive/` — went with the code they measured, which is now in RelicLLM, relic-core
+and relic-engine; do not recreate them here.
+
 | Directory | What belongs in it |
 |---|---|
-| `docs/guides/` | Rules and procedures — benchmarking, API, release flow, Ascend platform notes |
+| `docs/guides/` | Rules and procedures — release flow today |
 | `docs/architecture/` | Design documents, refactor plans, **roadmaps**, engine comparisons |
-| `docs/performance/` | Measured results and bottleneck analyses for capability that is live today |
 | `docs/models/` | Per-checkpoint guides and the support matrix |
-| `docs/migration/` | Breaking-change migration notes |
 | `docs/reports/` | Rendered long-form reports |
-| `docs/archive/phase2-phase3/` | Completed Phase 2/3 records, kept for measurement context |
 
-Filenames are lowercase `snake_case`. Every directory has an `index.md` listing its documents in a
-table, and `docs/README.md` indexes the directories — a new document that is not added to its
-directory's `index.md` is unreachable except by guessing a path, so **update the index in the same
-commit**, and add the page to `mkdocs.yml`'s `nav` and re-run `scripts/gen_llms_txt.py` in the same
-one. Relative links between directories need the `../` prefix; moving a file means fixing every
-inbound reference in the same commit (source comments and test headers link here too, not just other
-Markdown).
+Filenames are lowercase `snake_case`. `docs/guides/` has an `index.md` and `docs/models/` has a
+`README.md`; a new document has to be listed in one of those and in `docs/README.md`, because one
+that is not is unreachable except by guessing a path — so **update the index in the same commit**,
+and add the page to `mkdocs.yml`'s `nav` and re-run `scripts/gen_llms_txt.py` in the same one.
+Relative links between directories need the `../` prefix; **links back to the repository root
+cannot be relative** — `README.md` and `README_CN.md` are outside `docs_dir`, so link them by
+absolute URL (`https://github.com/lvyufeng/PocketLLM#…`), which is also how every cross-repository
+link is written. Moving a file means fixing every inbound reference in the same commit (source
+comments and test headers link here too, not just other Markdown).
 
 This is not only a filing convention: `docs/` is the published site and the build runs
 `mkdocs build --strict`, so a link that no longer resolves fails the page build rather than just
@@ -56,70 +69,62 @@ looking untidy.
 
 | Path | What it is |
 |---|---|
-| `cpp_engine/` | C++ engine. `core/` is device-agnostic, `engine/` is the layer model, and `backends/{api,cuda,ascend}/` holds the vendor code. Build and run instructions: `cpp_engine/README.md`. |
-| `src/` | Python/PyTorch implementation and kernel library. |
-| `pocketllm/` | The installed package: CLI, HTTP server, supervisor. Imports `pocketllm_cpp` when the native engine was built. |
+| `src/` | The surviving Python/PyTorch tree: `models/xing4_0/` (the one model runtime), `loader/gguf/`, `kernels/`, `components/gguf/`. `src/csrc/` is gone — the kernels are relic-core's now. |
+| `pocketllm/` | The installed package: CLI and HTTP server. One runtime — `backends/xing4_backend.py`; the rest of `backends/` is the dispatch machinery (declarations, refusals, option surfaces) that the single runtime still reads. |
 | `tests/` | pytest suite — see **Testing** below. |
 | `hooks/` | MkDocs build-time checks, registered under `hooks:` in `mkdocs.yml`. One file: it fails the docs build when `docs/llms.txt` is stale. |
-| `docs/` | Topic directories — `guides/`, `architecture/`, `performance/`, `models/`, `migration/`, `reports/`, `archive/` — indexed by `docs/README.md`. Also the source of the published site: `mkdocs.yml` points `docs_dir` at it and `.github/workflows/pages.yml` builds it to <https://lvyufeng.github.io/PocketLLM/>, where `docs/llms.txt` is published as the machine-readable index. New files go in a topic directory, never at the top level; see **Documentation layout** above. |
+| `docs/` | The three topic directories above, indexed by `docs/README.md`. Also the source of the published site: `mkdocs.yml` points `docs_dir` at it and `.github/workflows/pages.yml` builds it to <https://lvyufeng.github.io/PocketLLM/>, where `docs/llms.txt` is published as the machine-readable index. New files go in a topic directory, never at the top level; see **Documentation layout** above. |
 
 Two invariants the layout exists to protect:
 
-- **Kernels stay behind the C ABI.** `cpp_engine/include/cuda_ops.hpp` declares 93 ops, 91 of which
-  take `void* stream`, and it includes no CUDA headers at all. `cpp_engine/engine/` likewise
-  includes no CUDA headers and contains **zero `<<<` launches** — all 359 of them are under
-  `backends/`. Adding a vendor-specific type to an op signature breaks the other vendor's build.
-- **Backend selection happens at build time.** Per-hardware tuning is not traded away for
-  portability, so do not "unify" a 2080 Ti or 910B specific kernel in the name of sharing code.
+- **The install is pure Python.** `setup.py` has no `ext_modules`; every native kernel lives in
+  relic-core, reached through the installed `relic_core` package. Do not reintroduce a compile step
+  here, and do not vendor a kernel into `src/` — the vendored GGML tables (for example
+  `ggml-common.h`, read by `src/loader/gguf/iq4_nl.py`) are resolved *through*
+  `relic_core.__file__`, not by a path relative to this tree.
+- **One process owns one card.** Nothing in this tree launches a second rank or a collective. A
+  checkpoint that does not fit is quantized further, not split.
 
 Quantized kernel dispatch on the Python side goes through `src/kernels/ops.py`
 (`_auto_impl` / `_resolve_impl`), with paired `*_torch` / `*_triton` implementations behind it.
 
-### What stays untracked
-
-Two directories at the repository root are **measurement artifacts, not sources**, and neither is in
-`.gitignore` — they show up as untracked on every `git status`, which is why they are listed here
-rather than left to be discovered:
-
-| Path | What it is |
-|---|---|
-| `sweep-rep-flip/`, `sweep-rep-flip2/` | Output of the `QWEN_ASCEND_REPLICATE_ROWS` sweeps — per-arm `.json`, `.metrics` and `.out` files, tens of MB, one directory a sweep session. |
-
-**Never commit either of them.** The sweeps in particular are cited by the records in
-`docs/performance/` under those file names, so keep the directories where they are rather than moving
-them into a build tree or deleting them after a write-up. A working tree whose only untracked entries
-are these two is clean.
-
 ## Hardware and toolchain
 
-Two development machines, one per backend. **Determine which one you are on before concluding
-anything about what can be built, run, or measured.** A command that is correct on one is usually
-wrong on the other — most visibly, the CUDA path does not exist on the Ascend machine at all.
+Two development machines. **Determine which one you are on before concluding anything about what can
+be built, run, or measured.** A command that is correct on one is usually wrong on the other — most
+visibly, the CUDA path does not exist on the Ascend machine at all.
 
 ### x86_64 CUDA machine — 4 x RTX 2080 Ti
 
 - **GPUs**: 4 x RTX 2080 Ti, 22528 MiB each, compute capability **7.5 (Turing / sm_75)**.
-  `cpp_engine` defaults to `CMAKE_CUDA_ARCHITECTURES=75`; do not drop sm_75-specific paths.
+  relic-core builds for sm_75; do not drop sm_75-specific kernel paths there.
 - **Topology**: `GPU0-GPU1` are PHB (PCIe, same NUMA node); **`GPU2-GPU3` are NV2 (NVLink)**; every
-  cross-pair is SYS. NVLink-sensitive work and fair TP2 comparisons must run on physical GPUs
-  **2 and 3**.
+  cross-pair is SYS. This tree runs one card per process, so the topology matters only when several
+  processes are started on the same box and their cards are chosen by `--device-ids` — a fair
+  side-by-side comparison still wants physical GPUs **2 and 3**.
 - **CPU / RAM**: 2 x Xeon E5-2696 v4, 22 cores each (88 hardware threads), 2 NUMA nodes, ~1 TiB RAM.
   GPUs 0-1 sit on NUMA node 0, GPUs 2-3 on node 1.
 - **OS / Python**: Ubuntu 22.04.5, x86_64, kernel 5.15. Python 3.10.10 (conda).
-- **Compilers**: gcc 11.4.0, cmake 3.26.3 (conda's, first on `PATH`).
+- **Compilers**: gcc 11.4.0, cmake 3.26.3 (conda's, first on `PATH`). Neither is needed here any
+  more — relic-core does the compiling.
 - **CUDA**: `nvcc` on `PATH` is **13.0** (`/usr/local/cuda` → 13.0) while `CUDA_HOME` points at
   **`/usr/local/cuda-12.4`**; 11.8, 12.4 and 13.0 are all installed.
   - **Trap**: a pip-installed torch is built against CUDA 12.4, and `torch.utils.cpp_extension`
     hard-fails on the mismatch (`The detected CUDA version (13.0) mismatches the version that was
-    used to compile PyTorch (12.4)`). Keep `CUDA_HOME` on a 12.x toolkit, and do not put
-    `/usr/local/cuda-13.0/bin` ahead on `PATH` when building an extension against that torch.
-- **No NPU here**: no `/dev/davinci*` and no CANN. `cpp_engine/build_ascend/` is a synced artifact
-  tree; its presence tells you nothing about this host.
+    used to compile PyTorch (12.4)`). This tree no longer compiles anything, but relic-core does:
+    keep `CUDA_HOME` on a 12.x toolkit, and do not put `/usr/local/cuda-13.0/bin` ahead on `PATH`
+    when building an extension against that torch.
+- **No NPU here**: no `/dev/davinci*` and no CANN. The Ascend notes below are recorded from that
+  machine, not verifiable from this host.
 
 ### aarch64 Ascend machine — 8 x Ascend 910B
 
-These facts are recorded from that machine, not measured on the x86_64 host, so **none of them can
-be verified from here** — treat them as claims to re-check in place.
+**Nothing in this tree runs on that machine any more.** The Ascend runtime was the C++ engine's, and
+it is archived in relic-engine; the build scripts that drove it (`scripts/ascend_env.sh`,
+`scripts/build_ascend.sh`) went with it. The recorded facts below are kept because they are the only
+description of that host these notes have — **none of them can be verified from the x86_64 host, so
+treat them as claims to re-check in place**, and check them against the machine only if Ascend work
+resumes.
 
 - **NPU**: 8 x Ascend `910B` with no trailing digit, i.e. **1st generation**
   (`Short_SoC_version=Ascend910`); 32 GB HBM per card, `/dev/davinci0-7`. See **Ascend chip naming
@@ -128,9 +133,9 @@ be verified from here** — treat them as claims to re-check in place.
   (`ascendhal 7.35.23`).
 - **OS**: Ubuntu 22.04.5, aarch64, kernel 5.15. Compilers: gcc 11.4.0.
 - **No CUDA toolchain**, so CUDA builds and 2080 Ti regression runs cannot happen there.
-- **Build**: `source scripts/ascend_env.sh` first — CANN's own `set_env.sh` is required, not just
-  `LD_LIBRARY_PATH`, because an ACL binary launched without it does not fail but *hangs* before
-  `aclInit` returns. Then `scripts/build_ascend.sh`.
+- **Build (historical)**: `source scripts/ascend_env.sh` first — CANN's own `set_env.sh` is required,
+  not just `LD_LIBRARY_PATH`, because an ACL binary launched without it does not fail but *hangs*
+  before `aclInit` returns. Then `scripts/build_ascend.sh`. Both scripts are in relic-engine now.
 - `/etc/hccn.conf` exists but is empty: multi-card **HCCL over RDMA** needs it configured first.
   Intra-server SDMA does not depend on it.
 
@@ -161,8 +166,9 @@ name `npu-smi info` prints is not the SoC generation, so read `Short_SoC_version
 which hardware you are on. The two generations need **separate AscendC kernel implementations, not
 retuned parameters**.
 
-Full table, platform_config layout, and the CMake variable that consumes it:
-[docs/guides/ascend_soc_generations.md](docs/guides/ascend_soc_generations.md).
+Full table, platform_config layout, and the CMake variable that consumed it:
+[docs/guides/ascend_soc_generations.md](https://github.com/lvyufeng/relic-core/blob/master/docs/guides/ascend_soc_generations.md)
+— that page went to relic-core with the hardware notes.
 
 ## Git workflow
 
@@ -198,8 +204,9 @@ severe. This should be well under 1% of commits.
 
 ## Testing
 
-The suite is `tests/`, alongside `bench_*` and `profile_*` scripts that pytest does not collect.
-There is no `conftest.py` and no pytest configuration; modules import from the repository root, so
+The suite is `tests/`, which also still carries a few `bench_*` / `probe_*` / `summarize_*` scripts
+that pytest does not collect (`tests/README.md` lists what is left). There is no `conftest.py` and
+no pytest configuration; modules import from the repository root, so
 **run pytest from the repository root**:
 
 ```bash
@@ -210,18 +217,15 @@ python -m pytest tests/ -q
 skip policy, the golden fixtures, and what CI does and does not run. Read it before changing how the
 suite is invoked.
 
-- **The suite is not green on `master`, and the known failures are recorded as a set of node ids** in
-  `tests/baseline_failures.txt`. Diff a run against it with
-  `python scripts/check_test_baseline.py` (`--update` to re-record). It is a set and not a count on
-  purpose: three tests fixed and one broken is a net improvement in a count and a regression in the
-  tree.
-- Modules that need a GPU, a real checkpoint, or a built extension **skip** themselves — and a skip
-  is not a pass. `tests/cuda_bindings.py::extension(requires=...)` is how a test asks for the op it
-  is about, so a binding this build does not export reads as a skip naming it rather than as an
-  `AttributeError` that looks like a broken test.
+- **The baseline is empty**, and `tests/baseline_failures.txt` records the known failures as a set of
+  node ids. Diff a run against it with `python scripts/check_test_baseline.py` (`--update` to
+  re-record). It is a set and not a count on purpose: three tests fixed and one broken is a net
+  improvement in a count and a regression in the tree. A test that fails on this host belongs in the
+  file; one skipped for want of a card or a checkpoint does not.
+- Modules that need a GPU or a real checkpoint **skip** themselves — and a skip is not a pass.
 - The **golden fixtures** in `tests/fixtures/golden/` are the only end-to-end claims: one real
-  request through one real entry point per backend, compared against recorded token ids. Record one
-  with `scripts/record_golden_fixture.py`.
+  request through one real entry point per backend, compared against recorded token ids. One entry
+  point survives (`xing4`); record its fixture with `scripts/record_golden_fixture.py`.
 - **CI runs no tests.** `.github/workflows/publish-pypi.yml` builds and uploads a release, and
   `.github/workflows/pages.yml` builds the documentation site with `mkdocs build --strict`. No
   workflow runs the pytest suite, so the baseline check is a manual step and a gate only where

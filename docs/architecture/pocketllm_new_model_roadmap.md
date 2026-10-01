@@ -1,5 +1,12 @@
 # New model support on the 2080 Ti: an ordered roadmap
 
+> **Repository scope note.** This is the plan, and two of its three checkpoints no longer have a
+> runtime here. Ternary-Bonsai-2-27B was served through the C++ front end and Xing4.0-29B-A4B
+> through `--backend xing4`; the front end was deleted with the multi-card cut, so only the Xing4
+> stage is still live. GLM-5.3-Flash never landed. The stages below are kept as the record of the
+> plan and of the measurements taken while executing it, not as a description of the current
+> checkout.
+
 This is the engineering record and the plan behind [issue #380](https://github.com/lvyufeng/PocketLLM/issues/380),
 the repository's second roadmap. [The old-hardware roadmap](pocketllm_roadmap_old_hardware.md) asks what
 *capability* the engine is missing — continuous batching, prefix caching, KV quantization, offload. This

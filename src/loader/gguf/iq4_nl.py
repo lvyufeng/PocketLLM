@@ -18,15 +18,16 @@ The nibbles are *not* interleaved: ``qs[j] & 0x0f`` is weight ``j`` and
 same way, which is why both decoders in ``tensor_reader`` write their low halves
 into the first 16 slots rather than alternating.  The codebook is read out of the
 vendored llama.cpp header rather than transcribed, so there is one statement of
-it in this repository: ``kvalues_iq4nl`` in
-``src/csrc/llama_mmq/ggml-common.h``.
+it across the tree: ``kvalues_iq4nl`` in
+``relic_core/csrc/llama_mmq/ggml-common.h``, vendored with the kernels in
+relic-core.
 
 Decoding blocks and running them are different things, and for one stage they
 were separated here on purpose: ``IQ4_NL`` was absent from ``GGUF_DENSE_TYPE_IDS``
 -- the raw-block runtime's dispatch table -- so a checkpoint whose tensors were
 ``IQ4_NL`` raised rather than reaching a kernel that would read 32-weight blocks
 as a 256-weight format.  It is in that table now (``#393``), because
-``src/csrc/cuda_kernel_impl.cu`` has a ``iq4nl_block_dot_256`` that walks eight
+relic-core's ``cuda_kernel_impl.cu`` has a ``iq4nl_block_dot_256`` that walks eight
 native blocks where the other ten formats unpack one 256-weight header.  What
 made that a small kernel rather than a second kernel family is
 :func:`fold_to_runtime_span` below: the loader folds eight native blocks into a
@@ -41,6 +42,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
+import relic_core
 
 QK_IQ4_NL = 32
 """Weights per block."""
@@ -51,7 +53,10 @@ IQ4_NL_BLOCK_BYTES = 18
 IQ4_NL_FILE_TYPE_ID = 20
 """The GGML file type id, as it appears in a GGUF tensor table."""
 
-_GGML_COMMON = Path(__file__).parents[2] / "csrc" / "llama_mmq" / "ggml-common.h"
+# The header is vendored with the kernels, which live in relic-core, so it is resolved against that
+# installed package rather than this tree. A path relative to `__file__` would point into a `csrc/`
+# directory this repository does not have.
+_GGML_COMMON = Path(relic_core.__file__).parent / "csrc" / "llama_mmq" / "ggml-common.h"
 
 
 @lru_cache(maxsize=1)

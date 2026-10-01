@@ -26,8 +26,9 @@ the weight format until it does.
     parallelism, host offload, the multi-card serving paths — now lives in
     [RelicLLM](https://lvyufeng.github.io/RelicLLM/), and the native kernels in
     [relic-core](https://lvyufeng.github.io/relic-core/). What is left here is the single-accelerator
-    story, and the pages that were never about one card have moved with it. The code has not been
-    cut yet; this site is the statement of where the boundary is going.
+    story, and the pages that were never about one card have moved with it. **The cut has landed**:
+    the multi-card Python, the native C++ front end and the C++ build are gone, and this build has
+    one runtime, `--backend xing4`.
 
 ## The rule
 
@@ -38,13 +39,17 @@ model still answers correctly in. Host offload and multi-card tensor parallelism
 out of scope: a hybrid GPU/CPU expert path was measured at **2.3× slower** than keeping the experts
 on the card, and a checkpoint that needs four cards to answer a prompt is a different product.
 
-That leaves three checkpoints, and each of them fits one card whole:
+**One checkpoint has a runtime here**, and it fits one card whole:
 
 | Model | Format | Fits in |
 |---|---|---|
-| [Ternary-Bonsai-2-27B](models/ternary-bonsai-2-27b.md) | GGUF `PTQ1_0` — 1.75 bits a weight | **5.53 GiB** |
 | [Xing4.0-29B-A4B](models/xing4.0-29b-a4b.md) | GGUF `IQ4_NL` — 4.5 bits a weight | **17.94 GiB** |
-| [DeepSeek-V4 on GGUF Q2](models/deepseek-v4-gguf-q2-single-gpu.md) | GGUF Q2 / IQ2 / IQ1 | one 22 GiB card |
+
+Two more single-card pages are kept as records of what was measured before the cut, each marked
+**Stale** at the top and in the [support matrix](models/README.md): Ternary-Bonsai-2-27B (GGUF
+`PTQ1_0`, 1.75 bits a weight, **5.53 GiB**) and DeepSeek-V4 on GGUF Q2/IQ2/IQ1. Neither has a
+runtime in this tree — they ran on the C++ front end, which is now in the relic-engine archive.
+Ternary-Bonsai is the one worth re-porting: nothing else here reaches 1.75 bits.
 
 Nothing on this site needs a second card. A page that documents a four-card run is not here; it is
 in [RelicLLM](https://lvyufeng.github.io/RelicLLM/).
@@ -68,14 +73,15 @@ improves both this library and the multi-GPU one.
 This is the question the whole library is organised around, so it is worth showing the answer rather
 than the headline. Both served models report their own footprint and their ceiling:
 
-- **Ternary-Bonsai-2-27B** — 5.53 GiB of weights leaves **245,760 tokens of context** (262,144 with
-  an fp8 KV cache) on a 22 GiB card, at **636.0 tok/s of prefill** and **25.9 tok/s of decode** on a
-  4,096-token prompt.
 - **Xing4.0-29B-A4B** — 17.94 GiB resident with **all 64 experts of all 38 MoE layers on the card**,
   flat in context to 32,768 tokens, at **75.22 tok/s of prefill** and **6.72 tok/s of decode**.
 
-Read the model page before quoting either number: it carries the checkpoint, the prompt, the warm
-state and the measurement convention, and each has a `## Known limitations` section.
+Read the model page before quoting that number: it carries the checkpoint, the prompt, the warm
+state and the measurement convention, and it has a `## Known limitations` section. The same applies
+to the two **Stale** pages — 5.53 GiB of Ternary-Bonsai-2-27B left **245,760 tokens of context**
+(262,144 with an fp8 KV cache) on a 22 GiB card at **636.0 tok/s of prefill** and **25.9 tok/s of
+decode** on a 4,096-token prompt — but those were measured on code this repository no longer has,
+so nothing users can run reproduces them.
 
 ## Documentation
 

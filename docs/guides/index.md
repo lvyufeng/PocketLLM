@@ -9,9 +9,9 @@ conventions the rest of the documentation assumes.
 | --- | --- |
 | [Benchmarking and reporting rules](https://github.com/lvyufeng/RelicLLM/blob/master/docs/guides/benchmarking.md) | The prefill/decode split, what every result record must contain, and the hardware and invocation details a comparable number needs. |
 | [Serving latency metrics (vLLM convention)](https://github.com/lvyufeng/RelicLLM/blob/master/docs/guides/latency_metrics.md) | TTFT, TPOT, ITL and E2EL as vLLM defines them, the `pocket_*` series that back each one, and how they relate to the prefill/decode convention. |
-| [PocketLLM API and backend guide](https://github.com/lvyufeng/RelicLLM/blob/master/docs/guides/pocketllm_api.md) | The single user-facing API over the two execution planes (Torch and C++), backend selection, tensor parallelism, and the batch/scheduler surface. |
+| [PocketLLM API and backend guide](https://github.com/lvyufeng/RelicLLM/blob/master/docs/guides/pocketllm_api.md) | The single user-facing API, backend selection, and the batch/scheduler surface — documented in RelicLLM, where the multi-card execution planes it also covers now live. |
 | [PyPI release guide](pypi_release.md) | The single source of truth for releasing `pocketllm` to PyPI, including the Test PyPI dry run. |
-| [Building and loading the CUDA extensions](https://github.com/lvyufeng/relic-core/blob/master/docs/guides/cuda_extension_builds.md) | Which `.so` the loader resolves and in what order, the two silent wrong-build failures and the three checks that separate them, and the sources in `src/csrc/` that `setup.py` does not compile. |
+| [Building and loading the CUDA extensions](https://github.com/lvyufeng/relic-core/blob/master/docs/guides/cuda_extension_builds.md) | Which `.so` the loader resolves and in what order, and the two silent wrong-build failures and the three checks that separate them. The extensions compile in relic-core, not here. |
 | [Ascend SoC generations](https://github.com/lvyufeng/relic-core/blob/master/docs/guides/ascend_soc_generations.md) | Why `910B` and `910B1`–`910B4` are different chips, how to read `Short_SoC_version`, and why they cannot share kernels. |
 
 For install and build instructions, see [Getting started](../getting-started.md).

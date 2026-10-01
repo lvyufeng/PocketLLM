@@ -39,15 +39,13 @@ import argparse
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-from . import mimo_backend, v41_backend, xing4_backend
+from . import xing4_backend
 from .options import BackendOption, Group, Kind
 
-#: The runtimes that declare options, in ``capabilities.AUTO_ORDER``. Not every runtime does: the
-#: native and generic adapters take their tuning from ``EngineArgs`` fields and the CLI's own flags,
-#: so this is also the list of runtimes a generated flag can belong to.
+#: The runtimes that declare options, in ``capabilities.AUTO_ORDER``. Not every runtime does -- one
+#: that takes its tuning from ``EngineArgs`` fields and the CLI's own flags has nothing to generate
+#: -- so this is also the list of runtimes a generated flag can belong to.
 DECLARING: dict[str, Any] = {
-    "v41": v41_backend,
-    "mimo": mimo_backend,
     "xing4": xing4_backend,
 }
 

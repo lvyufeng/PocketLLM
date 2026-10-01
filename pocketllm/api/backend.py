@@ -1,4 +1,4 @@
-"""Protocol implemented by Torch and native C++ execution adapters."""
+"""Protocol implemented by execution adapters."""
 
 from __future__ import annotations
 
@@ -31,11 +31,15 @@ class EngineBackend(Protocol):
         ...
 
     def prepare(self) -> None:
-        """Eagerly initialize the backend for a supervised rank."""
+        """Eagerly initialize the backend before one request is served."""
         ...
 
     def run_worker(self, on_ready: Callable[[], None] | None = None) -> None:
-        """Enter the backend-specific worker loop for a nonzero TP rank."""
+        """Enter the backend-specific worker loop for a supervised rank.
+
+        Optional even where it exists: no runtime in this build spans more than one process, so
+        an adapter that has no worker entry point refuses here instead of returning.
+        """
         ...
 
     def cancel(self, request_id: str) -> bool:

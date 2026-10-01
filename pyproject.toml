@@ -1,21 +1,16 @@
 [build-system]
-# Torch is deliberately absent from this list. setup.py imports
-# torch.utils.cpp_extension at module level, and a Torch resolved fresh into an
-# isolated build environment does not necessarily match the CUDA toolkit the host
-# extensions are compiled against. Build with --no-build-isolation so the active
-# environment's Torch is the one that drives the extension build.
+# Pure Python: the native kernels moved to relic-core, so nothing here compiles
+# and setuptools is the whole build surface.
 requires = [
     "setuptools>=68",
     "wheel",
-    "pybind11>=2.10",
-    "cmake>=3.18",
 ]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pocketllm"
 version = "0.1.2.dev0"
-description = "Inference engine for large language models on consumer GPUs with deep optimization for older hardware"
+description = "Inference engine for large language models on a single accelerator, edge and mobile"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -28,11 +23,9 @@ keywords = [
     "cuda",
     "gguf",
     "quantization",
-    "deepseek",
-    "qwen",
-    "fp4",
-    "fp8",
-    "tensor-parallel"
+    "edge",
+    "mobile",
+    "single-card",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -44,23 +37,24 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: C++",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
     "torch>=2.0,<2.7",
+    # The shared operator library (CUDA kernels + the CPU host ops), which is
+    # where the vendored GGML tables and every native kernel now live. Not on
+    # PyPI yet; install it from its checkout first:
+    #   pip install -e ../relic-core --no-build-isolation
+    "relic-core",
     "transformers>=4.40",
     "safetensors>=0.4",
     "tqdm>=4.66",
     "setuptools>=68",
-    "ninja>=1.11",
-    "pybind11>=2.10",
-    "cmake>=3.18",
 ]
 
 [project.optional-dependencies]
 triton = ["triton>=2.0"]
-minimal = []  # PyTorch-only, no C++ engine (set POCKETLLM_BUILD_CPP=0)
+minimal = []  # kept for callers that pinned it; the base install is already minimal
 all = ["pocketllm[triton]"]
 
 [project.scripts]
@@ -73,5 +67,5 @@ Repository = "https://github.com/lvyufeng/PocketLLM"
 Issues = "https://github.com/lvyufeng/PocketLLM/issues"
 Changelog = "https://github.com/lvyufeng/PocketLLM/blob/master/CHANGELOG.md"
 
-# Packages are resolved in setup.py via find_packages() so the list cannot drift
-# from the tree the way a hand-maintained literal did.
+# Packages are resolved in setup.py via find_namespace_packages() so the list
+# cannot drift from the tree the way a hand-maintained literal did.

@@ -161,29 +161,6 @@ def _encode_with_template(
     return _token_ids(encoded, tokenizer)
 
 
-def _encode_with_deepseek(
-    tokenizer: Any,
-    messages: Sequence[Mapping[str, Any]],
-    *,
-    thinking_mode: str,
-    reasoning_effort: Any,
-) -> list[int] | None:
-    """Use the legacy DeepSeek encoder only for no-template tokenizers."""
-    try:
-        from src.encoding.deepseek_v4 import encode_messages
-    except Exception:
-        return None
-    text = encode_messages(
-        [dict(message) for message in messages],
-        thinking_mode=thinking_mode,
-        reasoning_effort=reasoning_effort,
-    )
-    encoder = getattr(tokenizer, "encode", None)
-    if not callable(encoder):
-        return None
-    return _token_ids(encoder(text), tokenizer)
-
-
 def encode_chat_prompt(
     tokenizer: Any,
     messages: Sequence[Mapping[str, Any]],
@@ -192,43 +169,27 @@ def encode_chat_prompt(
     reasoning_effort: Any = None,
     tools: Any = None,
     add_generation_prompt: bool = True,
-    deepseek_fallback: bool = False,
 ) -> list[int] | None:
-    """Encode normalized chat messages using the best available model format.
+    """Encode normalized chat messages using the checkpoint's own template.
 
-    A checkpoint-owned ``apply_chat_template`` always wins.  The legacy
-    DeepSeek encoder is used only when ``deepseek_fallback`` is explicitly
-    enabled by the DeepSeek adapter; generic callers otherwise receive
-    ``None`` and may use their own fallback.  ``None`` means the tokenizer
-    cannot encode this chat request.
+    A checkpoint-owned ``apply_chat_template`` wins.  ``None`` means the tokenizer cannot encode
+    this chat request -- a checkpoint that ships no template has no prompt format this side knows,
+    and the caller supplies its own fallback rather than being handed a prompt from a different
+    model's encoder.
 
-    ``add_generation_prompt`` is passed to the checkpoint's template, where it
-    decides whether the prompt ends with the assistant header the model answers
-    into.  It has no counterpart in the legacy DeepSeek encoder, which builds its
-    own framing and always opens the assistant turn -- so a caller that turns it
-    off and lands on that path gets the framing it always got, rather than a
-    prompt neither encoder would produce.
+    ``add_generation_prompt`` is passed to the checkpoint's template, where it decides whether the
+    prompt ends with the assistant header the model answers into.
     """
     if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
         raise ValueError("messages must be a non-empty sequence")
     normalized = [message for message in messages if isinstance(message, Mapping)]
     if not normalized:
         raise ValueError("messages must contain at least one object")
-    encoded = _encode_with_template(
+    return _encode_with_template(
         tokenizer,
         normalized,
         thinking_mode=thinking_mode,
         reasoning_effort=reasoning_effort,
         tools=tools,
         add_generation_prompt=add_generation_prompt,
-    )
-    if encoded is not None:
-        return encoded
-    if not deepseek_fallback:
-        return None
-    return _encode_with_deepseek(
-        tokenizer,
-        normalized,
-        thinking_mode=thinking_mode,
-        reasoning_effort=reasoning_effort,
     )

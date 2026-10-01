@@ -1,7 +1,15 @@
 # Ternary-Bonsai-2-27B
 
+> **Stale: this repository no longer has a runtime for this checkpoint.** Ternary-Bonsai routed
+> through the `cpp` backend, which was deleted with the multi-card cut — the C++ engine moved to the
+> [relic-engine](https://github.com/lvyufeng/relic-engine) archive, and the Python that drove it is
+> not in this tree. Nothing below runs here today; the command is kept as the record of what was
+> measured and how. What the page is still good for is the checkpoint itself: the 1.75-bit format,
+> the 5.53 GiB footprint, and the 245,760-token context that footprint buys. Re-porting it as a
+> relic-core consumer is on the [roadmap](https://github.com/lvyufeng/PocketLLM#roadmap).
+
 A 27B hybrid-attention text model — 48 Gated DeltaNet layers and 16 full-attention layers over a
-**dense** 17,408-wide MLP — released as a GGUF whose weights are **1.75 bits each**. PocketLLM runs
+**dense** 17,408-wide MLP — released as a GGUF whose weights are **1.75 bits each**. PocketLLM ran
 the whole checkpoint on **one** 2080 Ti, behind the same OpenAI-compatible server as its other
 models.
 
@@ -93,7 +101,7 @@ file declaring general.architecture=qwen35; other GGUF checkpoints must use back
 | `--prefill-chunk-tokens` | 8192 | Tokens one prefill call takes at once. |
 | `--enable-batching` / `--max-batch-size` | on / 8 | The batch scheduler. A width above 1 asks for it on its own; `--no-enable-batching` selects the serialized session and cannot be combined with a width above 1. **On by default, at width 8: the width buys aggregate throughput and costs per-request latency — see Known limitations.** |
 | `--backend-option kv_paged=true` | off | Paged KV blocks instead of one contiguous arena. Memory-neutral on its own, and measured to give up the prefix resume — see Known limitations. |
-| `--tensor-parallel-size` | 1 | The engine supports TP4, which is how the FP8 sibling is served, but **TP > 1 was not measured for this artifact**. |
+| `--device-ids` | first card | Cards this process may run on. There is no `--tensor-parallel-size` in this build — the C++ engine's TP4 is how the FP8 sibling was served, and it went to RelicLLM with the cut. |
 
 ### Without a server
 
