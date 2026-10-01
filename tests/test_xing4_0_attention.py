@@ -31,8 +31,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from src.models.xing4_0.attention import KVLatentCache, MLAAttention, MLAAttentionWeights
-from src.models.xing4_0.config import Xing4_0Params, yarn_get_mscale
+from pocketllm.models.xing4_0.attention import KVLatentCache, MLAAttention, MLAAttentionWeights
+from pocketllm.models.xing4_0.config import Xing4_0Params, yarn_get_mscale
 
 CONFIG = Path("/mnt/data2/Xing4.0-29B-A4B/config.json")
 

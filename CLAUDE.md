@@ -40,7 +40,7 @@ level nobody writes by hand. Regenerate it with `scripts/gen_llms_txt.py` whenev
 changes, in the same commit. `mkdocs build --strict` fails when it is stale
 (`hooks/llms_txt_staleness.py`), and that build is the only check CI runs on a documentation change.
 
-Three directories survive the multi-card cut. The topics that left with it — `performance/`,
+Four directories survive the multi-card cut. The topics that left with it — `performance/`,
 `migration/` and `archive/` — went with the code they measured, which is now in RelicLLM, relic-core
 and relic-engine; do not recreate them here.
 
@@ -69,8 +69,7 @@ looking untidy.
 
 | Path | What it is |
 |---|---|
-| `src/` | The surviving Python/PyTorch tree: `models/xing4_0/` (the one model runtime), `loader/gguf/`, `kernels/`, `components/gguf/`. `src/csrc/` is gone — the kernels are relic-core's now. |
-| `pocketllm/` | The installed package: CLI and HTTP server. One runtime — `backends/xing4_backend.py`; the rest of `backends/` is the dispatch machinery (declarations, refusals, option surfaces) that the single runtime still reads. |
+| `pocketllm/` | **The whole installable package, and the only top-level package name this wheel claims.** `models/xing4_0/` (the one model runtime), `loader/gguf/` (the GGUF decoders), `components/gguf/`, plus the CLI, the HTTP server and `backends/` — one runtime, `backends/xing4_backend.py`; the rest of `backends/` is the dispatch machinery (declarations, refusals, option surfaces) that the single runtime still reads. There is no `src/` tree any more: it was folded in here so the tree stops claiming a generic package name RelicLLM's wheel also claimed. |
 | `tests/` | pytest suite — see **Testing** below. |
 | `hooks/` | MkDocs build-time checks, registered under `hooks:` in `mkdocs.yml`. One file: it fails the docs build when `docs/llms.txt` is stale. |
 | `docs/` | The three topic directories above, indexed by `docs/README.md`. Also the source of the published site: `mkdocs.yml` points `docs_dir` at it and `.github/workflows/pages.yml` builds it to <https://lvyufeng.github.io/PocketLLM/>, where `docs/llms.txt` is published as the machine-readable index. New files go in a topic directory, never at the top level; see **Documentation layout** above. |
@@ -79,14 +78,18 @@ Two invariants the layout exists to protect:
 
 - **The install is pure Python.** `setup.py` has no `ext_modules`; every native kernel lives in
   relic-core, reached through the installed `relic_core` package. Do not reintroduce a compile step
-  here, and do not vendor a kernel into `src/` — the vendored GGML tables (for example
-  `ggml-common.h`, read by `src/loader/gguf/iq4_nl.py`) are resolved *through*
+  here, and do not vendor a kernel into `pocketllm/` — the vendored GGML tables (for example
+  `ggml-common.h`, read by `pocketllm/loader/gguf/iq4_nl.py`) are resolved *through*
   `relic_core.__file__`, not by a path relative to this tree.
 - **One process owns one card.** Nothing in this tree launches a second rank or a collective. A
   checkpoint that does not fit is quantized further, not split.
+- **One top-level package name.** `pocketllm/` is the only root `setup.py` packages. Do not
+  reintroduce a second root (the generic `src` was one) — a wheel that claims a name another wheel
+  also claims has no defined owner, and install order silently decides which tree wins.
 
-Quantized kernel dispatch on the Python side goes through `src/kernels/ops.py`
-(`_auto_impl` / `_resolve_impl`), with paired `*_torch` / `*_triton` implementations behind it.
+Quantized kernel dispatch on the Python side goes through `relic_core.kernels.ops`
+(`_auto_impl` / `_resolve_impl`), with paired `*_torch` / `*_triton` implementations behind it —
+that module is relic-core's now, not this tree's.
 
 ## Hardware and toolchain
 

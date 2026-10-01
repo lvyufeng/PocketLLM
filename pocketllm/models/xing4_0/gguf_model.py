@@ -31,12 +31,12 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from src.models.xing4_0.attention import MLAAttentionWeights
-from src.models.xing4_0.block import DecoderLayer, DecoderLayerWeights, rms_norm
-from src.models.xing4_0.config import Xing4_0Params
-from src.models.xing4_0.decode_pos import Pos
-from src.models.xing4_0.hyper_connection import HyperConnectionWeights
-from src.models.xing4_0.mlp import GroupedExpertStack, MoEWeights, RoutedMoE, SwiGLUMLP
+from pocketllm.models.xing4_0.attention import MLAAttentionWeights
+from pocketllm.models.xing4_0.block import DecoderLayer, DecoderLayerWeights, rms_norm
+from pocketllm.models.xing4_0.config import Xing4_0Params
+from pocketllm.models.xing4_0.decode_pos import Pos
+from pocketllm.models.xing4_0.hyper_connection import HyperConnectionWeights
+from pocketllm.models.xing4_0.mlp import GroupedExpertStack, MoEWeights, RoutedMoE, SwiGLUMLP
 
 __all__ = ["Xing4_0GGUFModel"]
 
@@ -62,7 +62,7 @@ class Xing4_0GGUFModel:
         use_kernel: bool = True,
         residual_dtype: torch.dtype = torch.float32,
     ):
-        from src.loader.gguf.quantized_loader import GGUFQuantizedTensorLoader
+        from pocketllm.loader.gguf.quantized_loader import GGUFQuantizedTensorLoader
 
         self.path = str(gguf_path)
         self.device = torch.device(device)
@@ -80,7 +80,7 @@ class Xing4_0GGUFModel:
 
         self.embedding = self.loader.read_dense("token_embd.weight", dtype=dtype)
         self.output_norm = self.loader.read_dense("output_norm.weight", dtype=torch.float32)
-        from src.components.gguf.quantized_ops import QuantizedGGUFLinear
+        from pocketllm.components.gguf.quantized_ops import QuantizedGGUFLinear
 
         self.lm_head = QuantizedGGUFLinear(
             self.loader.read_quant("output.weight", self._type_of("output.weight")),
@@ -206,7 +206,7 @@ class Xing4_0GGUFModel:
         return self.loader.tensor_ref(name).type_name
 
     def _cuda(self):
-        from src.kernels.cuda_loader import load_cuda_kernel
+        from relic_core.kernels.cuda_loader import load_cuda_kernel
 
         module = load_cuda_kernel()
         if module is None:
@@ -227,7 +227,7 @@ class Xing4_0GGUFModel:
         product and everything it is then contracted with stay wide; the caller
         that needs a narrow tensor is the block, and it makes that choice once.
         """
-        from src.components.gguf.quantized_ops import QuantizedGGUFLinear
+        from pocketllm.components.gguf.quantized_ops import QuantizedGGUFLinear
 
         if index < int(self.params.first_k_dense_replace):
             return SwiGLUMLP(
@@ -296,7 +296,7 @@ class Xing4_0GGUFModel:
         `start_pos` is an `int` for every eager caller and a `Pos` for a decode step a graph replays.
         The one place the two differ here is the rotary table's row: a Python `int` is a value a
         capture freezes, so on the device path the table is built as `arange(seq) + pos` — the same
-        numbers, from an index tensor the graph reads.  See :mod:`src.models.xing4_0.decode_pos`.
+        numbers, from an index tensor the graph reads.  See :mod:`pocketllm.models.xing4_0.decode_pos`.
         """
         pos = Pos.of(start_pos)
         hidden = self.embed(input_ids)
@@ -323,7 +323,7 @@ class Xing4_0GGUFModel:
         return self.lm_head(collapsed).reshape(-1, self.lm_head.out_dim).float()
 
     def make_cache(self, capacity: int, *, batch: int = 1):
-        from src.models.xing4_0.attention import KVLatentCache
+        from pocketllm.models.xing4_0.attention import KVLatentCache
 
         return [
             KVLatentCache(batch, capacity, self.params, device=self.device, dtype=self.dtype)

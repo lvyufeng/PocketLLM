@@ -73,7 +73,7 @@ def _gguf_architecture(path: str) -> str:
     if not path:
         return ""
     try:
-        from src.loader.gguf.bundle import read_gguf_bundle
+        from pocketllm.loader.gguf.bundle import read_gguf_bundle
 
         metadata = read_gguf_bundle(path).metadata
     except Exception:

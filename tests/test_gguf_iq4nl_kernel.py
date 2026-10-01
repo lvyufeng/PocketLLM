@@ -30,11 +30,11 @@ import numpy as np
 import pytest
 import torch
 
-from src.loader.gguf import iq4_nl
-from src.loader.gguf.bundle import read_gguf_bundle
-from src.loader.gguf.quant_types import IQ4_NL_RUNTIME_SPAN
-from src.loader.gguf.quantized_loader import GGUFQuantizedTensorLoader
-from src.loader.gguf.tensor_reader import GGUFTensorDataReader
+from pocketllm.loader.gguf import iq4_nl
+from pocketllm.loader.gguf.bundle import read_gguf_bundle
+from pocketllm.loader.gguf.quant_types import IQ4_NL_RUNTIME_SPAN
+from pocketllm.loader.gguf.quantized_loader import GGUFQuantizedTensorLoader
+from pocketllm.loader.gguf.tensor_reader import GGUFTensorDataReader
 
 
 CHECKPOINT_DIR_ENV = "POCKETLLM_XING4_DIR"
@@ -77,7 +77,7 @@ def _assert_matches(got: np.ndarray, want: np.ndarray) -> None:
 def _cuda_mod():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    from src.kernels.cuda_loader import load_cuda_kernel
+    from relic_core.kernels.cuda_loader import load_cuda_kernel
 
     module = load_cuda_kernel()
     if module is None or not hasattr(module, "gguf_quant_gemm_forward"):

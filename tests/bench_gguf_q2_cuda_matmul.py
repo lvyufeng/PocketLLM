@@ -2,8 +2,8 @@ import time
 
 import torch
 
-from src.loader.gguf.tensor_reader import GGUFTensorDataReader, get_iq2xxs_signed_grid_tensor
-from src.kernels.cuda_loader import load_cuda_kernel
+from pocketllm.loader.gguf.tensor_reader import GGUFTensorDataReader, get_iq2xxs_signed_grid_tensor
+from relic_core.kernels.cuda_loader import load_cuda_kernel
 
 GGUF_PATH = "/mnt/data1/dsv4_inference/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf"
 

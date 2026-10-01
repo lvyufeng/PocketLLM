@@ -38,9 +38,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from src.models.xing4_0.block import DecoderLayer, DecoderLayerWeights, rms_norm
-from src.models.xing4_0.config import Xing4_0Params
-from src.models.xing4_0.hyper_connection import HyperConnection, HyperConnectionWeights
+from pocketllm.models.xing4_0.block import DecoderLayer, DecoderLayerWeights, rms_norm
+from pocketllm.models.xing4_0.config import Xing4_0Params
+from pocketllm.models.xing4_0.hyper_connection import HyperConnection, HyperConnectionWeights
 
 CONFIG = Path("/mnt/data2/Xing4.0-29B-A4B/config.json")
 SHARD = Path("/mnt/data2/Xing4.0-29B-A4B/model-00003-of-00041.safetensors")
@@ -372,7 +372,7 @@ def _layer(
     residual_dtype: torch.dtype | None = None,
 ) -> DecoderLayer:
     """A layer whose FFN is known, so only the plumbing is measured."""
-    from src.models.xing4_0.attention import MLAAttentionWeights
+    from pocketllm.models.xing4_0.attention import MLAAttentionWeights
 
     if mlp is None:
         mlp = lambda x: x  # noqa: E731
@@ -523,7 +523,7 @@ _KERNEL_REL_TOL = {torch.float32: 1e-5, torch.float16: 4e-3, torch.bfloat16: 4e-
 def _kernel():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    from src.models.xing4_0.hyper_connection import _load_hyper_connection_kernel
+    from pocketllm.models.xing4_0.hyper_connection import _load_hyper_connection_kernel
 
     module = _load_hyper_connection_kernel()
     if module is None:

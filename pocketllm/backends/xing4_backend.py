@@ -21,7 +21,7 @@ that resends its history pays for the history on every turn;
 ``--enable-prefix-caching`` (on by default) holds each prompt's cache state on
 the host keyed by the prompt's own tokens, and a later request restores the
 longest prefix it shares with one already served and forwards only the rest. See
-:mod:`src.models.xing4_0.prefix_cache` for what is stored and why the whole
+:mod:`pocketllm.models.xing4_0.prefix_cache` for what is stored and why the whole
 latent a layer is enough.
 
 **Requests serialize, and now they can serialize under the shared scheduler.** The trunk's
@@ -414,7 +414,7 @@ class Xing4Backend(SchedulerHost, RuntimeAdapter):
         at the same seam whether the cancel came from there or from the scheduler retiring the
         request, so the two are asked together.
         """
-        from src.models.xing4_0.generate import generate
+        from pocketllm.models.xing4_0.generate import generate
 
         self._ensure_loaded()
         self._ensure_prefix_cache()
@@ -469,7 +469,7 @@ class Xing4Backend(SchedulerHost, RuntimeAdapter):
         if self._loader is not None:
             self._model = self._loader(self._model_path, self._options)
         else:
-            from src.models.xing4_0.gguf_model import Xing4_0GGUFModel
+            from pocketllm.models.xing4_0.gguf_model import Xing4_0GGUFModel
 
             gguf, directory = resolve_paths(self._model_path, self._options, self._tokenizer_path)
             self._say(f"reading {gguf}")
@@ -545,7 +545,7 @@ class Xing4Backend(SchedulerHost, RuntimeAdapter):
             return
         if self._model is None:
             return
-        from src.models.xing4_0.prefix_cache import LatentPrefixCache
+        from pocketllm.models.xing4_0.prefix_cache import LatentPrefixCache
 
         self._prefix_cache = LatentPrefixCache(
             budget_bytes=self._options.prefix_cache_bytes,
@@ -724,7 +724,7 @@ class Xing4Backend(SchedulerHost, RuntimeAdapter):
         correctly, because the two routes never overlap. An ``on_step`` parameter that every caller
         left as ``None`` was a parameter with no caller, so it is gone.
         """
-        from src.models.xing4_0.generate import generate
+        from pocketllm.models.xing4_0.generate import generate
 
         self._ensure_loaded()
         self._ensure_prefix_cache()

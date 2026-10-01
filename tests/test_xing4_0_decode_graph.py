@@ -34,10 +34,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from src.models.xing4_0.decode_pos import Pos
-from src.models.xing4_0.gguf_model import Xing4_0GGUFModel
-from src.models.xing4_0.generate import generate
-from src.models.xing4_0.graphs import CAPTURE_WARMUP, MIN_BUCKET, DecodeGraphs, bucket_ladder
+from pocketllm.models.xing4_0.decode_pos import Pos
+from pocketllm.models.xing4_0.gguf_model import Xing4_0GGUFModel
+from pocketllm.models.xing4_0.generate import generate
+from pocketllm.models.xing4_0.graphs import CAPTURE_WARMUP, MIN_BUCKET, DecodeGraphs, bucket_ladder
 
 
 CHECKPOINT_DIR_ENV = "POCKETLLM_XING4_DIR"
@@ -118,7 +118,7 @@ def model():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for a capture")
     root = _dir()
-    from src.kernels.cuda_loader import load_cuda_kernel
+    from relic_core.kernels.cuda_loader import load_cuda_kernel
 
     module = load_cuda_kernel()
     if module is None or not hasattr(module, "gguf_moe_prefill_grouped_forward"):

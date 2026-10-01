@@ -45,7 +45,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from src.models.xing4_0.config import Xing4_0Params
+from pocketllm.models.xing4_0.config import Xing4_0Params
 
 __all__ = ["HyperConnection", "HyperConnectionWeights", "sinkhorn"]
 
@@ -109,7 +109,7 @@ def _load_hyper_connection_kernel():
     is correct, just slower.  The op's absence is the only thing being tolerated
     here -- an op that exists and fails still raises.
     """
-    from src.kernels.cuda_loader import load_cuda_kernel
+    from relic_core.kernels.cuda_loader import load_cuda_kernel
 
     module = load_cuda_kernel()
     if module is None or not hasattr(module, "xing4_hyper_connection_forward"):

@@ -38,9 +38,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from src.loader.gguf.iq4_nl import fold_to_runtime_span
-from src.loader.gguf.quant_types import IQ4_NL_RUNTIME_SPAN
-from src.models.xing4_0.config import Xing4_0Params
+from pocketllm.loader.gguf.iq4_nl import fold_to_runtime_span
+from pocketllm.loader.gguf.quant_types import IQ4_NL_RUNTIME_SPAN
+from pocketllm.models.xing4_0.config import Xing4_0Params
 
 __all__ = [
     "DenseExpertStack",
@@ -110,7 +110,7 @@ class MoEWeights:
         `silu(gate) * up` reaches values fp16 saturates.  Narrowing it here would
         put an inf into the sum the routed experts are added to.
         """
-        from src.components.gguf.quantized_ops import QuantizedGGUFLinear
+        from pocketllm.components.gguf.quantized_ops import QuantizedGGUFLinear
 
         def _folded(suffix: str) -> torch.Tensor:
             reference = loader.tensor_ref(f"{prefix}{suffix}")

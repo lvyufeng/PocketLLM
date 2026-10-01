@@ -21,9 +21,9 @@ from pathlib import Path
 import pytest
 import torch
 
-from src.models.xing4_0.attention import KVLatentCache
-from src.models.xing4_0.config import Xing4_0Params
-from src.models.xing4_0.decode_pos import Pos, write_row
+from pocketllm.models.xing4_0.attention import KVLatentCache
+from pocketllm.models.xing4_0.config import Xing4_0Params
+from pocketllm.models.xing4_0.decode_pos import Pos, write_row
 
 
 CONFIG = Path("/mnt/data2/Xing4.0-29B-A4B/config.json")

@@ -9,9 +9,11 @@ __pycache__/
 # Distribution / packaging
 .Python
 **/build/
-# Build trees under cpp_engine. `scripts/build_ascend.sh` and the documented cmake
-# invocations use the hyphenated names, but hand-run cmake commands have produced
-# underscore variants (build_cuda, build_ascend) that a hyphen-only pattern misses.
+# Build trees. Nothing here compiles any more -- the C++ engine these patterns
+# were written for is archived in relic-engine and relic-core does its own
+# building -- but they are kept because a stale build tree reappears the moment
+# anyone runs cmake in a checkout, and a hyphen-only pattern misses the
+# underscore variants (build_cuda, build_ascend) that hand-run cmake produces.
 **/build[-_]*/
 **/develop-eggs/
 **/dist/

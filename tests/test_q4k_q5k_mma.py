@@ -19,7 +19,7 @@ REAL_MINIMAX_PATH = Path("/mnt/data1/dsv4_inference/gguf_hfd/MiniMax-M2.7-GGUF/U
 def _cuda_gguf_ext_available() -> bool:
     if not torch.cuda.is_available():
         return False
-    from src.kernels.cuda_loader import load_cuda_kernel
+    from relic_core.kernels.cuda_loader import load_cuda_kernel
 
     cuda_mod = load_cuda_kernel()
     return cuda_mod is not None and hasattr(cuda_mod, "gguf_quant_gemm_prefill_forward")
@@ -30,8 +30,8 @@ def _load_qk_weight_rows(tensor_name: str, row_count: int):
 
     Returns (blocks[N, blocks_per_row, block_bytes] uint8 on cuda, row_elems, type_id).
     """
-    from src.loader.gguf.bundle import read_gguf_bundle
-    from src.loader.gguf.tensor_reader import get_cached_gguf_tensor_reader
+    from pocketllm.loader.gguf.bundle import read_gguf_bundle
+    from pocketllm.loader.gguf.tensor_reader import get_cached_gguf_tensor_reader
 
     bundle = read_gguf_bundle(REAL_MINIMAX_PATH)
     # Find the shard that actually holds this tensor name.
@@ -59,7 +59,7 @@ def _load_qk_weight_rows(tensor_name: str, row_count: int):
 )
 def test_q5k_mma_vs_float():
     """Q5_K MMA prefill output matches float baseline within int8 tolerance."""
-    from src.kernels.cuda_loader import load_cuda_kernel
+    from relic_core.kernels.cuda_loader import load_cuda_kernel
 
     cuda_mod = load_cuda_kernel()
 
@@ -113,7 +113,7 @@ def test_q5k_mma_vs_float():
 )
 def test_q4k_mma_vs_float():
     """Q4_K MMA prefill output matches float baseline within int8 tolerance."""
-    from src.kernels.cuda_loader import load_cuda_kernel
+    from relic_core.kernels.cuda_loader import load_cuda_kernel
 
     cuda_mod = load_cuda_kernel()
 

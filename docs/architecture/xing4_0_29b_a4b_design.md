@@ -202,7 +202,7 @@ and the whole checkpoint is 17.94 GiB against a 22 GiB card. Every other MoE in 
 its active experts over PCIe because its checkpoint is several times a card; here a per-token copy
 would be a round trip for weights that are already resident. So the experts are read once at load,
 folded into the 144-byte row element the grouped kernel indexes rows by
-(`src/loader/gguf/iq4_nl.fold_to_runtime_span`), and held.
+(`pocketllm/loader/gguf/iq4_nl.fold_to_runtime_span`), and held.
 
 **One grouped kernel for prefill and decode.** 64 experts × 3 projections is 192 GEMMs a layer if each
 is its own launch, and a 256-token chunk is 1024 routes. `gguf_moe_prefill_grouped_forward` takes a CSR
@@ -423,7 +423,7 @@ one aborted request).
 
 ### The prefix store, and the bug a served run found
 
-`src/models/xing4_0/prefix_cache.py` holds each prompt's cache state on the host keyed by the prompt's
+`pocketllm/models/xing4_0/prefix_cache.py` holds each prompt's cache state on the host keyed by the prompt's
 own token tuple, under an LRU byte budget. A later request restores the longest prefix it shares with
 one already served and forwards only the rest, at absolute positions.
 

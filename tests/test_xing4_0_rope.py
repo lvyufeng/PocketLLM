@@ -27,8 +27,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from src.models.xing4_0 import rope
-from src.models.xing4_0.config import Xing4_0Params, yarn_get_mscale
+from pocketllm.models.xing4_0 import rope
+from pocketllm.models.xing4_0.config import Xing4_0Params, yarn_get_mscale
 
 CONFIG = Path("/mnt/data2/Xing4.0-29B-A4B/config.json")
 
