@@ -32,16 +32,16 @@ import numpy as np
 import pytest
 import torch
 
-from src.loader.gguf import iq4_nl
-from src.loader.gguf.quant_types import (
+from pocketllm.loader.gguf import iq4_nl
+from pocketllm.loader.gguf.quant_types import (
     GGUF_ADDRESSABLE_TYPE_NAMES,
     GGUF_DENSE_TYPE_IDS,
     GGUF_DENSE_TYPE_NAMES,
     GGUF_LOADER_TYPE_NAMES,
 )
-from src.loader.gguf.quantized_loader import GGUFQuantizedTensorLoader
-from src.loader.gguf.reader import GGML_TYPES, GGUFReader, tensor_nbytes
-from src.loader.gguf.tensor_reader import GGUFTensorDataReader
+from pocketllm.loader.gguf.quantized_loader import GGUFQuantizedTensorLoader
+from pocketllm.loader.gguf.reader import GGML_TYPES, GGUFReader, tensor_nbytes
+from pocketllm.loader.gguf.tensor_reader import GGUFTensorDataReader
 from tests.gguf_test_utils import GGML_F32, GGML_IQ4_NL, write_gguf
 
 

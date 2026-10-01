@@ -42,7 +42,7 @@ import math
 
 import torch
 
-from src.models.xing4_0.config import Xing4_0Params
+from pocketllm.models.xing4_0.config import Xing4_0Params
 
 __all__ = [
     "cos_sin",

@@ -18,8 +18,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from src.loader.gguf.bundle import read_gguf_bundle
-from src.loader.gguf.tensor_reader import (
+from pocketllm.loader.gguf.bundle import read_gguf_bundle
+from pocketllm.loader.gguf.tensor_reader import (
     GGUFTensorDataReader,
     get_iq2xs_iq3xxs_signed_grid_tensor,
 )
@@ -31,7 +31,7 @@ REAL_GLM_PATH = Path("/mnt/data3/GLM-5.2-GGUF/UD-Q2_K_XL")
 def _cuda_gguf_ext_available() -> bool:
     if not torch.cuda.is_available():
         return False
-    from src.kernels.cuda_loader import load_cuda_kernel
+    from relic_core.kernels.cuda_loader import load_cuda_kernel
 
     cuda_mod = load_cuda_kernel()
     return cuda_mod is not None and hasattr(cuda_mod, "gguf_moe_prefill_grouped_forward")
@@ -48,7 +48,7 @@ def _stack_expert_blocks(reader, name, experts):
 
 
 def _type_id(tn: str) -> int:
-    from src.loader.gguf.quant_types import GGUF_DENSE_TYPE_IDS
+    from pocketllm.loader.gguf.quant_types import GGUF_DENSE_TYPE_IDS
 
     return GGUF_DENSE_TYPE_IDS[tn]
 
@@ -83,7 +83,7 @@ def _run_grouped(cuda_mod, x, rt, rw, seg, w1, w3, w2, meta, grid, env_flags_on)
     reason="real GLM GGUF or CUDA extension not available",
 )
 def test_glm_iq2xs_iq3xxs_dp4a_matches_fp32() -> None:
-    from src.kernels.cuda_loader import load_cuda_kernel
+    from relic_core.kernels.cuda_loader import load_cuda_kernel
 
     cuda_mod = load_cuda_kernel()
     bundle = read_gguf_bundle(REAL_GLM_PATH)

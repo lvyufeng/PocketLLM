@@ -35,8 +35,8 @@ from pocketllm.backends.xing4_backend import (
     _Options,
     resolve_paths,
 )
-from src.models.xing4_0.generate import Generation, _drain, generate, sample_token
-from src.models.xing4_0.prefix_cache import LatentPrefixCache, restore, snapshot
+from pocketllm.models.xing4_0.generate import Generation, _drain, generate, sample_token
+from pocketllm.models.xing4_0.prefix_cache import LatentPrefixCache, restore, snapshot
 
 # ---------------------------------------------------------------------------- stand-ins
 

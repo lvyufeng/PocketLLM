@@ -57,9 +57,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from src.models.xing4_0.config import Xing4_0Params
-from src.models.xing4_0.decode_pos import Pos, write_row
-from src.models.xing4_0.rope import cos_sin, inv_freq, rotate_interleaved
+from pocketllm.models.xing4_0.config import Xing4_0Params
+from pocketllm.models.xing4_0.decode_pos import Pos, write_row
+from pocketllm.models.xing4_0.rope import cos_sin, inv_freq, rotate_interleaved
 
 __all__ = ["MLAAttention", "MLAAttentionWeights", "KVLatentCache"]
 
@@ -367,7 +367,7 @@ class MLAAttention:
 
         `start_pos` is a `Pos` on the path a graph replays, and the three things it carries are used
         here: the row the cache writes, the width the cache is read at, and the position the mask is
-        expressed against.  See :mod:`src.models.xing4_0.decode_pos`.
+        expressed against.  See :mod:`pocketllm.models.xing4_0.decode_pos`.
         """
         p = self.params
         pos = Pos.of(start_pos)

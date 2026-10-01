@@ -137,7 +137,7 @@ def gguf_architecture(path: str) -> str | None:
             candidate = found[0]
         if not candidate.is_file() or candidate.suffix.lower() != ".gguf":
             return None
-        from src.loader.gguf.bundle import read_gguf_bundle
+        from pocketllm.loader.gguf.bundle import read_gguf_bundle
 
         metadata = read_gguf_bundle(candidate).metadata
         return str(metadata.get("general.architecture") or "") or None

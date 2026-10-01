@@ -58,7 +58,7 @@ import time
 
 import torch
 
-from src.models.xing4_0.decode_pos import Pos
+from pocketllm.models.xing4_0.decode_pos import Pos
 
 __all__ = ["CAPTURE_WARMUP", "MIN_BUCKET", "DecodeGraphs", "bucket_ladder"]
 

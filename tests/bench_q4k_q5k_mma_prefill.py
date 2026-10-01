@@ -13,8 +13,8 @@ from pathlib import Path
 
 import torch
 
-from src.loader.gguf.bundle import read_gguf_bundle
-from src.loader.gguf.tensor_reader import get_cached_gguf_tensor_reader
+from pocketllm.loader.gguf.bundle import read_gguf_bundle
+from pocketllm.loader.gguf.tensor_reader import get_cached_gguf_tensor_reader
 
 REAL_MINIMAX_PATH = Path("/mnt/data1/dsv4_inference/gguf_hfd/MiniMax-M2.7-GGUF/UD-IQ1_M")
 
@@ -46,7 +46,7 @@ def bench(fn, iters=20, warmup=5):
 
 
 def main():
-    from src.kernels.cuda_loader import load_cuda_kernel
+    from relic_core.kernels.cuda_loader import load_cuda_kernel
 
     cuda_mod = load_cuda_kernel()
     device = torch.device("cuda:0")

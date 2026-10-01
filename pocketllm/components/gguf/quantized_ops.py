@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import torch
 
-from src.kernels.cuda_loader import load_cuda_kernel
-from src.loader.gguf.quantized_tensor import QuantizedGGUFTensor
+from relic_core.kernels.cuda_loader import load_cuda_kernel
+from pocketllm.loader.gguf.quantized_tensor import QuantizedGGUFTensor
 
 
 class QuantizedGGUFLinear:

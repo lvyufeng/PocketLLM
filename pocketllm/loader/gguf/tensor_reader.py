@@ -11,9 +11,9 @@ from typing import Iterable
 import numpy as np
 import torch
 
-from src.loader.gguf import iq4_nl
-from src.loader.gguf.quant_types import GGUF_TERNARY_TYPE_NAMES
-from src.loader.gguf.reader import GGUFFile, GGUFReader, GGUFTensorInfo
+from pocketllm.loader.gguf import iq4_nl
+from pocketllm.loader.gguf.quant_types import GGUF_TERNARY_TYPE_NAMES
+from pocketllm.loader.gguf.reader import GGUFFile, GGUFReader, GGUFTensorInfo
 
 
 _GGUF_READER_PROFILE = os.getenv("DEEPSEEK_GGUF_READER_PROFILE", "0").lower() in {"1", "true", "yes"}
@@ -186,7 +186,7 @@ def _extract_ggml_table(table_name: str, *, dtype: str, expected: int) -> np.nda
     """Parse a vendored llama.cpp IQ lookup table without duplicating constants.
 
     The header ships with the kernels in relic-core, so the path comes from
-    :mod:`src.loader.gguf.iq4_nl`, which resolves it against that installed package.
+    :mod:`pocketllm.loader.gguf.iq4_nl`, which resolves it against that installed package.
     """
     header = iq4_nl._GGML_COMMON
     text = header.read_text(encoding="utf-8")
@@ -285,7 +285,7 @@ def get_iq2xs_iq3xxs_signed_grid_tensor() -> torch.Tensor:
 
 @lru_cache(maxsize=1)
 def get_iq1_grid_tensor() -> torch.Tensor:
-    from src.loader.gguf.iq1_grid import iq1_grid_i8
+    from pocketllm.loader.gguf.iq1_grid import iq1_grid_i8
 
     return torch.from_numpy(iq1_grid_i8().copy()).contiguous().to(device="cpu")
 
@@ -1081,7 +1081,7 @@ class GGUFTensorDataReader:
         delta = np.where(qh_parts & 0x08 == 0, np.float32(0.125), np.float32(-0.125))
         delta = delta.reshape((n_blocks, -1, 2, 2, 1))
 
-        from src.loader.gguf.iq1_grid import iq1_grid_i8
+        from pocketllm.loader.gguf.iq1_grid import iq1_grid_i8
 
         grid = iq1_grid_i8().astype(np.float32, copy=False)[qidx.reshape(-1)].reshape((n_blocks, -1, 2, 2, 8))
         out = (dl * (grid + delta)).reshape((rows, blocks_per_row, 256))

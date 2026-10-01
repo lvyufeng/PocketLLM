@@ -28,8 +28,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from src.models.xing4_0.config import Xing4_0Params
-from src.models.xing4_0.mlp import (
+from pocketllm.models.xing4_0.config import Xing4_0Params
+from pocketllm.models.xing4_0.mlp import (
     DenseExpertStack,
     GroupedExpertStack,
     MoEWeights,
@@ -75,7 +75,7 @@ def _params() -> Xing4_0Params:
 def _cuda_mod():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    from src.kernels.cuda_loader import load_cuda_kernel
+    from relic_core.kernels.cuda_loader import load_cuda_kernel
 
     module = load_cuda_kernel()
     if module is None or not hasattr(module, "gguf_moe_prefill_grouped_forward"):
@@ -345,7 +345,7 @@ def test_the_plan_never_reads_back_from_the_card() -> None:
 
 
 def _quantized_moe(params: Xing4_0Params, experts: int) -> MoEWeights:
-    from src.loader.gguf.quantized_loader import GGUFQuantizedTensorLoader
+    from pocketllm.loader.gguf.quantized_loader import GGUFQuantizedTensorLoader
 
     with GGUFQuantizedTensorLoader(str(_gguf_path()), device="cuda") as loader:
         weights = MoEWeights.from_gguf(loader, GGUF_PREFIX)
@@ -366,7 +366,7 @@ def _quantized_moe(params: Xing4_0Params, experts: int) -> MoEWeights:
 
 def _decoded_dense(weights: MoEWeights, in_dim: int, inter_dim: int) -> dict[str, torch.Tensor]:
     """The same blocks, decoded to fp32 on the host, in the dense stacks' layout."""
-    from src.loader.gguf import iq4_nl
+    from pocketllm.loader.gguf import iq4_nl
 
     out = {}
     for key, row_elems in (("w1", in_dim), ("w3", in_dim), ("w2", inter_dim)):
@@ -615,7 +615,7 @@ def test_the_gguf_block_has_the_shape_the_kernel_wants() -> None:
     -- and shape-checks pass, because 64 x 3584 and 3584 x 64 are both square
     against their own inputs in the wrong order only at the *end*.
     """
-    from src.loader.gguf.quantized_loader import GGUFQuantizedTensorLoader
+    from pocketllm.loader.gguf.quantized_loader import GGUFQuantizedTensorLoader
 
     params = _params()
     with GGUFQuantizedTensorLoader(str(_gguf_path()), device="cuda") as loader:

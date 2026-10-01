@@ -4,18 +4,18 @@ from pathlib import Path
 
 import torch
 
-from src.loader.gguf.bundle import GGUFBundle, GGUFTensorRef, read_gguf_bundle
-from src.loader.gguf.iq4_nl import fold_to_runtime_span
-from src.loader.gguf.quant_types import GGUF_DENSE_TYPE_IDS
-from src.loader.gguf.quantized_tensor import QuantizedGGUFTensor
-from src.loader.gguf.tensor_reader import GGUFTensorDataReader
+from pocketllm.loader.gguf.bundle import GGUFBundle, GGUFTensorRef, read_gguf_bundle
+from pocketllm.loader.gguf.iq4_nl import fold_to_runtime_span
+from pocketllm.loader.gguf.quant_types import GGUF_DENSE_TYPE_IDS
+from pocketllm.loader.gguf.quantized_tensor import QuantizedGGUFTensor
+from pocketllm.loader.gguf.tensor_reader import GGUFTensorDataReader
 
 
 class GGUFQuantizedTensorLoader:
     """Read dense and raw quantized GGUF tensors into device memory.
 
     This class owns GGUF file readers and format/type checks only.  CUDA kernel
-    invocation lives under src.components.gguf.
+    invocation lives under pocketllm.components.gguf.
     """
 
     def __init__(self, bundle_or_path: GGUFBundle | str | Path, *, device: str | torch.device = "cuda"):

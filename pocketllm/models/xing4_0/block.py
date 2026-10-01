@@ -36,10 +36,10 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from src.models.xing4_0.attention import MLAAttention, MLAAttentionWeights
-from src.models.xing4_0.config import Xing4_0Params
-from src.models.xing4_0.decode_pos import Pos
-from src.models.xing4_0.hyper_connection import HyperConnection, HyperConnectionWeights
+from pocketllm.models.xing4_0.attention import MLAAttention, MLAAttentionWeights
+from pocketllm.models.xing4_0.config import Xing4_0Params
+from pocketllm.models.xing4_0.decode_pos import Pos
+from pocketllm.models.xing4_0.hyper_connection import HyperConnection, HyperConnectionWeights
 
 __all__ = ["DecoderLayer", "DecoderLayerWeights", "rms_norm"]
 
@@ -121,7 +121,7 @@ class DecoderLayer:
         `start_pos` is an `int` on the eager path and a `Pos` on the one a graph replays.  Nothing in
         this method reads it — the two sublayers both hand it to the attention, which is the only
         place in a block that a position means anything.  See
-        :mod:`src.models.xing4_0.decode_pos`.
+        :mod:`pocketllm.models.xing4_0.decode_pos`.
         """
         p = self.params
         # The sublayers work in `dtype` -- the width the GEMMs and the attention

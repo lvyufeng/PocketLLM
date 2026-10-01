@@ -1,3 +1,17 @@
+"""Where code may not be imported from, one test per surviving layer.
+
+Each rule here is a boundary the tree is expected to hold, written the way the
+crate asks for it: the loader, the components, and the models are separate
+layers, and an import that crosses the wrong way is a design error rather than
+a style one.
+
+The rules once described a `src/` tree with a runtime layer and a MoE
+component layer beside it. Those layers went out with the multi-card cut, and
+the survivors now sit under `pocketllm/`, so each rule was retargeted at the
+package that is actually there instead of being left pointed at a directory
+that no longer exists.
+"""
+
 from __future__ import annotations
 
 import ast
@@ -5,44 +19,34 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = REPO_ROOT / "src"
+PACKAGE_ROOT = REPO_ROOT / "pocketllm"
 
+# Namespaces that were removed with the multi-card cut. They must not be
+# imported anywhere; a hit means a module survived that should not have.
 REMOVED_IMPORT_PREFIXES = (
-    "src.gguf",
-    "src.models.moe",
-    "src.runtime.deepseek_v4",
-    "src.runtime.moe",
-    "src.moe",
-    "src.moe_model",
+    "pocketllm.moe",
+    "pocketllm.moe_model",
+    "pocketllm.models.moe",
+    "pocketllm.runtime",
+    "pocketllm.csrc",
+    "pocketllm.gguf",
 )
 
-RUNTIME_FORBIDDEN_IMPORT_PREFIXES = (
-    "safetensors",
-    "src.loader",
-    "src.models",
-)
-
+# The checkpoint format is a loader concern. Nothing in the loader is allowed
+# to reach up into the models or the serving adapters.
 LOADER_FORBIDDEN_IMPORT_PREFIXES = (
-    "src.models",
-    "src.runtime",
+    "pocketllm.models",
+    "pocketllm.backends",
+    "pocketllm.server",
+    "pocketllm.api",
 )
 
-COMPONENTS_MOE_ALLOWED_MODEL_IMPORTS = {
-    # Exactly the specs `src/components/moe/registry.py::_init_specs` imports to build its
-    # `general.architecture` table. GLM-DSA was registered there and left out of this set, so the
-    # test failed on a registry that is doing the one thing it is allowed to do.
-    "src.models.deepseek_v4.spec",
-    "src.models.glm_dsa.spec",
-    "src.models.minimax_m2.spec",
-}
-
-COMPONENTS_MOE_FORBIDDEN_MODEL_MODULES = (
-    ".generation",
-    ".loader",
-    ".moe_runtime",
-    ".moe_server",
-    ".partition",
-    ".runtime",
+# The GGUF component layer wraps a loader for a model. It may read the loader,
+# but it must not pull in a whole model or the runtime that drives one.
+COMPONENTS_FORBIDDEN_IMPORT_PREFIXES = (
+    "pocketllm.models",
+    "pocketllm.backends",
+    "pocketllm.server",
 )
 
 
@@ -75,7 +79,7 @@ def _format_violations(violations: list[tuple[Path, str]]) -> str:
 
 def test_removed_namespaces_are_not_imported_from_source() -> None:
     violations: list[tuple[Path, str]] = []
-    for path in _python_files(SRC_ROOT):
+    for path in _python_files(PACKAGE_ROOT):
         for module in _imported_modules(path):
             if _starts_with_any(module, REMOVED_IMPORT_PREFIXES):
                 violations.append((path, module))
@@ -83,19 +87,9 @@ def test_removed_namespaces_are_not_imported_from_source() -> None:
     assert not violations, _format_violations(violations)
 
 
-def test_runtime_stays_model_and_checkpoint_format_agnostic() -> None:
+def test_loader_does_not_depend_on_models_components_or_serving() -> None:
     violations: list[tuple[Path, str]] = []
-    for path in _python_files(SRC_ROOT / "runtime"):
-        for module in _imported_modules(path):
-            if _starts_with_any(module, RUNTIME_FORBIDDEN_IMPORT_PREFIXES):
-                violations.append((path, module))
-
-    assert not violations, _format_violations(violations)
-
-
-def test_loader_does_not_depend_on_runtime_or_model_packages() -> None:
-    violations: list[tuple[Path, str]] = []
-    for path in _python_files(SRC_ROOT / "loader"):
+    for path in _python_files(PACKAGE_ROOT / "loader"):
         for module in _imported_modules(path):
             if _starts_with_any(module, LOADER_FORBIDDEN_IMPORT_PREFIXES):
                 violations.append((path, module))
@@ -103,24 +97,11 @@ def test_loader_does_not_depend_on_runtime_or_model_packages() -> None:
     assert not violations, _format_violations(violations)
 
 
-def test_components_moe_only_imports_model_specs_for_registry_discovery() -> None:
+def test_components_do_not_depend_on_models_or_serving() -> None:
     violations: list[tuple[Path, str]] = []
-    for path in _python_files(SRC_ROOT / "components" / "moe"):
+    for path in _python_files(PACKAGE_ROOT / "components"):
         for module in _imported_modules(path):
-            if not _starts_with_any(module, ("src.models",)):
-                continue
-            if path.name == "registry.py" and module in COMPONENTS_MOE_ALLOWED_MODEL_IMPORTS:
-                continue
-            violations.append((path, module))
-
-    assert not violations, _format_violations(violations)
-
-
-def test_components_moe_does_not_import_model_runtime_loader_or_servers() -> None:
-    violations: list[tuple[Path, str]] = []
-    for path in _python_files(SRC_ROOT / "components" / "moe"):
-        for module in _imported_modules(path):
-            if module.startswith("src.models") and module.endswith(COMPONENTS_MOE_FORBIDDEN_MODEL_MODULES):
+            if _starts_with_any(module, COMPONENTS_FORBIDDEN_IMPORT_PREFIXES):
                 violations.append((path, module))
 
     assert not violations, _format_violations(violations)

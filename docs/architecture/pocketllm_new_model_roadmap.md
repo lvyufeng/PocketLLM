@@ -68,7 +68,7 @@ Every id here is read out of the file's own header, not from documentation. Two 
 are unusual:
 
 - **The type ids are fork-private.** Upstream GGML assigns nothing near 142; our
-  `src/loader/gguf/quant_types.py` lists nine dense types and no ternary one. The failure mode to design
+  `pocketllm/loader/gguf/quant_types.py` lists nine dense types and no ternary one. The failure mode to design
   against is a silent F16 upcast, which costs ten times the memory and makes a wrong kernel look right.
 - **`token_embd.weight` and `output.weight` are ternary too**, and `token_embd` carries an *inverse*
   Hadamard. The model card is explicit that there are "no high-precision escape hatches behind a low-bit
