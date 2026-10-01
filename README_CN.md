@@ -1,84 +1,86 @@
 # PocketLLM
 
+[![PyPI version](https://badge.fury.io/py/pocketllm.svg)](https://pypi.org/project/pocketllm/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Docs](https://img.shields.io/badge/docs-lvyufeng.github.io%2FPocketLLM-blue.svg)](https://lvyufeng.github.io/PocketLLM/)
+
 [English](README.md) | 中文
 
-PocketLLM 是一个面向消费级多卡系统的大模型推理工程栈，包含 C++/CUDA 与 PyTorch runtime。它结合模型专用 kernel、低 bit 格式、tensor/expert parallel、CPU/GPU placement，以及面向单请求的可复现实测 benchmark。
+PocketLLM 把大模型跑在**单个加速器**上——一张消费级显卡，或者端侧、手机这类目标。模型装得下就整卡常驻；装不下就继续降位宽，而不是加第二张卡。
 
-项目最初来自在 4×RTX 2080 Ti 上运行 DeepSeek-V4 的工程实践，目前已经包含 DeepSeek-V4、MiniMax-M2.7、GLM-5.2、Qwen3.8-27B、DeepSeek-V4.1-Flash、MiMo-V2.6-Flash 和 Ternary-Bonsai-2-27B 的已验证 runtime。PocketLLM 不是一个“所有模型共用同一后端”的框架：不同模型使用与其架构和 checkpoint 格式匹配的执行路径。
+> **本仓的定位已经收紧。** 它以前描述的是整个多卡栈。那个栈——tensor parallel、expert parallel、host offload、多卡 serving 路径——现在在 **[RelicLLM](https://github.com/lvyufeng/RelicLLM)**，原生 kernel 在 **[relic-core](https://github.com/lvyufeng/relic-core)**，退役的 C++ engine 归档在 **[relic-engine](https://github.com/lvyufeng/relic-engine)**。代码还没有切；本 README 和文档说明的是边界将落在哪里。
 
-其中四个模型已经通过 OpenAI 兼容 API 端到端服务：**Qwen3.8-27B-FP8** 走原生 C++ runtime，**Ternary-Bonsai-2-27B** 走同一个 runtime 且只用**一张**卡，**DeepSeek-V4.1-Flash** 走 `pocketllm serve --backend v41`，**MiMo-V2.6-Flash** 走 `pocketllm serve --backend mimo`。四条路径都在真实 checkpoint 上做过验证。
+> **项目状态：** 研究和工程软件。本仓的每个数字都来自特定 checkpoint 和硬件配置的实测，不代表通用性能保证。
 
-> **项目状态：** 研究和工程软件。下面的数字来自特定 checkpoint、硬件和测试口径，不代表通用性能保证。
+## 规则
+
+**装不下就降位宽——不 offload，也不拆到多卡。**
+
+位宽阶梯是 Q4 → Q2 → IQ2 → IQ1 → ternary，按这个顺序往下走，停在模型还能正确作答的最低一档。host offload 和多卡 tensor parallel 明确不在范围内：实测 hybrid GPU/CPU expert 路径比 experts 常驻卡上慢 **2.3×**，而一个需要四张卡才能回答问题的 checkpoint 是另一个产品。
+
+有三类 checkpoint 能整卡装下：
+
+| 模型 | 格式 | 占用 |
+| --- | --- | --- |
+| [Ternary-Bonsai-2-27B](docs/models/ternary-bonsai-2-27b.md) | GGUF `PTQ1_0` —— 每权重 1.75 bit | **5.53 GiB** |
+| [Xing4.0-29B-A4B](docs/models/xing4.0-29b-a4b.md) | GGUF `IQ4_NL` —— 每权重 4.5 bit | **17.94 GiB** |
+| [DeepSeek-V4 GGUF Q2](docs/models/deepseek-v4-gguf-q2-single-gpu.md) | GGUF Q2 / IQ2 / IQ1 | 一张 22 GiB 卡 |
 
 ## News
 
-- [2026/09] [Ternary-Bonsai-2-27B 单卡端到端可服务](docs/models/ternary-bonsai-2-27b.md)
-- [2026/09] [MiMo-V2.6-Flash 四卡端到端可服务](docs/models/mimo-v2.6-flash.md)
-- [2026/09] [DeepSeek-V4.1-Flash 端到端可服务](docs/models/deepseek-v4.1-flash.md)
-- [2026/09] [Qwen3.8-27B-FP8 有了原生 OpenAI 兼容 server](docs/models/qwen3.8-27b-fp8.md)
-- [2026/08] [Qwen3.8-27B 接上两个外部投机 drafter](docs/models/qwen3.8-27b-fp8.md#optional-speculative-decoding)
+- [2026/09] [Ternary-Bonsai-2-27B 单卡端到端服务](docs/models/ternary-bonsai-2-27b.md)
+- [2026/09] [Xing4.0-29B-A4B 单卡端到端服务](docs/models/xing4.0-29b-a4b.md)
+- [2026/09] [DeepSeek-V4.1-Flash 四卡端到端服务](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/deepseek-v4.1-flash.md)
+- [2026/09] [Qwen3.8-27B-FP8 有了原生 OpenAI 兼容服务端](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/qwen3.8-27b-fp8.md)
+- [2026/05] [DeepSeek-V4 GGUF Q2 单卡运行](docs/models/deepseek-v4-gguf-q2-single-gpu.md)
 
-[更早的条目与每条的实测数字 →](https://lvyufeng.github.io/PocketLLM/#news)
+多卡条目只作衔接列出，它们的记录在 [RelicLLM 的文档](https://lvyufeng.github.io/RelicLLM/)里。
 
-## PocketLLM 提供什么
+## 安装
 
-- **模型专用推理路径：** 支持 hybrid attention、MLA、GQA、Gated DeltaNet、dense MLP 和 routed MoE 层。
-- **避免不必要的低 bit 展开：** 在支持的热路径中直接消费 FP4、FP8 E4M3、GGUF Q4/Q5/Q8、IQ1/IQ2/IQ3、Q2 等量化 block。
-- **消费级 GPU 并行：** 支持 PCIe 多卡上的 TP4/NCCL；对放不进显存的 checkpoint，支持 CPU/NUMA expert placement。
-- **Prefill/decode 分离：** 大 batch kernel 与单 token latency 路径独立调度、独立优化。
-- **原生 C++/CUDA runtime：** `cpp_engine/` 当前支持 DeepSeek-V4 GGUF/Safetensors 路径、Qwen3.8 FP8 Safetensors 文本生成、端到端按 ternary 消费的 1.75 bit GGUF，以及已验证的 OpenAI 兼容文本 server。
-- **为“放不进显存的 checkpoint”准备的 host-PyTorch adapter：** `--backend v41` 用四个进程（每卡一个）在 memory-mapped checkpoint 上运行 DeepSeek-V4.1-Flash —— dense tree 和 packed FP4 expert 在 GPU 上执行，routed expert 从 pinned host bank 读取。
-- **四个 rank 共享的 host 常驻 expert bank：** `--backend mimo` 把 MiMo-V2.6-Flash 的 149.81 GiB MXFP4 expert 放在一个 `/dev/shm` 段里，每个 rank 都 attach 到同一份，并逐层把 expert 分出去 —— decode 一步按“抽取”分，prefill chunk 按“expert”分 —— 于是一个 rank 只需要 stage 一个 token 抽到的 8 个 expert 中的 2 个，而不是全部 8 个。
-- **检查和验证工具：** GGUF 架构/spec 报告、Safetensors audit、tensor shape 检查、数值 parity 测试和真实 checkpoint benchmark。
-
-## 支持模型一览
-
-每个模型都有与其架构和 checkpoint 格式匹配的 runtime，每个名字都链到它的模型页。表里的数字是该页
-的 headline，不是这里的独立 benchmark —— 记录是那一页，连同它的测量条件和 `## Known limitations`。
-
-| 模型 | 格式 | Runtime | 状态 | Headline |
-| --- | --- | --- | --- | --- |
-| [DeepSeek-V4.1-Flash](docs/models/deepseek-v4.1-flash.md) | Safetensors FP8 + FP4 | `--backend v41`，host PyTorch，TP4 | 文本 + OpenAI server | 260k prompt prefill 150–152 tok/s |
-| [MiMo-V2.6-Flash](docs/models/mimo-v2.6-flash.md) | Safetensors FP8 + MXFP4 | `--backend mimo`，host expert bank，TP4 | 文本 + OpenAI server | 262k prompt prefill 104 tok/s |
-| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | C++/CUDA，TP4 | 文本 + OpenAI server | prefill 865 tok/s，decode 43 tok/s |
-| [Ternary-Bonsai-2-27B](docs/models/ternary-bonsai-2-27b.md) | GGUF ternary，1.75 bit/权重 | C++/CUDA，**单卡**，无需 flag | 文本 + OpenAI server | prefill 636 tok/s，decode 26 tok/s |
-| [DeepSeek-V4-Flash](docs/models/deepseek-v4.md) | Safetensors FP4/FP8，GGUF Q2 | PyTorch 与 C++/CUDA，TP4 | 文本 + server（C++/PyTorch） | C++ FP4 prefill 约 401 tok/s |
-| [MiniMax-M2.7](docs/models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | Raw-block CUDA，TP4 | 文本，仅 CLI | 256-token prefill 约 105 tok/s |
-| [GLM-5.2](docs/models/glm-5.2.md) | GGUF `UD-Q2_K_XL` | Raw-block CUDA，TP4 | 文本，仅 CLI | prefill 约 0.79 tok/s |
-
-[Qwen3.8-27B](docs/models/qwen3.8-27b-fp8.md) 一行还覆盖同一文本架构下的
-[NVFP4](docs/models/qwen3.8-27b-nvfp4.md) 和[官方 BF16](docs/models/qwen3.8-27b-bf16.md) 两个
-checkpoint；上面这张表的完整八列版本、带格式与验证细节，是[支持矩阵](docs/models/README.md)。
-
-模型页面会把“模型架构规格”和“PocketLLM 当前实际实现能力”分开。`inspect`、`smoke` 和 benchmark 也不自动等于 production serving 保证。
-
-## 性能
-
-这里发布的每一个数字都是一次测量 —— 一个 checkpoint、一套硬件、一种测法 —— 从来不是性能承诺。
-结果紧挨着产生它的 runtime 存放：每个模型页都有自己的 Performance 段，连同测量条件和不能做的对比。
-更长的记录独立放在[性能记录](docs/performance/index.md)下，其中包括
-[DeepSeek-V4.1-Flash served 运行记录](docs/performance/deepseek_v4_1_flash_served_gate.md)和
-[Qwen 并发验证](docs/performance/cpp_openai_concurrency_validation.md)。
-
-比较这个 repository 里任意两个结果之前，先读 [Benchmark 口径](docs/guides/benchmarking.md)。
-
-## 架构概览
-
-PocketLLM 包含两类互补执行方式：
-
-1. **GPU-resident 与低 bit 执行：** 在总显存预算允许时，让本地权重或 expert block 常驻 GPU。
-2. **异构执行：** 将 routed experts 放在 CPU/NUMA 内存，只把当前 token 或 prefill chunk 激活的量化 block 搬到 GPU。
-
-Runtime 是模型专用的：DeepSeek-V4 使用 MLA/indexing 和 routed-expert 调度；DeepSeek-V4.1-Flash 使用 causal encoder-decoder 与 CSA2 shared-KV attention，其 checkpoint 的 268.95 GiB routed expert 和 189.13 GiB Engram 表留在 host 内存或磁盘上；MiMo-V2.6-Flash 使用 global attention 与带 per-head sink 的滑窗 attention 的混合结构，149.81 GiB MXFP4 expert 放在共享 host bank 里，attention 按 checkpoint 自带的四路划分切开；MiniMax-M2.7、GLM-5.2 使用 GGUF raw-block 路径；Qwen3.8 使用 Safetensors FP8 online unpacking 加 hybrid linear/full attention；Ternary-Bonsai-2-27B 是同一种 hybrid attention 装在一个 1.75 bit 的 GGUF 里，tensor 端到端按 ternary 消费，文件声明的 incoherence 旋转作用在激活上。设计上的热路径不会将完整量化权重展开成 FP32 副本。
-
-## 快速开始
-
-安装方式和坑见 [Getting started](docs/getting-started.md)。从源码构建：
+### 完整安装
 
 ```bash
-python -m pip install -r requirements.txt
-python -m pip install --no-build-isolation .
+# 先装构建前置依赖：构建过程是从环境里 import 它们，不会自己去拉。
+pip install "torch>=2.0,<2.7" "setuptools>=68" wheel ninja cmake pybind11
+
+pip install pocketllm --no-build-isolation
 ```
+
+会编译 CUDA 扩展和原生 C++ engine，耗时 5–15 分钟。
+
+**环境要求：**
+- Python >= 3.10
+- PyTorch >= 2.0, < 2.7（先装：`pip install "torch>=2.0,<2.7"`）
+- CUDA toolkit 11.8+（GPU 加速）
+- CMake >= 3.18、pybind11 >= 2.10、Ninja >= 1.11
+- `setuptools >= 68` 和 `wheel`
+- 16 GB+ 内存（编译用）
+
+**注意：** `--no-build-isolation` 是必须的，它让构建用你环境里的 PyTorch——后者必须与你的 CUDA toolkit 版本匹配。代价是 pip 不会去拉上面那些构建前置依赖，你必须在安装前把它们装进环境。新建的 virtualenv 一个都没有：`python -m venv` 只带解释器自带的 `setuptools`，Python 3.10 上它比提供 `bdist_wheel` 命令的版本旧，Python 3.12+ 上则根本不装 setuptools——所以安装会先在元数据生成阶段以 `invalid command 'bdist_wheel'` 失败，再在原生 engine 构建阶段因为缺 `pybind11` 或 `cmake` 失败。上面那行 `pip install "torch…"` 会把它们都装上。
+
+### 仅 PyTorch 安装（跳过 C++ engine）
+
+只需要 PyTorch 后端，或者缺 C++ 构建依赖时：
+
+```bash
+pip install "torch>=2.0,<2.7" "setuptools>=68" wheel
+POCKETLLM_BUILD_CPP=0 pip install pocketllm --no-build-isolation
+```
+
+跳过 C++ engine，但仍然会编译 PyTorch CUDA 扩展，所以依然需要 `torch` 和一个够新的 `setuptools`。
+
+### 开发安装
+
+```bash
+git clone https://github.com/lvyufeng/PocketLLM.git
+cd PocketLLM
+pip install "torch>=2.0,<2.7" "setuptools>=68" wheel ninja cmake pybind11
+pip install -e . --no-build-isolation
+```
+
+## 快速开始
 
 ### Python API
 
@@ -91,97 +93,116 @@ llm = LLM(
     tensor_parallel_size=1,
 )
 
-print(llm.generate("What is artificial intelligence?").text)
+result = llm.generate("What is artificial intelligence?")
+print(result.text)
 
 for token in llm.stream("Explain quantum computing"):
     print(token.text, end="", flush=True)
 ```
 
-### OpenAI 兼容 server
+### OpenAI 兼容服务端
 
 ```bash
-pocketllm serve \
-    --model /path/to/checkpoint \
-    --backend auto \
-    --tensor-parallel-size 4
-```
+# 单卡，默认路径
+pocketllm serve --model /path/to/checkpoint --backend auto
 
-```bash
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "pocketllm", "messages": [{"role": "user", "content": "Hello!"}], "stream": true}'
+  -d '{
+    "model": "pocketllm",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
 ```
 
-### Tensor Parallel（多卡）
+`--tensor-parallel-size` 在 CLI 里还在，取值大于 1 今天也还能跑——但那是多卡路径，属于 [RelicLLM](https://github.com/lvyufeng/RelicLLM)，不是本库的目标。
 
-```bash
-pocketllm serve \
-    --model /path/to/qwen-27b-fp8 \
-    --backend cpp \
-    --tensor-parallel-size 4 \
-    --host 0.0.0.0 \
-    --port 8000
-```
+## 什么时候用 PocketLLM
 
-各模型的启动命令、可调项和 standalone engine 的用法在[模型页](docs/models/README.md)和
-[Getting started](docs/getting-started.md)；C++ 引擎的独立构建见
-[cpp_engine/README.md](cpp_engine/README.md)。
+**PocketLLM 面向：**
+- ✅ 一张消费级显卡（RTX 2080 Ti、3090、4090）跑一个**整卡常驻**的 checkpoint，没有 host bank，没有第二个进程
+- ✅ 把量化当作"装得下"的手段——GGUF Q4/Q2/IQ2/IQ1、FP4，以及一份 1.75-bit 的 ternary GGUF，它的权重始终按 ternary 消费、从不 upcast 成 fp32
+- ✅ 低延迟单请求推理：prefill 与 decode 分派路径独立，优化其中一个不会伤到另一个
+- ✅ 端侧与手机目标——那里"装得下"是硬约束，不是一个可调参数
+
+**如果你需要以下能力，请看 [RelicLLM](https://github.com/lvyufeng/RelicLLM)：**
+- ❌ **多卡。** tensor parallel、expert parallel、host expert bank、CPU/NUMA placement 都是 RelicLLM 的，这是刻意的——本仓不往那边走。
+- ❌ **超过一张卡的 checkpoint。** 这里的答案是继续降位宽，不是加卡。
+
+**如果你需要**广泛的模型覆盖、multi-LoRA、多模态输入或生产级调度特性，请看 vLLM 或 SGLang。PocketLLM 是一份很短的 checkpoint 清单配上很深的模型专用优化，不是一个通用后端。
+
+## PocketLLM 提供什么
+
+- **单卡执行。** checkpoint 常驻一张卡。没有 host bank，没有第二个进程，没有需要同步的集合通信。
+- **低 bit 执行，不做无谓展开。** GGUF Q4/Q2/IQ2/IQ1、FP4、FP8 E4M3 与 1.75-bit ternary 格式都在热路径上直接消费量化块；该省的地方不会把原始权重展开成完整 FP32 拷贝。
+- **一条低到 1.75 bit 的量化阶梯。** Ternary-Bonsai-2-27B 把 27B 模型放进 **5.53 GiB**，于是 22 GiB 的卡上还剩下 245,760 token 的上下文空间。
+- **一个 experts 全常驻的 29B MoE。** Xing4.0-29B-A4B 的 **17.94 GiB** `IQ4_NL` 权重——38 个 MoE 层全部 64 个 expert——整卡装下，decode 时没有 expert 目录要查。
+- **prefill / decode 分派。** 大行 kernel 与单 token 延迟路径各自优化。
+- **检查与验证工具：** GGUF 架构/spec 报告、Safetensors 审计、张量形状检查、数值 parity 测试、真实 checkpoint benchmark。
+
+## 支持的模型
+
+每个名字链到它的模型页，那上面写着数字的测量条件和一个 `## Known limitations` 小节。四类 checkpoint 是单卡的，也是本仓的目标：
+
+| 模型 | 格式 | Runtime | 数字 |
+| --- | --- | --- | --- |
+| [Ternary-Bonsai-2-27B](docs/models/ternary-bonsai-2-27b.md) | GGUF ternary，1.75 bit | 原生 C++/CUDA，**单卡**，无需 flag | prefill 636 tok/s，decode 26 tok/s，常驻 5.53 GiB |
+| [Xing4.0-29B-A4B](docs/models/xing4.0-29b-a4b.md) | GGUF `IQ4_NL` | **单卡**，64 个 expert 全常驻 | prefill 75.22 tok/s，decode 6.72 tok/s，常驻 17.94 GiB |
+| [DeepSeek-V4 GGUF Q2](docs/models/deepseek-v4-gguf-q2-single-gpu.md) | GGUF Q2 / IQ2 / IQ1 | PyTorch 与 C++/CUDA，一张 22 GiB 卡 | 32K–64K 上约 401 tok/s prefill |
+| [DeepSeek-V4-Flash](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/deepseek-v4.md) | Safetensors FP4/FP8 | 其中的 GGUF Q2/IQ2/IQ1 单卡路径 | 见 [RelicLLM 页面](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/deepseek-v4.md) |
+
+多卡的 runtime——DeepSeek-V4.1-Flash、MiMo-V2.6-Flash、Qwen3.8-27B、MiniMax-M2.7——模型页在 [RelicLLM](https://lvyufeng.github.io/RelicLLM/)。本仓的[支持矩阵](docs/models/README.md)只覆盖单卡部分。
+
+`inspect`、`smoke` 和一次 benchmark 并不自动等于生产级 serving 保证。
+
+## 架构
+
+一张卡，checkpoint 整卡常驻。设计围绕的是**装得下**：这个 checkpoint 还能正确作答的最低格式是哪一档，以及它给 KV cache 留下多少空间。
+
+- **Ternary-Bonsai-2-27B** 是一个 27B 混合注意力模型——48 层 Gated DeltaNet 加 16 层 GQA，上面是 dense MLP——装在一份每权重 1.75 bit 的 GGUF 里，文件声明的 Hadamard 旋转作用在激活上。22 GiB 的卡上，5.53 GiB 权重换来的几乎是完整的 262,144 token 上下文。
+- **Xing4.0-29B-A4B** 是一个 29B MoE——MLA 注意力、64 个 routed expert 取 top-4 加一个 shared，每个 block 还有四条 residual stream 由一个矩阵 hyper-connection 混合——官方 `IQ4_NL` GGUF 整卡装下。它的 residual stream 比 sublayer 带得更宽，因为这个 checkpoint 的激活超出 fp16 范围。
+- **DeepSeek-V4** 的 GGUF Q2/IQ2/IQ1 把全精度路径的 MLA/indexing 与 routed-expert 调度塞进一张卡的内存预算里。
+
+热路径上不会把量化权重展开成完整 FP32 拷贝。
 
 ## 文档
 
-文档站点已发布在 **<https://lvyufeng.github.io/PocketLLM/>**，由本仓库的 `docs/` 目录构建，
-支持全文搜索和分主题导航，内容与下面的文件一致。模型页已在上面的模型表里逐行链接，这里列的是
-不是模型页的入口。
+发布在 **<https://lvyufeng.github.io/PocketLLM/>**，由本仓 `docs/` 构建，支持全文检索和按主题导航。
 
-- [文档总览](docs/README.md)
-- [快速开始](docs/getting-started.md)
+- [文档索引](docs/README.md)
+- [快速上手](docs/getting-started.md)
 - [模型支持矩阵](docs/models/README.md)
-- [Benchmark 口径](docs/guides/benchmarking.md)
-- [原生引擎 API 与 backend](docs/guides/pocketllm_api.md)
-- [架构总览](docs/architecture/index.md)
-- [性能记录](docs/performance/index.md)
-- [在 OpenAI server 后服务 V4.1](docs/performance/deepseek_v4_1_flash_served_gate.md)
-- [OpenAI 并发验证](docs/performance/cpp_openai_concurrency_validation.md)
-- [DSpark speculative decoding](docs/performance/dspark.md)
-- [FlashMemory 1M context](docs/performance/flashmemory_1m_context.md)
-- [历史 2080 Ti 报告](docs/reports/dsv4_2080ti_report.pdf)
+- [架构与老硬件 roadmap](docs/architecture/pocketllm_roadmap_old_hardware.md)
+- [2080 Ti 上的新模型支持](docs/architecture/pocketllm_new_model_roadmap.md)
+- [PyPI 发布](docs/guides/pypi_release.md)
+- [2080 Ti 历史报告](docs/reports/dsv4_2080ti_report.pdf)
+
+主题属于多卡 runtime、算子层或退役 engine 的页面不在这里——它们待在所描述代码的旁边，上面的链接和站内各处链接都指向那里。
 
 ## Roadmap
 
-- [x] DeepSeek-V4 FP4/FP8 与 GGUF Q2/IQ2/IQ1 generation 路径。
-- [x] MiniMax-M2.7 与 GLM-5.2 GGUF raw-block generation 路径。
-- [x] Qwen3.8-27B-FP8 C++ TP4 文本 runtime。
-- [ ] 在不破坏现有脚本的前提下，统一 C++ model dispatch 和 binary 命名。
-- [x] Qwen OpenAI 兼容文本 serving adapter。
-- [x] OpenAI server 后的 DeepSeek-V4.1-Flash TP4 文本生成，以及跨请求 prefix caching。
-- [x] OpenAI server 后的 MiMo-V2.6-Flash TP4 文本生成：host 常驻 expert bank、按 checkpoint 自带划分切开的 attention、256k 上下文。
-- [x] Ternary-Bonsai-2-27B：1.75 bit ternary GGUF 在**单卡**上服务，5.53 GiB 权重换来 636 tok/s prefill 和 245,760 token 上下文。
-- [ ] 在实测有收益时接入 CUDA Graph 和 persistent decode dispatch。
-- [ ] 增加更多模型 benchmark fixture 和自动化 regression dashboard。
+- [x] Ternary-Bonsai-2-27B：1.75-bit ternary GGUF 在**单卡**上服务，5.53 GiB 权重换来 prefill 636 tok/s 与 245,760 token 上下文。
+- [x] Xing4.0-29B-A4B：38 个 MoE 层全部 64 个 expert 在**单卡**常驻。
+- [x] DeepSeek-V4 GGUF Q2/IQ2/IQ1 单卡生成。
+- [ ] 把多卡代码从本仓切出去，交给 RelicLLM。
+- [ ] 端侧与手机后端——"单卡"所代表的那个真正的目标。
+- [ ] 在实测有收益的地方引入 CUDA Graph 与 persistent decode dispatch。
+- [ ] 更多单卡 benchmark fixture 与自动化回归看板。
 
 ## 已知限制
 
-这三条会改变一个数字的含义，而不只是给它加限定。每个模型页末尾都有各自的
-`## Known limitations` 列出其余部分。
+下面三条会改变一个数字的含义，而不只是给它加个前提。每个模型页末尾各自还有一份 `## Known limitations`。
 
-- **prefill 的速率不代表 decode 的速率，任何数字都不能跨配置搬用。** PCIe 拓扑、NUMA placement、
-  驱动与 toolkit 版本、checkpoint 变体和 warm state 都会改变结果；GGUF expert staging 尤其可能
-  压住 decode 而 prefill 看起来很健康。见 [Benchmark 口径](docs/guides/benchmarking.md)。
-- **Ternary-Bonsai-2-27B 在 prompt token 数不是 64 的整数倍时会付一次性代价**：4,097 token 要
-  18.11 s，而 4,096 token 只要 6.44 s。多一个 token 造成 3 倍误差，可复现但机制尚未查明 ——
-  [模型页](docs/models/ternary-bonsai-2-27b.md#known-limitations)。
-- **不是每个 backend 都做 batching。** 原生 C++ runtime 有 request scheduler、paged KV pool 和一次
-  覆盖整批的 batched decode step；`--backend v41` 和 `--backend mimo` 各持一把请求锁，一次服务一个。
-  见[并发验证记录](docs/performance/cpp_openai_concurrency_validation.md)。
+- **prefill 速率不蕴含 decode 速率，任何数字都不能跨配置迁移。** PCIe 拓扑、NUMA 位置、driver 与 toolkit 版本、checkpoint 变体和 warm state 都会改变结果。见[benchmark 与报告规则](https://github.com/lvyufeng/RelicLLM/blob/master/docs/guides/benchmarking.md)。
+- **Ternary-Bonsai-2-27B 在 prompt 不是 64 token 整数倍时要付一次性代价**：4,097 token 的 prefill 花 18.11 s，而 4,096 token 只要 6.44 s。多一个 token 带来 3× 误差，可测量、可复现，机理尚未定位——见[模型页](docs/models/ternary-bonsai-2-27b.md#known-limitations)。
+- **多卡路径仍然会构建。** `--tensor-parallel-size 4`、`--backend v41`、`--backend mimo` 在代码切完之前都还在这棵树里。按定位它们属于 RelicLLM，本仓维护的是上面那些单卡路径。
 
-部分实验性优化在真实端到端出现回归后被保留为 opt-in 或关闭；具体哪个见各模型页。
+## 许可证
 
-## License
+PocketLLM 以 [MIT License](LICENSE) 发布。你可以自由使用、修改和分发代码，包括商业用途，但需保留版权声明和许可声明。
 
-PocketLLM 采用 [MIT License](LICENSE) 发布。你可以自由使用、修改和分发本代码，包括商业用途，只需保留版权声明和许可声明。
-
-模型权重、tokenizer、CUDA、PyTorch、GGUF 资源和其他第三方组件分别受其自身许可证约束。PocketLLM 代码许可证不授予任何第三方模型资产的额外权利。
+模型权重、tokenizer 文件、CUDA、PyTorch、GGUF 资产及其他第三方组件受各自许可证约束。PocketLLM 的代码许可证不授予对第三方模型资产的额外权利。
 
 ## 致谢
 
-PocketLLM 基于 CUDA、PyTorch、safetensors、GGUF、Transformers、NCCL 和 llama.cpp 量化研究。仓库中的模型专用 runtime 与 benchmark，是面向消费级硬件可复现本地推理的工程实践。
+PocketLLM 构建在 CUDA、PyTorch、safetensors、GGUF、Transformers、NCCL 以及 llama.cpp 的量化研究之上。各模型专用 runtime 与 benchmark 是为了在消费级硬件上可复现本地推理而做的工程工作。

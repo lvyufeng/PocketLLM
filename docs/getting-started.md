@@ -63,7 +63,7 @@ cmake -S cpp_engine -B build/cpp_engine -DPOCKET_BACKEND=cuda
 `POCKET_BACKEND=ascend` builds the ACL runtime, the AscendC kernels and the HCCL
 collectives under `cpp_engine/backends/ascend/`; on the Ascend host the entry point
 is `scripts/build_ascend.sh` rather than the two commands above. See
-[Ascend SoC generations](guides/ascend_soc_generations.md) for the generation table,
+[Ascend SoC generations](https://github.com/lvyufeng/relic-core/blob/master/docs/guides/ascend_soc_generations.md) for the generation table,
 for the `Short_SoC_version` check that decides whether two cards can share a kernel,
 and for why the product name `npu-smi info` prints cannot answer that question.
 
@@ -146,7 +146,7 @@ python -m pocketllm serve \
 It is one request at a time too, and for a firmer reason: every routed layer closes with an
 all-reduce that every rank has to reach, so the ranks run the request as a symmetric group and rank
 0 broadcasts the whole request before it starts generating. See the
-[MiMo-V2.6-Flash model page](models/mimo-v2.6-flash.md) for the numbers and the memory that bank
+[MiMo-V2.6-Flash model page](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/mimo-v2.6-flash.md) for the numbers and the memory that bank
 takes.
 
 **Ternary-Bonsai-2-27B** is the one that fits on a single card, and the only thing you have to pass
@@ -173,14 +173,14 @@ reading before you benchmark it.
 
 | If you are running | Start here |
 | --- | --- |
-| DeepSeek-V4 | [DeepSeek-V4](models/deepseek-v4.md), or [GGUF Q2 on one GPU](models/deepseek-v4-gguf-q2-single-gpu.md) |
-| DeepSeek-V4.1-Flash | [DeepSeek-V4.1-Flash](models/deepseek-v4.1-flash.md), then [serving it behind the OpenAI server](performance/deepseek_v4_1_flash_served_gate.md) |
-| MiMo-V2.6-Flash | [MiMo-V2.6-Flash](models/mimo-v2.6-flash.md) |
+| DeepSeek-V4 | [DeepSeek-V4](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/deepseek-v4.md), or [GGUF Q2 on one GPU](models/deepseek-v4-gguf-q2-single-gpu.md) |
+| DeepSeek-V4.1-Flash | [DeepSeek-V4.1-Flash](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/deepseek-v4.1-flash.md), then [serving it behind the OpenAI server](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/deepseek_v4_1_flash_served_gate.md) |
+| MiMo-V2.6-Flash | [MiMo-V2.6-Flash](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/mimo-v2.6-flash.md) |
 | Ternary-Bonsai-2-27B (**one card**) | [Ternary-Bonsai-2-27B](models/ternary-bonsai-2-27b.md) |
-| MiniMax-M2.7 | [MiniMax-M2.7](models/minimax-m2.7.md) |
-| GLM-5.2 | [GLM-5.2](models/glm-5.2.md) |
-| Qwen3.8-27B (FP8 / NVFP4 / BF16) | [Qwen3.8-27B-FP8](models/qwen3.8-27b-fp8.md) |
+| MiniMax-M2.7 | [MiniMax-M2.7](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/minimax-m2.7.md) |
+| GLM-5.2 | [GLM-5.2](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/glm-5.2.md) |
+| Qwen3.8-27B (FP8 / NVFP4 / BF16) | [Qwen3.8-27B-FP8](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/qwen3.8-27b-fp8.md) |
 | A model not listed above | [Model support matrix](models/README.md) first |
 
 Before quoting any number you measure or read here, read
-[Benchmarking and reporting rules](guides/benchmarking.md).
+[Benchmarking and reporting rules](https://github.com/lvyufeng/RelicLLM/blob/master/docs/guides/benchmarking.md).

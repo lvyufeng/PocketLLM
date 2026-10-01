@@ -3,8 +3,8 @@
 This is task 6 of 6 in [stage 1 of the checkpoint roadmap](pocketllm_new_model_roadmap.md#stage-1--ternary-bonsai-2-27b)
 ([#387](https://github.com/lvyufeng/PocketLLM/issues/387) under [#381](https://github.com/lvyufeng/PocketLLM/issues/381)),
 the last one: wire the checkpoint to `pocketllm serve`, measure it there, and write it down. The five
-pages before it are the [reference gate](ternary_bonsai_2_reference_gate.md), the container reader,
-the Hadamard, and the [sm_75 dense GEMM](ternary_bonsai_2_dense_gemm.md); the user-facing page is
+pages before it are the [reference gate](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/ternary_bonsai_2_reference_gate.md), the container reader,
+the Hadamard, and the [sm_75 dense GEMM](https://github.com/lvyufeng/relic-core/blob/master/docs/architecture/ternary_bonsai_2_dense_gemm.md); the user-facing page is
 [the model guide](../models/ternary-bonsai-2-27b.md).
 
 **Verdict: served on one card, and the prefill number the earlier stages recorded was wrong — for a
@@ -66,7 +66,7 @@ its geometry and refuses it by name, which is deliberate — reading a 2.13-bit 
 `scripts/bench_pocketllm_serve_phases.py` splits one served request into prefill and decode from the
 **engine's own clock**, not from chunk arrival times: `pocketllm_ttft_seconds_sum/_count` is the time to
 the first generated token, `pocketllm_request_duration_seconds_sum` the whole request. By this
-repository's [timing convention](../guides/benchmarking.md) the first token is produced by the prompt
+repository's [timing convention](https://github.com/lvyufeng/RelicLLM/blob/master/docs/guides/benchmarking.md) the first token is produced by the prompt
 forward and therefore belongs to prefill, so `prefill_tps = prompt_tokens / ttft`. The script refuses
 to report a row whose metric deltas are not exactly one request's — the trap being a stray health
 check or a second client landing inside the window.
@@ -529,11 +529,11 @@ python -m pytest tests/test_ptq1_0_layout.py tests/test_gguf_tokenizer_pre.py \
 
 - [The model guide](../models/ternary-bonsai-2-27b.md) — what a user needs, and the same numbers
   without the probes
-- [The reference gate](ternary_bonsai_2_reference_gate.md) — what upstream measures on this card
-- [The sm_75 dense GEMM](ternary_bonsai_2_dense_gemm.md) — the two ternary kernels, their correctness
+- [The reference gate](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/ternary_bonsai_2_reference_gate.md) — what upstream measures on this card
+- [The sm_75 dense GEMM](https://github.com/lvyufeng/relic-core/blob/master/docs/architecture/ternary_bonsai_2_dense_gemm.md) — the two ternary kernels, their correctness
   evidence, and the fixed-512-row measurement this page corrects at the model level
 - [#406](https://github.com/lvyufeng/PocketLLM/issues/406) — the prefill tile geometry, which the
   ragged-tail measurement above belongs to
-- [Benchmarking and reporting rules](../guides/benchmarking.md) — the convention every number here
+- [Benchmarking and reporting rules](https://github.com/lvyufeng/RelicLLM/blob/master/docs/guides/benchmarking.md) — the convention every number here
   follows
 - The support matrix in [models/README.md](../models/README.md)
