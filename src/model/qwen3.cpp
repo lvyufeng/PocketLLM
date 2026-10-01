@@ -4,8 +4,8 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <vector>
 
-#include "kernel/cpu/kernels.h"
 #include "abi/spec.h"
 #include "quant/half.h"
 #include "runtime/status.h"
@@ -22,12 +22,12 @@ namespace {
 constexpr int kTypeF32 = 0;
 constexpr int kTypeF16 = 1;
 
-/* The initial cache and rotary-table size, in positions.
+/* How many positions the cache and the rotary table start with.
  *
  * A prompt is usually tens to a few thousand tokens and a decode grows one at a
  * time, so starting at 256 and doubling keeps a 12-token smoke test from
- * allocating the 335 MB a full 40960-position cache would cost. Both are capped
- * at the model's own context length, so the growth cannot run away. */
+ * allocating the 335 MB a full 40960-position cache would cost. Both grow with
+ * the sequence and are capped at the model's own context length. */
 constexpr int64_t kInitialPositions = 256;
 
 [[noreturn]] void missing(const std::string &what, const std::string &name) {
@@ -38,7 +38,7 @@ constexpr int64_t kInitialPositions = 256;
 
 Qwen3Model::~Qwen3Model() = default;
 
-const float *Qwen3Model::bind_dense(const GgufReader &checkpoint, const std::string &name) {
+kernel::DeviceBuffer Qwen3Model::bind_dense(const GgufReader &checkpoint, const std::string &name) {
   uint64_t nbytes = 0;
   const uint8_t *bytes = checkpoint.tensor_data(name, &nbytes);
   const GgufTensorInfo *info = checkpoint.tensor(name);
@@ -47,21 +47,23 @@ const float *Qwen3Model::bind_dense(const GgufReader &checkpoint, const std::str
     elements *= static_cast<int64_t>(dim);
   }
 
-  auto blob = std::make_unique<float[]>(static_cast<std::size_t>(elements));
+  std::vector<float> widened(static_cast<std::size_t>(elements));
   if (info->type_id == kTypeF32) {
-    std::memcpy(blob.get(), bytes, static_cast<std::size_t>(nbytes));
+    /* A byte-for-byte copy, which is also what makes the f32 path exact: no
+     * arithmetic happens to a tensor that is already in the right format. */
+    std::memcpy(widened.data(), bytes, static_cast<std::size_t>(nbytes));
   } else if (info->type_id == kTypeF16) {
     for (int64_t i = 0; i < elements; ++i) {
-      blob[i] = half_to_float(load_u16(bytes + 2 * i));
+      widened[static_cast<std::size_t>(i)] = half_to_float(load_u16(bytes + 2 * i));
     }
   } else {
     throw Error("tensor '" + name + "' is " + ggml_type_of(info->type_id).name +
                 ", which the dense path does not read; this build handles f32 and f16");
   }
 
-  const float *data = blob.get();
-  blobs_.push_back(std::move(blob));
-  return data;
+  kernel::DeviceBuffer device = backend_->allocate(elements * 4);
+  backend_->copy_to_device(device, widened.data(), elements * 4);
+  return device;
 }
 
 Weight Qwen3Model::bind_matrix(const GgufReader &checkpoint, const std::string &name) {
@@ -84,23 +86,18 @@ Weight Qwen3Model::bind_matrix(const GgufReader &checkpoint, const std::string &
   weight.rows = static_cast<int64_t>(info->dimensions[1]);
   weight.type_id = info->type_id;
   weight.nbytes = static_cast<int64_t>(info->nbytes);
-
-  /* Expanded to f32 at load. This is step 4's shape and not the final one: it
-   * costs twice the checkpoint's size in host memory to run weights that are
-   * stored in half that. A quantized kernel reads `blocks` in place instead,
-   * and that is what replaces this -- which is why `Weight` carries the type id
-   * and the raw size even though nothing here needs them. */
   weight.data = bind_dense(checkpoint, name);
   return weight;
 }
 
-std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint) {
+std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
+                                             kernel::Backend &backend) {
   const std::string arch = checkpoint.get_string("general.architecture", "");
   if (arch != "qwen3") {
     throw Error("this build runs 'qwen3' checkpoints; this one declares architecture '" + arch + "'");
   }
 
-  std::unique_ptr<Qwen3Model> model(new Qwen3Model());
+  std::unique_ptr<Qwen3Model> model(new Qwen3Model(backend));
 
   /* The keys are namespaced by architecture, and the prefix comes from the file
    * rather than from a literal so that a checkpoint declaring `qwen3` cannot be
@@ -114,7 +111,8 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint) {
   model->n_ff_ = checkpoint.get_int(p + "feed_forward_length", 0);
   model->n_vocab_ = checkpoint.get_int(p + "vocab_size", 0);
   model->capacity_ = checkpoint.get_int(p + "context_length", 0);
-  model->rms_eps_ = static_cast<float>(checkpoint.get_float(p + "attention.layer_norm_rms_epsilon", 1e-6));
+  model->rms_eps_ =
+      static_cast<float>(checkpoint.get_float(p + "attention.layer_norm_rms_epsilon", 1e-6));
   model->rope_theta_ = static_cast<float>(checkpoint.get_float(p + "rope.freq_base", 10000.0));
 
   if (model->n_vocab_ <= 0) {
@@ -133,9 +131,10 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint) {
     model->capacity_ = 4096;
   }
 
-  model->tok_embd_ = model->bind_matrix(checkpoint, "token_embd.weight");
-  if (model->tok_embd_.cols != model->n_embd_) {
-    throw Error("token_embd.weight has " + std::to_string(model->tok_embd_.cols) +
+  model->tok_embd_ = model->bind_dense(checkpoint, "token_embd.weight");
+  const GgufTensorInfo *embd_info = checkpoint.tensor("token_embd.weight");
+  if (static_cast<int64_t>(embd_info->dimensions[0]) != model->n_embd_) {
+    throw Error("token_embd.weight has " + std::to_string(embd_info->dimensions[0]) +
                 " columns but embedding_length says " + std::to_string(model->n_embd_));
   }
 
@@ -146,7 +145,9 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint) {
   if (checkpoint.tensor("output.weight") != nullptr) {
     model->output_ = model->bind_matrix(checkpoint, "output.weight");
   } else {
-    model->output_ = model->tok_embd_;
+    model->output_.cols = model->n_embd_;
+    model->output_.rows = model->n_vocab_;
+    model->output_.data = model->tok_embd_;
   }
 
   model->output_norm_ = model->bind_dense(checkpoint, "output_norm.weight");
@@ -170,62 +171,118 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint) {
   }
 
   model->build_rope_table();
-  model->ensure_capacity(1);
+  model->ensure_capacity(1, 1);
   return model;
 }
 
 void Qwen3Model::build_rope_table() {
-  /* Neox rotary: pair `i` with `i + half`, at angle
-   * `position * theta^(-2i/d)` for `i` in `[0, d/2)`. The exponent is the one
-   * the reference and llama.cpp both use, and it is why the base is read from
-   * the checkpoint rather than assumed: 1e6 spreads the angles far more slowly
-   * than the 1e4 a smaller model would use, and the two are not interchangeable
-   * at long context. */
-  const int64_t half = head_dim_ / 2;
   const int64_t rows = std::min<int64_t>(kInitialPositions, capacity_);
-  rope_cos_.resize(static_cast<std::size_t>(rows * half));
-  rope_sin_.resize(static_cast<std::size_t>(rows * half));
+  position_capacity_ = rows;
+  const int64_t half = head_dim_ / 2;
+  std::vector<float> cos_table(static_cast<std::size_t>(rows * half));
+  std::vector<float> sin_table(static_cast<std::size_t>(rows * half));
   for (int64_t pos = 0; pos < rows; ++pos) {
     for (int64_t i = 0; i < half; ++i) {
+      /* Neox rotary: pair `i` with `i + half`, at angle
+       * `position * theta^(-2i/d)`. The base is read from the checkpoint rather
+       * than assumed: 1e6 spreads the angles far more slowly than the 1e4 a
+       * smaller model would use, and the two are not interchangeable at long
+       * context. */
       const double angle =
-          static_cast<double>(pos) * std::pow(static_cast<double>(rope_theta_),
-                                              -2.0 * static_cast<double>(i) / static_cast<double>(head_dim_));
-      rope_cos_[static_cast<std::size_t>(pos * half + i)] = static_cast<float>(std::cos(angle));
-      rope_sin_[static_cast<std::size_t>(pos * half + i)] = static_cast<float>(std::sin(angle));
+          static_cast<double>(pos) *
+          std::pow(static_cast<double>(rope_theta_),
+                   -2.0 * static_cast<double>(i) / static_cast<double>(head_dim_));
+      cos_table[static_cast<std::size_t>(pos * half + i)] = static_cast<float>(std::cos(angle));
+      sin_table[static_cast<std::size_t>(pos * half + i)] = static_cast<float>(std::sin(angle));
     }
   }
+  rope_cos_ = backend_->allocate(rows * half * 4);
+  rope_sin_ = backend_->allocate(rows * half * 4);
+  backend_->copy_to_device(rope_cos_, cos_table.data(), rows * half * 4);
+  backend_->copy_to_device(rope_sin_, sin_table.data(), rows * half * 4);
 }
 
-void Qwen3Model::ensure_capacity(int64_t n) {
-  const std::size_t tokens = static_cast<std::size_t>(n);
-  const std::size_t embd = static_cast<std::size_t>(n_embd_);
-  const std::size_t q_width = static_cast<std::size_t>(n_head_ * head_dim_);
-  const std::size_t kv_width = static_cast<std::size_t>(n_head_kv_ * head_dim_);
-  const std::size_t ff = static_cast<std::size_t>(n_ff_);
-
-  x_.resize(tokens * embd);
-  x_norm_.resize(tokens * embd);
-  q_.resize(tokens * q_width);
-  k_.resize(tokens * kv_width);
-  v_.resize(tokens * kv_width);
-  attn_.resize(tokens * q_width);
-  gate_.resize(tokens * ff);
-  up_.resize(tokens * ff);
-  ffn_.resize(tokens * ff);
-  last_.resize(embd);
-  logits_.resize(static_cast<std::size_t>(n_vocab_));
+void Qwen3Model::grow_rope_table(int64_t positions) {
+  if (positions <= position_capacity_) {
+    return;
+  }
+  int64_t grown = position_capacity_;
+  while (grown < positions) {
+    grown = std::min<int64_t>(grown * 2, capacity_);
+  }
+  const int64_t half = head_dim_ / 2;
+  std::vector<float> cos_table(static_cast<std::size_t>(grown * half));
+  std::vector<float> sin_table(static_cast<std::size_t>(grown * half));
+  for (int64_t pos = 0; pos < grown; ++pos) {
+    for (int64_t i = 0; i < half; ++i) {
+      const double angle =
+          static_cast<double>(pos) *
+          std::pow(static_cast<double>(rope_theta_),
+                   -2.0 * static_cast<double>(i) / static_cast<double>(head_dim_));
+      cos_table[static_cast<std::size_t>(pos * half + i)] = static_cast<float>(std::cos(angle));
+      sin_table[static_cast<std::size_t>(pos * half + i)] = static_cast<float>(std::sin(angle));
+    }
+  }
+  backend_->release(rope_cos_);
+  backend_->release(rope_sin_);
+  rope_cos_ = backend_->allocate(grown * half * 4);
+  rope_sin_ = backend_->allocate(grown * half * 4);
+  backend_->copy_to_device(rope_cos_, cos_table.data(), grown * half * 4);
+  backend_->copy_to_device(rope_sin_, sin_table.data(), grown * half * 4);
+  position_capacity_ = grown;
 }
 
-void Qwen3Model::matmul(const Weight &w, const float *x, float *out, int64_t m, bool accumulate) const {
+void Qwen3Model::ensure_capacity(int64_t n, int64_t end_pos) {
+  backend_->release(x_);
+  backend_->release(x_norm_);
+  backend_->release(q_);
+  backend_->release(k_);
+  backend_->release(v_);
+  backend_->release(attn_);
+  backend_->release(gate_);
+  backend_->release(up_);
+  backend_->release(ffn_);
+  backend_->release(last_);
+  backend_->release(logits_);
+  backend_->release(scores_);
+  backend_->release(tokens_);
+
+  x_ = backend_->allocate(n * n_embd_ * 4);
+  x_norm_ = backend_->allocate(n * n_embd_ * 4);
+  q_ = backend_->allocate(n * n_head_ * head_dim_ * 4);
+  k_ = backend_->allocate(n * n_head_kv_ * head_dim_ * 4);
+  v_ = backend_->allocate(n * n_head_kv_ * head_dim_ * 4);
+  attn_ = backend_->allocate(n * n_head_ * head_dim_ * 4);
+  gate_ = backend_->allocate(n * n_ff_ * 4);
+  up_ = backend_->allocate(n * n_ff_ * 4);
+  ffn_ = backend_->allocate(n * n_ff_ * 4);
+  last_ = backend_->allocate(n_embd_ * 4);
+  logits_ = backend_->allocate(n_vocab_ * 4);
+  /* The score row is per query token per head, over the whole visible cache, and
+   * the kernel indexes it by *absolute* key position -- so its length is the end
+   * position of this batch, not the batch size. Sizing it to the batch is the
+   * easy mistake and a quiet one: a fresh prompt of n tokens would happen to fit
+   * (`end_pos == n`), and a decode at position 300 would write 300 floats past a
+   * two-float allocation. */
+  scores_ = backend_->allocate(end_pos * 4);
+  /* The token ids go to the device once per forward: the embedding is a gather
+   * and a backend whose indices live on the host would have to fetch the whole
+   * table back. */
+  tokens_ = backend_->allocate(n * 4 + 64);
+}
+
+void Qwen3Model::matmul(const Weight &w, kernel::DeviceBuffer x, kernel::DeviceBuffer out, int64_t m,
+                        bool accumulate) const {
   /* Every weight this build binds is f32 by now -- `bind_matrix` widened it --
    * so the type id is not consulted. It stays in `Weight` for the quantized
    * kernel, which is the one place the raw bytes are read. */
-  cpu::gemm(x, w.data, nullptr, out, m, w.rows, w.cols, accumulate);
+  kernel::DeviceBuffer no_bias;
+  backend_->gemm(x, w.data, no_bias, out, m, w.rows, w.cols, accumulate);
 }
 
 void Qwen3Model::reset() { cache_length_ = 0; }
 
-const float *Qwen3Model::forward(const int32_t *tokens, int64_t n, int64_t start_pos) {
+kernel::DeviceBuffer Qwen3Model::forward(const int32_t *tokens, int64_t n, int64_t start_pos) {
   if (n <= 0) {
     throw Error("forward needs at least one token");
   }
@@ -238,108 +295,114 @@ const float *Qwen3Model::forward(const int32_t *tokens, int64_t n, int64_t start
                 ", past the checkpoint's context length of " + std::to_string(capacity_));
   }
 
-  ensure_capacity(n);
+  ensure_capacity(n, start_pos + n);
 
-  /* The KV cache and the rotary table both grow with the sequence, so both are
-   * extended before anything reads them. The cache is sized to the end of this
-   * batch rather than to the context: a session that decodes ten tokens should
-   * not have allocated room for 40960. */
-  const int64_t needed_cache = start_pos + n;
-  if (needed_cache > cache_capacity_) {
+  /* Both the cache and the rotary table grow with the sequence, and they grow
+   * together: a token that fits the cache but not the table is a read past the
+   * end of the table. Sized to the end of this batch rather than to the context,
+   * so a session that decodes ten tokens has not allocated room for 40960. */
+  const int64_t needed = start_pos + n;
+  if (needed > cache_capacity_) {
     int64_t grown = std::max<int64_t>(cache_capacity_, kInitialPositions);
-    while (grown < needed_cache) {
+    while (grown < needed) {
       grown = std::min<int64_t>(grown * 2, capacity_);
     }
     const std::size_t per_layer =
         static_cast<std::size_t>(grown) * static_cast<std::size_t>(n_head_kv_ * head_dim_);
-    k_cache_.resize(per_layer * static_cast<std::size_t>(n_layer_));
-    v_cache_.resize(per_layer * static_cast<std::size_t>(n_layer_));
+    if (k_cache_.handle != 0) {
+      backend_->release(k_cache_);
+      backend_->release(v_cache_);
+    }
+    k_cache_ = backend_->allocate(static_cast<int64_t>(per_layer) * n_layer_ * 4);
+    v_cache_ = backend_->allocate(static_cast<int64_t>(per_layer) * n_layer_ * 4);
     cache_capacity_ = grown;
   }
-  const int64_t rope_rows = static_cast<int64_t>(rope_cos_.size()) / (head_dim_ / 2);
-  if (start_pos + n > rope_rows) {
-    int64_t grown = std::max<int64_t>(rope_rows, kInitialPositions);
-    while (grown < start_pos + n) {
-      grown = std::min<int64_t>(grown * 2, capacity_);
-    }
-    const int64_t half = head_dim_ / 2;
-    rope_cos_.resize(static_cast<std::size_t>(grown * half));
-    rope_sin_.resize(static_cast<std::size_t>(grown * half));
-    for (int64_t pos = rope_rows; pos < grown; ++pos) {
-      for (int64_t i = 0; i < half; ++i) {
-        const double angle = static_cast<double>(pos) *
-                             std::pow(static_cast<double>(rope_theta_),
-                                      -2.0 * static_cast<double>(i) / static_cast<double>(head_dim_));
-        rope_cos_[static_cast<std::size_t>(pos * half + i)] = static_cast<float>(std::cos(angle));
-        rope_sin_[static_cast<std::size_t>(pos * half + i)] = static_cast<float>(std::sin(angle));
-      }
-    }
-  }
+  grow_rope_table(needed);
 
   const int64_t kv_width = n_head_kv_ * head_dim_;
 
-  cpu::embedding(tokens, n, tok_embd_.data, n_vocab_, n_embd_, x_.data());
+  /* The prompt is uploaded once and gathered on the device; only the ids cross
+   * the bus, not the embedding rows they select. */
+  backend_->copy_to_device(tokens_, tokens, n * 4);
+  backend_->embedding(tokens_, n, tok_embd_, n_vocab_, n_embd_, x_);
 
   for (int64_t il = 0; il < n_layer_; ++il) {
     const Layer &layer = layers_[static_cast<std::size_t>(il)];
 
-    cpu::rms_norm(x_.data(), layer.attn_norm, x_norm_.data(), n, n_embd_, rms_eps_);
+    backend_->rms_norm(x_, layer.attn_norm, x_norm_, n, n_embd_, rms_eps_);
 
-    matmul(layer.wq, x_norm_.data(), q_.data(), n, false);
-    matmul(layer.wk, x_norm_.data(), k_.data(), n, false);
-    matmul(layer.wv, x_norm_.data(), v_.data(), n, false);
+    matmul(layer.wq, x_norm_, q_, n, false);
+    matmul(layer.wk, x_norm_, k_, n, false);
+    matmul(layer.wv, x_norm_, v_, n, false);
 
     /* Per head, over `head_dim`. The projection is `n_head * head_dim` wide, so
-     * normalizing the row instead would reduce over sixteen times as many
-     * values and produce a different -- still finite, still plausible -- model.
-     * The weight is shared across heads and tokens, which is why one call can
-     * do all of them. */
-    cpu::rms_norm(q_.data(), layer.q_norm, q_.data(), n * n_head_, head_dim_, rms_eps_);
-    cpu::rms_norm(k_.data(), layer.k_norm, k_.data(), n * n_head_kv_, head_dim_, rms_eps_);
+     * normalizing the row instead would reduce over sixteen times as many values
+     * and produce a different -- still finite, still plausible -- model. The
+     * weight is shared across heads and tokens, which is why one call can do all
+     * of them. */
+    backend_->rms_norm(q_, layer.q_norm, q_, n * n_head_, head_dim_, rms_eps_);
+    backend_->rms_norm(k_, layer.k_norm, k_, n * n_head_kv_, head_dim_, rms_eps_);
 
-    cpu::rope_neox(q_.data(), n, n_head_, head_dim_, start_pos, rope_cos_.data(), rope_sin_.data());
-    cpu::rope_neox(k_.data(), n, n_head_kv_, head_dim_, start_pos, rope_cos_.data(), rope_sin_.data());
+    backend_->rope_neox(q_, n, n_head_, head_dim_, start_pos, rope_cos_, rope_sin_);
+    backend_->rope_neox(k_, n, n_head_kv_, head_dim_, start_pos, rope_cos_, rope_sin_);
 
     /* The cache holds the *rotated* key: attention scores are not a function of
      * the unrotated one, so storing before the rotation would silently drop the
      * positional signal for every token after the first.
      *
-     * The write goes to this layer's own slab of the cache. Writing to a single
-     * shared slab would leave the layer's keys overwritten by the next layer's
-     * by the time the next call read them. */
-    const std::size_t layer_stride =
-        static_cast<std::size_t>(cache_capacity_ * kv_width) * static_cast<std::size_t>(il);
-    const std::size_t span = static_cast<std::size_t>(n * kv_width);
-    float *layer_k = k_cache_.data() + layer_stride;
-    float *layer_v = v_cache_.data() + layer_stride;
-    std::memcpy(layer_k + static_cast<std::size_t>(start_pos * kv_width), k_.data(),
-                span * sizeof(float));
-    std::memcpy(layer_v + static_cast<std::size_t>(start_pos * kv_width), v_.data(),
-                span * sizeof(float));
+     * The write goes to this layer's own slab. Writing to a single shared slab
+     * would leave the layer's keys overwritten by the next layer's by the time
+     * the next call read them. */
+    const int64_t layer_offset = cache_capacity_ * kv_width * il;
+    kernel::DeviceBuffer layer_k{k_cache_.handle +
+                                     static_cast<uintptr_t>(layer_offset * 4),
+                                 kv_width * cache_capacity_ * 4};
+    kernel::DeviceBuffer layer_v{v_cache_.handle +
+                                     static_cast<uintptr_t>(layer_offset * 4),
+                                 kv_width * cache_capacity_ * 4};
+    /* Both directions are device memory, so this is `copy_device_to_device` and
+     * not `copy_to_device`: the source is a device address, and a backend that
+     * dereferenced it as a host pointer would read the CPU's memory on a card.
+     * The CPU backend cannot tell the difference, which is exactly why the
+     * interface carries the distinction. */
+    backend_->copy_device_to_device(
+        kernel::DeviceBuffer{layer_k.handle + static_cast<uintptr_t>(start_pos * kv_width * 4),
+                             n * kv_width * 4},
+        k_, n * kv_width * 4);
+    backend_->copy_device_to_device(
+        kernel::DeviceBuffer{layer_v.handle + static_cast<uintptr_t>(start_pos * kv_width * 4),
+                             n * kv_width * 4},
+        v_, n * kv_width * 4);
 
     const float scale = 1.0F / std::sqrt(static_cast<float>(head_dim_));
-    scores_.resize(static_cast<std::size_t>(start_pos + n));
-    cpu::attention(q_.data(), n, n_head_, layer_k, layer_v, n_head_kv_, head_dim_,
-                   /*first_key=*/0, start_pos, scale, attn_.data(), scores_.data());
+    backend_->attention(q_, n, n_head_, layer_k, layer_v, n_head_kv_, head_dim_,
+                        /*first_key=*/0, start_pos, scale, attn_, scores_);
 
-    matmul(layer.wo, attn_.data(), x_.data(), n, /*accumulate=*/true);
+    matmul(layer.wo, attn_, x_, n, /*accumulate=*/true);
 
-    cpu::rms_norm(x_.data(), layer.ffn_norm, x_norm_.data(), n, n_embd_, rms_eps_);
-    matmul(layer.w_gate, x_norm_.data(), gate_.data(), n, false);
-    matmul(layer.w_up, x_norm_.data(), up_.data(), n, false);
-    cpu::silu_mul(gate_.data(), up_.data(), ffn_.data(), n * n_ff_);
-    matmul(layer.w_down, ffn_.data(), x_.data(), n, /*accumulate=*/true);
+    backend_->rms_norm(x_, layer.ffn_norm, x_norm_, n, n_embd_, rms_eps_);
+    matmul(layer.w_gate, x_norm_, gate_, n, false);
+    matmul(layer.w_up, x_norm_, up_, n, false);
+    backend_->silu_mul(gate_, up_, ffn_, n * n_ff_);
+    matmul(layer.w_down, ffn_, x_, n, /*accumulate=*/true);
   }
 
   /* Only the last position's logits are produced. A caller wanting a
    * continuation asks for one token at a time; the prefill's earlier positions
    * are computed because the layers are sequential, but their logits are not
-   * wanted and projecting them would be 151936 values per token of waste. */
-  cpu::rms_norm(x_.data() + (n - 1) * n_embd_, output_norm_, last_.data(), 1, n_embd_, rms_eps_);
-  matmul(output_, last_.data(), logits_.data(), 1, false);
+   * wanted and projecting them would be 151936 values per token of waste.
+   *
+   * The final row is a handle into `x_` with an offset, rather than a copy --
+   * a handle is an address and an address plus an offset is the next row. That
+   * is a legitimate thing to do to a `DeviceBuffer` precisely because the graph
+   * never dereferences one. */
+  const kernel::DeviceBuffer x_last{x_.handle + static_cast<uintptr_t>((n - 1) * n_embd_ * 4),
+                                    n_embd_ * 4};
+  backend_->rms_norm(x_last, output_norm_, last_, 1, n_embd_, rms_eps_);
+  matmul(output_, last_, logits_, 1, false);
 
   cache_length_ = start_pos + n;
-  return logits_.data();
+  return logits_;
 }
 
 }  // namespace pocketllm

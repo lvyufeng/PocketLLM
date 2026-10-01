@@ -1,7 +1,7 @@
-/* Qwen3, dense, running on the CPU.
+/* Qwen3, dense, on whatever device the session was opened on.
  *
  * The architecture is small enough to state in full: an embedding, twenty-eight
- * identical blocks, and a final norm feeding a tied output projection. Each
+ * identical blocks, and a final norm feeding a (tied) output projection. Each
  * block is a pre-norm residual around grouped-query attention and a SwiGLU
  * feed-forward network:
  *
@@ -27,6 +27,11 @@
  * a *wider* output than the residual stream. `n_embd` is 1024 and the attention
  * head space is 2048, so those two numbers are not interchangeable anywhere in
  * this file.
+ *
+ * Everything here is written against `kernel::Backend` and holds only opaque
+ * device handles. The one place a host value is read is `forward`, which
+ * returns a *device* buffer; `Session` copies it back with `to_host`. That is
+ * what lets the same source run on the CPU and on a card.
  */
 
 #ifndef POCKETLLM_MODEL_QWEN3_H
@@ -34,26 +39,29 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "gguf/reader.h"
+#include "kernel/backend.h"
 
 namespace pocketllm {
 
 /* How a stored weight is used by `matmul`.
  *
  * Today both spellings describe an f16/f32 tensor: the bytes are read once at
- * load and `data` points at the widened copy. The `blocks` form is where the
- * quantized path lands -- a step-5 kernel reads those bytes directly and never
- * expands them -- and it is declared now so that adding it is a change inside
- * `matmul` rather than a change to every call site. */
+ * load, widened on the host, and `data` is the device copy of that. The `blocks`
+ * form is where the quantized path lands -- a step-5 kernel reads those bytes
+ * directly and never expands them -- and it is declared now so that adding it is
+ * a change inside `matmul` rather than a change to every call site. */
 struct Weight {
-  const float *data = nullptr;     /* dequantized, for an unquantized tensor */
-  const uint8_t *blocks = nullptr; /* the raw bytes, for a quantized one */
+  kernel::DeviceBuffer data;       /* dequantized, resident on the backend */
+  kernel::DeviceBuffer blocks;     /* the raw bytes, for a quantized tensor */
   int64_t rows = 0;                /* output features (GGUF ne1) */
   int64_t cols = 0;                /* input features (GGUF ne0) */
   int type_id = 0;
   int64_t nbytes = 0;
+  bool quantized = false;
 };
 
 class Qwen3Model {
@@ -63,9 +71,8 @@ class Qwen3Model {
    * 199 weights produces nonsense rather than a failure, and the nonsense
    * arrives as a wrong token several hundred milliseconds later.
    *
-   * The reader must outlive the model: unquantized weights are copied out of
-   * it, but a quantized one would be a pointer into its mapping. */
-  static std::unique_ptr<Qwen3Model> load(const GgufReader &checkpoint);
+   * The reader must outlive the load; the backend must outlive the model. */
+  static std::unique_ptr<Qwen3Model> load(const GgufReader &checkpoint, kernel::Backend &backend);
 
   ~Qwen3Model();
   Qwen3Model(const Qwen3Model &) = delete;
@@ -85,14 +92,14 @@ class Qwen3Model {
   int64_t cache_length() const { return cache_length_; }
 
   /* Run `n` tokens occupying positions `start_pos .. start_pos + n - 1` and
-   * return the logits of the *last* one. `logits` must have room for `n_vocab`
+   * return the logits of the *last* one, as a device buffer of `n_vocab`
    * floats. `start_pos` must equal `cache_length()` for a decode and 0 for a
    * fresh prompt -- the graph does not special-case a restart, so a caller that
    * wants one calls `reset()`.
    *
-   * The returned pointer is owned by the model and stays valid until the next
-   * call. */
-  const float *forward(const int32_t *tokens, int64_t n, int64_t start_pos);
+   * The returned handle is owned by the model and stays valid until the next
+   * call. It is *not* host memory: read it with the backend's `copy_to_host`. */
+  kernel::DeviceBuffer forward(const int32_t *tokens, int64_t n, int64_t start_pos);
 
   /* Drop the KV cache. The buffers are kept -- a decode after a reset is the
    * next thing that happens, and reallocating 300 MB to fill none of it is
@@ -100,36 +107,43 @@ class Qwen3Model {
   void reset();
 
  private:
-  Qwen3Model() = default;
+  explicit Qwen3Model(kernel::Backend &backend) : backend_(&backend) {}
 
-  /* Everything a layer needs, resolved to pointers once. An index-and-lookup
+  /* Everything a layer needs, resolved to handles once. An index-and-lookup
    * per weight would be a string comparison in the inner loop's preamble and a
    * null check in every layer of every forward. */
   struct Layer {
-    const float *attn_norm = nullptr;
-    const float *ffn_norm = nullptr;
-    const float *q_norm = nullptr;
-    const float *k_norm = nullptr;
+    kernel::DeviceBuffer attn_norm, ffn_norm, q_norm, k_norm;
     Weight wq, wk, wv, wo;
     Weight w_gate, w_up, w_down;
   };
 
-  /* The widened copy of a tensor, kept alive for the model's lifetime. Returned
-   * by pointer into a stable allocation: `std::vector<Weight>` would move its
-   * elements on growth and invalidate every `data` a layer holds. */
-  const float *bind_dense(const GgufReader &checkpoint, const std::string &name);
+  /* Read a tensor from the checkpoint, widen it to f32 on the host, and upload
+   * it. The widening happens here and not in a kernel because it is a load-time
+   * cost paid once -- a step-5 quantized kernel reads the bytes in place and
+   * never expands them, which is what makes that step worth doing. */
+  kernel::DeviceBuffer bind_dense(const GgufReader &checkpoint, const std::string &name);
   Weight bind_matrix(const GgufReader &checkpoint, const std::string &name);
 
-  void matmul(const Weight &w, const float *x, float *out, int64_t m, bool accumulate) const;
-  void ensure_capacity(int64_t n);
+  void matmul(const Weight &w, kernel::DeviceBuffer x, kernel::DeviceBuffer out, int64_t m,
+              bool accumulate) const;
+  /* Size the scratch buffers for a batch of `n` tokens whose last position is
+   `end_pos - 1`. The second argument is not derivable from the first because the
+   attention score row is indexed by absolute key position: a one-token decode at
+   position 300 needs a row 300 long, and `n` alone would say one. */
+  void ensure_capacity(int64_t n, int64_t end_pos);
   void build_rope_table();
+  void grow_rope_table(int64_t positions);
 
-  /* Scratch, resized to the batch as it is needed. Held on the model because
-   * the shape is the model's (n_embd, n_head, ...) and reallocating them per
+  kernel::Backend *backend_ = nullptr;
+
+  /* Scratch, sized to the batch as it is needed. Held on the model because the
+   * shape is the model's (n_embd, n_head, ...) and reallocating them per
    * forward would touch the allocator several times per token. */
-  std::vector<float> x_, x_norm_, q_, k_, v_, attn_, gate_, up_, ffn_, last_, logits_;
-  std::vector<float> scores_;
-  std::vector<float> rope_cos_, rope_sin_;
+  kernel::DeviceBuffer x_, x_norm_, q_, k_, v_, attn_, gate_, up_, ffn_, last_, logits_;
+  kernel::DeviceBuffer scores_;
+  kernel::DeviceBuffer tokens_;
+  kernel::DeviceBuffer rope_cos_, rope_sin_;
 
   /* The KV cache, `[layer][position][kv_head][head_dim]`.
    *
@@ -140,21 +154,25 @@ class Qwen3Model {
    * its own positions immediately before reading them -- and a second call
    * reads 27 layers of stale keys and produces a fluent, completely wrong
    * token. That is exactly the bug this dimension was added to fix. */
-  std::vector<float> k_cache_, v_cache_;
+  kernel::DeviceBuffer k_cache_, v_cache_;
+  int64_t cache_capacity_ = 0;
 
-  std::vector<std::unique_ptr<float[]>> blobs_;
-  std::vector<Layer> layers_;
-
-  Weight tok_embd_, output_;
-  const float *output_norm_ = nullptr;
+  kernel::DeviceBuffer tok_embd_;
+  Weight output_;
+  kernel::DeviceBuffer output_norm_;
 
   int64_t n_embd_ = 0, n_layer_ = 0, n_head_ = 0, n_head_kv_ = 0, head_dim_ = 0, n_ff_ = 0;
   int64_t n_vocab_ = 0, capacity_ = 0;
   float rms_eps_ = 1e-6F;
   float rope_theta_ = 10000.0F;
 
-  int64_t cache_capacity_ = 0;
+  /* How many positions the cache and the rotary table have room for. Grown
+   * together, because a token that fits the cache but not the table would be a
+   * read past the end of the table. */
+  int64_t position_capacity_ = 0;
   int64_t cache_length_ = 0;
+
+  std::vector<Layer> layers_;
 };
 
 }  // namespace pocketllm

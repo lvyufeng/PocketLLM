@@ -36,7 +36,9 @@ add_library(pocketllm SHARED
   tokenizer/unicode.cpp
   tokenizer/pretokenize.cpp
   tokenizer/bpe.cpp
-  kernel/cpu/kernels.cpp
+  kernel/kernels.cpp
+  kernel/cpu/backend.cpp
+  kernel/registry.cpp
   model/qwen3.cpp
 )
 
@@ -96,7 +98,9 @@ add_executable(pocketllm-run
   tokenizer/unicode.cpp
   tokenizer/pretokenize.cpp
   tokenizer/bpe.cpp
-  kernel/cpu/kernels.cpp
+  kernel/kernels.cpp
+  kernel/cpu/backend.cpp
+  kernel/registry.cpp
   model/qwen3.cpp
 )
 target_include_directories(pocketllm-run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
