@@ -9,9 +9,9 @@ name: Publish documentation
 # fails here instead of shipping a 404. It is also the only check CI runs on a
 # documentation change -- no workflow runs the pytest suite.
 #
-# `hooks/` and the llms.txt generator are inputs to the build, not just to the site: the
-# `on_config` hook in hooks/llms_txt_staleness.py compares docs/llms.txt against the nav, and
-# scripts/gen_llms_txt.py defines what it should contain. A change to either can make that file
+# `.mkdocs/` and the llms.txt generator are inputs to the build, not just to the site: the
+# `on_config` hook in .mkdocs/hooks/llms_txt_staleness.py compares docs/llms.txt against the nav,
+# and scripts/gen_llms_txt.py defines what it should contain. A change to either can make that file
 # stale, so a push touching only them still has to build -- otherwise the guard has a blind spot
 # exactly where it is most likely to be needed.
 on:
@@ -19,8 +19,7 @@ on:
     branches: [main]
     paths:
       - 'docs/**'
-      - 'overrides/**'
-      - 'hooks/**'
+      - '.mkdocs/**'
       - 'scripts/gen_llms_txt.py'
       - 'mkdocs.yml'
       - 'requirements-docs.txt'
