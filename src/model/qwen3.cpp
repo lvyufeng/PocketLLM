@@ -36,7 +36,50 @@ constexpr int64_t kInitialPositions = 256;
 
 }  // namespace
 
-Qwen3Model::~Qwen3Model() = default;
+Qwen3Model::~Qwen3Model() {
+  /* Every buffer the model owns is a raw handle, so a defaulted destructor
+   * frees none of them -- and the leak is invisible on the host, where a few
+   * gigabytes fall back into a terabyte of RAM, and fatal on a card, where the
+   * second session is the one that runs out.  This was found by opening two
+   * CUDA sessions in a row and watching the second fail to allocate.
+   *
+   * The buffers are not stored in one list because they are not one kind of
+   * thing: the scratch is a fixed set of members, the layers are a vector of
+   * structs holding both handles and weights, and the two caches are managed
+   * together.  Releasing them in three statements says what the shape is. */
+  if (backend_ == nullptr) {
+    return;
+  }
+  for (kernel::DeviceBuffer buffer : {x_, x_norm_, q_, k_, v_, attn_, gate_, up_, ffn_, last_,
+                                      logits_, scores_, tokens_, rope_cos_, rope_sin_, k_cache_,
+                                      v_cache_, tok_embd_, output_norm_}) {
+    if (buffer.handle != 0) {
+      backend_->release(buffer);
+    }
+  }
+  for (const Layer &layer : layers_) {
+    for (kernel::DeviceBuffer buffer :
+         {layer.attn_norm, layer.ffn_norm, layer.q_norm, layer.k_norm}) {
+      if (buffer.handle != 0) {
+        backend_->release(buffer);
+      }
+    }
+    for (const Weight &weight : {layer.wq, layer.wk, layer.wv, layer.wo, layer.w_gate, layer.w_up,
+                                 layer.w_down}) {
+      if (weight.data.handle != 0) {
+        backend_->release(weight.data);
+      }
+    }
+  }
+  /* The output projection is tied to the embedding when the checkpoint has no
+   * separate head, in which case the two members hold the *same* handle and
+   * releasing both would be a double free.  Comparing the handles is how the
+   * tie is detected here; a flag would be a second copy of a fact that is
+   * already in the values. */
+  if (output_.data.handle != 0 && output_.data.handle != tok_embd_.handle) {
+    backend_->release(output_.data);
+  }
+}
 
 kernel::DeviceBuffer Qwen3Model::bind_dense(const GgufReader &checkpoint, const std::string &name) {
   uint64_t nbytes = 0;
@@ -259,12 +302,15 @@ void Qwen3Model::ensure_capacity(int64_t n, int64_t end_pos) {
   last_ = backend_->allocate(n_embd_ * 4);
   logits_ = backend_->allocate(n_vocab_ * 4);
   /* The score row is per query token per head, over the whole visible cache, and
-   * the kernel indexes it by *absolute* key position -- so its length is the end
-   * position of this batch, not the batch size. Sizing it to the batch is the
-   * easy mistake and a quiet one: a fresh prompt of n tokens would happen to fit
+   * it is indexed by *absolute* key position -- so the span is the end position
+   * of this batch, not the batch size. Sizing it to the batch is the easy mistake
+   * and a quiet one: a fresh prompt of n tokens would happen to fit
    * (`end_pos == n`), and a decode at position 300 would write 300 floats past a
-   * two-float allocation. */
-  scores_ = backend_->allocate(end_pos * 4);
+   * two-float allocation.
+   *
+   * How much room that needs on top is the backend's to say, because it depends
+   * on how many of the (query, head) pairs it runs at once. */
+  scores_ = backend_->allocate(backend_->attention_scratch(n, n_head_, end_pos));
   /* The token ids go to the device once per forward: the embedding is a gather
    * and a backend whose indices live on the host would have to fetch the whole
    * table back. */

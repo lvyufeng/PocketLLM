@@ -99,6 +99,15 @@ class CpuBackend final : public Backend {
     kernel::rope_neox(w(x), n_tokens, n_heads, d, start_pos, f(cos_table), f(sin_table));
   }
 
+  int64_t attention_scratch(int64_t q_len, int64_t n_heads, int64_t max_span) const override {
+    /* One row, reused by every (query, head) pair: this backend runs them in a
+     * loop, so nothing else can be looking at it. `q_len` and `n_heads` are part
+     * of the signature for the backends where they are not irrelevant. */
+    static_cast<void>(q_len);
+    static_cast<void>(n_heads);
+    return max_span * 4;
+  }
+
   void attention(DeviceBuffer q, int64_t q_len, int64_t n_heads, DeviceBuffer k_cache,
                  DeviceBuffer v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
                  int64_t q_offset, float scale, DeviceBuffer out, DeviceBuffer scores) override {

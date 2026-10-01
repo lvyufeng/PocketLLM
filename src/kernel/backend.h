@@ -91,8 +91,24 @@ class Backend {
   virtual void rope_neox(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d,
                          int64_t start_pos, DeviceBuffer cos_table, DeviceBuffer sin_table) = 0;
 
+  /* How many bytes the scratch for an `attention` call must hold, given that the
+   * longest score row in it is `max_span` entries.
+   *
+   * This is a query rather than a constant because the answer is a property of
+   * *how the backend is parallelized*, which the graph has no way to know. The
+   * CPU computes the `q_len * n_heads` (query, head) pairs one at a time and
+   * reuses a single row; a GPU runs them as concurrent blocks and each needs its
+   * own, or two blocks writing the same row would interleave into a softmax over
+   * a mixture of two different heads. Sizing this from the graph would be a
+   * silent cross-backend assumption that is correct on exactly one of them.
+   *
+   * `max_span` must be at least `q_offset + q_len - first_key` for the call it
+   * is sizing. */
+  virtual int64_t attention_scratch(int64_t q_len, int64_t n_heads, int64_t max_span) const = 0;
+
   /* Causal grouped-query attention over a cache laid out ``[position][head][d]``,
-   * with the query chunk at `q_offset`. `scores` is backend-owned scratch. */
+   * with the query chunk at `q_offset`. `scores` holds what `attention_scratch`
+   * asked for. */
   virtual void attention(DeviceBuffer q, int64_t q_len, int64_t n_heads, DeviceBuffer k_cache,
                          DeviceBuffer v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
                          int64_t q_offset, float scale, DeviceBuffer out,
