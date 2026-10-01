@@ -311,7 +311,7 @@ limitations** on the guide is about launch count and not about bandwidth.
 which is a host clock around a boundary the device does not have — the prompt's last chunk drained
 inside the first decode step and was charged to it. The measured size of that error, and the corrected
 table, are in
-[the record](../performance/xing4_0_rate_clock_split.md). Nothing in this section moves: the launch
+[the record](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/xing4_0_rate_clock_split.md). Nothing in this section moves: the launch
 count, the host time and the device time are all the step's own.
 
 Two things follow, and both are left for a later stage rather than half-done here:
@@ -323,7 +323,7 @@ Two things follow, and both are left for a later stage rather than half-done her
   what it is worth: 2.17× and 5,800 launches gone at once.
 
 **Both were then measured, and this section's premise was wrong about where the host time goes.**
-[Xing4.0-29B-A4B: the decode step's launch count, and what a graph buys](../performance/xing4_0_decode_launch_gap.md)
+[Xing4.0-29B-A4B: the decode step's launch count, and what a graph buys](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/xing4_0_decode_launch_gap.md)
 profiles the step by name and prices the ceiling. The step hands the host **22,155 ATen dispatches**,
 of which **10,508 are metadata-only** (`view`, `reshape`, `as_strided` and their kin, 24 ms of host
 time for nothing) and a further **4,349 are fp16↔fp32 casts** (21 ms); those submit **5,346
@@ -346,7 +346,7 @@ This section's own 11,536 launches does not reconcile with the profile above's 5
 5,577 kernels — different instruments, and the newer pair is the one that can be reproduced.
 
 **The loop was built, and the ceiling held.**
-[Xing4.0-29B-A4B: the decode step, captured a bucket at a time](../performance/xing4_0_decode_graph.md)
+[Xing4.0-29B-A4B: the decode step, captured a bucket at a time](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/xing4_0_decode_graph.md)
 makes the position reach the card as an index tensor in all four places it is read and freezes the
 attention's `N` by rounding the cache read up to a power-of-two bucket with the rows past the position
 masked. Measured in one process, interleaved: **38.6 ms a replayed step against an eager 148.1 —
@@ -464,7 +464,7 @@ already bounds decode (§6) rather than subtract from it. The measurement that s
 *processes*, one a card, on the same prompt: **82.81 and 84.29 tok/s prefill against 83.94 alone, and
 7.27 and 7.09 tok/s decode against 7.10 alone** — 2× aggregate at no cost to either. (Both columns
 were re-measured after §6's *Corrected later* note; the same seam was in them, and
-[the record](../performance/xing4_0_rate_clock_split.md#the-two-card-table) carries the before and
+[the record](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/xing4_0_rate_clock_split.md#the-two-card-table) carries the before and
 after.) Running one
 server a card is the supported multi-card shape here. Whether TP2 would raise a *single* stream's rate
 is left open, and would have to be priced against the added collective.

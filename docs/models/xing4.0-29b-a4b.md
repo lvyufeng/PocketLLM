@@ -82,7 +82,7 @@ Every rate below is from the corrected instrument: the seam between the prompt a
 drained, so what the two clocks report is what the two phases cost. That correction moved decode from
 6.50 to 6.75 tok/s at a 512-token context and from 6.07 to 6.76 at 32,768, and it is what makes the
 trend flat rather than falling — see
-[the record](../performance/xing4_0_rate_clock_split.md).
+[the record](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/xing4_0_rate_clock_split.md).
 
 ### One token's path
 
@@ -250,7 +250,7 @@ Three things to read with the table:
   token regardless of how much context is behind it, so growing the context barely changes what a step
   touches. A previous version of this table read 6.50 down to 6.07 — a 7% *fall* — and that trend was
   an artefact of the prefill/decode seam rather than of the model; see
-  [the record](../performance/xing4_0_rate_clock_split.md).
+  [the record](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/xing4_0_rate_clock_split.md).
 - **Prefill falls 19% from 512 to 32,768 tokens**, which is the quadratic attention term appearing
   against a linear MoE term: the MoE kernels are 75% of prefill at short prompts and the attention
   takes a growing share of a long one.
@@ -288,7 +288,7 @@ Each process above was measured twice on the same prompt and the row is its warm
 first one was 81.75 tok/s and 7.03 tok/s alone, 79.33/7.19 and 80.82/7.05 concurrent, with a 158–170 ms
 first decode step against 135–139 warm — the same one-off allocation the table above reports. These
 rows were re-measured alongside the corrected table and moved the way that correction predicts; see
-[the record](../performance/xing4_0_rate_clock_split.md#the-two-card-table).
+[the record](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/xing4_0_rate_clock_split.md#the-two-card-table).
 
 ### Against the Qwen3.8-27B paths at comparable size
 
@@ -388,6 +388,6 @@ questions — what the runtime will promise, and what the card can just barely d
 - [The checkpoint audit](../architecture/xing4_0_29b_a4b_audit.md) — the block read out of the
   released remote code, the artifact inventory, and the four places the issue tree's reading did not
   hold.
-- [Benchmarking and reporting rules](../guides/benchmarking.md) — the convention every number here
+- [Benchmarking and reporting rules](https://github.com/lvyufeng/RelicLLM/blob/master/docs/guides/benchmarking.md) — the convention every number here
   follows.
 - The support matrix in [models/README.md](README.md).

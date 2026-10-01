@@ -82,7 +82,7 @@ card reports 84.78 average over 14 thinking-mode benchmarks, 98.2% of the FP16 p
 for a conventional IQ2_XXS build at a larger size** — and IQ2_XXS is a quant this repository already has
 hand-written kernels for.
 
-[The gate measurement](ternary_bonsai_2_reference_gate.md) has run since this was written: the upstream
+[The gate measurement](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/ternary_bonsai_2_reference_gate.md) has run since this was written: the upstream
 reference decodes at 30.7 tokens/s and prefills at 665 tokens/s on one card, and 262144 contexts fit in
 15,836 MiB with a quantized KV cache. It passes, and it also shows the reference spending only a third of
 the card's bandwidth per decode step, which is the number the kernel task has to beat.
@@ -110,7 +110,7 @@ projections at a 512-token prompt, 1.27× slower** than handing the same weights
 phases are behind what the gate measured the upstream *whole model* reaching on this card. The decode gap has a
 measured mechanism — a lane reads its own 28-byte block with seven 4-byte loads, and a reduction at that stride
 reaches 73 GiB/s of useful bytes where a dense one reaches 526 — so the fix is staged loads rather than a
-different unpack. [The measurement and both gaps](ternary_bonsai_2_dense_gemm.md) are written up in full.
+different unpack. [The measurement and both gaps](https://github.com/lvyufeng/relic-core/blob/master/docs/architecture/ternary_bonsai_2_dense_gemm.md) are written up in full.
 
 What remains before the model generates is the runtime wiring
 ([#387](https://github.com/lvyufeng/PocketLLM/issues/387)), and the kernel work the two gaps above name.
@@ -195,7 +195,7 @@ against it:
    model's own tokenizer, not a list of synthetic ids. A synthetic prompt moves the router's draw and
    invalidates every bytes-moved figure, which is a mistake this repository has made and recorded.
 2. A **comparable** number: prefill and decode tokens a second at a stated context, taken as
-   [the benchmarking rules](../guides/benchmarking.md) require — a real prompt, warm state, one
+   [the benchmarking rules](https://github.com/lvyufeng/RelicLLM/blob/master/docs/guides/benchmarking.md) require — a real prompt, warm state, one
    configuration per process, differences taken interleaved inside one process with a null arm where the
    difference is small.
 3. Served behind the OpenAI-compatible endpoint, when the checkpoint is text-only.
@@ -218,7 +218,7 @@ The order is cost-of-reuse, and each stage has an explicit early gate rather tha
 | GLM-5.3-Flash | task 1/5 identifies whether the linear layer is GDN | it is not → the stage grows a new attention kernel and the estimate changes |
 
 Stage 1's gate has run: [the reference measures 30.7 tokens/s of decode and 665 tokens/s of prefill on one
-card](ternary_bonsai_2_reference_gate.md), which is a pass on both the memory and the speed axis. That page also
+card](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/ternary_bonsai_2_reference_gate.md), which is a pass on both the memory and the speed axis. That page also
 pins the block format, the Hadamard and the kernel question, so the tasks after it start from a measured artifact
 rather than from a model card.
 
@@ -228,7 +228,7 @@ operation for operation by the two published implementations of it, which is wha
 here. It also re-reads this document's Stage 2 table against the artifacts and produces the per-token
 byte table that the stage's final task is measured against.
 
-Xing4.0's third task has landed and is [measured on sm_75](../performance/xing4_0_attention_sm75.md):
+Xing4.0's third task has landed and is [measured on sm_75](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/xing4_0_attention_sm75.md):
 the MLA attention is ported in both the expanded form the checkpoint's own code uses and the absorbed
 form its released GGUF is shaped for, the two agree with the reference and with each other, and the
 cost measurement found the thing worth knowing. The expected geometry held — 2.117 GiB of attention
@@ -239,7 +239,7 @@ to 0.516 ms per layer. Prefill takes the expanded form and decode the absorbed o
 2048 tokens and 20x at 32768.
 
 Xing4.0's fourth task has landed too, and it is [measured on the same
-card](../performance/xing4_0_hyper_connection_sm75.md): the matrix hyper-connection is ported as the
+card](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/xing4_0_hyper_connection_sm75.md): the matrix hyper-connection is ported as the
 audit read it — four residual streams, a 4 + 4 + 16 coefficient split, a 20-iteration Sinkhorn, and a
 residual that is *rebuilt* from `post` and `comb` rather than accumulated — and its forward pass is
 held to the released code's own line for line. The finding is a dispatch count rather than an
@@ -273,9 +273,9 @@ and HTTP range requests. The specific reads:
 
 - [Feature roadmap for old hardware](pocketllm_roadmap_old_hardware.md) — the capability axis, and the
   other half of what this repository is for
-- [PocketLLM vs vLLM vs SGLang](vllm_sglang_architecture_analysis.md) — the comparison that motivates
+- [PocketLLM vs vLLM vs SGLang](https://github.com/lvyufeng/relic-engine/blob/master/docs/architecture/vllm_sglang_architecture_analysis.md) — the comparison that motivates
   serving a single card well rather than scaling out
-- [Qwen3.8-27B-FP8 design and measurements](qwen3_8_27b_fp8_design.md) — the runtime stage 1 reuses
-- [GLM-5.2 design and measurements](glm_5_2_design.md) — the DSA path stage 3 reuses
-- [Benchmarking and reporting](../guides/benchmarking.md) — how every number in these stages must be
+- [Qwen3.8-27B-FP8 design and measurements](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/qwen3_8_27b_fp8_design.md) — the runtime stage 1 reuses
+- [GLM-5.2 design and measurements](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/glm_5_2_design.md) — the DSA path stage 3 reuses
+- [Benchmarking and reporting](https://github.com/lvyufeng/RelicLLM/blob/master/docs/guides/benchmarking.md) — how every number in these stages must be
   taken

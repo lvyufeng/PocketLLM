@@ -162,7 +162,7 @@ deltas rather than from chunk arrival times; the command is in
 ### Against the upstream reference, same card
 
 The number that says where this runtime stands is the fork's own `llama-bench` on the same artifact
-and the same card, from [the reference gate](../architecture/ternary_bonsai_2_reference_gate.md):
+and the same card, from [the reference gate](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/ternary_bonsai_2_reference_gate.md):
 
 | | PocketLLM, 1 card | llama.cpp `prism`, 1 card |
 | --- | ---: | ---: |
@@ -173,7 +173,7 @@ Prefill is **level with the reference** — 99% of it at 4,096 tokens and 104% a
 aligned to aligned, because `llama-bench` prefills each prompt in one piece and never pays the
 ragged-tail penalty above. Decode is 84% of it. Decode is the side with the real gap and the side the
 1.75-bit packing was supposed to buy, and the earlier stages measured it doing exactly that
-([the dense GEMM](../architecture/ternary_bonsai_2_dense_gemm.md): 2.4× the FP8-width arm at a tenth
+([the dense GEMM](https://github.com/lvyufeng/relic-core/blob/master/docs/architecture/ternary_bonsai_2_dense_gemm.md): 2.4× the FP8-width arm at a tenth
 of the bytes).
 
 ## Hardware and memory
@@ -318,7 +318,7 @@ worst_logit_abs=0.0076313
   (`--max-batch-size 2`) or off (`--no-enable-batching`) for single-caller latency, and up for
   aggregate throughput. The per-request cost of the width, measured with the prompt cache held
   fixed, is in
-  [the concurrency acceptance page](../performance/cpp_openai_concurrency_validation.md).
+  [the concurrency acceptance page](https://github.com/lvyufeng/relic-engine/blob/master/docs/performance/cpp_openai_concurrency_validation.md).
 - **An earlier build of this branch reported that a greedy answer could depend on the batch.** Four
   identical requests produced two distinct texts, and a prompt choosing between `"5:00:00"` and
   `"0:15:00"` gave one row each. That measurement came from a build whose greedy runs did not stop at
@@ -334,7 +334,7 @@ worst_logit_abs=0.0076313
   a repeat of *that* prompt resumes and a repeat of an earlier one does not. Sending prompt A, then
   B, then A again forwards A in full the second time. It is a resume, not a store.
 - **Decode is 84% of the reference on the same card** (25.9 against 30.7 tok/s). This is inherited
-  from the [dense-GEMM stage](../architecture/ternary_bonsai_2_dense_gemm.md), not introduced by the
+  from the [dense-GEMM stage](https://github.com/lvyufeng/relic-core/blob/master/docs/architecture/ternary_bonsai_2_dense_gemm.md), not introduced by the
   server, and it is where the format's remaining work is: the packing already buys 2.4× against the
   FP8-width arm at a tenth of the bytes.
 - **Speculative decoding is not validated here.** MTP, DSpark and DFlash2 exist in this engine for
@@ -349,10 +349,10 @@ worst_logit_abs=0.0076313
 
 - [Design and measurements](../architecture/bonsai_2_27b_design.md) — the container, the transform,
   the kernels, the probes, and every number above with the command that produced it.
-- [The reference gate](../architecture/ternary_bonsai_2_reference_gate.md) — what the upstream
+- [The reference gate](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/ternary_bonsai_2_reference_gate.md) — what the upstream
   runtime measures on this card, and the four facts the adaptation rests on.
-- [The sm_75 dense GEMM](../architecture/ternary_bonsai_2_dense_gemm.md) — the two ternary kernels
+- [The sm_75 dense GEMM](https://github.com/lvyufeng/relic-core/blob/master/docs/architecture/ternary_bonsai_2_dense_gemm.md) — the two ternary kernels
   and the two gaps they leave.
-- [Benchmarking and reporting rules](../guides/benchmarking.md) — the convention every number here
+- [Benchmarking and reporting rules](https://github.com/lvyufeng/RelicLLM/blob/master/docs/guides/benchmarking.md) — the convention every number here
   follows.
 - The support matrix in [models/README.md](README.md).

@@ -6,8 +6,8 @@
 the local 2080 Ti fork `vLLM-2080Ti-Definitive-v0.1.15`, whose upstream base is vLLM **0.21.0**.
 
 This document exists because the two comparisons already in this directory are no longer against
-current engines. [PocketLLM vs vLLM vs SGLang](vllm_sglang_architecture_analysis.md) was written
-against the local fork, which is nine upstream releases behind; [the pre-Phase-1 comparison](vllm_sglang_comparison.md)
+current engines. [PocketLLM vs vLLM vs SGLang](https://github.com/lvyufeng/relic-engine/blob/master/docs/architecture/vllm_sglang_architecture_analysis.md) was written
+against the local fork, which is nine upstream releases behind; [the pre-Phase-1 comparison](https://github.com/lvyufeng/relic-engine/blob/master/docs/architecture/vllm_sglang_comparison.md)
 predates the `pocketllm` control plane altogether. And both of them catalogue *features* — batching,
 prefix caching, speculation — while the two questions this repository keeps running into are
 architectural:
@@ -322,7 +322,7 @@ above 1 next to `--no-enable-batching` is a `ConfigurationError` rather than a r
 default width is 8 and not 1 deliberately — a width of 1 is not a batch — which means the cost the
 paragraph above describes now lands on the default path instead of on an opt-in; it is measured with
 the prompt cache held fixed in
-[cpp_openai_concurrency_validation.md](../performance/cpp_openai_concurrency_validation.md). The
+[cpp_openai_concurrency_validation.md](https://github.com/lvyufeng/relic-engine/blob/master/docs/performance/cpp_openai_concurrency_validation.md). The
 third is still open, and it is narrower than it reads: the V4.1 adapter already raises
 `UnsupportedFeatureError` for a width it cannot honour, so what remains is deciding the prefill-only
 shape rather than removing a silent clamp.
@@ -332,7 +332,7 @@ shape rather than removing a silent clamp.
 This is the largest single measured headroom in the repository. The evidence is entirely local:
 
 - Xing4.0, **one card**, eager decode step 148–178 ms against a replayed graph at **38–38.6 ms — 3.84×**
-  ([the decode-graph record](../performance/xing4_0_decode_graph.md)), with the bucket itself costing
+  ([the decode-graph record](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/xing4_0_decode_graph.md)), with the bucket itself costing
   nothing (147.5 vs 148.1 ms) and capture exact to the bit against its own width.
 - The launch-count probe found the reason: **22,155 ATen dispatches a step, 10,508 of which launch no
   kernel**, against 11,536 launches and 46.5 ms of device work.
@@ -367,7 +367,7 @@ removed before capture is even meaningful.
 
 Independent of any comparison, the serving record leaves one large number on the table: **merging the
 admission wave into a single prefill forward, worth ~1.6× rather than the ~1.06× quoted in the engine's
-own comment** ([serving throughput scaling](../performance/serving_throughput_scaling.md), §"next
+own comment** ([serving throughput scaling](https://github.com/lvyufeng/relic-engine/blob/master/docs/performance/serving_throughput_scaling.md), §"next
 steps" item 2). The arithmetic is local and it is tight: a 325-token prompt costs 331 ms of prefill, of
 which **131 ms — 40% — is paid before the first token-dependent FLOP**, because a forward pass issues
 129 collectives whatever the prompt's width. At `L16` that is 5,385 ms of wave prefill against 3,414 ms
@@ -417,7 +417,7 @@ different `supports_batch` answers.
 
 ### 6.7 The version problem in the existing comparison
 
-[The current comparison](vllm_sglang_architecture_analysis.md) is a good document against the wrong
+[The current comparison](https://github.com/lvyufeng/relic-engine/blob/master/docs/architecture/vllm_sglang_architecture_analysis.md) is a good document against the wrong
 baseline. Its vLLM column is the local 2080 Ti fork: upstream base **0.21.0**, fork version 0.1.15,
 squashed to a single commit. Upstream has since shipped **0.22 → 0.30** (nine releases, ~5,000 commits).
 Things in that document that no longer describe upstream:
@@ -583,8 +583,8 @@ stacks, and each of the three has its own documented reason:
 
 | Runtime | What the record says stands in front of the scheduler |
 |---|---|
-| v41 | "What it still has none of is **batching, continuous batching** and an MTP layer" ([design record](deepseek_v4_1_flash_design.md)) |
-| MiMo | "Batching, a scheduler — **Not implemented — one request at a time**" ([design record](mimo_v2_6_flash_design.md)) |
+| v41 | "What it still has none of is **batching, continuous batching** and an MTP layer" ([design record](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/deepseek_v4_1_flash_design.md)) |
+| MiMo | "Batching, a scheduler — **Not implemented — one request at a time**" ([design record](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/mimo_v2_6_flash_design.md)) |
 | Xing4 | "`supports_batch` is **False** — the trunk's forward flattens its input to one token axis, so two sequences given to it together would **attend to each other**" ([design record](xing4_0_29b_a4b_design.md)) |
 
 Xing4's is the structural one: its forward has a token axis but no independent value-batch axis. All
@@ -726,7 +726,7 @@ something to lose to a refactor, so the first two moved to
 the third is a sampling-time kernel feature rather than a front-end one and survives the deletion,
 but reaching it from the Python host needs the schema to cross `BatchSamplingParams` into the engine,
 which is one new binding and its own issue. The measured consequence is in
-[the API guide](../guides/pocketllm_api.md#tool-calls): a `cpp` request through `pocketllm serve`
+[the API guide](https://github.com/lvyufeng/RelicLLM/blob/master/docs/guides/pocketllm_api.md#tool-calls): a `cpp` request through `pocketllm serve`
 used to answer with a call as prose and return `"stop"` where the native binary returned
 `tool_calls`.
 
@@ -821,12 +821,12 @@ Repository reads at `8162937`:
   (`cuda_ops.hpp`) + 148 (`qwen_cuda_ops.hpp`), 45 `_ascend` symbols; `difflib` on the `_decode` body of
   `mimo_backend.py` vs `xing4_backend.py` → ratio 1.00.
 
-Repository measurements cited: [native C++ concurrency validation](../performance/cpp_openai_concurrency_validation.md),
-[Xing4 decode launch gap](../performance/xing4_0_decode_launch_gap.md),
-[Xing4 decode graph buckets](../performance/xing4_0_decode_graph.md),
-[Ascend single-request decode](../performance/ascend_single_request_tps.md),
-[Ascend TP collective overlap](../performance/ascend_tp_collective_overlap.md),
-[Ascend performance roadmap](ascend_performance_roadmap.md).
+Repository measurements cited: [native C++ concurrency validation](https://github.com/lvyufeng/relic-engine/blob/master/docs/performance/cpp_openai_concurrency_validation.md),
+[Xing4 decode launch gap](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/xing4_0_decode_launch_gap.md),
+[Xing4 decode graph buckets](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/xing4_0_decode_graph.md),
+[Ascend single-request decode](https://github.com/lvyufeng/relic-engine/blob/master/docs/performance/ascend_single_request_tps.md),
+[Ascend TP collective overlap](https://github.com/lvyufeng/relic-engine/blob/master/docs/performance/ascend_tp_collective_overlap.md),
+[Ascend performance roadmap](https://github.com/lvyufeng/relic-engine/blob/master/docs/architecture/ascend_performance_roadmap.md).
 
 Upstream reads: vLLM `v0.30.0` tag and release notes, RFCs #42770, #44219, #45470, #51212, #45133,
 #11162, #21481, #47187, #48277, #47361; SGLang `v0.5.20` tag, release notes and the platform-plugin and
@@ -838,13 +838,13 @@ provider docs; TensorRT-LLM DeepSeek-V4 blog.
 - [Refactor project: one request lifecycle, one scheduler](https://github.com/users/lvyufeng/projects/7) —
   §8's decision as a tracked issue tree, tracked from
   [#432](https://github.com/lvyufeng/PocketLLM/issues/432)
-- [PocketLLM vs vLLM vs SGLang](vllm_sglang_architecture_analysis.md) — the earlier comparison, against
+- [PocketLLM vs vLLM vs SGLang](https://github.com/lvyufeng/relic-engine/blob/master/docs/architecture/vllm_sglang_architecture_analysis.md) — the earlier comparison, against
   the local 0.21.0 fork
-- [cpp_engine multi-backend refactor plan](cpp_engine_multi_backend_plan.md) — the layering plan item 6
+- [cpp_engine multi-backend refactor plan](https://github.com/lvyufeng/relic-engine/blob/master/docs/architecture/cpp_engine_multi_backend_plan.md) — the layering plan item 6
   of §7 completes
-- [Backend unification design](backend_unification_design.md) and
-  [PocketLLM refactor analysis (2026-09)](pocketllm_refactor_analysis_2026_09.md) — the two earlier drafts
+- [Backend unification design](https://github.com/lvyufeng/relic-engine/blob/master/docs/architecture/backend_unification_design.md) and
+  [PocketLLM refactor analysis (2026-09)](https://github.com/lvyufeng/relic-engine/blob/master/docs/architecture/pocketllm_refactor_analysis_2026_09.md) — the two earlier drafts
 - [Feature roadmap for old hardware](pocketllm_roadmap_old_hardware.md) — the capability axis
 - [New model support on the 2080 Ti](pocketllm_new_model_roadmap.md) — the checkpoint axis
-- [Cross-request prefix caching on V4.1](v41_prefix_cache.md) and
-  [on MiMo-V2.6-Flash](mimo_v2_6_flash_prefix_cache.md) — the shared store item 5 of §7 generalises
+- [Cross-request prefix caching on V4.1](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/v41_prefix_cache.md) and
+  [on MiMo-V2.6-Flash](https://github.com/lvyufeng/RelicLLM/blob/master/docs/architecture/mimo_v2_6_flash_prefix_cache.md) — the shared store item 5 of §7 generalises

@@ -174,7 +174,7 @@
 **现状**（2026-09-15 实测，PR #253）：
 
 上面两段收益预估是规划值，没有一条在本机量过。完整测量与复现命令见
-[CPU offload 与 prefetch 的实测天花板](../performance/cpu_offload_profile.md)，
+[CPU offload 与 prefetch 的实测天花板](https://github.com/lvyufeng/RelicLLM/blob/master/docs/performance/cpu_offload_profile.md)，
 逐条对照如下：
 
 - ✅ **prefill 侧的算术成立**：TP1 下 512 行 chunk 搬 12.28 GiB，完美流水时 439 tok/s，
@@ -199,7 +199,7 @@
 
 结论：按各 checkpoint 的真实几何与实测带宽算出的 offload ceiling 是 **0.025–0.29 tok/s**
 （跨 checkpoint），低于仓库已经交付的 expert 粒度路径在本机的实测值——GLM-5.2 走
-expert staging 的 decode 是 0.54–0.66 tok/s（[GLM-5.2 模型页](../models/glm-5.2.md)）。
+expert staging 的 decode 是 0.54–0.66 tok/s（[GLM-5.2 模型页](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/glm-5.2.md)）。
 而唯一真正受益的 70B FP4 TP1 配置在本机没有 checkpoint，无法端到端验证。
 **是否仍然实现 `--gpu-layers`，由这条测量结论决定**（见 #156）。
 

@@ -7,7 +7,7 @@ behind that conclusion.
 - **Use it for**: smoke tests, demos, and very short prompts on one RTX 2080 Ti
 - **Do not use it for**: anything interactive beyond a few hundred prompt tokens
 - **Prefer instead**: the four-GPU GGUF Q2 resident path or the FP4 resident path — see
-  [the DeepSeek-V4 guide](deepseek-v4.md)
+  [the DeepSeek-V4 guide](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/deepseek-v4.md)
 
 ## Run it
 
@@ -65,4 +65,4 @@ expert mmap.
 For production-like use on this repository, prefer the four-GPU GGUF Q2 TP resident path or the FP4
 resident path. Treat single-GPU Q2 as functional validation and very short-prompt experimentation.
 
-Back to [the current DeepSeek-V4 guide](deepseek-v4.md).
+Back to [the current DeepSeek-V4 guide](https://github.com/lvyufeng/RelicLLM/blob/master/docs/models/deepseek-v4.md).

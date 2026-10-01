@@ -9,8 +9,8 @@
 site_name: PocketLLM
 site_url: https://lvyufeng.github.io/PocketLLM/
 site_description: >-
-  Inference engine for large language models on consumer GPUs with deep
-  optimization for older hardware
+  Inference library for large language models on a single consumer GPU, and for
+  edge and mobile targets -- quantized checkpoints, no host offload
 site_author: lvyufeng
 copyright: MIT licensed. Model weights and third-party components keep their own licenses.
 
@@ -106,120 +106,19 @@ nav:
   - Getting started: getting-started.md
   - Model guides:
       - Support matrix: models/README.md
-      - DeepSeek-V4: models/deepseek-v4.md
       - DeepSeek-V4 GGUF Q2 on one GPU: models/deepseek-v4-gguf-q2-single-gpu.md
-      - MiniMax-M2.7: models/minimax-m2.7.md
-      - GLM-5.2: models/glm-5.2.md
-      - Qwen3.8-27B-FP8: models/qwen3.8-27b-fp8.md
-      - Qwen3.8-27B-NVFP4: models/qwen3.8-27b-nvfp4.md
-      - Qwen3.8-27B-BF16: models/qwen3.8-27b-bf16.md
-      - DeepSeek-V4.1-Flash: models/deepseek-v4.1-flash.md
-      - MiMo-V2.6-Flash: models/mimo-v2.6-flash.md
       - Ternary-Bonsai-2-27B: models/ternary-bonsai-2-27b.md
       - Xing4.0-29B-A4B: models/xing4.0-29b-a4b.md
-  - Guides:
-      - Overview: guides/index.md
-      - Benchmarking and reporting: guides/benchmarking.md
-      - Serving latency metrics: guides/latency_metrics.md
-      - Native engine API: guides/pocketllm_api.md
-      - PyPI release: guides/pypi_release.md
-      - CUDA extension builds: guides/cuda_extension_builds.md
-      - Ascend SoC generations: guides/ascend_soc_generations.md
-  - Performance:
-      - Overview: performance/index.md
-      - DSpark speculative decoding: performance/dspark.md
-      - FlashMemory 1M context: performance/flashmemory_1m_context.md
-      - MiniMax decode bottleneck: performance/minimax_decode_bottleneck_analysis.md
-      - Qwen4-Exp expert placement: performance/qwen4_exp_performance.md
-      - CPU offload and prefetch ceiling: performance/cpu_offload_profile.md
-      - Qwen KV cache at 65K: performance/qwen_kv_cache_65k_tg512.md
-      - Qwen drafter acceptance: performance/qwen_drafter_acceptance.md
-      - OpenAI API concurrency validation: performance/cpp_openai_concurrency_validation.md
-      - OpenAI API tool-calling acceptance: performance/cpp_openai_tool_acceptance.md
-      - Ascend 910B attention: performance/ascend_attention_optimization.md
-      - Ascend 910B TP collective overlap: performance/ascend_tp_collective_overlap.md
-      - Ascend decode collectives and batch scaling: performance/ascend_decode_collective_ab.md
-      - Ascend 910B single-request decode: performance/ascend_single_request_tps.md
-      - Ascend gated-delta value-axis slice: performance/ascend_gated_delta_slice.md
-      - Ascend RoPE table workspace slot: performance/ascend_rope_table_workspace_aliasing.md
-      - DeepSeek-V4 PersistentEngine baseline: performance/deepseek_v4_serial_baseline.md
-      - DeepSeek-V4.1 shard audit: performance/deepseek_v4_1_shard_audit.md
-      - DeepSeek-V4.1-Flash host run: performance/deepseek_v4_1_flash_host_run.md
-      - DeepSeek-V4.1-Flash device experts: performance/deepseek_v4_1_flash_device_experts.md
-      - DeepSeek-V4.1-Flash remaining bottlenecks: performance/deepseek_v4_1_flash_remaining_bottlenecks.md
-      - DeepSeek-V4.1-Flash decode graph: performance/deepseek_v4_1_flash_decode_graph.md
-      - DeepSeek-V4.1-Flash graphed decode, live: performance/deepseek_v4_1_flash_decode_graph_live.md
-      - DeepSeek-V4.1-Flash chunked prefill: performance/deepseek_v4_1_flash_chunked_prefill.md
-      - DeepSeek-V4.1-Flash prefill stack: performance/deepseek_v4_1_flash_prefill_stack.md
-      - DeepSeek-V4.1-Flash MoE weight staging: performance/deepseek_v4_1_flash_moe_weight_staging.md
-      - DeepSeek-V4.1-Flash MoE reduction: performance/deepseek_v4_1_flash_moe_reduce_csr.md
-      - DeepSeek-V4.1-Flash single-request capability: performance/deepseek_v4_1_flash_single_request_capability.md
-      - DeepSeek-V4.1-Flash behind the server: performance/deepseek_v4_1_flash_served_gate.md
-      - DeepSeek-V4.1-Flash dense stack in fp16, withdrawn: performance/v41_dense_gemm_dtype.md
-      - Serving latency baseline: performance/serving_latency_baseline.md
-      - Serving latency with IPC all-reduce: performance/serving_latency_optimized.md
-      - Serving concurrency and throughput: performance/serving_throughput_scaling.md
-      - Ascend 910B serving ladder: performance/ascend_cpp_serving_ladder.md
-      - Qwen3.8-27B BF16 behind the server: performance/ascend_qwen_bf16_served.md
-      - Xing4.0-29B-A4B MLA attention on sm_75: performance/xing4_0_attention_sm75.md
-      - Xing4.0-29B-A4B hyper-connection on sm_75: performance/xing4_0_hyper_connection_sm75.md
-      - Xing4.0-29B-A4B decode launch gap: performance/xing4_0_decode_launch_gap.md
-      - Xing4.0-29B-A4B prefill/decode seam: performance/xing4_0_rate_clock_split.md
-      - Xing4.0-29B-A4B decode graph: performance/xing4_0_decode_graph.md
   - Architecture:
-      - Overview: architecture/index.md
-      - MiMo-V2.6-Flash design and measurements: architecture/mimo_v2_6_flash_design.md
-      - DeepSeek-V4.1-Flash design and measurements: architecture/deepseek_v4_1_flash_design.md
-      - Qwen3.8-27B-FP8 design and measurements: architecture/qwen3_8_27b_fp8_design.md
-      - Qwen3.8-27B-NVFP4 design and measurements: architecture/qwen3_8_27b_nvfp4_design.md
-      - Qwen3.8-27B BF16 design and measurements: architecture/qwen3_8_27b_bf16_design.md
-      - DeepSeek-V4-Flash design and measurements: architecture/deepseek_v4_design.md
-      - GLM-5.2 design and measurements: architecture/glm_5_2_design.md
-      - MiniMax-M2.7 design and measurements: architecture/minimax_m2_7_design.md
-      - Backend unification design: architecture/backend_unification_design.md
-      - Cross-request prefix caching on V4.1: architecture/v41_prefix_cache.md
-      - Cross-request prefix caching on MiMo-V2.6-Flash: architecture/mimo_v2_6_flash_prefix_cache.md
-      - C++ engine multi-backend plan: architecture/cpp_engine_multi_backend_plan.md
-      - Refactor analysis (2026-09): architecture/pocketllm_refactor_analysis_2026_09.md
-      - Roadmap for old hardware: architecture/pocketllm_roadmap_old_hardware.md
-      - New model roadmap: architecture/pocketllm_new_model_roadmap.md
-      - Ternary-Bonsai-2-27B reference gate: architecture/ternary_bonsai_2_reference_gate.md
+      - Overview: architecture/pocketllm_roadmap_old_hardware.md
+      - Ternary-Bonsai-2-27B served runtime: architecture/bonsai_2_27b_design.md
       - Xing4.0-29B-A4B checkpoint audit: architecture/xing4_0_29b_a4b_audit.md
       - Xing4.0-29B-A4B design and measurements: architecture/xing4_0_29b_a4b_design.md
-      - Ternary-Bonsai-2-27B dense GEMM: architecture/ternary_bonsai_2_dense_gemm.md
-      - Ternary-Bonsai-2-27B served runtime: architecture/bonsai_2_27b_design.md
-      - GLM-5.3-Flash checkpoint audit: architecture/glm_5_3_flash_audit.md
-      - vLLM and SGLang architecture analysis: architecture/vllm_sglang_architecture_analysis.md
-      - Multi-backend and multi-model (vLLM 0.30, SGLang 0.5.20): architecture/multi_backend_multi_model_2026_09.md
-      - vLLM and SGLang comparison (pre-Phase-1): architecture/vllm_sglang_comparison.md
-      - The command-line surface against vLLM and SGLang: architecture/cli_surface_design_2026_09.md
-      - Ascend 910B performance roadmap: architecture/ascend_performance_roadmap.md
-      - Per-method duplication across the five adapters: architecture/per_method_duplication_2026_09.md
-  - Migration:
-      - Overview: migration/index.md
-      - "A max_tokens the context cannot hold is refused": migration/overlong-max-tokens-is-refused.md
-      - "A --max-batch-size that cannot be honoured is refused": migration/unhonourable-batch-width-is-refused.md
-      - "The C++ binary's --serve front end is removed": migration/native-serve-front-end-removed.md
-      - "--device splits into a platform and a card list": migration/device-splits-into-platform-and-cards.md
-      - Batching is on by default for the cpp backend: migration/batching-default-on.md
-      - The dsv4 to pocket rename: migration/dsv4-to-pocket-rename.md
-  - Archive (Phase 2/3):
-      - Overview: archive/phase2-phase3/index.md
-      - Phase 2 validation results: archive/phase2-phase3/phase2_validation_results.md
-      - Backend auto-TP design: archive/phase2-phase3/cpp_backend_auto_tp.md
-      - Phase 3.1 batching design: archive/phase2-phase3/cpp_engine_batching_phase3_1.md
-      - Phase 3.1 progress report: archive/phase2-phase3/phase3_1_progress_report.md
-      - Phase 3.1 completion summary: archive/phase2-phase3/phase3_1_completion_summary.md
-      - Phase 3.2 implementation plan: archive/phase2-phase3/phase3_2_implementation_plan.md
-      - Phase 3.2 completion summary: archive/phase2-phase3/phase3_2_completion_summary.md
-      - Phase 3.3 implementation plan: archive/phase2-phase3/phase3_3_implementation_plan.md
-      - Phase 3.3 completion summary: archive/phase2-phase3/phase3_3_completion_summary.md
-      - Phase 3.4 completion summary: archive/phase2-phase3/phase3_4_completion_summary.md
-      - Phase 3.5 auto-TP results: archive/phase2-phase3/phase3_5_auto_tp_results.md
-      - Phase 3.5 benchmark guide: archive/phase2-phase3/phase3_5_benchmark_guide.md
-      - Phase 3.5 performance report: archive/phase2-phase3/phase3_5_performance_report.md
-      - Phase 3.5 validation results: archive/phase2-phase3/phase3_5_validation_results.md
-  - Changelog: https://github.com/lvyufeng/PocketLLM/blob/master/CHANGELOG.md
+      - New model support on the 2080 Ti: architecture/pocketllm_new_model_roadmap.md
+      - Multi-backend and multi-model: architecture/multi_backend_multi_model_2026_09.md
+  - Guides:
+      - Overview: guides/index.md
+      - PyPI release: guides/pypi_release.md
 
 # MkDocs hooks. One, and it is a build-time check rather than a feature: it warns
 # when `docs/llms.txt` is out of date with the nav below, which `--strict` turns
