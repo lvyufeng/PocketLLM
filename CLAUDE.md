@@ -50,7 +50,8 @@ This applies to commit messages, code comments, docstrings, and all `.md` files.
 `llms.txt` is not a document — it is a generated artifact of the nav, and it is the one file at that
 level nobody writes by hand. Regenerate it with `scripts/gen_llms_txt.py` whenever a nav entry
 changes, in the same commit. `mkdocs build --strict` fails when it is stale
-(`hooks/llms_txt_staleness.py`), and that build is the only check CI runs on a documentation change.
+(`.mkdocs/hooks/llms_txt_staleness.py`), and that build is the only check CI runs on a documentation
+change.
 
 Four directories, each with one subject:
 
@@ -87,7 +88,7 @@ looking untidy.
 | `pocketllm/architectures/` | The model IR (`ir.py`, `cache.py`, `registry.py`) and the builders. Only `toy` ships. |
 | `pocketllm/api/`, `protocol/`, `server/`, `choices.py`, `tokenizer/`, `cli.py` | The intent types, the OpenAI-compatible HTTP surface, n-choice fan-out, the GGUF-vocabulary tokenizer skeleton, and the CLI. |
 | `tests/` | pytest suite — see **Testing** below; `tests/README.md` is its own documentation. |
-| `hooks/`, `scripts/`, `docs/`, `overrides/`, `mkdocs.yml` | The documentation site and the three scripts that keep it and the baseline honest. |
+| `.mkdocs/`, `docs/`, `scripts/`, `mkdocs.yml` | The documentation site and the three scripts that keep it and the baseline honest. `.mkdocs/` holds the two **build-only** inputs — `overrides/` (`theme.custom_dir`) and `hooks/` (the `llms.txt` staleness guard); they are configuration, not content, so they sit in a dot-directory rather than at the repo root, and both paths are resolved relative to `mkdocs.yml`. |
 
 **This is the whole installable package, and the only top-level package name the wheel claims.**
 There is no `src/` tree and no second root: a wheel that claims a name another wheel also claims has

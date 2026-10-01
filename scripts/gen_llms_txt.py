@@ -16,8 +16,8 @@ Usage::
     python scripts/gen_llms_txt.py            # write docs/llms.txt
     python scripts/gen_llms_txt.py --check    # exit 1 if the checked-in file is stale
 
-``hooks/llms_txt_staleness.py`` calls :func:`generate` on every docs build, so the check runs in CI
-as well — see the note in ``CLAUDE.md``.
+``.mkdocs/hooks/llms_txt_staleness.py`` calls :func:`generate` on every docs build, so the check
+runs in CI as well — see the note in ``CLAUDE.md``.
 """
 
 from __future__ import annotations

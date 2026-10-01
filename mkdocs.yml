@@ -14,7 +14,8 @@ site_dir: site
 
 theme:
   name: material
-  custom_dir: overrides
+  # A build-only input: see the note above `hooks:` below.
+  custom_dir: .mkdocs/overrides
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
@@ -40,8 +41,12 @@ theme:
 extra_css:
   - stylesheets/extra.css
 
+# `custom_dir` and `hooks` are relative to this file, not the working directory,
+# so the two build-only inputs live together under `.mkdocs/` -- a dot-directory
+# reads as configuration rather than content, and keeping them out of the repo
+# root keeps the top level to the packages, the tests and the docs.
 hooks:
-  - hooks/llms_txt_staleness.py
+  - .mkdocs/hooks/llms_txt_staleness.py
 
 markdown_extensions:
   - admonition
