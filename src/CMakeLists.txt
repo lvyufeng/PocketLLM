@@ -32,6 +32,10 @@ add_library(pocketllm SHARED
   gguf/reader.cpp
   runtime/status.cpp
   runtime/session.cpp
+  tokenizer/unicode_data.cpp
+  tokenizer/unicode.cpp
+  tokenizer/pretokenize.cpp
+  tokenizer/bpe.cpp
 )
 
 target_include_directories(pocketllm
@@ -56,6 +60,25 @@ add_executable(pocketllm-gguf-dump
 target_include_directories(pocketllm-gguf-dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(pocketllm-gguf-dump PRIVATE -Wall -Wextra -Werror)
+endif()
+
+# The tokenizer, as a standalone tool.  Same reason as the dump: the tokenizer
+# test wants to run *the C tokenizer* over a corpus and diff the ids, and going
+# through libpocketllm.so would mean a session per line.  It also gives a
+# `--text` mode so the same binary can be diffed against `llama-tokenize`.
+add_executable(pocketllm-tokenize
+  tools/tokenize.cpp
+  abi/spec.cpp
+  gguf/reader.cpp
+  runtime/status.cpp
+  tokenizer/unicode_data.cpp
+  tokenizer/unicode.cpp
+  tokenizer/pretokenize.cpp
+  tokenizer/bpe.cpp
+)
+target_include_directories(pocketllm-tokenize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(pocketllm-tokenize PRIVATE -Wall -Wextra -Werror)
 endif()
 
 # `POCKETLLM_ABI_VERSION_MAJOR` is a C preprocessor macro in the header, not a

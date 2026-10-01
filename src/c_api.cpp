@@ -17,6 +17,7 @@
 #include <exception>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "runtime/session.h"
 #include "runtime/status.h"
@@ -39,6 +40,14 @@ const std::string &abi_version_string() {
  * one-place change. */
 pocketllm::Session *as_session(pocketllm_session *handle) {
   return reinterpret_cast<pocketllm::Session *>(handle);
+}
+
+/* `encode` and `decode` take a `const` session in the header -- they do not
+ * change the model or the cache -- so they need their own spelling of the same
+ * cast.  Casting the constness away would be a lie the type system is entitled
+ * to catch; this keeps it honest. */
+const pocketllm::Session *as_session(const pocketllm_session *handle) {
+  return reinterpret_cast<const pocketllm::Session *>(handle);
 }
 
 }  // namespace
@@ -68,27 +77,58 @@ void pocketllm_close(pocketllm_session *session) {
   delete as_session(session);
 }
 
-int pocketllm_encode(const pocketllm_session *session, const char *text, int add_special, int32_t *out, int cap) {
-  if (session == nullptr || text == nullptr) {
+int pocketllm_encode(const pocketllm_session *session, const char *text, int add_special, int parse_special,
+                     int32_t *out, int cap) {
+  if (session == nullptr || text == nullptr || cap < 0) {
     return -1;
   }
-  /* The tokenizer lands in the next step.  Failing with a distinct code now
-   * keeps `forward`'s failure -- which is about the model, not the vocabulary --
-   * distinguishable from it. */
-  (void)add_special;
-  (void)out;
-  (void)cap;
-  return -2;
+  try {
+    const pocketllm::Tokenizer *tokenizer = as_session(session)->tokenizer();
+    if (tokenizer == nullptr) {
+      return -2;
+    }
+    /* `out == NULL && cap == 0` is the sizing call the header documents, and it
+     * works because `data()` on an empty vector is never written to before the
+     * size check. */
+    const std::vector<int32_t> ids = tokenizer->encode(text, add_special != 0, parse_special != 0);
+    if (out == nullptr) {
+      return static_cast<int>(ids.size());
+    }
+    if (static_cast<int>(ids.size()) > cap) {
+      /* The header promises the caller can size the buffer from a sizing call,
+       * so a result that does not fit reports the size it needed and writes
+       * nothing. */
+      return static_cast<int>(ids.size());
+    }
+    std::memcpy(out, ids.data(), ids.size() * sizeof(int32_t));
+    return static_cast<int>(ids.size());
+  } catch (const std::exception &) {
+    return -1;
+  }
 }
 
 int pocketllm_decode(const pocketllm_session *session, const int32_t *ids, int n, char *out, int cap) {
   if (session == nullptr || ids == nullptr || out == nullptr || n < 0 || cap <= 0) {
     return -1;
   }
-  (void)ids;
-  (void)n;
-  out[0] = '\0';
-  return 0;
+  try {
+    const pocketllm::Tokenizer *tokenizer = as_session(session)->tokenizer();
+    if (tokenizer == nullptr) {
+      return -2;
+    }
+    const std::string text = tokenizer->decode(std::vector<int32_t>(ids, ids + n));
+    /* The terminator has to fit, so the body is capped one short of `cap`.
+     * Truncating mid-character is the caller's choice -- the header says the
+     * result is NUL-terminated and says nothing about cutting on a character
+     * boundary, and a caller streaming a partial answer wants the bytes. */
+    const std::size_t room = static_cast<std::size_t>(cap) - 1;
+    const std::size_t written = text.size() < room ? text.size() : room;
+    std::memcpy(out, text.data(), written);
+    out[written] = '\0';
+    return static_cast<int>(written);
+  } catch (const std::exception &) {
+    return -1;
+  }
 }
 
 int pocketllm_forward(pocketllm_session *session, const int32_t *tokens, int n, float *logits, int logits_cap) {

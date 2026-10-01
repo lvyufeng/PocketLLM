@@ -4,8 +4,12 @@
 
 namespace pocketllm {
 
-Session::Session(std::string gguf_path, std::string backend, std::unique_ptr<GgufReader> checkpoint)
-    : gguf_path_(std::move(gguf_path)), backend_(std::move(backend)), checkpoint_(std::move(checkpoint)) {}
+Session::Session(std::string gguf_path, std::string backend, std::unique_ptr<GgufReader> checkpoint,
+                 std::unique_ptr<Tokenizer> tokenizer)
+    : gguf_path_(std::move(gguf_path)),
+      backend_(std::move(backend)),
+      checkpoint_(std::move(checkpoint)),
+      tokenizer_(std::move(tokenizer)) {}
 
 Session::~Session() = default;
 
@@ -25,7 +29,9 @@ std::unique_ptr<Session> Session::open(const std::string &gguf_path, const std::
    * missing one with the same errno message, so checking first would only be a
    * second place that can disagree about what "opens" means. */
   auto checkpoint = std::make_unique<GgufReader>(gguf_path);
-  return std::unique_ptr<Session>(new Session(gguf_path, device, std::move(checkpoint)));
+  auto tokenizer = std::make_unique<Tokenizer>(*checkpoint);
+  return std::unique_ptr<Session>(
+      new Session(gguf_path, device, std::move(checkpoint), std::move(tokenizer)));
 }
 
 void Session::reset() { position_ = 0; }

@@ -80,12 +80,21 @@ POCKETLLM_API void pocketllm_close(pocketllm_session *session);
 /* Tokenize `text` into `out`.
  *
  * `add_special` asks for the model's BOS/EOS convention rather than raw text.
+ *
+ * `parse_special` decides whether a control token spelled inside `text` -- a
+ * chat template's `<|im_start|>`, say -- becomes that one token or the
+ * characters it is spelled with.  The two are not the same request: a caller
+ * driving a chat template wants 1, and one feeding user-typed text wants 0,
+ * because that text merely mentions the spelling.  User-defined tokens are
+ * recognized either way.  The distinction is llama.cpp's, and the test uses
+ * it to compare against `llama_tokenize` in both modes.
+ *
  * Returns the number of token ids written, or a negative value on failure.
  * A return greater than `cap` means the result did not fit and `out` was not
  * written -- callers should treat that as an error and size the buffer from
  * `pocketllm_encode`'s first call with a NULL `out` and a zero `cap`. */
 POCKETLLM_API int pocketllm_encode(const pocketllm_session *session, const char *text, int add_special,
-                                   int32_t *out, int cap);
+                                   int parse_special, int32_t *out, int cap);
 
 /* Detokenize `n` token ids into `out`, NUL-terminated.
  *

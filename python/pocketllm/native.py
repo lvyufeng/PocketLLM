@@ -120,6 +120,7 @@ def _bind(lib: "CDLL") -> None:
         ctypes.c_void_p,
         ctypes.c_char_p,
         ctypes.c_int,
+        ctypes.c_int,
         ctypes.POINTER(ctypes.c_int32),
         ctypes.c_int,
     ]
@@ -243,15 +244,20 @@ class Engine:
         reported = load().pocketllm_abi_version()
         return reported.decode("ascii", "replace") if reported else ""
 
-    def encode(self, text: str, add_special: bool = True) -> list[int]:
+    def encode(self, text: str, add_special: bool = True, parse_special: bool = False) -> list[int]:
         """Tokenize ``text``, sizing the output buffer from a first call.
 
         The header documents that an undersized buffer fails with a count
         rather than writing partially, so the two-call pattern is: ask with a
         null pointer to learn the length, then ask again with room for it.
+
+        ``parse_special`` defaults to false and mirrors ``llama_tokenize``: a
+        caller feeding a chat template passes true so that ``<|im_start|>``
+        becomes one token, and a caller feeding user-typed text leaves it
+        false so that a literal mention stays literal.
         """
         n = self._lib.pocketllm_encode(
-            self._handle, text.encode(), int(bool(add_special)), None, 0
+            self._handle, text.encode(), int(bool(add_special)), int(bool(parse_special)), None, 0
         )
         if n < 0:
             raise EngineUnavailable(f"pocketllm_encode failed ({n})")
@@ -259,7 +265,7 @@ class Engine:
             return []
         out = (ctypes.c_int32 * n)()
         written = self._lib.pocketllm_encode(
-            self._handle, text.encode(), int(bool(add_special)), out, n
+            self._handle, text.encode(), int(bool(add_special)), int(bool(parse_special)), out, n
         )
         if written < 0:
             raise EngineUnavailable(f"pocketllm_encode failed ({written})")

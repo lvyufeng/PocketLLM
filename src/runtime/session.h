@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "gguf/reader.h"
+#include "tokenizer/bpe.h"
 
 namespace pocketllm {
 
@@ -52,15 +53,26 @@ class Session {
    * straight out of the mapping by the kernels. */
   const GgufReader &checkpoint() const { return *checkpoint_; }
 
+  /* The tokenizer built from this checkpoint's metadata, or nullptr if the
+   * checkpoint's vocabulary is one this build cannot read.  It is built in
+   * `open` -- deliberately there rather than on first use -- because a
+   * vocabulary this build cannot tokenize is a checkpoint this build cannot
+   * run, and that belongs in the open's error rather than in the first
+   * `encode`'s.  The two callers below still check, because the pointer is
+   * what they have. */
+  const Tokenizer *tokenizer() const { return tokenizer_.get(); }
+
   /* Drop the KV cache and rewind to position 0. */
   void reset();
 
  private:
-  Session(std::string gguf_path, std::string backend, std::unique_ptr<GgufReader> checkpoint);
+  Session(std::string gguf_path, std::string backend, std::unique_ptr<GgufReader> checkpoint,
+          std::unique_ptr<Tokenizer> tokenizer);
 
   std::string gguf_path_;
   std::string backend_;
   std::unique_ptr<GgufReader> checkpoint_;
+  std::unique_ptr<Tokenizer> tokenizer_;
 
   /* The next position the model will write.  It is the KV cache's length, and
    * keeping the two in one object is what stops them drifting. */
