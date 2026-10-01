@@ -28,6 +28,8 @@ endif()
 
 add_library(pocketllm SHARED
   c_api.cpp
+  abi/spec.cpp
+  gguf/reader.cpp
   runtime/status.cpp
   runtime/session.cpp
 )
@@ -39,6 +41,21 @@ target_include_directories(pocketllm
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(pocketllm PRIVATE -Wall -Wextra -Werror)
+endif()
+
+# An internal tool, not part of the ABI: it prints a checkpoint's directory as
+# JSON so the reader test can diff the C parse against the Python reader's on a
+# real file.  It links the reader directly rather than libpocketllm.so, which is
+# how the ABI stays the eight functions the header declares.
+add_executable(pocketllm-gguf-dump
+  tools/gguf_dump.cpp
+  abi/spec.cpp
+  gguf/reader.cpp
+  runtime/status.cpp
+)
+target_include_directories(pocketllm-gguf-dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(pocketllm-gguf-dump PRIVATE -Wall -Wextra -Werror)
 endif()
 
 # `POCKETLLM_ABI_VERSION_MAJOR` is a C preprocessor macro in the header, not a

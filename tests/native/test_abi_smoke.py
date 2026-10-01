@@ -117,34 +117,25 @@ def test_argmax_rejects_an_empty_input(lib: "ctypes.CDLL") -> None:
     assert lib.pocketllm_argmax(logits, 0) < 0
 
 
-def test_opening_a_checkpoint_that_exists_succeeds(lib: "ctypes.CDLL", tmp_path) -> None:
-    """The positive path: a real file opens and closes without a leak.
+def test_a_file_that_is_not_a_gguf_fails_with_a_message(lib: "ctypes.CDLL", tmp_path) -> None:
+    """A file that exists but is not a GGUF is a load failure, not a crash.
 
-    The file is a stub, not a GGUF, because the reader does not exist yet. The
-    test is therefore about the session's lifetime and the handle round trip,
-    and it moves to the reader's tests once there is a format to check.
+    The reader is reached through `pocketllm_open`, so this is where a wrong
+    magic has to be caught: a session built on a file that was never parsed
+    would fail later, in the first kernel, where the message is far away from
+    the mistake.
     """
-    checkpoint = tmp_path / "stub.gguf"
-    checkpoint.write_bytes(b"\x00" * 8)
+    checkpoint = tmp_path / "not-a-model.gguf"
+    checkpoint.write_bytes(b"\x00" * 64)
     err = ctypes.create_string_buffer(native._ERR_CAP)
     handle = lib.pocketllm_open(str(checkpoint).encode(), b"cpu", err, native._ERR_CAP)
-    assert handle, err.value
-    lib.pocketllm_close(handle)
+    assert not handle
+    assert b"GGUF" in err.value
 
 
 def test_close_accepts_null(lib: "ctypes.CDLL") -> None:
     """A NULL close is a no-op, which is what makes the failure path safe."""
     lib.pocketllm_close(None)
-
-
-def test_reset_round_trips(lib: "ctypes.CDLL", tmp_path) -> None:
-    checkpoint = tmp_path / "stub.gguf"
-    checkpoint.write_bytes(b"\x00" * 8)
-    err = ctypes.create_string_buffer(native._ERR_CAP)
-    handle = lib.pocketllm_open(str(checkpoint).encode(), b"cpu", err, native._ERR_CAP)
-    assert handle
-    assert lib.pocketllm_reset(handle) == 0
-    lib.pocketllm_close(handle)
 
 
 def test_an_unbuilt_engine_is_reported_not_raised_at_import() -> None:

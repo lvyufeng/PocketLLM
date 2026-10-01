@@ -28,6 +28,8 @@
 #include <string>
 #include <vector>
 
+#include "gguf/reader.h"
+
 namespace pocketllm {
 
 class Session {
@@ -45,14 +47,20 @@ class Session {
 
   const std::string &backend() const { return backend_; }
 
+  /* The mapped checkpoint.  Held open for the session's lifetime: re-opening a
+   * 1.5 GB file per `forward` would re-map it per call, and the tensors are read
+   * straight out of the mapping by the kernels. */
+  const GgufReader &checkpoint() const { return *checkpoint_; }
+
   /* Drop the KV cache and rewind to position 0. */
   void reset();
 
  private:
-  Session(std::string gguf_path, std::string backend);
+  Session(std::string gguf_path, std::string backend, std::unique_ptr<GgufReader> checkpoint);
 
   std::string gguf_path_;
   std::string backend_;
+  std::unique_ptr<GgufReader> checkpoint_;
 
   /* The next position the model will write.  It is the KV cache's length, and
    * keeping the two in one object is what stops them drifting. */
