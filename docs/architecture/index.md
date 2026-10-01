@@ -10,6 +10,7 @@ forces. The pages here are the design record, in the order the layers depend on 
 | [Backends and dispatch](backend_model.md) | How an op finds a backend, and how a device is named |
 | [Execution](execution.md) | The execution layer, memory, plans, and reading a GGUF checkpoint |
 | [Device targets](devices.md) | What each backend is for and what it is waiting for |
+| [The C engine](c_engine.md) | The native `libpocketllm.so`: what it runs today, and the backend interface the graph is written against |
 
 ## The three words
 

@@ -138,7 +138,8 @@ Ascend machine at all, and neither machine can run a model from this tree today.
 ### x86_64 CUDA machine — 4 x RTX 2080 Ti
 
 - **GPUs**: 4 x RTX 2080 Ti, 22528 MiB each, compute capability **7.5 (Turing / sm_75)**. relic-core
-  builds for sm_75; do not drop sm_75-specific kernel paths there. This tree compiles nothing.
+  builds for sm_75; do not drop sm_75-specific kernel paths there. `src/kernel/cuda/` is built for
+  sm_75 too (`POCKETLLM_CUDA_ARCHITECTURES`), and one process uses exactly one of these cards.
 - **CPU / RAM**: 2 x Xeon E5-2696 v4, 22 cores each (88 hardware threads), ~1 TiB RAM.
 - **OS / Python**: Ubuntu 22.04.5, x86_64, kernel 5.15. Python 3.10.10 (conda).
 - **CUDA**: `nvcc` on `PATH` is **13.0** while `CUDA_HOME` points at **`/usr/local/cuda-12.4`**;

@@ -84,6 +84,7 @@ nav:
       - Backends and dispatch: architecture/backend_model.md
       - Execution: architecture/execution.md
       - Device targets: architecture/devices.md
+      - The C engine: architecture/c_engine.md
   - Models:
       - Overview: models/README.md
       - Reference architectures: models/architectures.md
