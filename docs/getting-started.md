@@ -35,10 +35,12 @@ cd PocketLLM
 pip install -e ".[dev]"
 ```
 
-The install compiles nothing. `setup.py`/`pyproject.toml` declare no extension modules and there is
-no `src/csrc/` tree: every native kernel belongs to
-[relic-core](https://github.com/lvyufeng/relic-core), and the C++ engine this repository used to
-build is archived in [relic-engine](https://github.com/lvyufeng/relic-engine).
+The install compiles nothing. `pyproject.toml` declares no extension modules and the Python package
+carries no compiled artifact. The engine is a **separate native library** built from the `src/` tree
+in this repository and loaded at runtime, so `pip install` never needs a compiler. Every native
+kernel *inside* a Python backend belongs to
+[relic-core](https://github.com/lvyufeng/relic-core), which is an optional extra here rather than a
+dependency.
 
 ## What your device can do
 
@@ -107,10 +109,11 @@ importable HTTP surface the CLI will call once a backend exists.
 python -m pytest tests/ -q
 ```
 
-Run it **from the repository root**: there is no `conftest.py` and no pytest configuration, and the
-modules import from the repository root. Modules that need a device or a real checkpoint skip
-themselves — and a skip is not a pass. `tests/baseline_failures.txt` records the known failures as a
-set; compare a run against it with:
+Run it **from the repository root**: the import path comes from the `pythonpath = ["python"]` setting
+in `pyproject.toml` and from `tests/conftest.py`, both of which pytest reads from the root and
+nowhere else. Modules that need a device or a real checkpoint skip themselves — and a skip is not a
+pass. `tests/baseline_failures.txt` records the known failures as a set; compare a run against it
+with:
 
 ```bash
 python scripts/check_test_baseline.py

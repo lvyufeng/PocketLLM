@@ -9,11 +9,12 @@ __pycache__/
 # Distribution / packaging
 .Python
 **/build/
-# Build trees. Nothing here compiles any more -- the C++ engine these patterns
-# were written for is archived in relic-engine and relic-core does its own
-# building -- but they are kept because a stale build tree reappears the moment
-# anyone runs cmake in a checkout, and a hyphen-only pattern misses the
+# Build trees. The engine under src/ is built out of tree with CMake, which
+# writes into a build/ directory next to it -- so how it is invoked is not a
+# promise that can be made here, and a hyphen-only pattern would miss the
 # underscore variants (build_cuda, build_ascend) that hand-run cmake produces.
+# `**` rather than a bare `build/` because the Python package and the engine
+# both build, and only one of them is at the root.
 **/build[-_]*/
 **/develop-eggs/
 **/dist/

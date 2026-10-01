@@ -7,15 +7,15 @@ include pyproject.toml
 # The vendored GGML tables are read at import time by the quant decoders, and
 # package discovery does not ship non-.py files on its own: without this line an
 # installed wheel's loader dies at the first codebook read.
-recursive-include pocketllm/loader/gguf/vendor *.h *.md
+recursive-include python/pocketllm/loader/gguf/vendor *.h *.md
 
 # Each backend's README says what it is waiting for; `pocketllm devices` prints
 # the same sentence, and the two have to ship together.
-recursive-include pocketllm/backends README.md
+recursive-include python/pocketllm/backends README.md
 
-# The sdist is pure Python: the native sources moved to relic-core and the C++
-# engine to the relic-engine archive, so there is nothing to ship for them and
-# nothing here to compile.
+# The Python package is pure Python, so the sdist ships only `python/`.  The C++
+# engine under `src/` is a separate native library built out of tree; it is not a
+# Python extension and nothing here compiles as part of `pip install`.
 
 # Build trees are environment-specific and are already git-ignored.
 prune build

@@ -19,7 +19,7 @@ to match against.
 
 ## Why this file is here
 
-Before the rebuild, `pocketllm/loader/gguf/iq4_nl.py` resolved this header through
+Before the rebuild, `python/pocketllm/loader/gguf/iq4_nl.py` resolved this header through
 `Path(relic_core.__file__).parent / "csrc" / "llama_mmq" / "ggml-common.h"`, which made the loader
 depend on the kernel library being installed. The rebuilt tree's core is **torch-free and
 native-toolchain-free**: a phone or edge install must not need relic-core. Vendoring the header is

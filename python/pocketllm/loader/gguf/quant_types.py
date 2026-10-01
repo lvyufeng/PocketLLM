@@ -30,7 +30,7 @@ GGUF_DENSE_TYPE_NAMES = {value: key for key, value in GGUF_DENSE_TYPE_IDS.items(
 # kernel exists to consume the blocks; there is none yet, and the failure it
 # would produce is a silent F16 upcast -- ten times the memory and a wrong
 # kernel that looks right.  The loader addresses the bytes and refuses to
-# interpret them.  `pocketllm/loader/gguf/tensor_reader.py` carries the refusal and
+# interpret them.  `python/pocketllm/loader/gguf/tensor_reader.py` carries the refusal and
 # says so in its message.
 GGUF_TERNARY_FILE_TYPE_IDS = {
     "ptq1_0": 143,

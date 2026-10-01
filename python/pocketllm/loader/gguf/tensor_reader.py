@@ -163,7 +163,7 @@ class GGUFTensorDataReader:
             f"(read_quantized_matrix_block_rows) {kernel} -- but this entry point returns a "
             "dense tensor, so it refuses rather than dequantizing to f16: a silent upcast "
             "costs ten times the memory and makes a wrong kernel look right. The decoder "
-            f"lives in pocketllm/quant/{tensor.type_name}.py"
+            f"lives in python/pocketllm/quant/{tensor.type_name}.py"
         )
 
     def read_tensor_rows(self, name: str | GGUFTensorInfo, row_start: int, row_count: int) -> np.ndarray:

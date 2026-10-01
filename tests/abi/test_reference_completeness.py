@@ -5,8 +5,8 @@ that some backend can run it; if the *only* implementation is an accelerated one
 on hardware nobody has, the op has no definition -- there is nothing to compare a
 kernel against, and no way to tell a wrong fast answer from a right one.
 
-So a new op in ``pocketllm/kernels/ops/`` is not complete until
-``pocketllm/backends/reference/kernels.py`` has an entry for it, and this test
+So a new op in ``python/pocketllm/kernels/ops/`` is not complete until
+``python/pocketllm/backends/reference/kernels.py`` has an entry for it, and this test
 fails until it does.  The failure message names the missing op, because the fix
 is to write a kernel and not to relax the assertion.
 """
@@ -28,7 +28,7 @@ def test_every_declared_op_has_a_reference_kernel():
     missing = sorted(declared - implemented)
     extra = sorted(implemented - declared)
     assert not missing, (
-        "these ops are declared in pocketllm/kernels/ops/ but the reference backend "
+        "these ops are declared in python/pocketllm/kernels/ops/ but the reference backend "
         f"does not implement them: {missing}. A declared op with no reference kernel "
         "has no definition for any backend to be checked against."
     )

@@ -50,6 +50,15 @@ device, and `EngineArgs` has no `tensor_parallel_size` to set.
 Read [Getting started](getting-started.md) for the install and the four read-only commands that work
 on any host.
 
+### Two trees
+
+The repository holds a Python tree under `python/`, and `src/` beside it is where the C++ engine
+lands. The Python side is the host: the kernel ABI is its **spec**, and the reference backend, the
+loader and the quantization decoders are the **numeric oracle**. The `src/` side will be the C++17
+engine and the part that actually runs a model — it owns the GGUF read, the tokenizer and the graph
+walk, and the CLI reaches it through a C ABI. Its status row appears here when its first artifact
+builds.
+
 ## Where the code lives now
 
 This repository used to describe the whole multi-GPU stack. The split is by hardware, and this is

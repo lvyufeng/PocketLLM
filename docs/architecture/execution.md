@@ -98,7 +98,7 @@ depends on `pocketllm.quant` and numpy, and not on torch — which is what lets 
 checkpoint without the training stack.
 
 ```
-pocketllm/loader/gguf/
+python/pocketllm/loader/gguf/
 ├── reader.py            the file format: header, metadata KV, tensor directory
 ├── bundle.py            the parsed file: metadata + tensor directory
 ├── quant_types.py       which GGML type id a tensor names

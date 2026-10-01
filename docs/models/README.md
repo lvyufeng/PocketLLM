@@ -49,7 +49,7 @@ nothing else, and a test enforces it.
 
 ## Adding an architecture
 
-An architecture under this tree ships as a package under `pocketllm/architectures/<name>/`; a
+An architecture under this tree ships as a package under `python/pocketllm/architectures/<name>/`; a
 third-party one is registered through the `pocketllm.architectures` entry-point group, the same way a
 [third-party backend](../architecture/devices.md#adding-a-backend) is. Either way it must:
 
@@ -59,6 +59,6 @@ third-party one is registered through the `pocketllm.architectures` entry-point 
 4. Import no backend and no device.
 
 An architecture that needs an op the ABI does not declare cannot ship alone: a new op is declared in
-`pocketllm/kernels/ops/` **with a reference implementation in the same commit**, because an op whose
+`python/pocketllm/kernels/ops/` **with a reference implementation in the same commit**, because an op whose
 only implementation is on hardware most people do not have has no way to tell a wrong fast answer
 from a right one.
