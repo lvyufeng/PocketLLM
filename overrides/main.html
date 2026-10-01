@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+
+{#
+  Material renders `{% block announce %}` through its own `md-banner` markup, and
+  only when the block is non-empty, so a blank override is the same as having none.
+
+  A banner is HTML, not a page, so these are absolute site URLs rather than the
+  relative links the Markdown uses, and `<strong>` rather than `**`. `theme.features`
+  carries `announce.dismiss`, which is Material's own close button -- it remembers
+  the dismissal in localStorage and needs no script of ours.
+
+  The wording is deliberately about the *shape* of the tree rather than about a
+  release: this is a pre-release skeleton, and a banner naming a version would go
+  stale between commits.
+#}
+{% block announce %}
+  <p><strong>This tree is a pre-release skeleton.</strong> The kernel ABI, the backend registry, the
+  GGUF loader and the serving layer are in place; no device backend implements a kernel yet, so
+  nothing runs a model. Read
+  <a href="https://lvyufeng.github.io/PocketLLM/architecture/kernel_abi_v1/">the kernel ABI</a> ·
+  <a href="https://lvyufeng.github.io/PocketLLM/architecture/devices/">the device targets</a> ·
+  <a href="https://github.com/lvyufeng/PocketLLM#current-status">the status table</a></p>
+{% endblock %}

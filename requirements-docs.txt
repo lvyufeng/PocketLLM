@@ -1,0 +1,3 @@
+# The only dependency of the documentation site. Pinned so a Material major release
+# cannot break the build without a commit here and in .github/workflows/pages.yml.
+mkdocs-material==9.7.7

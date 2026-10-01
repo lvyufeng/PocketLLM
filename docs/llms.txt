@@ -1,0 +1,34 @@
+# PocketLLM
+
+> Run a large model on one accelerator — edge, mobile and phone. One process owns one device; a checkpoint that does not fit is quantized further, never split.
+
+This is the index of every page the documentation site publishes. It is generated from `mkdocs.yml`
+by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script.
+
+## Pages
+
+- [Home](https://lvyufeng.github.io/PocketLLM/)
+- [Getting started](https://lvyufeng.github.io/PocketLLM/getting-started/)
+- [Changelog](https://github.com/lvyufeng/PocketLLM/releases)
+
+## Architecture
+
+- [Overview](https://lvyufeng.github.io/PocketLLM/architecture/)
+- [The kernel ABI](https://lvyufeng.github.io/PocketLLM/architecture/kernel_abi_v1/)
+- [Backends and dispatch](https://lvyufeng.github.io/PocketLLM/architecture/backend_model/)
+- [Execution](https://lvyufeng.github.io/PocketLLM/architecture/execution/)
+- [Device targets](https://lvyufeng.github.io/PocketLLM/architecture/devices/)
+
+## Models
+
+- [Overview](https://lvyufeng.github.io/PocketLLM/models/)
+- [Reference architectures](https://lvyufeng.github.io/PocketLLM/models/architectures/)
+
+## Guides
+
+- [Overview](https://lvyufeng.github.io/PocketLLM/guides/)
+- [Cutting a release](https://lvyufeng.github.io/PocketLLM/guides/pypi_release/)
+
+## Reports
+
+- [Overview](https://lvyufeng.github.io/PocketLLM/reports/)

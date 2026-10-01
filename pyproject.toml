@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pocketllm"
+version = "0.2.0.dev0"
+description = "Run a large model on one accelerator: edge, mobile and phone inference."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+keywords = ["llm", "inference", "edge", "mobile", "gguf", "quantization", "npu"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# The base install is deliberately one dependency.  The kernel ABI is stdlib-only
+# and the reference backend is numpy; everything else -- a CUDA card, an Apple
+# GPU, a phone NPU -- is an extra, so a wheel built here installs on a device that
+# has none of them.
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+# The correctness oracle, the CPU backend and the GGUF loader all run on this.
+# It is what the base dependency already gives, so the extra is documentation.
+reference = []
+cuda = ["torch>=2.0,<2.7"]
+mps = ["torch>=2.2"]
+# The optional shared operator library.  A CUDA backend may wrap it; nothing in
+# the core imports it, and it is absent from every other install.
+cuda-kernels = ["relic-core"]
+dev = ["pytest>=7.0"]
+docs = ["mkdocs-material==9.7.7"]
+
+[project.urls]
+Homepage = "https://github.com/lvyufeng/PocketLLM"
+Documentation = "https://lvyufeng.github.io/PocketLLM/"
+Source = "https://github.com/lvyufeng/PocketLLM"
+
+# Extension points are declared *by the plugin*, not here: a third party ships a
+# backend under the `pocketllm.backends` group or an architecture under
+# `pocketllm.architectures`, and the registries read both.  Declaring an empty
+# group on this side would be a promise this wheel does not keep -- the in-tree
+# backends are found through the static table in `pocketllm/backends/registry.py`,
+# because a bare install must import no backend at all.
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+# `pocketllm` is the only top-level package this wheel claims.
+include = ["pocketllm*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+# The vendored GGML tables are non-`.py` payload, and `find_packages` does not
+# ship those on its own: an installed wheel's loader would die at `kvalues()`
+# without this line.
+"pocketllm.loader.gguf" = ["vendor/*.h", "vendor/*.md"]
+# Each backend's README says what it is waiting for, which is the same sentence
+# `pocketllm devices` prints; the two have to ship together.  Keys are listed
+# one by one because a `*` is not a valid package-data key.
+"pocketllm.backends.reference" = ["README.md"]
+"pocketllm.backends.cpu" = ["README.md"]
+"pocketllm.backends.cuda" = ["README.md"]
+"pocketllm.backends.mps" = ["README.md"]
+"pocketllm.backends.qnn" = ["README.md"]
+"pocketllm.backends.horizon" = ["README.md"]
+"pocketllm.backends.ascend" = ["README.md"]

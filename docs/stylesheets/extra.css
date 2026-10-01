@@ -1,0 +1,98 @@
+/* Styles for the documentation site's own chrome. Everything here is additive:
+   the site is readable without this file, and on GitHub — where no stylesheet is
+   loaded — the hero degrades to ordinary headings, paragraphs and links. */
+
+.md-typeset .pll-hero {
+  margin: 0 0 2rem;
+  padding: 2.2rem 1.6rem;
+  border-radius: 0.4rem;
+  background: linear-gradient(
+    135deg,
+    var(--md-primary-fg-color--dark) 0%,
+    var(--md-primary-fg-color) 100%
+  );
+  color: #fff;
+  text-align: center;
+}
+
+.md-typeset .pll-hero__eyebrow {
+  margin: 0;
+  font-size: 0.65rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  opacity: 0.78;
+}
+
+.md-typeset .pll-hero__title {
+  margin: 0.3rem 0 0.5rem;
+  font-size: 2.6rem;
+  font-weight: 700;
+  line-height: 1.1;
+  color: #fff;
+}
+
+.md-typeset .pll-hero__tagline {
+  margin: 0 auto;
+  max-width: 34rem;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  opacity: 0.92;
+}
+
+.md-typeset .pll-hero__badges {
+  margin: 1rem 0 0;
+  line-height: 1.8;
+}
+
+.md-typeset .pll-hero__badges img {
+  display: inline-block;
+  margin: 0 0.12rem;
+  vertical-align: middle;
+}
+
+.md-typeset .pll-hero__actions {
+  margin: 1.3rem 0 0;
+}
+
+.md-typeset .pll-btn {
+  display: inline-block;
+  margin: 0.2rem 0.25rem;
+  padding: 0.42rem 1.1rem;
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  border-radius: 0.25rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #fff;
+  text-decoration: none;
+  transition: background-color 125ms, border-color 125ms;
+}
+
+.md-typeset .pll-btn:focus,
+.md-typeset .pll-btn:hover {
+  background-color: rgba(255, 255, 255, 0.16);
+  border-color: #fff;
+  color: #fff;
+}
+
+.md-typeset .pll-btn--primary,
+.md-typeset .pll-btn--primary:focus,
+.md-typeset .pll-btn--primary:hover {
+  background-color: #fff;
+  border-color: #fff;
+  color: var(--md-primary-fg-color);
+}
+
+.md-typeset .pll-btn--primary:hover {
+  background-color: rgba(255, 255, 255, 0.85);
+}
+
+/* The feature grid on the home page: give the cards a little more breathing room
+   than Material's default, and drop the list marker the source markdown carries. */
+.md-typeset .grid.cards > ul > li {
+  border-radius: 0.3rem;
+  padding: 1rem 1.1rem;
+}
+
+.md-typeset .grid.cards > ul > li > p:first-child {
+  margin-top: 0;
+}

@@ -1,0 +1,90 @@
+site_name: PocketLLM
+site_url: https://lvyufeng.github.io/PocketLLM/
+site_description: >-
+  Run a large model on one accelerator — edge, mobile and phone. One process owns one device;
+  a checkpoint that does not fit is quantized further, never split.
+site_author: PocketLLM contributors
+repo_url: https://github.com/lvyufeng/PocketLLM
+repo_name: lvyufeng/PocketLLM
+edit_uri: edit/main/docs/
+copyright: Apache-2.0
+
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  custom_dir: overrides
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - announce.dismiss
+    - content.code.copy
+    - navigation.indexes
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+
+extra_css:
+  - stylesheets/extra.css
+
+hooks:
+  - hooks/llms_txt_staleness.py
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+validation:
+  links:
+    not_found: warn
+    absolute_links: warn
+  nav:
+    omitted_files: warn
+    not_found: warn
+
+plugins:
+  - search:
+      separator: '[\s\-]'
+
+nav:
+  - Home: README.md
+  - Getting started: getting-started.md
+  - Architecture:
+      - Overview: architecture/index.md
+      - The kernel ABI: architecture/kernel_abi_v1.md
+      - Backends and dispatch: architecture/backend_model.md
+      - Execution: architecture/execution.md
+      - Device targets: architecture/devices.md
+  - Models:
+      - Overview: models/README.md
+      - Reference architectures: models/architectures.md
+  - Guides:
+      - Overview: guides/index.md
+      - Cutting a release: guides/pypi_release.md
+  - Reports:
+      - Overview: reports/index.md
+  - Changelog: https://github.com/lvyufeng/PocketLLM/releases

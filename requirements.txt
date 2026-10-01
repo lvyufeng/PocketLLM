@@ -1,0 +1,4 @@
+# The runtime dependency. The kernel ABI is stdlib-only and the reference
+# backend is numpy; a device backend adds its own runtime as an extra rather
+# than here, so this file stays installable on a phone.
+numpy>=1.24

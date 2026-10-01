@@ -1,0 +1,109 @@
+name: Publish to PyPI
+
+# Manual trigger only. PyPI versions are immutable, so the production upload stays
+# behind an explicit input rather than running on tags.
+on:
+  workflow_dispatch:
+    inputs:
+      publish_production:
+        description: >-
+          Upload to Production PyPI. Leave as "no" until the published metadata check
+          below has been reviewed - a version number can never be reused.
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
+        default: 'no'
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      # `build` and `twine`, and nothing else. This package declares no extension
+      # modules and its only runtime dependency is numpy, so there is no torch or
+      # CUDA toolkit to provision on the runner.
+      run: |
+        python -m pip install --upgrade pip
+        pip install build twine
+
+    - name: Build package
+      # sdist only, matching the manual flow in docs/guides/pypi_release.md. A wheel
+      # would be justified only if a build step appeared, which is the thing this
+      # tree exists not to have.
+      run: python -m build --sdist
+
+    - name: Check package
+      run: twine check dist/*
+
+    - name: Read the expected version
+      id: version
+      run: |
+        version=$(python -c "import re,pathlib; print(re.search(r'^version = \"(.+)\"', pathlib.Path('pyproject.toml').read_text(), re.M).group(1))")
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Publish to Test PyPI
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+      run: twine upload --repository testpypi dist/* --verbose
+
+    - name: Wait for Test PyPI to process
+      run: sleep 60
+
+    - name: Verify the published metadata
+      # Verifies what Test PyPI actually serves, not the local tree. This is the
+      # check that catches the 0.1.0 class of bug: the artifact's metadata and the
+      # rendered description it serves disagreed about the license, and `twine
+      # check` did not notice because the description is README.md and `twine
+      # check` does not read metadata.
+      env:
+        EXPECTED_VERSION: ${{ steps.version.outputs.version }}
+      run: |
+        python - <<'PY'
+        import json
+        import os
+        import urllib.request
+
+        version = os.environ["EXPECTED_VERSION"]
+        url = f"https://test.pypi.org/pypi/pocketllm/{version}/json"
+        with urllib.request.urlopen(url) as response:
+            info = json.load(response)["info"]
+
+        problems = []
+
+        if info["version"] != version:
+            problems.append(f"version is {info['version']}, expected {version}")
+
+        if info.get("license") != "Apache-2.0":
+            problems.append(f"license is {info.get('license')!r}, expected 'Apache-2.0'")
+
+        classifiers = info.get("classifiers") or []
+        if "License :: OSI Approved :: Apache Software License" not in classifiers:
+            problems.append("the Apache-2.0 license classifier is missing")
+
+        description = info.get("description") or ""
+        for stale in ("PolyForm", "Noncommercial"):
+            if stale in description:
+                problems.append(f"the rendered description still mentions {stale}")
+
+        if problems:
+            raise SystemExit("published metadata is wrong:\n  - " + "\n  - ".join(problems))
+
+        print(f"Test PyPI serves {version}: Apache-2.0 license, description consistent")
+        PY
+
+    - name: Publish to Production PyPI
+      if: inputs.publish_production == 'yes'
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      run: twine upload dist/* --verbose
