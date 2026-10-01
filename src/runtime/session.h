@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "gguf/reader.h"
+#include "model/qwen3.h"
 #include "tokenizer/bpe.h"
 
 namespace pocketllm {
@@ -62,17 +63,29 @@ class Session {
    * what they have. */
   const Tokenizer *tokenizer() const { return tokenizer_.get(); }
 
+  /* The bound model, or nullptr for a checkpoint whose architecture this build
+   * does not implement. Built in `open` for the same reason the tokenizer is:
+   * a checkpoint this build cannot run belongs in the open's error, not in the
+   * first `forward`'s. nullptr is still possible -- a checkpoint with a
+   * vocabulary but an unrecognised architecture is one `encode` can serve. */
+  const Qwen3Model *model() const { return model_.get(); }
+
+  /* Run `tokens` and return the logits of the last one, or throw. The model
+   * owns the returned buffer; it is valid until the next call. */
+  const float *forward(const int32_t *tokens, int64_t n);
+
   /* Drop the KV cache and rewind to position 0. */
   void reset();
 
  private:
   Session(std::string gguf_path, std::string backend, std::unique_ptr<GgufReader> checkpoint,
-          std::unique_ptr<Tokenizer> tokenizer);
+          std::unique_ptr<Tokenizer> tokenizer, std::unique_ptr<Qwen3Model> model);
 
   std::string gguf_path_;
   std::string backend_;
   std::unique_ptr<GgufReader> checkpoint_;
   std::unique_ptr<Tokenizer> tokenizer_;
+  std::unique_ptr<Qwen3Model> model_;
 
   /* The next position the model will write.  It is the KV cache's length, and
    * keeping the two in one object is what stops them drifting. */

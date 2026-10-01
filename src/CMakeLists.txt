@@ -36,6 +36,8 @@ add_library(pocketllm SHARED
   tokenizer/unicode.cpp
   tokenizer/pretokenize.cpp
   tokenizer/bpe.cpp
+  kernel/cpu/kernels.cpp
+  model/qwen3.cpp
 )
 
 target_include_directories(pocketllm
@@ -79,6 +81,27 @@ add_executable(pocketllm-tokenize
 target_include_directories(pocketllm-tokenize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(pocketllm-tokenize PRIVATE -Wall -Wextra -Werror)
+endif()
+
+# Generate text with the engine, for watching it work and for diffing the first
+# tokens against `llama-cli`.  Same shape as the two above: the engine's objects
+# linked directly, so the tool can print inside the loop and the ABI stays the
+# eight functions the header declares.
+add_executable(pocketllm-run
+  tools/run.cpp
+  abi/spec.cpp
+  gguf/reader.cpp
+  runtime/status.cpp
+  tokenizer/unicode_data.cpp
+  tokenizer/unicode.cpp
+  tokenizer/pretokenize.cpp
+  tokenizer/bpe.cpp
+  kernel/cpu/kernels.cpp
+  model/qwen3.cpp
+)
+target_include_directories(pocketllm-run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(pocketllm-run PRIVATE -Wall -Wextra -Werror)
 endif()
 
 # `POCKETLLM_ABI_VERSION_MAJOR` is a C preprocessor macro in the header, not a

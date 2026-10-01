@@ -89,9 +89,10 @@ def test_a_missing_checkpoint_fails_with_a_message_not_a_crash(lib: "ctypes.CDLL
 def test_an_unimplemented_backend_is_named_in_the_error(lib: "ctypes.CDLL", tmp_path) -> None:
     """A backend the C side does not have fails loudly rather than silently.
 
-    `cuda` is declared in the Python registry and has no C implementation yet,
-    which is precisely the case where a silent fallback to CPU would be worse
-    than an error: it would look like the wrong answer was the right one.
+    `cuda` is declared in the Python registry and has no C implementation, which
+    is precisely the case where a silent fallback to CPU would be worse than an
+    error: it would look like the wrong answer was the right one, and on the
+    card the user asked for it would look like it was being used.
     """
     checkpoint = tmp_path / "fake.gguf"
     checkpoint.write_bytes(b"not really a gguf")

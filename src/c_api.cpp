@@ -135,10 +135,27 @@ int pocketllm_forward(pocketllm_session *session, const int32_t *tokens, int n, 
   if (session == nullptr || tokens == nullptr || n <= 0 || logits == nullptr || logits_cap <= 0) {
     return -1;
   }
-  /* The graph walk lands after the reader and the tokenizer.  Until then this
-   * is the one call that reports the missing piece by name, because it is the
-   * one a caller reaches last. */
-  return -3;
+  try {
+    pocketllm::Session *self = as_session(session);
+    const pocketllm::Qwen3Model *model = self->model();
+    /* Asked before the work rather than after: the gather needs the vocabulary
+     * size to bound its output, and a caller whose buffer is too small has
+     * already lost by the time the logits exist. */
+    if (model == nullptr) {
+      return -2;
+    }
+    const int64_t vocab = model->n_vocab();
+    if (vocab > logits_cap) {
+      /* The header promises a negative return rather than a partial write, so
+       * the caller can reissue with a larger buffer. */
+      return -1;
+    }
+    const float *values = self->forward(tokens, n);
+    std::memcpy(logits, values, static_cast<std::size_t>(vocab) * sizeof(float));
+    return static_cast<int>(vocab);
+  } catch (const std::exception &) {
+    return -1;
+  }
 }
 
 int pocketllm_reset(pocketllm_session *session) {
