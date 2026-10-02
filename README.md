@@ -10,10 +10,12 @@
 Run a large language model on **one accelerator** — a single GPU, an edge board, the phone in your
 pocket. One process owns one device. If the checkpoint does not fit, it is quantized further.
 
-> **Status: the C engine runs Qwen3-0.6B; the Python package does not run a model.**
-> `src/` (`libpocketllm.so`) reads a GGUF, tokenizes with the checkpoint's own BPE, walks the dense
-> Qwen3 graph and decodes greedily, checked token-for-token against llama.cpp on `cpu` and on a
-> `cuda` card. The Python package is the *host side* — the kernel ABI as spec, the numpy oracle, the
+> **Status: the C engine runs Qwen3-0.6B, f16 or `q4_k_m`; the Python package does not run a model.**
+> `src/` (`libpocketllm.so`) reads a GGUF, tokenizes with the checkpoint's own BPE, walks the Qwen3
+> graph and decodes greedily — on `f32`/`f16` weights, and on packed `q4_k`/`q6_k` that are decoded
+> inside the kernel and never widened. Checked token-for-token against llama.cpp on `cpu` and on a
+> `cuda` card, for both a 1.4 GB f16 checkpoint and the 456 MB `q4_k_m` one quantized from it.
+> The Python package is the *host side* — the kernel ABI as spec, the numpy oracle, the
 > GGUF loader, the quantization decoders, the execution layer and the OpenAI-compatible HTTP surface
 > — and **no Python backend implements a kernel**: every backend except `reference` is a declaration
 > whose session raises `BackendNotImplementedError`.
@@ -50,7 +52,7 @@ this page is the design those pieces are being built toward.
 | `pocketllm.tokenizer` — GGUF-vocabulary BPE | **Skeleton.** Whitespace works; BPE raises |
 | `pocketllm.protocol` / `pocketllm.server` — OpenAI-compatible HTTP | **Ported.** Importable and testable; needs a backend to serve |
 | `pocketllm.cli` | **Done** for `devices` / `backends` / `architectures` / `ops` |
-| `src/` — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B.** GGUF read, BPE tokenize, dense forward, greedy decode; checked token-for-token against llama.cpp on `cpu` and `cuda` |
+| `src/` — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B in f16 and in `q4_k_m`.** GGUF read, BPE tokenize, forward, greedy decode; `q4_k`/`q6_k` decoded in the kernel; checked token-for-token against llama.cpp on `cpu` and `cuda` |
 
 There is no `main`-branch history before the seed commit: this tree was rebuilt on an orphan branch
 and the previous one is preserved as `legacy`. See [Where the code lives now](#where-the-code-lives-now).
@@ -217,9 +219,9 @@ core imports it.
 - [x] **The C core runs Qwen3-0.6B.** GGUF read, BPE tokenize, dense forward and greedy decode, on
       `cpu` and on one `cuda` card, checked against llama.cpp.
 - [x] **Wire the host shell.** `pocketllm run` reaches the C core through `native.py` and generates.
-- [ ] **Quantized weights in the C core.** `src/quant/` handles f16 alone; a packed `q4_k` GEMM
-      (then `q6_k`, which a real `q4_k_m` file mixes in) is what lets a checkpoint that does not fit
-      in f16 be read at all.
+- [x] **Quantized weights in the C core.** `q4_k` and `q6_k` decode inside the kernel, packed,
+      never widened — which is what a `q4_k_m` file is made of, so a 456 MB checkpoint now reads
+      where the 1.4 GB f16 one did. Checked against llama.cpp token for token on `cpu` and `cuda`.
 - [ ] **Sampling.** The engine is greedy only; `topk_sample` and `logits_temperature` are declared
       with no C implementation, so `run` offers no temperature.
 - [ ] **`pocketllm serve`.** The HTTP surface exists but has no *Python* backend to serve from.

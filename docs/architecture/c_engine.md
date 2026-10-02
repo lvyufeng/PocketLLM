@@ -82,10 +82,15 @@ to `pocketllm.backends.reference`, applied one level down.
 
 ### The C surface is a strict subset of the ABI, on purpose
 
-The ABI declares 17 ops. The engine implements 7 of them as ops — `rms_norm`, `gemm`, `embedding`,
-`silu_mul`, `rope`, `attention`, `argmax` — and the rest are either *inlined into the graph* or
-*not needed yet*. Neither case is a missing kernel, and the distinction matters when reading the
-conformance test, which drives the 7 and deliberately skips the others.
+The ABI declares 17 ops. The engine implements 9 of them as ops — `rms_norm`, `gemm`, `gemm_quant`,
+`embedding`, `embedding_quant`, `silu_mul`, `rope`, `attention`, `argmax` — and the rest are either
+*inlined into the graph* or *not needed yet*. Neither case is a missing kernel, and the distinction
+matters when reading the conformance test, which drives the 9 and deliberately skips the others.
+
+(`embedding_quant` is a second entry point rather than a flag on `embedding` because the two read
+different memory — a float table and packed bytes — and it exists because Qwen3 ties its output
+projection to the embedding, so `token_embd.weight` is both the graph's first op and a weight the
+final matmul contracts against.)
 
 **Inlined, because the graph does it somewhere there is no op.** `add` is `gemm(accumulate=true)`:
 the residual is the product's job, so there is no second pass over the activation. `cache_append` is
@@ -114,6 +119,31 @@ op and give **different answers**:
 
 Both are the C behaviour by choice and both are pinned by
 `tests/native/test_op_conformance.py`, so a change to either is a failure rather than a drift.
+
+### The packed weights
+
+`src/quant/blocks.h` decodes `q4_k` and `q6_k` one weight at a time, and it is the one header the CPU
+and the CUDA kernels *share* — the exception to the independence above, and a deliberate one. What
+those two kernels owe each other is correctness of an *algorithm*, and two implementations of an
+algorithm can only disagree by one of them being wrong. A bit layout is not an algorithm; it is a
+property of the file, and a second transcription of it would be a third place for the layout to be
+wrong, agreeing with the first exactly where both misread the same nibble.
+
+`python/pocketllm/quant/k_quants.py` is the other transcription, and it is the oracle the packed
+kernels are checked against one op at a time on inputs the test authors. That comparison is
+exact — and blind in one direction: if all three read the format the same wrong way, they agree
+perfectly. The authority that closes that hole is llama.cpp, which wrote the format and quantized
+the file, and it is reached end-to-end rather than per op in
+`tests/native/test_quantized_forward.py`.
+
+That file also records where llama.cpp is *not* an oracle. Its `q4_K` dot product does not decode the
+weight and multiply it by a float activation: it quantizes the activation to int8 (`block_q8_K`) and
+does an integer product. The extra step is an error of its own, and on a one-token prompt it is a
+large one — measured, llama.cpp's q4_k answer sits 3.53 (mean absolute) from its own f16 answer,
+while ours sits 3.77 away and lands closer to the f16 truth. So the two quantized results are compared
+on their argmax and their greedy sequence, not elementwise. Both sequences match exactly, and both
+differ from the f16 sequence from the second token on: quantizing to 4.5 bits per weight is lossy
+enough to change the continuation, which is the format working rather than a kernel failing.
 
 ## Building
 

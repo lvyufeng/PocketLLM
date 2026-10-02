@@ -81,9 +81,28 @@ class Backend {
   virtual void gemm(DeviceBuffer x, DeviceBuffer w, DeviceBuffer bias, DeviceBuffer out,
                     int64_t m, int64_t n, int64_t k, bool accumulate) = 0;
 
+  /* ``out[r, j] = sum_k x[r, k] * w[j, k]`` with `w` packed as k-quant blocks.
+   *
+   * `blocks` is `(n, k / 256, block_bytes)` for the single `type_id` the tensor
+   * carries, and the decode is per weight -- no f32 copy of the weight exists
+   * at any point, which is the whole reason the packing is worth reading. A
+   * backend whose device cannot decode a format refuses the call by name rather
+   * than falling back to a dequantized path, because the fallback is the
+   * memory the quantization was supposed to save.
+   *
+   * `type_id` is a GGML storage id, the same numbering `abi/spec.h` and the
+   * checkpoint use, so a caller never translates between two vocabularies. */
+  virtual void gemm_quant(DeviceBuffer x, DeviceBuffer blocks, DeviceBuffer bias, DeviceBuffer out,
+                          int64_t m, int64_t n, int64_t k, int type_id, bool accumulate) = 0;
+
   /* ``out[i, :] = table[token[i], :]``. `tokens` holds `n_tokens` int32 ids. */
   virtual void embedding(DeviceBuffer tokens, int64_t n_tokens, DeviceBuffer table, int64_t vocab,
                          int64_t d, DeviceBuffer out) = 0;
+
+  /* The same gather from a packed table -- see `kernels.h`'s `embedding_quant`
+   * for why a tied-embedding checkpoint needs it. */
+  virtual void embedding_quant(DeviceBuffer tokens, int64_t n_tokens, DeviceBuffer blocks,
+                               int64_t vocab, int64_t d, int type_id, DeviceBuffer out) = 0;
 
   virtual void silu_mul(DeviceBuffer gate, DeviceBuffer up, DeviceBuffer out, int64_t n) = 0;
 

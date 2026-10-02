@@ -18,13 +18,24 @@
 #include <cstdint>
 #include <cstring>
 
+/* `quant/blocks.h` decodes a block on the device as well as on the host, and an
+ * fp16 field is part of every k-quant block header -- so these two conversions
+ * have to be callable from a CUDA kernel and not merely from a host function.
+ * The marker is the same one `blocks.h` defines; it is repeated here rather
+ * than included from there because the dependency runs the other way. */
+#ifdef __CUDACC__
+#define POCKETLLM_HALF_HD __host__ __device__
+#else
+#define POCKETLLM_HALF_HD inline
+#endif
+
 namespace pocketllm {
 
 /* The little-endian u16 at `p`.  GGUF is little-endian on disk, which is the
  * byte order of every host this runs on; a memcpy rather than a cast because a
  * misaligned load is undefined and a packed tensor's first element is exactly
  * that. */
-inline uint16_t load_u16(const uint8_t *p) {
+POCKETLLM_HALF_HD uint16_t load_u16(const uint8_t *p) {
   uint16_t value = 0;
   std::memcpy(&value, p, sizeof(value));
   return value;
@@ -42,7 +53,7 @@ inline uint16_t load_u16(const uint8_t *p) {
  * implicit leading bit is at position 10 makes it (1.f) * 2^(p-24) for a top
  * set bit p, whose float32 exponent field is p + 103. That is the `e` the loop
  * lands on, and `m & 0x3FF` after the shift is the fraction. */
-inline float half_to_float(uint16_t h) {
+POCKETLLM_HALF_HD float half_to_float(uint16_t h) {
   const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
   const uint32_t exponent = (h >> 10) & 0x1Fu;
   uint32_t mantissa = h & 0x03FFu;
@@ -74,7 +85,7 @@ inline float half_to_float(uint16_t h) {
 /* bfloat16 -> binary32.  The format is the top 16 bits of a float32, so the
  * conversion is exact by construction and needs no rounding: the low 16 bits
  * are zeros, which is what a left shift by 16 gives. */
-inline float bf16_to_float(uint16_t b) {
+POCKETLLM_HALF_HD float bf16_to_float(uint16_t b) {
   const uint32_t bits = static_cast<uint32_t>(b) << 16;
   float value = 0.0F;
   std::memcpy(&value, &bits, sizeof(value));

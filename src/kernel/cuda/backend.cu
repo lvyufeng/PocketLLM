@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "kernel/backend.h"
+#include "quant/blocks.h"
 #include "runtime/status.h"
 
 namespace pocketllm {
@@ -165,6 +166,68 @@ __global__ void gemm_kernel(const float *x, const float *w, const float *bias, f
    * element, so its read-modify-write is private to it. */
   float *dst = out + r * n + j;
   *dst = accumulate ? *dst + value : value;
+}
+
+/* The packed product: one thread per output element, walking the weight row's
+ * blocks and decoding each weight as the sum consumes it.
+ *
+ * The decode is `quant/blocks.h`, the same header the CPU kernel includes, so
+ * the bit layout is stated once. What is *not* shared is the accumulation: the
+ * CPU walks a row block by block with a single running sum, and so does this,
+ * which is what keeps the two comparable at the tolerance the test uses. A
+ * shared-memory reduction over the row would be the faster shape and would
+ * differ from the CPU by the association order rather than by the arithmetic.
+ *
+ * The block boundary is computed per column -- `col / 256` and `col % 256` --
+ * rather than walked by an outer loop over blocks. Every row is block-aligned
+ * here, because the caller refuses a `k` that is not a whole number of blocks,
+ * so the two spellings index the same bytes; the division costs one modulus per
+ * weight and says on the line what the layout is, which an outer loop would
+ * leave to the reader to reconstruct. */
+__global__ void gemm_quant_kernel(const float *x, const uint8_t *blocks, const float *bias,
+                                  float *out, int64_t m, int64_t n, int64_t k, int type_id,
+                                  int block_bytes, int accumulate) {
+  const int64_t r = blockIdx.y;
+  const int64_t j = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (r >= m || j >= n) {
+    return;
+  }
+  const int64_t row_bytes = (k / quant::kBlockWeights) * block_bytes;
+  const uint8_t *row_blocks = blocks + j * row_bytes;
+  const float *row = x + r * k;
+
+  float total = 0.0F;
+  for (int64_t col = 0; col < k; ++col) {
+    const int64_t block = col / quant::kBlockWeights;
+    const int within = static_cast<int>(col % quant::kBlockWeights);
+    total += row[col] * quant::dequant_block(type_id, row_blocks + block * block_bytes, within);
+  }
+  if (bias != nullptr) {
+    total += bias[j];
+  }
+  float *dst = out + r * n + j;
+  *dst = accumulate ? *dst + total : total;
+}
+
+__global__ void embedding_quant_kernel(const int32_t *tokens, int64_t n_tokens,
+                                       const uint8_t *blocks, int64_t vocab, int64_t d, int type_id,
+                                       int block_bytes, float *out) {
+  const int64_t t = blockIdx.y;
+  const int64_t col = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= n_tokens || col >= d) {
+    return;
+  }
+  const int32_t id = tokens[t];
+  float *dst = out + t * d;
+  if (id < 0 || id >= vocab) {
+    dst[col] = 0.0F;
+    return;
+  }
+  const int64_t row_bytes = (d / quant::kBlockWeights) * block_bytes;
+  const uint8_t *row_blocks = blocks + static_cast<int64_t>(id) * row_bytes;
+  const int64_t block = col / quant::kBlockWeights;
+  const int within = static_cast<int>(col % quant::kBlockWeights);
+  dst[col] = quant::dequant_block(type_id, row_blocks + block * block_bytes, within);
 }
 
 __global__ void embedding_kernel(const int32_t *tokens, int64_t n_tokens, const float *table,
@@ -417,6 +480,46 @@ class CudaBackend final : public Backend {
     gemm_kernel<<<grid, threads>>>(f(x), f(weight), bias.handle ? f(bias) : nullptr, w(out), m, n, k,
                                    accumulate ? 1 : 0);
     check(cudaGetLastError(), "gemm");
+  }
+
+  void gemm_quant(DeviceBuffer x, DeviceBuffer blocks, DeviceBuffer bias, DeviceBuffer out,
+                  int64_t m, int64_t n, int64_t k, int type_id, bool accumulate) override {
+    if (m <= 0 || n <= 0 || k <= 0) {
+      return;
+    }
+    const int block_bytes = quant::block_bytes_of(type_id);
+    if (block_bytes == 0) {
+      /* Refused by name, and refused *here* rather than at the caller: a build
+       * whose device half does not carry a decoder has to say so on the device
+       * path, and a caller that caught it earlier would have had to know which
+       * formats this particular build compiles. */
+      throw Error("backend 'cuda': no packed kernel for GGML type id " + std::to_string(type_id));
+    }
+    const unsigned threads = 256;
+    const dim3 grid(static_cast<unsigned>((n + threads - 1) / threads), static_cast<unsigned>(m));
+    gemm_quant_kernel<<<grid, threads>>>(f(x), reinterpret_cast<const uint8_t *>(blocks.handle),
+                                         bias.handle ? f(bias) : nullptr, w(out), m, n, k, type_id,
+                                         block_bytes, accumulate ? 1 : 0);
+    check(cudaGetLastError(), "gemm_quant");
+  }
+
+  void embedding_quant(DeviceBuffer tokens, int64_t n_tokens, DeviceBuffer blocks, int64_t vocab,
+                       int64_t d, int type_id, DeviceBuffer out) override {
+    if (n_tokens <= 0 || d <= 0) {
+      return;
+    }
+    const int block_bytes = quant::block_bytes_of(type_id);
+    if (block_bytes == 0) {
+      throw Error("backend 'cuda': no packed kernel for GGML type id " + std::to_string(type_id));
+    }
+    const unsigned threads = 256;
+    const dim3 grid(static_cast<unsigned>((d + threads - 1) / threads),
+                    static_cast<unsigned>(n_tokens));
+    embedding_quant_kernel<<<grid, threads>>>(reinterpret_cast<const int32_t *>(tokens.handle),
+                                              n_tokens,
+                                              reinterpret_cast<const uint8_t *>(blocks.handle),
+                                              vocab, d, type_id, block_bytes, w(out));
+    check(cudaGetLastError(), "embedding_quant");
   }
 
   void embedding(DeviceBuffer tokens, int64_t n_tokens, DeviceBuffer table, int64_t vocab, int64_t d,

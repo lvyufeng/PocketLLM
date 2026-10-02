@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "abi/spec.h"
+#include "quant/blocks.h"
 #include "quant/half.h"
 #include "runtime/status.h"
 
@@ -21,6 +22,16 @@ namespace {
  * and the day the two disagree is the day a quantized kernel is added. */
 constexpr int kTypeF32 = 0;
 constexpr int kTypeF16 = 1;
+
+/* The two k-quants the packed kernels decode. A `q4_k_m` checkpoint -- the
+ * format this project's ladder starts at -- is made of exactly these two plus
+ * the f32 norms, so these are the only ids that need to name a kernel. Anything
+ * else is refused at load with the type's own name in the message, which is how
+ * a `q5_k_m` or an `iq4_xs` file gets a diagnosis rather than a wrong token. */
+constexpr int kTypeQ4K = 12;
+constexpr int kTypeQ6K = 14;
+
+bool has_packed_kernel(int type_id) { return type_id == kTypeQ4K || type_id == kTypeQ6K; }
 
 /* How many positions the cache and the rotary table start with.
  *
@@ -52,7 +63,7 @@ Qwen3Model::~Qwen3Model() {
   }
   for (kernel::DeviceBuffer buffer : {x_, x_norm_, q_, k_, v_, attn_, gate_, up_, ffn_, last_,
                                       logits_, scores_, tokens_, rope_cos_, rope_sin_, k_cache_,
-                                      v_cache_, tok_embd_, output_norm_}) {
+                                      v_cache_, output_norm_}) {
     if (buffer.handle != 0) {
       backend_->release(buffer);
     }
@@ -66,9 +77,7 @@ Qwen3Model::~Qwen3Model() {
     }
     for (const Weight &weight : {layer.wq, layer.wk, layer.wv, layer.wo, layer.w_gate, layer.w_up,
                                  layer.w_down}) {
-      if (weight.data.handle != 0) {
-        backend_->release(weight.data);
-      }
+      release_weight(weight);
     }
   }
   /* The output projection is tied to the embedding when the checkpoint has no
@@ -76,8 +85,21 @@ Qwen3Model::~Qwen3Model() {
    * releasing both would be a double free.  Comparing the handles is how the
    * tie is detected here; a flag would be a second copy of a fact that is
    * already in the values. */
-  if (output_.data.handle != 0 && output_.data.handle != tok_embd_.handle) {
-    backend_->release(output_.data);
+  if (output_.rows != 0 && (output_.rows != tok_embd_.rows || output_.cols != tok_embd_.cols)) {
+    release_weight(output_);
+  }
+  release_weight(tok_embd_);
+}
+
+void Qwen3Model::release_weight(const Weight &weight) {
+  /* Exactly one of the two handles is live in a `Weight`; releasing the other
+   * would free a null and, on a device, fault. */
+  if (weight.quantized) {
+    if (weight.blocks.handle != 0) {
+      backend_->release(weight.blocks);
+    }
+  } else if (weight.data.handle != 0) {
+    backend_->release(weight.data);
   }
 }
 
@@ -100,13 +122,29 @@ kernel::DeviceBuffer Qwen3Model::bind_dense(const GgufReader &checkpoint, const 
       widened[static_cast<std::size_t>(i)] = half_to_float(load_u16(bytes + 2 * i));
     }
   } else {
+    /* A quantized tensor reaching this function is a caller that chose the
+     * dense binding for it, not a format this build cannot read: the paths are
+     * picked in `bind_matrix` and `bind_table`. Naming both the type and the
+     * function is what makes that distinction legible. */
     throw Error("tensor '" + name + "' is " + ggml_type_of(info->type_id).name +
-                ", which the dense path does not read; this build handles f32 and f16");
+                ", which bind_dense cannot widen; the packed path binds that one");
   }
 
   kernel::DeviceBuffer device = backend_->allocate(elements * 4);
   backend_->copy_to_device(device, widened.data(), elements * 4);
   return device;
+}
+
+Weight Qwen3Model::bind_packed(const GgufReader &checkpoint, const std::string &name) {
+  uint64_t nbytes = 0;
+  const uint8_t *bytes = checkpoint.tensor_data(name, &nbytes);
+
+  Weight weight;
+  weight.blocks = backend_->allocate(static_cast<int64_t>(nbytes));
+  backend_->copy_to_device(weight.blocks, bytes, static_cast<int64_t>(nbytes));
+  weight.quantized = true;
+  weight.nbytes = static_cast<int64_t>(nbytes);
+  return weight;
 }
 
 Weight Qwen3Model::bind_matrix(const GgufReader &checkpoint, const std::string &name) {
@@ -129,8 +167,68 @@ Weight Qwen3Model::bind_matrix(const GgufReader &checkpoint, const std::string &
   weight.rows = static_cast<int64_t>(info->dimensions[1]);
   weight.type_id = info->type_id;
   weight.nbytes = static_cast<int64_t>(info->nbytes);
-  weight.data = bind_dense(checkpoint, name);
+
+  if (info->type_id == kTypeF32 || info->type_id == kTypeF16) {
+    weight.data = bind_dense(checkpoint, name);
+    return weight;
+  }
+  if (!has_packed_kernel(info->type_id)) {
+    throw Error("tensor '" + name + "' is " + ggml_type_of(info->type_id).name +
+                ", which this build has no kernel for; it reads f32, f16, q4_k and q6_k");
+  }
+  /* The contraction axis has to be a whole number of super-blocks. GGUF
+   * guarantees it for a valid file, and the alternative to checking is a
+   * row stride that is a fraction of a block -- which would decode a weight
+   * from the next row's bytes and look like a small numerical error rather
+   * than a bad file. */
+  if (weight.cols % 256 != 0) {
+    throw Error("tensor '" + name + "' has " + std::to_string(weight.cols) +
+                " columns, which is not a whole number of 256-weight blocks");
+  }
+  /* The size has to be exactly what the block geometry says. A reader whose
+   * table and whose kernel disagreed about a block's width would otherwise
+   * stride the file one way and walk it another, which reads every weight from
+   * a neighbouring position -- a small numerical error rather than a bad-file
+   * message. */
+  const int64_t expected =
+      weight.rows * (weight.cols / 256) * quant::block_bytes_of(info->type_id);
+  if (weight.nbytes != expected) {
+    throw Error("tensor '" + name + "' is " + std::to_string(weight.nbytes) + " bytes but " +
+                std::to_string(weight.rows) + "x" + std::to_string(weight.cols) + " of " +
+                ggml_type_of(info->type_id).name + " is " + std::to_string(expected));
+  }
+  weight.quantized = true;
+  weight.blocks = bind_packed(checkpoint, name).blocks;
   return weight;
+}
+
+Weight Qwen3Model::bind_table(const GgufReader &checkpoint, const std::string &name) {
+  const GgufTensorInfo *info = checkpoint.tensor(name);
+  if (info == nullptr) {
+    missing("tensor", name);
+  }
+  if (info->dimensions.size() != 2) {
+    throw Error("tensor '" + name + "' is not a matrix (it has " +
+                std::to_string(info->dimensions.size()) + " dimensions)");
+  }
+  Weight table;
+  table.cols = static_cast<int64_t>(info->dimensions[0]);
+  table.rows = static_cast<int64_t>(info->dimensions[1]);
+  table.type_id = info->type_id;
+  table.nbytes = static_cast<int64_t>(info->nbytes);
+  if (info->type_id == kTypeF32 || info->type_id == kTypeF16) {
+    table.data = bind_dense(checkpoint, name);
+    return table;
+  }
+  if (!has_packed_kernel(info->type_id) || table.cols % 256 != 0) {
+    throw Error(std::string("token_embd.weight is ") + ggml_type_of(info->type_id).name +
+                " with " + std::to_string(table.cols) +
+                " columns; this build gathers from f32, f16, q4_k and q6_k tables whose row is a "
+                "whole number of 256-weight blocks");
+  }
+  table.quantized = true;
+  table.blocks = bind_packed(checkpoint, name).blocks;
+  return table;
 }
 
 std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
@@ -174,7 +272,10 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
     model->capacity_ = 4096;
   }
 
-  model->tok_embd_ = model->bind_dense(checkpoint, "token_embd.weight");
+  /* The table is bound through its own path because it is both a gather source
+   * and -- when the checkpoint ties the head to it -- a GEMM operand, and the
+   * two need different things from the same bytes. */
+  model->tok_embd_ = model->bind_table(checkpoint, "token_embd.weight");
   const GgufTensorInfo *embd_info = checkpoint.tensor("token_embd.weight");
   if (static_cast<int64_t>(embd_info->dimensions[0]) != model->n_embd_) {
     throw Error("token_embd.weight has " + std::to_string(embd_info->dimensions[0]) +
@@ -184,13 +285,14 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
   /* Qwen3 ties the output projection to the embedding when the checkpoint does
    * not carry a separate head, and this one does carry one. Binding whichever
    * is present -- rather than requiring `output.weight` -- is what lets the same
-   * loader read a smaller conversion later. */
+   * loader read a smaller conversion later. The tie copies the whole `Weight`
+   * and not just the handle: a tied head is the same tensor, so it is the same
+   * shape and the same format, and a copy of the handle alone would lose which
+   * of the two it is. */
   if (checkpoint.tensor("output.weight") != nullptr) {
     model->output_ = model->bind_matrix(checkpoint, "output.weight");
   } else {
-    model->output_.cols = model->n_embd_;
-    model->output_.rows = model->n_vocab_;
-    model->output_.data = model->tok_embd_;
+    model->output_ = model->tok_embd_;
   }
 
   model->output_norm_ = model->bind_dense(checkpoint, "output_norm.weight");
@@ -319,11 +421,20 @@ void Qwen3Model::ensure_capacity(int64_t n, int64_t end_pos) {
 
 void Qwen3Model::matmul(const Weight &w, kernel::DeviceBuffer x, kernel::DeviceBuffer out, int64_t m,
                         bool accumulate) const {
-  /* Every weight this build binds is f32 by now -- `bind_matrix` widened it --
-   * so the type id is not consulted. It stays in `Weight` for the quantized
-   * kernel, which is the one place the raw bytes are read. */
   kernel::DeviceBuffer no_bias;
+  if (w.quantized) {
+    backend_->gemm_quant(x, w.blocks, no_bias, out, m, w.rows, w.cols, w.type_id, accumulate);
+    return;
+  }
   backend_->gemm(x, w.data, no_bias, out, m, w.rows, w.cols, accumulate);
+}
+
+void Qwen3Model::embed(kernel::DeviceBuffer tokens, int64_t n, kernel::DeviceBuffer out) const {
+  if (tok_embd_.quantized) {
+    backend_->embedding_quant(tokens, n, tok_embd_.blocks, n_vocab_, n_embd_, tok_embd_.type_id, out);
+    return;
+  }
+  backend_->embedding(tokens, n, tok_embd_.data, n_vocab_, n_embd_, out);
 }
 
 void Qwen3Model::reset() { cache_length_ = 0; }
@@ -370,7 +481,7 @@ kernel::DeviceBuffer Qwen3Model::forward(const int32_t *tokens, int64_t n, int64
   /* The prompt is uploaded once and gathered on the device; only the ids cross
    * the bus, not the embedding rows they select. */
   backend_->copy_to_device(tokens_, tokens, n * 4);
-  backend_->embedding(tokens_, n, tok_embd_, n_vocab_, n_embd_, x_);
+  embed(tokens_, n, x_);
 
   for (int64_t il = 0; il < n_layer_; ++il) {
     const Layer &layer = layers_[static_cast<std::size_t>(il)];
