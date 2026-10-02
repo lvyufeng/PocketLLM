@@ -133,6 +133,25 @@ class CpuBackend final : public Backend {
     std::memcpy(reinterpret_cast<void *>(out.handle), &best, sizeof(best));
   }
 
+  void softmax(DeviceBuffer x, DeviceBuffer out, int64_t rows, int64_t cols) override {
+    kernel::softmax(f(x), w(out), rows, cols);
+  }
+
+  void logits_temperature(DeviceBuffer logits, DeviceBuffer out, int64_t n,
+                          float temperature) override {
+    kernel::logits_temperature(f(logits), w(out), n, temperature);
+  }
+
+  void topk_sample(DeviceBuffer logits, int64_t vocab, float uniform, int64_t top_k, float top_p,
+                   float min_p, DeviceBuffer order, DeviceBuffer out) override {
+    int64_t token = 0;
+    kernel::topk_sample(f(logits), vocab, uniform, top_k, top_p, min_p,
+                        reinterpret_cast<int64_t *>(w(order)), &token);
+    /* The output is an int64 index, not a float: the same width `argmax`
+     * writes, so the caller can read either with one `copy_to_host`. */
+    std::memcpy(reinterpret_cast<void *>(out.handle), &token, sizeof(token));
+  }
+
   /* The CPU runs as it goes, so there is nothing queued to wait for. The method
    * exists because the graph calls it, and a no-op is the honest answer. */
   void synchronize() override {}
