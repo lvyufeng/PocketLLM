@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "gguf/reader.h"
+#include "kernel/backend.h"
 #include "model/qwen3.h"
 #include "runtime/status.h"
 #include "tokenizer/bpe.h"
@@ -48,7 +49,7 @@ void print_top(const float *logits, int64_t n, int k) {
 
 int usage(const char *argv0) {
   std::fprintf(stderr,
-               "usage: %s <checkpoint.gguf> [--prompt TEXT] [--steps N] [--top K]\n"
+               "usage: %s <checkpoint.gguf> [--prompt TEXT] [--steps N] [--top K] [--device cpu|cuda]\n"
                "       %s <checkpoint.gguf> --tokens 1 2 3   # ids, bypassing the tokenizer\n",
                argv0, argv0);
   return 2;
@@ -65,6 +66,7 @@ int main(int argc, char **argv) {
   std::string prompt = "The capital of France is";
   int steps = kDefaultSteps;
   int top = 5;
+  std::string device = "cpu";
   std::vector<int32_t> literal_tokens;
   bool have_literal = false;
 
@@ -76,6 +78,8 @@ int main(int argc, char **argv) {
       steps = std::stoi(argv[++i]);
     } else if (arg == "--top" && i + 1 < argc) {
       top = std::stoi(argv[++i]);
+    } else if (arg == "--device" && i + 1 < argc) {
+      device = argv[++i];
     } else if (arg == "--tokens") {
       have_literal = true;
       while (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -89,7 +93,10 @@ int main(int argc, char **argv) {
   try {
     pocketllm::GgufReader checkpoint(path);
     const pocketllm::Tokenizer tokenizer(checkpoint);
-    auto model = pocketllm::Qwen3Model::load(checkpoint);
+    /* The tool is the one place that picks a backend from the command line, so
+     * that the same binary can run either path without a rebuild. */
+    auto backend = pocketllm::kernel::make_backend(device);
+    auto model = pocketllm::Qwen3Model::load(checkpoint, *backend);
 
     std::vector<int32_t> tokens =
         have_literal ? literal_tokens : tokenizer.encode(prompt, /*add_special=*/false,
@@ -111,8 +118,11 @@ int main(int argc, char **argv) {
     /* The prompt goes through the graph once, as a batch. Every token in it is
      * attended to by the ones after it, which is what makes the prefill one
      * pass rather than n. */
-    const float *logits = model->forward(tokens.data(), static_cast<int64_t>(tokens.size()),
-                                        /*start_pos=*/0);
+    const pocketllm::kernel::DeviceBuffer logits_device = model->forward(
+        tokens.data(), static_cast<int64_t>(tokens.size()), /*start_pos=*/0);
+    std::vector<float> logits_host(static_cast<std::size_t>(model->n_vocab()));
+    backend->copy_to_host(logits_host.data(), logits_device, model->n_vocab() * 4);
+    const float *logits = logits_host.data();
 
     int32_t next = 0;
     for (int step = 0; step < steps; ++step) {
@@ -146,7 +156,10 @@ int main(int argc, char **argv) {
        * it inside `forward`, so a local counter would be a second copy of the
        * same fact that can disagree with it. */
       const int32_t one = next;
-      logits = model->forward(&one, 1, model->cache_length());
+      const pocketllm::kernel::DeviceBuffer next_logits =
+          model->forward(&one, 1, model->cache_length());
+      backend->copy_to_host(logits_host.data(), next_logits, model->n_vocab() * 4);
+      logits = logits_host.data();
     }
 
     std::fprintf(stderr, "]\n");

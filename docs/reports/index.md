@@ -3,9 +3,11 @@
 Long-form rendered documents. This section is empty, and deliberately so rather than by oversight.
 
 A report here is a measurement taken against a runtime, with the configuration it was taken under.
-This tree is pre-release: **no device backend implements a kernel**, so there is nothing to measure
-and nothing that could be reported. A performance page written today would be a claim about code that
-does not exist.
+This section is empty because no measurement has been taken under conditions worth recording: the C
+engine runs Qwen3-0.6B correctly, but on f16 weights with a load path that still dominates decode, and
+a number taken now would describe the loader rather than the kernels. It will be worth writing when
+the weights are quantized — a Q4_K GEMM is where the width ladder starts to pay, and that is the
+regime this repository exists for.
 
 The previous tree's reports — the 2080 Ti DeepSeek-V4 study among them — measured runtimes that have
 since been rewritten. They belong with that code, which is preserved on the `legacy` branch, and the

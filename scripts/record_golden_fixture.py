@@ -7,8 +7,10 @@ point for real, records the command line, the environment and the answer, and wr
 and skips when the checkpoint is not on the machine reading it.
 
 **There are no fixtures and no re-running test yet**, because there is no entry point that can
-produce an answer: no architecture ships and no device backend implements a kernel. The first fixture
-belongs in the commit that makes `pocketllm run` work, together with the test module that replays it.
+produce a *served-path* answer: no architecture ships and no Python backend implements a kernel.
+`pocketllm run` does generate, through the C core rather than through the executor this script
+records against, and `tests/native/test_cli_run.py` compares it to llama.cpp directly instead. The
+first fixture belongs with `pocketllm serve`, together with the test module that replays it.
 
 Recording is a deliberate act rather than a side effect: a fixture is only worth having if a human
 looked at the answer and agreed it was right, because re-recording is how a real regression gets

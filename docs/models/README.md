@@ -12,7 +12,7 @@ A status is a claim about evidence, so each one names the evidence it stands on.
 
 | Status | What it means, and what proves it |
 |---|---|
-| **Runnable** | A real checkpoint generates tokens from a real checkpoint on the stated hardware, through an entry point in this tree. Nothing is here yet. |
+| **Runnable** | A real checkpoint generates tokens from a real checkpoint on the stated hardware, through an entry point in this tree. Nothing in *this* table is — the matrix below is the Python architectures, and the C engine's Qwen3 is not one of them. |
 | **Scaffold** | The architecture builds and the executor runs it, but the "checkpoint" is a synthetic model whose purpose is to exercise the ABI. `toy` is the one instance. |
 | **Planned** | The architecture is designed against the ABI and not yet written. |
 
@@ -23,10 +23,17 @@ A status is a claim about evidence, so each one names the evidence it stands on.
 | [`toy`](architectures.md#toy) | Embedding, one SwiGLU block, LM head | reference (numpy) | **Scaffold** — the executor's own smoke test |
 | `xing4_0` | MLA attention, 64-expert MoE, matrix hyper-connection | not yet | **Planned** |
 
-There is deliberately no row claiming a runnable checkpoint. **No device backend implements a kernel
-yet**, so a checkpoint could not be run even if an architecture existed for it. The previous tree's
-model pages — Xing4.0-29B-A4B, Ternary-Bonsai-2-27B, the DeepSeek-V4 GGUF path — measured code that
-has since been rewritten, and their numbers belong with that code; they are not carried here.
+**Every architecture here is a Python one, and none of the Python backends implements a kernel yet**,
+so a checkpoint could not be run through this table even if an architecture existed for it.
+
+Qwen3-0.6B does run — but not through any of this. It is implemented in the C engine
+(`src/model/qwen3.cpp`) over a different backend interface, and it is deliberately not a row above:
+an architecture here is a `ModelSpec` graph of ABI ops for `pocketllm.engine` to execute, and Qwen3
+in C never builds one. Adding it to this matrix would claim a Python path that does not exist.
+
+The previous tree's model pages — Xing4.0-29B-A4B, Ternary-Bonsai-2-27B, the DeepSeek-V4 GGUF path —
+measured code that has since been rewritten, and their numbers belong with that code; they are not
+carried here.
 
 ## What an architecture is
 

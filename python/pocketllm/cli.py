@@ -198,18 +198,89 @@ def _cmd_ops(namespace: argparse.Namespace) -> int:
     return 0
 
 
+def _run_device(engine_args: EngineArgs) -> str:
+    """The backend name the C core is asked for, from the engine args.
+
+    Two vocabularies meet here and only one of them is ours.  ``--device`` is
+    ``EngineArgs.device`` -- a *kind*, from the set ``pocketllm devices`` lists,
+    which is what a user picks from and what the Python registry validates.  The
+    C core is asked for a *backend*, and it serves ``cpu`` and ``cuda`` today.
+
+    ``auto`` is resolved here rather than passed down, because the C core has no
+    auto: it refuses a name it does not know.  It resolves to ``cpu``, which
+    every build of the library provides -- the conservative choice, and the one
+    that cannot fail on a host where CUDA was never compiled in.  Preferring a
+    card when one exists would mean probing, and a probe that opens a checkpoint
+    to find out is 1.5 GB of work to answer a question ``--device cuda`` asks
+    directly.
+    """
+    device = engine_args.device
+    if device == "auto":
+        device = "cpu"
+    return device.split(":")[0]
+
+
 def _cmd_run(namespace: argparse.Namespace) -> int:
-    """Load a checkpoint and generate.  Needs a model, which does not ship yet."""
+    """Load a checkpoint and generate greedily, through the C core.
+
+    The engine does the whole chain -- GGUF read, tokenize, graph walk, sample --
+    and this function is the host half the ABI's header describes: it opens a
+    session, drives the loop, and prints.  Nothing here knows what Qwen3 is.
+
+    Greedy only, and that is a statement about the engine rather than about the
+    flags: sampling is a declared op with no C implementation yet, so a
+    `--temperature` here would be a knob that does nothing.  It is not offered.
+    """
+    from . import native
+    from .native import Engine, EngineUnavailable
+
     engine_args = _args(namespace)
-    # The flags parse and validate -- that is real work, and the errors are the
-    # same ones a working `run` would give.  What is missing is the other half:
-    # a builder for the checkpoint's architecture, and the GGUF tokenizer.  Saying
-    # which is missing is the difference between a stub and a lie.
-    raise SystemExit(
-        "`pocketllm run` has no model architecture or tokenizer yet; "
-        f"parsed {engine_args.checkpoint_dir!r} on device {engine_args.device!r}. "
-        "Run `pocketllm devices` to see what this host can open."
-    )
+    device = _run_device(engine_args)
+    checkpoint = engine_args.checkpoint_dir
+
+    # **Two different failures wear the same exception.**  `Engine.open` raises
+    # `EngineUnavailable` both when there is no library to load and when the
+    # engine refuses the checkpoint -- and the second message is the *engine's
+    # own*, written for a caller with a working library.  Asking whether the
+    # library exists, before opening, is what tells them apart, so the advice
+    # below is only printed for the case it is advice about.
+    if not native.is_available():
+        raise SystemExit(
+            "`pocketllm run` needs the C engine, which is not built on this host.\n"
+            "Build it with `cmake -B build -S src && cmake --build build`, or point "
+            "POCKETLLM_CORE_LIB at an existing libpocketllm.so.\n"
+            "(`pocketllm devices` lists the *Python* backends, which are a separate "
+            "thing and still stubs.)"
+        )
+
+    try:
+        with Engine.open(checkpoint, device) as engine:
+            tokens = engine.encode(namespace.prompt, add_special=False, parse_special=True)
+            if not tokens:
+                print("the prompt tokenized to nothing", file=sys.stderr)
+                return 1
+
+            # The prompt is one batch: every token in it attends to the ones
+            # before it, which is what makes a prefill one pass instead of n.
+            logits = engine.forward(tokens)
+            print(namespace.prompt, end="", flush=True)
+
+            for _ in range(namespace.max_tokens):
+                token = Engine.argmax(logits)
+                piece = engine.decode([token])
+                print(piece, end="", flush=True)
+                # One token per call, from the position the session is holding.
+                # A local counter here would be a second copy of a fact the
+                # engine already owns, and the two could disagree.
+                logits = engine.forward([token])
+            print()
+            return 0
+    except EngineUnavailable as exc:
+        # Reaching here means the library loaded and the engine refused
+        # something -- a checkpoint it cannot read, a backend this build does
+        # not have.  The message is the engine's own and is already specific, so
+        # it is passed through rather than rephrased by this side.
+        raise SystemExit(f"`pocketllm run` failed: {exc}") from exc
 
 
 def _cmd_serve(namespace: argparse.Namespace) -> int:

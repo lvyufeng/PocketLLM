@@ -89,17 +89,28 @@ def test_a_missing_checkpoint_fails_with_a_message_not_a_crash(lib: "ctypes.CDLL
 def test_an_unimplemented_backend_is_named_in_the_error(lib: "ctypes.CDLL", tmp_path) -> None:
     """A backend the C side does not have fails loudly rather than silently.
 
-    `cuda` is declared in the Python registry and has no C implementation, which
-    is precisely the case where a silent fallback to CPU would be worse than an
-    error: it would look like the wrong answer was the right one, and on the
-    card the user asked for it would look like it was being used.
+    `ascend` is declared in the Python registry — it is a real target with a
+    real device page — and has no C implementation in any build of this
+    library, which is precisely the case where a silent fallback to CPU would be
+    worse than an error: it would look like the wrong answer was the right one,
+    and on the device the user asked for it would look like it was being used.
+
+    This test used to ask for `cuda`. It cannot any more: `cuda` now has an
+    implementation, so on a host with a card the request *succeeds* and this
+    would be asserting the opposite of what the library should do. The name has
+    to be one no build will ever provide, and `ascend` is the one the project's
+    own device notes call out as a chip this tree does not target.
+
+    The device is resolved before the checkpoint is read, which is why the file
+    here can be a stub: the answer says what the caller asked for wrongly, and
+    they asked wrongly about the device.
     """
     checkpoint = tmp_path / "fake.gguf"
     checkpoint.write_bytes(b"not really a gguf")
     err = ctypes.create_string_buffer(native._ERR_CAP)
-    handle = lib.pocketllm_open(str(checkpoint).encode(), b"cuda", err, native._ERR_CAP)
+    handle = lib.pocketllm_open(str(checkpoint).encode(), b"ascend", err, native._ERR_CAP)
     assert not handle
-    assert b"cuda" in err.value
+    assert b"ascend" in err.value
 
 
 def test_argmax_breaks_ties_toward_the_lowest_index(lib: "ctypes.CDLL") -> None:

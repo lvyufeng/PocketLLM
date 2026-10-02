@@ -322,9 +322,11 @@ Pre-releases: `0.2.0a1` (alpha), `0.2.0b1` (beta), `0.2.0rc1` (release candidate
 
 ## Known limitations of the published artifacts
 
-- **Nothing runs a model.** No device backend implements a kernel, so an installed `pocketllm` can
-  list devices, resolve ops and read a GGUF checkpoint, and cannot serve. Say so in the release notes
-  rather than letting a version number imply otherwise.
+- **The installed package cannot run a model.** No *Python* backend implements a kernel, so an
+  installed `pocketllm` can list devices, resolve ops and read a GGUF checkpoint, and cannot serve.
+  The C engine that does run Qwen3-0.6B is built from `src/` by CMake and is not in the wheel — no
+  wheel carries it, and `pip install` never compiles it. Say both halves in the release notes rather
+  than letting a version number imply either one alone.
 - **No pre-built wheels.** The sdist is pure Python; a wheel would be justified only if a build step
   appeared, which is the thing this tree exists not to have.
 - **Platform.** Nothing in the package is platform-specific, but only Linux x86_64 and aarch64 are

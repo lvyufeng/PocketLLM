@@ -150,8 +150,8 @@ int pocketllm_forward(pocketllm_session *session, const int32_t *tokens, int n, 
        * the caller can reissue with a larger buffer. */
       return -1;
     }
-    const float *values = self->forward(tokens, n);
-    std::memcpy(logits, values, static_cast<std::size_t>(vocab) * sizeof(float));
+    const std::vector<float> values = self->forward(tokens, n, nullptr);
+    std::memcpy(logits, values.data(), static_cast<std::size_t>(vocab) * sizeof(float));
     return static_cast<int>(vocab);
   } catch (const std::exception &) {
     return -1;

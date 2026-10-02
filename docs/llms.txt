@@ -18,6 +18,7 @@ by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script
 - [Backends and dispatch](https://lvyufeng.github.io/PocketLLM/architecture/backend_model/)
 - [Execution](https://lvyufeng.github.io/PocketLLM/architecture/execution/)
 - [Device targets](https://lvyufeng.github.io/PocketLLM/architecture/devices/)
+- [The C engine](https://lvyufeng.github.io/PocketLLM/architecture/c_engine/)
 
 ## Models
 

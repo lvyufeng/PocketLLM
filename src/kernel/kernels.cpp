@@ -1,4 +1,4 @@
-#include "kernel/cpu/kernels.h"
+#include "kernel/kernels.h"
 
 #include <algorithm>
 #include <cmath>
@@ -6,7 +6,7 @@
 #include <cstdint>
 
 namespace pocketllm {
-namespace cpu {
+namespace kernel {
 
 namespace {
 
@@ -179,5 +179,17 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_ca
   }
 }
 
-}  // namespace cpu
+void argmax(const float *values, int64_t n, int64_t *out) {
+  int64_t best = 0;
+  for (int64_t i = 1; i < n; ++i) {
+    /* Strictly greater, so ties take the lowest index -- the rule the ABI
+     * documents, and the one llama.cpp's greedy sampler applies. */
+    if (values[i] > values[best]) {
+      best = i;
+    }
+  }
+  *out = best;
+}
+
+}  // namespace kernel
 }  // namespace pocketllm

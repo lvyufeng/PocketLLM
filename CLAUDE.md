@@ -16,17 +16,41 @@ This repository is one of four:
 `docs/README.md` indexes the documentation — the kernel ABI, the backend model and the device targets
 are documented there.
 
-## Current state: interfaces, not implementations
+## Current state: two halves that have not met
 
-**The tree is a pre-release skeleton.** `pocketllm.kernels` (the ABI), `pocketllm.quant`,
-`pocketllm.loader.gguf`, `pocketllm.engine`, `pocketllm.protocol`, `pocketllm.server` and
-`pocketllm.cli` are real and tested. **No device backend implements a kernel**: every backend except
-`reference` is a declaration with a session that raises `BackendNotImplementedError` naming the
-runtime it waits for. `pocketllm run` and `pocketllm serve` parse and validate their arguments and
-then exit saying what is missing.
+The tree has two implementations of the same thing, at different levels of done, and **the exact
+statement of what runs is the point of this section** — the status table in `README.md` is the
+authority and is checked against `pocketllm devices` and the registry rather than maintained by hand.
 
-Do not describe this tree as able to run a model. The status table in `README.md` is the authority,
-and it is checked against `pocketllm devices` and the registry rather than maintained by hand.
+**The C core (`src/`) runs Qwen3-0.6B.** `libpocketllm.so` reads a GGUF, tokenizes with the
+checkpoint's own BPE, walks the dense Qwen3 graph, and decodes greedily — verified token-for-token
+against llama.cpp on `cpu` and on one `cuda` card. That is real, it is tested, and it is what the
+`src/` row of the README's status table claims.
+
+**The Python package is still a skeleton, and `pocketllm run` is still a stub.** `pocketllm.kernels`
+(the ABI), `pocketllm.quant`, `pocketllm.loader.gguf`, `pocketllm.engine`, `pocketllm.protocol`,
+`pocketllm.server` and `pocketllm.cli` are real and tested, but **no Python backend implements a
+kernel**: every backend except `reference` is a declaration with a session that raises
+`BackendNotImplementedError` naming the runtime it waits for.
+
+**These are two separate answers to two separate questions, and the trap is reading either one as the
+other.** `pocketllm.kernels` declares 17 ops; the C engine implements 7 of them over its own backend
+interface, which is a *different* interface from `pocketllm.backends` and shares no code with it. A
+statement about `pocketllm devices` — which lists the *Python* backends and their stubs — says
+nothing about what `src/` can do, and `pocketllm devices` on this host does not know the C core
+exists.
+
+They meet at exactly one place: `python/pocketllm/native.py`, the `ctypes` bridge, which
+**`pocketllm run` now drives** — it opens a session, tokenizes, runs the graph and decodes greedily
+through the C core, and `tests/native/test_cli_run.py` checks it against llama.cpp's sequence. So
+`pocketllm run` runs a model and `pocketllm serve` does not, and the two halves are wired at one end
+rather than joined. Greedy is the whole of it: `topk_sample` and `logits_temperature` have no C
+implementation, which is why `run` offers no temperature.
+
+So: do not describe the *Python package* as able to run a model, do not describe *the tree* as unable
+to, and do not describe the C core and the Python backends as one implementation — they are two, at
+different levels of done, joined at one entry point. Prefer the README's status table to any prose
+here.
 
 ## Language convention
 
@@ -138,14 +162,20 @@ Ascend machine at all, and neither machine can run a model from this tree today.
 ### x86_64 CUDA machine — 4 x RTX 2080 Ti
 
 - **GPUs**: 4 x RTX 2080 Ti, 22528 MiB each, compute capability **7.5 (Turing / sm_75)**. relic-core
-  builds for sm_75; do not drop sm_75-specific kernel paths there. This tree compiles nothing.
+  builds for sm_75; do not drop sm_75-specific kernel paths there. `src/kernel/cuda/` is built for
+  sm_75 too (`POCKETLLM_CUDA_ARCHITECTURES`), and one process uses exactly one of these cards.
 - **CPU / RAM**: 2 x Xeon E5-2696 v4, 22 cores each (88 hardware threads), ~1 TiB RAM.
 - **OS / Python**: Ubuntu 22.04.5, x86_64, kernel 5.15. Python 3.10.10 (conda).
 - **CUDA**: `nvcc` on `PATH` is **13.0** while `CUDA_HOME` points at **`/usr/local/cuda-12.4`**;
-  11.8, 12.4 and 13.0 are installed.
-  - **Trap**: a pip-installed torch is built against CUDA 12.4, and `torch.utils.cpp_extension`
-    hard-fails on the mismatch (`The detected CUDA version (13.0) mismatches the version that was
-    used to compile PyTorch (12.4)`). This tree no longer compiles anything, but relic-core does.
+  11.8, 12.4 and 13.0 are installed. `/usr/local/cuda` resolves through
+  `/etc/alternatives/cuda` to `cuda-13.0`, which is what CMake's search finds, so the CUDA backend
+  builds against 13.0 without any path being pinned. Do not pin one anyway: the mismatch between
+  `CUDA_HOME` and `nvcc` is a fact about this host, not about the next one.
+  - **Historical trap, now resolved**: a pip-installed torch used to be built against CUDA 12.4
+    while `nvcc` was 13.0, and `torch.utils.cpp_extension` hard-fails on that mismatch
+    (`The detected CUDA version (13.0) mismatches the version that was used to compile PyTorch
+    (12.4)`). Torch is now `2.13.0+cu130` and the two agree. relic-core still compiles CUDA and
+    would still hit this if torch were ever downgraded.
 - **No NPU here**: no `/dev/davinci*` and no CANN.
 - One relevant `git` note: `origin` is HTTP**S** (`https://github.com/lvyufeng/PocketLLM.git`) and
   there is no SSH key this host can authenticate to GitHub with. `gh` is authenticated separately as
