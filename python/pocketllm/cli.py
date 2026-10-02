@@ -26,9 +26,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 
-from .api import EngineArgs, device_kinds
+from .api import EngineArgs, SamplingParams, device_kinds
 from .backends import registry
 
 __all__ = ["build_parser", "main"]
@@ -62,6 +63,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_engine_flags(run)
     run.add_argument("--prompt", required=True, help="the prompt to run")
     run.add_argument("--max-tokens", type=int, default=16)
+    # The sampling flags live on `run` alone and not on `_add_engine_flags`,
+    # because `serve` has no decode loop to apply them in yet -- its session is
+    # still a stub.  A flag that is parsed and ignored is worse than one that
+    # does not exist.
+    run.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="0 means greedy (the default); anything above it samples",
+    )
+    run.add_argument("--top-k", type=int, help="keep the k most likely tokens (default: no limit)")
+    run.add_argument("--top-p", type=float, help="keep the smallest set whose mass reaches p")
+    run.add_argument("--min-p", type=float, help="drop tokens below this fraction of the top one")
+    run.add_argument("--seed", type=int, help="seed for the sampling draw; unset means it is not reproducible")
 
     serve = subparsers.add_parser("serve", help="start the OpenAI-compatible server")
     _add_engine_flags(serve)
@@ -221,15 +236,18 @@ def _run_device(engine_args: EngineArgs) -> str:
 
 
 def _cmd_run(namespace: argparse.Namespace) -> int:
-    """Load a checkpoint and generate greedily, through the C core.
+    """Load a checkpoint and generate through the C core.
 
     The engine does the whole chain -- GGUF read, tokenize, graph walk, sample --
     and this function is the host half the ABI's header describes: it opens a
     session, drives the loop, and prints.  Nothing here knows what Qwen3 is.
 
-    Greedy only, and that is a statement about the engine rather than about the
-    flags: sampling is a declared op with no C implementation yet, so a
-    `--temperature` here would be a knob that does nothing.  It is not offered.
+    Greedy is the default and its output is bit-identical to what it was before
+    sampling existed: a request with no flags takes the `argmax` path and never
+    touches the sampler.  Anything above a temperature of zero branches to the
+    sampler, and the draw comes from a `random.Random(seed)` held here rather
+    than from the engine -- the library has no RNG, which is what keeps it a
+    pure function of `(logits, uniform)` and makes this loop reproducible.
     """
     from . import native
     from .native import Engine, EngineUnavailable
@@ -237,6 +255,19 @@ def _cmd_run(namespace: argparse.Namespace) -> int:
     engine_args = _args(namespace)
     device = _run_device(engine_args)
     checkpoint = engine_args.checkpoint_dir
+
+    # `SamplingParams` validates as it is constructed -- a `top_p` outside (0, 1]
+    # is a `ConfigurationError` before the checkpoint is mapped -- so the flags
+    # are read through it rather than checked here, and the greedy branch below
+    # is the same predicate the server would use for the same request.
+    sampling = SamplingParams(
+        temperature=namespace.temperature,
+        top_k=namespace.top_k,
+        top_p=namespace.top_p,
+        min_p=namespace.min_p,
+        seed=namespace.seed,
+    )
+    draws = random.Random(sampling.seed)
 
     # **Two different failures wear the same exception.**  `Engine.open` raises
     # `EngineUnavailable` both when there is no library to load and when the
@@ -266,7 +297,21 @@ def _cmd_run(namespace: argparse.Namespace) -> int:
             print(namespace.prompt, end="", flush=True)
 
             for _ in range(namespace.max_tokens):
-                token = Engine.argmax(logits)
+                if sampling.greedy:
+                    token = Engine.argmax(logits)
+                else:
+                    # The transform is a separate call from the sample so the
+                    # logits stay the model's own -- a caller that later wants
+                    # logprobs wants the unscaled ones -- and the sampler is
+                    # handed a uniform draw from this loop's generator and no
+                    # other source of randomness.
+                    token = Engine.sample(
+                        Engine.temperature(logits, sampling.temperature),
+                        draws.random(),
+                        top_k=sampling.top_k or 0,
+                        top_p=sampling.top_p if sampling.top_p is not None else 1.0,
+                        min_p=sampling.min_p if sampling.min_p is not None else 0.0,
+                    )
                 piece = engine.decode([token])
                 print(piece, end="", flush=True)
                 # One token per call, from the position the session is holding.
