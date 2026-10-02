@@ -49,6 +49,7 @@ import pytest
 
 from pocketllm import native
 from pocketllm.backends.reference import kernels as ref
+from pocketllm.quant import formats
 
 #: The ABI's tolerance for a dense product, the same one `test_forward.py` uses
 #: against llama.cpp -- but here the comparison is two float32 computations of
@@ -104,6 +105,8 @@ def _format(values: np.ndarray) -> str:
     input the reference sees rather than a printed approximation of it.
     """
     flat = np.asarray(values).reshape(-1)
+    if flat.dtype == np.uint8:
+        return " ".join(f"{int(v)}" for v in flat)
     return " ".join(f"{int(v)}" if flat.dtype.kind in "iu" else f"{float(v):.9g}" for v in flat)
 
 
@@ -115,7 +118,10 @@ def write_request(op: str, tensors: dict, params: dict | None = None, poison: bo
         lines.append(f"param {key} {value}")
     for name, array in tensors.items():
         arr = np.asarray(array)
-        dtype = "f32" if arr.dtype.kind == "f" else "i32"
+        if arr.dtype == np.uint8:
+            dtype = "u8"
+        else:
+            dtype = "f32" if arr.dtype.kind == "f" else "i32"
         shape = " ".join(str(d) for d in arr.shape)
         lines.append(f"tensor {name} {dtype} {shape}" if shape else f"tensor {name} {dtype}")
         lines.append(_format(arr))
@@ -291,10 +297,108 @@ def case_gemm_accumulate(rng):
     )
 
 
+def case_gemm_quant_q4_k(rng):
+    """The packed product in the format a `q4_k_m` checkpoint spends most of its
+    bytes on. `k = 512` is two blocks a row, which is the smallest shape where a
+    kernel that read only the first block would still produce the right shape."""
+    x = rng.standard_normal((4, 512), dtype=np.float32)
+    blocks = packed_row(rng, rows=32, cols=512, fmt="q4_k")
+    return (
+        {"x": x, "w_blocks": blocks},
+        {"type_id": 12},
+        ref.gemm_quant(x, blocks, w_blocks_fmt="q4_k"),
+    )
+
+
+def case_gemm_quant_q6_k(rng):
+    """`q6_k`, which a `q4_k_m` file mixes in for `attn_v` and `ffn_down`.
+
+    A separate case rather than a parameter, because the two formats share
+    nothing but the block width: a single test would report a decode error in
+    either one under the same name, and the second format is where the
+    interleaved `ql`/`qh` layout is.
+    """
+    x = rng.standard_normal((3, 256), dtype=np.float32)
+    blocks = packed_row(rng, rows=16, cols=256, fmt="q6_k")
+    return (
+        {"x": x, "w_blocks": blocks},
+        {"type_id": 14},
+        ref.gemm_quant(x, blocks, w_blocks_fmt="q6_k"),
+    )
+
+
 def case_embedding(rng):
     table = rng.standard_normal((32, 48), dtype=np.float32)
     tokens = np.array([0, 31, 7, 7, 0], dtype=np.int32)
     return ({"tokens": tokens, "table": table}, {}, ref.embedding(tokens, table))
+
+
+def case_embedding_quant_q4_k(rng):
+    """The gather from a packed table, which is the tied-embedding path.
+
+    `token_embd.weight` is both the first op of the graph and — in a checkpoint
+    with no separate head — the matrix the final projection contracts against.
+    A `q4_k_m` file leaves it packed, so a build that could only gather from a
+    float table would expand 155 MB to 622 MB to read one row per token.
+    """
+    tokens = np.array([0, 7, 7, 3], dtype=np.int32)
+    blocks = packed_row(rng, rows=8, cols=512, fmt="q4_k")
+    return (
+        {"tokens": tokens, "table_blocks": blocks},
+        {"type_id": 12},
+        ref.embedding(tokens, blocks, table_fmt="q4_k"),
+    )
+
+
+def case_embedding_quant_q6_k(rng):
+    tokens = np.array([5, 0, 2], dtype=np.int32)
+    blocks = packed_row(rng, rows=6, cols=256, fmt="q6_k")
+    return (
+        {"tokens": tokens, "table_blocks": blocks},
+        {"type_id": 14},
+        ref.embedding(tokens, blocks, table_fmt="q6_k"),
+    )
+
+
+def packed_row(rng, rows: int, cols: int, fmt: str) -> np.ndarray:
+    """Random bytes with the geometry of `fmt`'s blocks, shaped as GGUF stores
+    the tensor: ``(rows, cols // 256, block_bytes)``.
+
+    The bytes are random *within* the format's fields and not uniform over the
+    whole block: the pair of fp16 header values is drawn from a small positive
+    range rather than from all 65536 bit patterns, because a uniform draw spends
+    most of its mass on NaNs and infinities and a block whose `d` is NaN would
+    make the comparison vacuous -- both sides would agree on "not a number".
+
+    This is a *synthetic* weight and not a quantized one: no quantizer produced
+    it, so it exercises the decode and the product on values the quantizer would
+    never write. That is the point -- a real `q4_k` tensor is close to what it
+    approximates, and the fields that matter (`d`, `dmin`, the 6-bit pairs) are
+    within a few percent of each other's, so an off-by-one in a bit field can
+    land on a plausible value. Random fields cannot.
+    """
+    fmt_desc = formats.format_for(fmt)
+    blocks = rng.integers(0, 256, size=(rows, cols // 256, fmt_desc.block_bytes), dtype=np.uint8)
+
+    def put_half(block: np.ndarray, offset: int, values: np.ndarray) -> None:
+        block[..., offset : offset + 2] = (
+            values.astype(np.float16).view(np.uint8).reshape(*block.shape[:-1], 2)
+        )
+
+    shape = blocks.shape[:-1]
+    if fmt == "q4_k":
+        # `d` at bytes 0..1 and `dmin` at 2..3, both fp16 and both positive.
+        put_half(blocks, 0, rng.uniform(0.01, 0.1, size=shape))
+        put_half(blocks, 2, rng.uniform(0.0, 0.05, size=shape))
+    elif fmt == "q6_k":
+        # `d` is the *last* field of a q6_k block, at 208..209. Writing it at
+        # offset 0 instead -- which is where q4_k's is -- puts a random fp16 in
+        # the scale slot and a random fp16 in `d`, and a random pair of bytes is
+        # a NaN or an infinity about one time in three.
+        put_half(blocks, 208, rng.uniform(0.01, 0.1, size=shape))
+    else:
+        raise ValueError(f"packed_row has no header layout for {fmt}")
+    return blocks
 
 
 def case_silu_mul(rng):
@@ -462,7 +566,11 @@ CASES = {
     "gemm_k_not_multiple_of_four": case_gemm_k_not_multiple_of_four,
     "gemm_bias": case_gemm_bias,
     "gemm_accumulate": case_gemm_accumulate,
+    "gemm_quant_q4_k": case_gemm_quant_q4_k,
+    "gemm_quant_q6_k": case_gemm_quant_q6_k,
     "embedding": case_embedding,
+    "embedding_quant_q4_k": case_embedding_quant_q4_k,
+    "embedding_quant_q6_k": case_embedding_quant_q6_k,
     "silu_mul": case_silu_mul,
     "silu_mul_large_negative": case_silu_mul_large_negative,
     "rope_start_zero": case_rope_start_zero,
@@ -486,7 +594,11 @@ OP_OF_CASE = {
     "gemm_k_not_multiple_of_four": "gemm",
     "gemm_bias": "gemm",
     "gemm_accumulate": "gemm",
+    "gemm_quant_q4_k": "gemm_quant",
+    "gemm_quant_q6_k": "gemm_quant",
     "embedding": "embedding",
+    "embedding_quant_q4_k": "embedding_quant",
+    "embedding_quant_q6_k": "embedding_quant",
     "silu_mul": "silu_mul",
     "silu_mul_large_negative": "silu_mul",
     "rope_start_zero": "rope",
@@ -514,6 +626,24 @@ INDEX_CASES = {"argmax", "argmax_ties"}
 POISONABLE = [case for case in CASES if case not in INDEX_CASES | {"gemm_accumulate"}]
 
 
+#: Cases whose right operand is a packed weight, and the tolerance they are
+#: compared at. A quantized product has a larger error than a dense one for a
+#: reason that is not a bug: the reference decodes the blocks with numpy and
+#: contracts in float64 through `einsum`, while the kernel contracts in float32
+#: as it decodes. On a `q4_k` block the decoded values are exact in both, so the
+#: difference is the accumulation -- but the accumulation is over 256 wide
+#: groups of values that are themselves the product of a coarse quantizer, and
+#: the measured spread is what :data:`QUANTIZED_RTOL` is set for.
+QUANTIZED_CASES = frozenset(
+    {
+        "gemm_quant_q4_k",
+        "gemm_quant_q6_k",
+        "embedding_quant_q4_k",
+        "embedding_quant_q6_k",
+    }
+)
+
+
 def _compare(case: str, result: dict, want: np.ndarray) -> None:
     """The request's answer against the reference's, at the case's tolerance."""
     if case in INDEX_CASES:
@@ -522,6 +652,20 @@ def _compare(case: str, result: dict, want: np.ndarray) -> None:
         return
     got = np.array(result["values"], dtype=np.float64).reshape(want.shape)
     assert got.shape == want.shape, f"{case}: got shape {got.shape}, expected {want.shape}"
+    if case in QUANTIZED_CASES:
+        # A relative bound on the *error*, not on the value: the weight is
+        # quantized, so the answer the reference produces is itself an
+        # approximation of the exact product, and comparing the two at a bound
+        # derived from the output's magnitude would be measuring the quantizer
+        # rather than the kernel. What is being asked is whether the two
+        # implementations decoded the same blocks, and a misread bit field
+        # changes a weight by a large fraction of its range.
+        error = float(np.max(np.abs(got - want.astype(np.float64))))
+        scale = float(np.max(np.abs(want))) or 1.0
+        assert error <= QUANTIZED_RTOL * scale, (
+            f"{case}: max |c - reference| = {error} over a scale of {scale}"
+        )
+        return
     spread = float(np.max(np.abs(want))) or 1.0
     worst = float(np.max(np.abs(got - want.astype(np.float64))))
     assert worst <= BACKEND_RTOL * spread, (

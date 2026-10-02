@@ -49,13 +49,19 @@ namespace pocketllm {
 
 /* How a stored weight is used by `matmul`.
  *
- * Today both spellings describe an f16/f32 tensor: the bytes are read once at
- * load, widened on the host, and `data` is the device copy of that. The `blocks`
- * form is where the quantized path lands -- a step-5 kernel reads those bytes
- * directly and never expands them -- and it is declared now so that adding it is
- * a change inside `matmul` rather than a change to every call site. */
+ * Exactly one of the two handles is live. A tensor this build can widen is read
+ * once at load, converted on the host, and `data` is the device copy of the
+ * result; a k-quant tensor has no widened form at all, and `blocks` holds the
+ * checkpoint's own bytes so the kernel can decode each weight as it consumes
+ * it. `quantized` says which, and it is a stored flag rather than a test of
+ * `blocks.handle != 0` so that a reader finds the decision in one place.
+ *
+ * The second form is not an optimization of the first. A `q4_k_m` weight is
+ * 4.5 bits per weight and its f32 expansion is 32 -- so widening one to run a
+ * dense GEMM would allocate seven times the checkpoint on the device, which on
+ * the card this project targets is the difference between fitting and not. */
 struct Weight {
-  kernel::DeviceBuffer data;       /* dequantized, resident on the backend */
+  kernel::DeviceBuffer data;       /* widened to f32, resident on the backend */
   kernel::DeviceBuffer blocks;     /* the raw bytes, for a quantized tensor */
   int64_t rows = 0;                /* output features (GGUF ne1) */
   int64_t cols = 0;                /* input features (GGUF ne0) */
@@ -120,13 +126,32 @@ class Qwen3Model {
 
   /* Read a tensor from the checkpoint, widen it to f32 on the host, and upload
    * it. The widening happens here and not in a kernel because it is a load-time
-   * cost paid once -- a step-5 quantized kernel reads the bytes in place and
-   * never expands them, which is what makes that step worth doing. */
+   * cost paid once. */
   kernel::DeviceBuffer bind_dense(const GgufReader &checkpoint, const std::string &name);
+
+  /* A weight, through whichever path its stored type calls for: widened if it
+   * is f32/f16, copied as packed blocks if it is a k-quant. The choice is made
+   * once, here, and every other function reads `Weight::quantized`. */
   Weight bind_matrix(const GgufReader &checkpoint, const std::string &name);
+
+  /* Copy a tensor's stored bytes to the device untouched and describe them as
+   * a `Weight`. Nothing is decoded at load: the type id travels with the
+   * handle and the kernel is what reads the layout. */
+  Weight bind_packed(const GgufReader &checkpoint, const std::string &name);
+
+  /* The embedding table, which is either a float matrix or a packed one. Kept
+   * as a `Weight` rather than a handle because the output projection is tied to
+   * it and needs the same shape and type. */
+  Weight bind_table(const GgufReader &checkpoint, const std::string &name);
 
   void matmul(const Weight &w, kernel::DeviceBuffer x, kernel::DeviceBuffer out, int64_t m,
               bool accumulate) const;
+  void embed(kernel::DeviceBuffer tokens, int64_t n, kernel::DeviceBuffer out) const;
+
+  /* Drop whichever of a `Weight`'s two buffers is the live one. A member
+   * function because the destructor and the tie-breaking in it both need to
+   * ask, and the answer must be the same in both places. */
+  void release_weight(const Weight &weight);
   /* Size the scratch buffers for a batch of `n` tokens whose last position is
    `end_pos - 1`. The second argument is not derivable from the first because the
    attention score row is indexed by absolute key position: a one-token decode at
@@ -157,7 +182,7 @@ class Qwen3Model {
   kernel::DeviceBuffer k_cache_, v_cache_;
   int64_t cache_capacity_ = 0;
 
-  kernel::DeviceBuffer tok_embd_;
+  Weight tok_embd_;
   Weight output_;
   kernel::DeviceBuffer output_norm_;
 

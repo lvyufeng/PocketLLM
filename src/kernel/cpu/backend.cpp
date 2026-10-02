@@ -84,10 +84,22 @@ class CpuBackend final : public Backend {
     kernel::gemm(f(x), f(weight), bias.handle ? f(bias) : nullptr, w(out), m, n, k, accumulate);
   }
 
+  void gemm_quant(DeviceBuffer x, DeviceBuffer blocks, DeviceBuffer bias, DeviceBuffer out,
+                  int64_t m, int64_t n, int64_t k, int type_id, bool accumulate) override {
+    kernel::gemm_quant(f(x), bytes(blocks), bias.handle ? f(bias) : nullptr, w(out), m, n, k, type_id,
+                       accumulate);
+  }
+
   void embedding(DeviceBuffer tokens, int64_t n_tokens, DeviceBuffer table, int64_t vocab,
                  int64_t d, DeviceBuffer out) override {
     kernel::embedding(reinterpret_cast<const int32_t *>(tokens.handle), n_tokens, f(table), vocab, d,
                       w(out));
+  }
+
+  void embedding_quant(DeviceBuffer tokens, int64_t n_tokens, DeviceBuffer blocks, int64_t vocab,
+                       int64_t d, int type_id, DeviceBuffer out) override {
+    kernel::embedding_quant(reinterpret_cast<const int32_t *>(tokens.handle), n_tokens, bytes(blocks),
+                            vocab, d, type_id, w(out));
   }
 
   void silu_mul(DeviceBuffer gate, DeviceBuffer up, DeviceBuffer out, int64_t n) override {
@@ -138,6 +150,13 @@ class CpuBackend final : public Backend {
     return reinterpret_cast<const float *>(buffer.handle);
   }
   static float *w(DeviceBuffer buffer) { return reinterpret_cast<float *>(buffer.handle); }
+  /* A packed weight is bytes, not floats, and the cast is the type: a tensor
+   * whose handle was allocated for `nbytes` of blocks is read as `uint8_t*` and
+   * never as an array of anything wider. The `f`/`w` split above is about
+   * constness; this one is about what the memory *is*. */
+  static const uint8_t *bytes(DeviceBuffer buffer) {
+    return reinterpret_cast<const uint8_t *>(buffer.handle);
+  }
 };
 
 }  // namespace

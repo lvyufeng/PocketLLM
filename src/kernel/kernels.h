@@ -49,10 +49,49 @@ void rms_norm(const float *x, const float *weight, float *out, int64_t n_tokens,
 void gemm(const float *x, const float *w, const float *bias, float *out, int64_t m, int64_t n,
           int64_t k, bool accumulate = false);
 
+/* ``out[r, j] = sum_k x[r, k] * w[j, k]`` with `w` stored as packed blocks.
+ *
+ * The same product as `gemm` with the right operand read through its quantizer
+ * on the fly, instead of from a float matrix a loader expanded. This is the op
+ * that makes the width ladder real: a 0.6B checkpoint in f16 is 1.4 GB and the
+ * same file at `q4_k_m` is 456 MB, and the difference is entirely in whether
+ * this function exists.
+ *
+ * `blocks` is `(n, k / block_weights, block_bytes)` as GGUF stores it, one
+ * `type_id` for the whole tensor, which is what GGUF requires -- a row's blocks
+ * are contiguous and a tensor has one type. `k` must be a multiple of the
+ * block width; a shape that is not is refused by the caller rather than padded
+ * here, because a silent tail would be a weight read from the wrong place.
+ *
+ * The decode is per *weight* and the value is consumed by the dot product
+ * immediately, so no row is ever materialized: the reference backend reaches
+ * the same answer by decoding the whole matrix with numpy first, and this does
+ * it without the f32 copy. The tolerance they are compared at is
+ * :data:`QUANTIZED_RTOL` on the test side. */
+void gemm_quant(const float *x, const uint8_t *blocks, const float *bias, float *out, int64_t m,
+                int64_t n, int64_t k, int type_id, bool accumulate = false);
+
 /* ``out[i, :] = table[token[i], :]``. A gather, not a product: the embedding is
  * the one op whose cost is the bytes it reads and not the arithmetic. */
 void embedding(const int32_t *tokens, int64_t n_tokens, const float *table, int64_t vocab,
                int64_t d, float *out);
+
+/* The same gather from a quantized table, `blocks` being
+ * `(vocab, d / block_weights, block_bytes)`.
+ *
+ * A separate entry point rather than a flag on the one above because the two
+ * read different memory: the dense table is `float`, this is packed bytes, and
+ * a pointer that could be either is a cast that loses the type that says which.
+ *
+ * This exists because Qwen3-0.6B ties its output projection to the embedding,
+ * so `token_embd.weight` is *both* the first op of the graph and a weight the
+ * final matmul contracts against. A `q4_k_m` checkpoint leaves it in `q4_k`,
+ * and a build that could only gather from a float table would have to expand
+ * 155 MB to 622 MB to read one row of it per token -- which is most of the
+ * saving the quantization was for. The decode is per row, so a token costs one
+ * block walk and not a full-table dequantization. */
+void embedding_quant(const int32_t *tokens, int64_t n_tokens, const uint8_t *blocks, int64_t vocab,
+                     int64_t d, int type_id, float *out);
 
 /* ``out = silu(gate) * up``, elementwise over the whole tensor. */
 void silu_mul(const float *gate, const float *up, float *out, int64_t n);

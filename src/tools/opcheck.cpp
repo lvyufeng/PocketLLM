@@ -52,6 +52,7 @@
 #include <vector>
 
 #include "kernel/backend.h"
+#include "quant/blocks.h"
 #include "runtime/status.h"
 
 namespace {
@@ -72,6 +73,10 @@ struct Tensor {
   std::vector<int64_t> shape;
   std::vector<float> floats;
   std::vector<int32_t> ints;
+  /* A packed weight is neither: it is the checkpoint's own bytes, and the whole
+   * point of these kernels is that the bytes are never reinterpreted as
+   * numbers on the way to the device. */
+  std::vector<uint8_t> bytes;
 
   int64_t elements() const {
     int64_t n = 1;
@@ -194,9 +199,23 @@ Request read_request(std::istream &in) {
         for (const std::string &field : fields) {
           tensor.ints.push_back(static_cast<int32_t>(std::stol(field)));
         }
+      } else if (tensor.dtype == "u8") {
+        /* One value per byte, each in 0..255. The count rule is the same as
+         * for a float tensor -- the shape's product is the number of *bytes* --
+         * which is what lets the caller say `w_blocks u8 4 1 144` and have the
+         * tool check that four 144-byte blocks arrived rather than four
+         * numbers. */
+        for (const std::string &field : fields) {
+          const long value = std::stol(field);
+          if (value < 0 || value > 255) {
+            throw pocketllm::Error("tensor '" + parts[1] + "' has byte value " + field +
+                                   ", which is outside 0..255");
+          }
+          tensor.bytes.push_back(static_cast<uint8_t>(value));
+        }
       } else {
         throw pocketllm::Error("tensor '" + parts[1] + "' has dtype '" + tensor.dtype +
-                               "', which is neither f32 nor i32");
+                               "', which is neither f32, i32 nor u8");
       }
       request.tensors.emplace_back(parts[1], std::move(tensor));
     } else {
@@ -230,6 +249,12 @@ void write_floats(std::ostream &out, const std::vector<float> &values) {
 DeviceBuffer upload(Backend &backend, const std::vector<float> &values) {
   DeviceBuffer buffer = backend.allocate(static_cast<int64_t>(values.size()) * 4);
   backend.copy_to_device(buffer, values.data(), static_cast<int64_t>(values.size()) * 4);
+  return buffer;
+}
+
+DeviceBuffer upload(Backend &backend, const std::vector<uint8_t> &values) {
+  DeviceBuffer buffer = backend.allocate(static_cast<int64_t>(values.size()));
+  backend.copy_to_device(buffer, values.data(), static_cast<int64_t>(values.size()));
   return buffer;
 }
 
@@ -349,6 +374,88 @@ void run_gemm(std::ostream &out, Backend &backend, const Request &request) {
   }
 }
 
+/* The packed product. Shape and the weight's *storage* are stated separately
+ * and checked against each other, because this is the one op where the two can
+ * disagree: `w_blocks n k/256 144` says how the row is walked, the block count
+ * in the last dimension says how many bytes arrived, and a mismatch would
+ * otherwise decode a weight from the neighbouring row and report a small
+ * numerical difference rather than a bad request. */
+void run_gemm_quant(std::ostream &out, Backend &backend, const Request &request) {
+  const Tensor &x = request.require("x");
+  const Tensor &w = request.require("w_blocks");
+  const int64_t m = x.shape[0];
+  const int64_t k = x.shape[1];
+  const int64_t n = w.shape[0];
+  const int type_id = static_cast<int>(request.int_param("type_id", 0));
+
+  const int block_bytes = pocketllm::quant::block_bytes_of(type_id);
+  if (block_bytes == 0) {
+    throw pocketllm::Error("gemm_quant: no packed kernel for GGML type id " +
+                           std::to_string(type_id));
+  }
+  if (k % pocketllm::quant::kBlockWeights != 0) {
+    throw pocketllm::Error("gemm_quant: k must be a whole number of 256-weight blocks, got " +
+                           std::to_string(k));
+  }
+  if (w.shape.size() != 3 || w.shape[1] != k / pocketllm::quant::kBlockWeights ||
+      w.shape[2] != block_bytes) {
+    throw pocketllm::Error("gemm_quant: w_blocks must be (n, k/256, " + std::to_string(block_bytes) +
+                           ") for this type id");
+  }
+  int64_t expected_bytes = 1;
+  for (int64_t dim : w.shape) {
+    expected_bytes *= dim;
+  }
+  if (static_cast<int64_t>(w.bytes.size()) != expected_bytes) {
+    throw pocketllm::Error("gemm_quant: w_blocks shape and byte count disagree");
+  }
+
+  DeviceBuffer dx = upload(backend, x.floats);
+  DeviceBuffer dw = upload(backend, w.bytes);
+  const bool accumulate = request.flag("accumulate");
+  if (accumulate && request.poison) {
+    throw pocketllm::Error(
+        "gemm_quant: --poison and accumulate are incompatible; the sentinel would be summed into "
+        "the residual");
+  }
+  run_and_report(out, backend, request, {m, n}, [&](DeviceBuffer result) {
+    if (accumulate) {
+      const Tensor &seed = request.require("out_seed");
+      backend.copy_to_device(result, seed.floats.data(),
+                             static_cast<int64_t>(seed.floats.size()) * 4);
+    }
+    backend.gemm_quant(dx, dw, DeviceBuffer{}, result, m, n, k, type_id, accumulate);
+  });
+  backend.release(dx);
+  backend.release(dw);
+}
+
+void run_embedding_quant(std::ostream &out, Backend &backend, const Request &request) {
+  const Tensor &tokens = request.require("tokens");
+  const Tensor &table = request.require("table_blocks");
+  const int64_t n_tokens = tokens.elements();
+  const int64_t vocab = table.shape[0];
+  const int64_t d = static_cast<int64_t>(table.shape[1]) * pocketllm::quant::kBlockWeights;
+  const int type_id = static_cast<int>(request.int_param("type_id", 0));
+  const int block_bytes = pocketllm::quant::block_bytes_of(type_id);
+  if (block_bytes == 0) {
+    throw pocketllm::Error("embedding_quant: no packed kernel for GGML type id " +
+                           std::to_string(type_id));
+  }
+  if (table.shape.size() != 3 || table.shape[2] != block_bytes) {
+    throw pocketllm::Error("embedding_quant: table_blocks must be (vocab, d/256, " +
+                           std::to_string(block_bytes) + ") for this type id");
+  }
+
+  DeviceBuffer dtokens = upload(backend, tokens.ints);
+  DeviceBuffer dtable = upload(backend, table.bytes);
+  run_and_report(out, backend, request, {n_tokens, d}, [&](DeviceBuffer result) {
+    backend.embedding_quant(dtokens, n_tokens, dtable, vocab, d, type_id, result);
+  });
+  backend.release(dtokens);
+  backend.release(dtable);
+}
+
 void run_embedding(std::ostream &out, Backend &backend, const Request &request) {
   const Tensor &tokens = request.require("tokens");
   const Tensor &table = request.require("table");
@@ -456,8 +563,10 @@ struct Entry {
 };
 
 const Entry kOps[] = {
-    {"rms_norm", run_rms_norm}, {"gemm", run_gemm},         {"embedding", run_embedding},
-    {"silu_mul", run_silu_mul}, {"rope", run_rope},         {"attention", run_attention},
+    {"rms_norm", run_rms_norm},   {"gemm", run_gemm},
+    {"gemm_quant", run_gemm_quant}, {"embedding", run_embedding},
+    {"embedding_quant", run_embedding_quant}, {"silu_mul", run_silu_mul},
+    {"rope", run_rope},           {"attention", run_attention},
     {"argmax", run_argmax},
 };
 

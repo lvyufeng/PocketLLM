@@ -22,10 +22,12 @@ The tree has two implementations of the same thing, at different levels of done,
 statement of what runs is the point of this section** — the status table in `README.md` is the
 authority and is checked against `pocketllm devices` and the registry rather than maintained by hand.
 
-**The C core (`src/`) runs Qwen3-0.6B.** `libpocketllm.so` reads a GGUF, tokenizes with the
-checkpoint's own BPE, walks the dense Qwen3 graph, and decodes greedily — verified token-for-token
-against llama.cpp on `cpu` and on one `cuda` card. That is real, it is tested, and it is what the
-`src/` row of the README's status table claims.
+**The C core (`src/`) runs Qwen3-0.6B, in f16 and in `q4_k_m`.** `libpocketllm.so` reads a GGUF,
+tokenizes with the checkpoint's own BPE, walks the Qwen3 graph, and decodes greedily — on widened
+`f32`/`f16` weights, and on packed `q4_k`/`q6_k` that `src/quant/blocks.h` decodes inside the kernel
+and never expands. Verified token-for-token against llama.cpp on `cpu` and on one `cuda` card, for
+both checkpoints. That is real, it is tested, and it is what the `src/` row of the README's status
+table claims.
 
 **The Python package is still a skeleton, and `pocketllm run` is still a stub.** `pocketllm.kernels`
 (the ABI), `pocketllm.quant`, `pocketllm.loader.gguf`, `pocketllm.engine`, `pocketllm.protocol`,
@@ -34,7 +36,7 @@ kernel**: every backend except `reference` is a declaration with a session that 
 `BackendNotImplementedError` naming the runtime it waits for.
 
 **These are two separate answers to two separate questions, and the trap is reading either one as the
-other.** `pocketllm.kernels` declares 17 ops; the C engine implements 7 of them over its own backend
+other.** `pocketllm.kernels` declares 17 ops; the C engine implements 9 of them over its own backend
 interface, which is a *different* interface from `pocketllm.backends` and shares no code with it. A
 statement about `pocketllm devices` — which lists the *Python* backends and their stubs — says
 nothing about what `src/` can do, and `pocketllm devices` on this host does not know the C core

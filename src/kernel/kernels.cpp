@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "quant/blocks.h"
+
 namespace pocketllm {
 namespace kernel {
 
@@ -76,6 +78,44 @@ void gemm(const float *x, const float *w, const float *bias, float *out, int64_t
   }
 }
 
+void gemm_quant(const float *x, const uint8_t *blocks, const float *bias, float *out, int64_t m,
+                int64_t n, int64_t k, int type_id, bool accumulate) {
+  const int block_bytes = quant::block_bytes_of(type_id);
+  const int per_block = quant::kBlockWeights;
+  /* The row stride in bytes comes from the block geometry and not from a
+   * parameter: a caller that passed it would be able to pass one that disagrees
+   * with the type id, and the disagreement would read a row from the middle of
+   * its neighbour. */
+  const int64_t row_bytes = (k / per_block) * block_bytes;
+
+  for (int64_t r = 0; r < m; ++r) {
+    const float *row = x + r * k;
+    float *dst = out + r * n;
+    for (int64_t j = 0; j < n; ++j) {
+      const uint8_t *row_blocks = blocks + j * row_bytes;
+      float total = 0.0F;
+      int64_t col = 0;
+      /* One block at a time, decoding each weight as the running sum consumes
+       * it. The four-way accumulator `dot` uses is deliberately not replicated
+       * here: it exists to avoid a long dependency chain over a thousand
+       * elements, and this loop already has one of a different shape -- the
+       * decode of the next weight can begin while the previous add is in
+       * flight. What it shares with `dot` is the *order*, which is what keeps
+       * the CPU and the card comparable at the tolerance the test uses. */
+      for (int64_t b = 0; b < k / per_block; ++b) {
+        const uint8_t *block = row_blocks + b * block_bytes;
+        for (int i = 0; i < per_block; ++i, ++col) {
+          total += row[col] * quant::dequant_block(type_id, block, i);
+        }
+      }
+      if (bias != nullptr) {
+        total += bias[j];
+      }
+      dst[j] = accumulate ? dst[j] + total : total;
+    }
+  }
+}
+
 void embedding(const int32_t *tokens, int64_t n_tokens, const float *table, int64_t vocab,
                int64_t d, float *out) {
   for (int64_t t = 0; t < n_tokens; ++t) {
@@ -90,6 +130,34 @@ void embedding(const int32_t *tokens, int64_t n_tokens, const float *table, int6
     }
     const float *src = table + static_cast<int64_t>(id) * d;
     std::copy(src, src + d, out + t * d);
+  }
+}
+
+void embedding_quant(const int32_t *tokens, int64_t n_tokens, const uint8_t *blocks, int64_t vocab,
+                     int64_t d, int type_id, float *out) {
+  const int block_bytes = quant::block_bytes_of(type_id);
+  const int per_block = quant::kBlockWeights;
+  const int64_t row_bytes = (d / per_block) * block_bytes;
+
+  for (int64_t t = 0; t < n_tokens; ++t) {
+    const int32_t id = tokens[t];
+    float *dst = out + t * d;
+    /* The same policy as the dense gather, for the same reason: an id outside
+     * the table zeroes its row rather than reading past the end of the
+     * mapping. The two must agree, and they are written out separately because
+     * one loop indexes floats and the other blocks. */
+    if (id < 0 || id >= vocab) {
+      std::fill(dst, dst + d, 0.0F);
+      continue;
+    }
+    const uint8_t *row_blocks = blocks + static_cast<int64_t>(id) * row_bytes;
+    int64_t col = 0;
+    for (int64_t b = 0; b < d / per_block; ++b) {
+      const uint8_t *block = row_blocks + b * block_bytes;
+      for (int i = 0; i < per_block; ++i, ++col) {
+        dst[col] = quant::dequant_block(type_id, block, i);
+      }
+    }
   }
 }
 
