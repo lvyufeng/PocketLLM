@@ -73,6 +73,11 @@ _ALLOWED: dict[str, set[str] | None] = {
     # Skeleton: a vocabulary and a merge table.  It reads the GGUF metadata the
     # loader exposes, and nothing else.
     "pocketllm.tokenizer": {"pocketllm.api", "pocketllm.loader", "pocketllm.tokenizer"},
+    # The ctypes bridge to the native engine.  It imports nothing from
+    # `pocketllm` at all -- it is the seam, and everything above it (the CLI,
+    # the server) calls *it* rather than `ctypes`, so there is exactly one place
+    # that knows a shared library exists.
+    "pocketllm.native": {"pocketllm.native"},
 }
 
 #: Runtimes that a base install does not have, so only a backend may import one.
