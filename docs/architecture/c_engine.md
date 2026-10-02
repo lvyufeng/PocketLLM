@@ -80,6 +80,41 @@ to `pocketllm.backends.reference`, applied one level down.
 - **`argmax` is an operation.** A caller that only wants the next token transfers four bytes instead
   of the whole logit vector — 600 KB at this vocabulary.
 
+### The C surface is a strict subset of the ABI, on purpose
+
+The ABI declares 17 ops. The engine implements 7 of them as ops — `rms_norm`, `gemm`, `embedding`,
+`silu_mul`, `rope`, `attention`, `argmax` — and the rest are either *inlined into the graph* or
+*not needed yet*. Neither case is a missing kernel, and the distinction matters when reading the
+conformance test, which drives the 7 and deliberately skips the others.
+
+**Inlined, because the graph does it somewhere there is no op.** `add` is `gemm(accumulate=true)`:
+the residual is the product's job, so there is no second pass over the activation. `cache_append` is
+a `copy_device_to_device` in `qwen3.cpp` rather than a kernel — the positions are always contiguous
+and `start_pos`-aligned, so the general scatter the reference op allows (`cache[positions[i]] =
+values[i]` for arbitrary indices) has no caller. `cache_truncate` likewise: `reset()` drops the
+length without clearing rows, because the next append overwrites what it needs.
+
+**Not needed yet.** `layer_norm` — Qwen3 is all RMSNorm, and the only `layer_norm` string in `src/`
+is the metadata key `attention.layer_norm_rms_epsilon`, which is an RMS epsilon. `softmax`,
+`logits_temperature`, `topk_sample`: the sampler is greedy today, and the one softmax the graph
+computes is fused inside `attention` over the visible-key span — a general `axis`-parameterized
+softmax has no caller. `mul`, `moe_ffn`: no dense Qwen3 path reaches them.
+
+These are gaps in *coverage*, not disagreements about arithmetic, and they close when a model that
+needs them arrives. What is worth stating is the other kind of gap — where both sides implement the
+op and give **different answers**:
+
+- **`embedding` with an id outside `[0, vocab)`** zeroes the row. The reference indexes the table:
+  a negative id wraps to a real row from the end (silently plausible output), and an id past the end
+  raises `IndexError` — which on a device is a fault rather than an exception. Zeroing is visible in
+  the logits instead.
+- **`argmax` of a row containing a NaN** returns the largest *finite* index. `np.argmax` returns the
+  first NaN's index, because every comparison against a NaN is false. Different integers, not
+  different roundings.
+
+Both are the C behaviour by choice and both are pinned by
+`tests/native/test_op_conformance.py`, so a change to either is a failure rather than a drift.
+
 ## Building
 
 Out of tree, so the Python package stays free of build artifacts:
