@@ -52,7 +52,7 @@ this page is the design those pieces are being built toward.
 | `pocketllm.tokenizer` — GGUF-vocabulary BPE | **Skeleton.** Whitespace works; BPE raises |
 | `pocketllm.protocol` / `pocketllm.server` — OpenAI-compatible HTTP | **Ported.** Importable and testable; needs a backend to serve |
 | `pocketllm.cli` | **Done** for `devices` / `backends` / `architectures` / `ops` |
-| `src/` — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B in f16 and in `q4_k_m`.** GGUF read, BPE tokenize, forward, greedy decode; `q4_k`/`q6_k` decoded in the kernel; checked token-for-token against llama.cpp on `cpu` and `cuda` |
+| `src/` — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B in f16 and in `q4_k_m`.** GGUF read, BPE tokenize, forward, greedy decode, and temperature/top-k/top-p/min-p sampling; `q4_k`/`q6_k` decoded in the kernel; greedy checked token-for-token against llama.cpp on `cpu` and `cuda`; the sampler checked token-for-token against the numpy reference |
 
 There is no `main`-branch history before the seed commit: this tree was rebuilt on an orphan branch
 and the previous one is preserved as `legacy`. See [Where the code lives now](#where-the-code-lives-now).
@@ -144,12 +144,15 @@ The capital of France is Paris, and the capital of Italy is Rome
 
 `src/tools/run.cpp` is the same thing a level lower — it links the engine's objects directly instead
 of going through `ctypes`, which is what lets it print inside the loop. It also takes `--tokens` to
-bypass the tokenizer and `--device` to pick a backend.
+bypass the tokenizer, `--device` to pick a backend, the same sampling flags as `run`, and
+`--print-top` for the diagnostic list of candidates at the first generated position.
+
+`run` is greedy by default and samples when `--temperature` is above zero, with `--top-k`, `--top-p`,
+`--min-p` and `--seed` beside it. The draw comes from the host — `random.Random(seed)` — because the
+engine takes a uniform variate and holds no RNG, so the same seed reproduces the same text.
 
 `serve` still validates its arguments and exits with the specific piece that is missing, because
-there is no *Python* backend for it to serve from. Sampling is not offered by `run` either: the
-sampler is a declared op with no C implementation, so a `--temperature` would be a knob that does
-nothing.
+there is no *Python* backend for it to serve from.
 
 ### Library
 
@@ -222,8 +225,10 @@ core imports it.
 - [x] **Quantized weights in the C core.** `q4_k` and `q6_k` decode inside the kernel, packed,
       never widened — which is what a `q4_k_m` file is made of, so a 456 MB checkpoint now reads
       where the 1.4 GB f16 one did. Checked against llama.cpp token for token on `cpu` and `cuda`.
-- [ ] **Sampling.** The engine is greedy only; `topk_sample` and `logits_temperature` are declared
-      with no C implementation, so `run` offers no temperature.
+- [x] **Sampling.** `softmax`, `logits_temperature` and `topk_sample` are implemented in the C core
+      and checked against the numpy reference; `run` and `run.cpp` take
+      `--temperature/--top-k/--top-p/--min-p/--seed`, with greedy unchanged as the default. The
+      draw is the host's, so the engine stays a pure function of `(logits, uniform)`.
 - [ ] **`pocketllm serve`.** The HTTP surface exists but has no *Python* backend to serve from.
 - [ ] **The Python backends.** `cuda` first; each is a declaration today.
 - [ ] **`python/pocketllm/tokenizer/`** — the BPE is a stub. The C core tokenizes the checkpoint's

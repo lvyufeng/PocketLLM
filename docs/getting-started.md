@@ -100,10 +100,24 @@ pocketllm run   --model /path/to/model.gguf --prompt "hello"
 pocketllm serve --model /path/to/model.gguf --port 8000
 ```
 
-Both parse and validate their arguments — that part is real, and the errors are the errors a working
-build would give — and then exit naming what is absent: no architecture builder for the checkpoint,
-no tokenizer, no backend. `pocketllm serve` names `pocketllm.server.openai.serve`, which is the
-importable HTTP surface the CLI will call once a backend exists.
+`pocketllm run` needs the C core built (`cmake -B build -S src && cmake --build build`) and generates
+the completion greedily. Add sampling flags to draw instead:
+
+```bash
+pocketllm run --model /path/to/model.gguf --prompt "hello" \
+  --temperature 0.7 --top-k 40 --top-p 0.9 --min-p 0.05 --seed 1
+```
+
+A `--temperature` above zero samples; zero, the default, is greedy, and `--seed` makes the draw
+reproducible (the RNG is the host's, not the engine's, so the engine stays a pure function of the
+logits and the draw). `--top-k`, `--top-p` and `--min-p` truncate the distribution; unset, they
+truncate nothing.
+
+`pocketllm serve` parses and validates its arguments — the errors are the errors a working build
+would give — and then exits naming what is absent: no *Python* backend to serve from. It names
+`pocketllm.server.openai.serve`, which is the importable HTTP surface the CLI will call once a
+backend exists, and it does not yet offer the sampling flags, because it has no decode loop to apply
+them in.
 
 ## Verify the source checkout
 
