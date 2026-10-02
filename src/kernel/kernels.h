@@ -140,6 +140,71 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_ca
  * beside the other ops because it is the same kind of thing. */
 void argmax(const float *values, int64_t n, int64_t *out);
 
+/* ``out[r, :] = exp(x[r, :] - max) / sum(exp(x[r, :] - max))``, the softmax
+ * over each row of an ``(rows, cols)`` tensor.
+ *
+ * The shift by the row maximum is not an optimization: a vocabulary of 151936
+ * accumulated logits has an exponent large enough to overflow the moment the
+ * distribution is not already near-uniform, and `exp` of a large positive float
+ * is infinity, whose ratio to infinity is a NaN distribution. The reference
+ * subtracts the row max for the same reason and is the definition this matches.
+ *
+ * A *row* and not the whole tensor because the reference's `axis=-1` is a row
+ * reduction over the last dimension, and a multi-row input is what the
+ * conformance case shapes its input as.
+ *
+ * `topk_sample` calls the same helper this does -- one file-local function,
+ * templated on the accumulator -- rather than carrying its own copy of the
+ * reduction: the conformance test certifies the code the sampler runs only if
+ * there is one of it. This op accumulates in float, matching the reference's
+ * numpy sum; the sampler accumulates the same expression in double, and the
+ * helper's own comment says why. */
+void softmax(const float *x, float *out, int64_t rows, int64_t cols);
+
+/* ``out[i] = logits[i] / temperature``, the one logit transform a decode
+ * applies before sampling.
+ *
+ * Refuses a `temperature <= 0` by throwing, which is the reference's rule: a
+ * division by zero is an infinity or a NaN in every entry, and a caller that
+ * meant greedy is a caller that should not have called this at all -- the
+ * engine's own greedy path never does. */
+void logits_temperature(const float *logits, float *out, int64_t n, float temperature);
+
+/* Draw one token from the top-k/top-p/min-p truncated softmax, given a uniform
+ * variate in ``[0, 1)``.
+ *
+ * This is a faithful port of `backends/reference/kernels.py:topk_sample`, and
+ * the places where a naive port picks a different token are each worth naming:
+ *
+ *   - The ranking is by *stable* descending probability, so a tie goes to the
+ *     lower token id. A comparator that is not a strict weak order (`>=` on the
+ *     value alone) reorders ties and is undefined behaviour besides.
+ *   - The `min_p` cutoff keeps ``p >= min_p * top`` -- inclusive, so `min_p=1`
+ *     keeps the argmax rather than discarding everything.
+ *   - `top_p` keeps the smallest set whose cumulative mass reaches `p`, which
+ *     is ``(cumulative - p) < top_p`` OR the first index where
+ *     ``cumulative >= top_p``. When nothing crosses, the kept index is **0**,
+ *     matching numpy's `argmax` of an all-false mask -- a loop that keeps the
+ *     last index instead picks a different token.
+ *   - The inverse CDF is a search for the first index with
+ *     ``cumulative >= uniform`` (`side="left"` in numpy), not `>`.
+ *   - A total mass that rounds to zero returns the top-ranked token rather than
+ *     dividing by it; the top token is always kept, so this is nearly
+ *     unreachable, but it is the reference's answer.
+ *
+ * `order` is caller-owned scratch of at least `vocab` int64s -- the ranked
+ * index list -- passed in rather than allocated so a decode does not allocate
+ * per token, the same reason `attention` takes its `scores` row from the
+ * caller. `uniform` is a value and not a pointer because the schema types it as
+ * a scalar: a real sampler passes the variate in, and the engine holds no RNG.
+ *
+ * NaN is not part of the contract -- the reference's answer on a NaN logit is
+ * whatever `argsort` and `searchsorted` happen to do with it, and this does not
+ * reproduce that. Do not feed it one.
+ */
+void topk_sample(const float *logits, int64_t vocab, float uniform, int64_t top_k, float top_p,
+                 float min_p, int64_t *order, int64_t *out);
+
 }  // namespace kernel
 }  // namespace pocketllm
 

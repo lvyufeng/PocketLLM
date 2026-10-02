@@ -67,6 +67,22 @@ QUANTIZED_RTOL = 5e-2
 #: only two association orders for the same sum.
 BACKEND_RTOL = 2e-4
 
+#: How far `softmax` may drift from the reference, as an *absolute* bound.
+#:
+#: Not :data:`BACKEND_RTOL`, and the difference is not slack: a relative bound
+#: applied to a probability is a bound on the reduction order, because the
+#: kernel sums 151936 exponentials sequentially while numpy sums them pairwise,
+#: and the two disagree in the last ulps of the row's *total*.  The measured
+#: error at that width is ~2e-5 absolute; the bound is set an order above it.
+#:
+#: The shape of the error is worth knowing: a probability that is large relative
+#: to its row -- the argmax of a peaked distribution -- is also the one whose own
+#: `exp` dominates the total, so it is the *small* probabilities in a flat row
+#: that carry the absolute error.  A row scaled so its maximum probability is
+#: small is therefore the worst case, and that is why the value below is a
+#: little above the 1.2e-5 measured on a standard-normal row.
+SOFTMAX_ATOL = 5e-5
+
 #: The seed every case draws from.  Fixed so a failure is reproducible from the
 #: test name alone -- the generated request is not checked in, so the inputs have
 #: to be recoverable from the code.
@@ -559,6 +575,102 @@ def case_argmax_ties(rng):
     return ({"values": values}, {}, np.array(ref.argmax(values), dtype=np.int64))
 
 
+def case_softmax(rng):
+    """A narrow row, where the error is the last few ulps of a short sum."""
+    x = rng.standard_normal((3, 64), dtype=np.float32) * 4.0
+    return ({"x": x}, {}, ref.softmax(x))
+
+
+def case_softmax_wide_row(rng):
+    """A whole vocabulary in one row, which is the shape the op is called at.
+
+    151936 is the Qwen3 vocabulary and not a round number: the error of a
+    sequential float32 sum against numpy's pairwise one grows with the length of
+    the row, and the bound this case is compared at is the measured error at
+    *this* width rather than at a width chosen to make the test easy.
+    """
+    x = rng.standard_normal((1, 151936), dtype=np.float32)
+    return ({"x": x}, {}, ref.softmax(x))
+
+
+def case_logits_temperature(rng):
+    """The one logit transform a decode applies, at a temperature a user would
+    actually pass -- and not 1.0, where a kernel that ignored the parameter
+    would still agree."""
+    logits = rng.standard_normal((2, 32), dtype=np.float32) * 8.0
+    return ({"logits": logits}, {"temperature": 0.7}, ref.logits_temperature(logits, temperature=0.7))
+
+
+def case_topk_sample(rng):
+    """Authored logits with a clear ranking and a uniform draw that lands in the
+    middle, so the answer is a token a reader can check by hand.
+
+    `rng` is deliberately unused: a sampled case built from a random draw would
+    change meaning if the seed ever moved, and the point of this one is that its
+    answer is obvious. The truncation rules each get a case of their own below.
+    """
+    logits = np.array([3.0, 2.0, 1.0, 0.5, -1.0, -4.0], dtype=np.float32)
+    uniform = np.array([0.5], dtype=np.float32)
+    want = ref.topk_sample(logits, uniform)
+    return ({"logits": logits, "uniform": uniform}, {}, np.array(want, dtype=np.int64))
+
+
+def case_topk_sample_uniform_on_a_boundary(rng):
+    """Four tied logits, so the cumulative is exactly 0.25/0.5/0.75/1.0 in both
+    implementations, and a draw of exactly 0.5.
+
+    This is the `side="left"` case. The reference takes the *first* index whose
+    cumulative reaches the draw, so the boundary belongs to the token at it;
+    an implementation that used `>` instead of `>=` picks the token after. The
+    ties are what make the cumulative exact: no `exp` rounding stands between
+    the two implementations and the number this is testing.
+    """
+    logits = np.zeros(4, dtype=np.float32)
+    uniform = np.array([0.5], dtype=np.float32)
+    want = ref.topk_sample(logits, uniform)
+    return ({"logits": logits, "uniform": uniform}, {}, np.array(want, dtype=np.int64))
+
+
+def case_topk_sample_min_p(rng):
+    """`min_p=1.0` keeps exactly the argmax: the cutoff is *inclusive*, so a
+    kernel that used `>` here would keep nothing and fall back to `order[0]` --
+    the same token, by a different route, which is why the case that would catch
+    it is a `min_p` that sits on a boundary between two tokens and not on 1.0.
+
+    The logits are spaced so the top probability is far above `min_p * top` for
+    the second token and the answer is the argmax either way; the *value* being
+    pinned is that the second token is dropped for the right reason.
+    """
+    logits = np.array([2.0, 1.0, 1.0, 0.0, -3.0], dtype=np.float32)
+    uniform = np.array([0.9], dtype=np.float32)
+    want = ref.topk_sample(logits, uniform, min_p=1.0)
+    return ({"logits": logits, "uniform": uniform}, {"min_p": 1.0}, np.array(want, dtype=np.int64))
+
+
+def case_topk_sample_top_p(rng):
+    """`top_p` cuts a distribution with a dominant token: a draw past the kept
+    prefix still returns a token from it, which is what makes the truncation
+    observable at all."""
+    logits = np.array([6.0, 5.0, 1.0, 0.0, -2.0], dtype=np.float32)
+    uniform = np.array([0.99], dtype=np.float32)
+    want = ref.topk_sample(logits, uniform, top_p=0.8)
+    return ({"logits": logits, "uniform": uniform}, {"top_p": 0.8}, np.array(want, dtype=np.int64))
+
+
+def case_topk_sample_all_tied(rng):
+    """Every logit equal, so the ranking is decided by the tie rule alone.
+
+    The reference's `argsort(..., kind="stable")` puts the lower index first,
+    and with eight equal probabilities the draw at 0.5 lands on the fifth. A
+    kernel that let ties fall the other way answers 3, which is a different
+    token and not a rounding.
+    """
+    logits = np.zeros(8, dtype=np.float32)
+    uniform = np.array([0.5], dtype=np.float32)
+    want = ref.topk_sample(logits, uniform)
+    return ({"logits": logits, "uniform": uniform}, {}, np.array(want, dtype=np.int64))
+
+
 CASES = {
     "rms_norm": case_rms_norm,
     "rms_norm_single_row": case_rms_norm_single_row,
@@ -582,6 +694,14 @@ CASES = {
     "attention_grouped": case_attention_grouped,
     "argmax": case_argmax,
     "argmax_ties": case_argmax_ties,
+    "softmax": case_softmax,
+    "softmax_wide_row": case_softmax_wide_row,
+    "logits_temperature": case_logits_temperature,
+    "topk_sample": case_topk_sample,
+    "topk_sample_uniform_on_a_boundary": case_topk_sample_uniform_on_a_boundary,
+    "topk_sample_min_p": case_topk_sample_min_p,
+    "topk_sample_top_p": case_topk_sample_top_p,
+    "topk_sample_all_tied": case_topk_sample_all_tied,
 }
 
 #: Which op each case drives.  Stated rather than parsed out of the function
@@ -610,14 +730,37 @@ OP_OF_CASE = {
     "attention_grouped": "attention",
     "argmax": "argmax",
     "argmax_ties": "argmax",
+    "softmax": "softmax",
+    "softmax_wide_row": "softmax",
+    "logits_temperature": "logits_temperature",
+    "topk_sample": "topk_sample",
+    "topk_sample_uniform_on_a_boundary": "topk_sample",
+    "topk_sample_min_p": "topk_sample",
+    "topk_sample_top_p": "topk_sample",
+    "topk_sample_all_tied": "topk_sample",
 }
 
 #: Cases whose answer is an index rather than a value.  They are compared
 #: exactly -- a float one off is rounding and an index one off is a different
 #: token -- and they are excluded from the poison test below, because `argmax`
-#: allocates a scalar rather than a tensor and reporting an unwritten element
-#: count for it would be counting something the op never claimed to fill.
-INDEX_CASES = {"argmax", "argmax_ties"}
+#: and `topk_sample` allocate a scalar rather than a tensor and reporting an
+#: unwritten element count for one would be counting something the op never
+#: claimed to fill.
+#:
+#: Exactness is the whole claim for `topk_sample` and it is meaningful here in a
+#: way it is not for a float op: the ranked probabilities the two implementations
+#: compute differ in the last ulps, yet the *token* is the same token unless the
+#: draw lands on a boundary between two of them -- and the boundary cases above
+#: put it there on purpose.
+INDEX_CASES = {
+    "argmax",
+    "argmax_ties",
+    "topk_sample",
+    "topk_sample_uniform_on_a_boundary",
+    "topk_sample_min_p",
+    "topk_sample_top_p",
+    "topk_sample_all_tied",
+}
 
 #: Cases the poison test cannot drive.  `gemm_accumulate` is refused by the tool
 #: when poisoned -- the sentinel would be summed into the residual -- and that
@@ -665,6 +808,10 @@ def _compare(case: str, result: dict, want: np.ndarray) -> None:
         assert error <= QUANTIZED_RTOL * scale, (
             f"{case}: max |c - reference| = {error} over a scale of {scale}"
         )
+        return
+    if case == "softmax" or case == "softmax_wide_row":
+        worst = float(np.max(np.abs(got - want.astype(np.float64))))
+        assert worst <= SOFTMAX_ATOL, f"{case}: max |c - reference| = {worst}"
         return
     spread = float(np.max(np.abs(want))) or 1.0
     worst = float(np.max(np.abs(got - want.astype(np.float64))))
@@ -824,6 +971,49 @@ def test_argmax_of_a_nan_row_differs_from_the_reference() -> None:
     assert run(request, "cpu")["ints"]["out"] == 2, "the largest finite value is the answer"
 
     assert int(ref.argmax(values)) == 1, "numpy returns the NaN's index, not the largest"
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_a_flat_tail_samples_where_an_exact_reference_would(device: str) -> None:
+    """The one place the sampler's answer and the reference's may differ, measured.
+
+    Both implementations rank *probabilities* off a shifted softmax and take the
+    first index whose cumulative reaches the draw.  The difference is the
+    accumulator: the reference's `np.cumsum` is float32 and the kernel's is
+    double, and over 151936 additions a float32 running sum drifts by ~4e-7 --
+    which sounds like nothing until the tail of the distribution is as flat as
+    the vocabulary makes it.  There a step of 4e-7 in the cumulative is a step of
+    tens of thousands of token ids, so a draw at the very top of the range lands
+    in a different place.
+
+    The reference's answer is the one that is wrong here: this test recomputes
+    the same cumulative in float64 and shows the kernel agrees with *that*, to
+    the index.  So the divergence is not "the kernel is approximate where the
+    reference is exact" -- the C implementation is the more accurate of the two
+    and the float32 cumsum is the outlier.
+
+    The check is stated rather than left implicit because a naive port that
+    matched `np.cumsum` bit for bit would be a port that reproduced numpy's
+    rounding error, and the next person to read `softmax_row`'s comment about
+    two accumulators deserves to find out why.
+    """
+    rng = np.random.default_rng(SEED)
+    logits = rng.standard_normal(151936, dtype=np.float32)
+    uniform = np.array([0.999], dtype=np.float32)
+
+    probs = ref.softmax(logits).astype(np.float64)
+    probs /= probs.sum()
+    order = np.argsort(-probs, kind="stable")
+    cumulative = np.cumsum(probs[order])
+    exact = int(order[int(np.searchsorted(cumulative, float(uniform[0]), side="left"))])
+
+    request = write_request("topk_sample", {"logits": logits, "uniform": uniform})
+    assert run(request, device)["ints"]["out"] == exact
+
+    # And the float32 reference is where the difference comes from: it is not
+    # the same index, which is what makes this a divergence and not a case
+    # where the two implementations happen to agree.
+    assert int(ref.topk_sample(logits, uniform)) != exact
 
 
 def test_a_malformed_request_is_refused() -> None:

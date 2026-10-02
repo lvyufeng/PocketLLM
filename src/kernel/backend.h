@@ -138,6 +138,26 @@ class Backend {
    * instead of the whole logit vector when it only wants the token. */
   virtual void argmax(DeviceBuffer values, int64_t n, DeviceBuffer out) = 0;
 
+  /* The three sampling-stage ops. Unlike everything above, these are a
+   * deliberate exception to the rule that the two backends are implemented
+   * independently: a sampler is a decision over the whole distribution, it is
+   * made on the host by construction (see `kernels.h`), and a second device
+   * transcription of the truncation arithmetic would be a second place for the
+   * token to differ rather than a check. So the CUDA methods round-trip the
+   * logits to the host and call the same `kernel::` functions the CPU backend
+   * calls, and the two agree bit for bit.
+   *
+   * What that costs is stated plainly: `test_the_backends_agree_with_each_other`
+   * is vacuous for these three -- it tests the transfer, not the arithmetic.
+   * Their correctness is established by the reference comparison instead.
+   *
+   * `order` is caller-owned scratch of at least `vocab` int64s. */
+  virtual void softmax(DeviceBuffer x, DeviceBuffer out, int64_t rows, int64_t cols) = 0;
+  virtual void logits_temperature(DeviceBuffer logits, DeviceBuffer out, int64_t n,
+                                  float temperature) = 0;
+  virtual void topk_sample(DeviceBuffer logits, int64_t vocab, float uniform, int64_t top_k,
+                           float top_p, float min_p, DeviceBuffer order, DeviceBuffer out) = 0;
+
   /* Run everything queued and report any device error. A backend may execute
    * eagerly, in which case this is a no-op; a backend that batches into a graph
    * needs it before a result is read. */

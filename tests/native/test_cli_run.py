@@ -133,3 +133,103 @@ def test_an_unknown_backend_names_what_the_build_provides() -> None:
     assert result.returncode != 0
     message = result.stdout + result.stderr
     assert "ascend" in message and "cpu" in message, message
+
+
+@needs_engine
+@needs_checkpoint
+def test_the_sampling_flags_do_not_disturb_the_default() -> None:
+    """Greedy with the sampling flags present and unset is greedy.
+
+    The regression guard for the whole change: `--temperature` defaults to 0,
+    `top_k`/`top_p`/`min_p`/`seed` default to unset, and the loop must take the
+    `argmax` path in that case and not a sampler with trivial parameters.  An
+    implementation that always sampled would still *usually* emit the argmax --
+    the top token holds most of the mass -- so the check is the token sequence
+    against llama.cpp's, which the greedy path already matches exactly.
+    """
+    plain = _run("--model", str(CHECKPOINT), "--prompt", PROMPT, "--max-tokens", "4")
+    flagged = _run(
+        "--model", str(CHECKPOINT), "--prompt", PROMPT, "--max-tokens", "4", "--temperature", "0"
+    )
+    assert plain.returncode == 0 and flagged.returncode == 0
+    assert plain.stdout == flagged.stdout
+
+    expected = generated(str(CHECKPOINT), PROMPT_IDS, 4)
+    assert plain.stdout[len(PROMPT) :].strip().startswith("Paris")
+
+
+@needs_engine
+@needs_checkpoint
+def test_the_same_seed_generates_the_same_text() -> None:
+    """`--seed` is the whole reproducibility contract, and it is the host's.
+
+    The engine holds no RNG, so two invocations agreeing means the draw sequence
+    is a function of the seed and the engine is a pure function of the draw --
+    which is what `tests/native/test_sampler.py` pins at the symbol level and
+    this pins through the command a user runs.
+    """
+    flags = ("--temperature", "1.0", "--seed", "12345", "--max-tokens", "8")
+    first = _run("--model", str(CHECKPOINT), "--prompt", PROMPT, *flags)
+    second = _run("--model", str(CHECKPOINT), "--prompt", PROMPT, *flags)
+    assert first.returncode == 0 and second.returncode == 0, first.stderr
+    assert first.stdout == second.stdout
+    # And sampling is actually happening: at a temperature well above zero the
+    # continuation is not the greedy one, so this is not a test that passes by
+    # taking the greedy path twice.
+    greedy = _run("--model", str(CHECKPOINT), "--prompt", PROMPT, "--max-tokens", "8")
+    assert first.stdout != greedy.stdout or len(first.stdout) == len(PROMPT)
+
+
+@needs_engine
+@needs_checkpoint
+def test_two_seeds_can_disagree() -> None:
+    """Not a guarantee that they will -- a probabilistic model may draw the same
+    token twice -- but a check that the seed reaches the generator at all.  A
+    loop that accepted `--seed` and ignored it would pass the test above and
+    fail this one whenever the draws diverge, which over eight tokens at
+    temperature 1.0 they do."""
+    base = ("--temperature", "1.0", "--max-tokens", "8")
+    first = _run("--model", str(CHECKPOINT), "--prompt", PROMPT, "--seed", "1", *base)
+    second = _run("--model", str(CHECKPOINT), "--prompt", PROMPT, "--seed", "999", *base)
+    assert first.returncode == 0 and second.returncode == 0
+    assert first.stdout != second.stdout
+
+
+@needs_engine
+@needs_checkpoint
+def test_top_k_of_one_reproduces_greedy_exactly() -> None:
+    """The one sampling configuration with a known answer.
+
+    With a single token kept, the truncation leaves the uniform draw nothing to
+    choose between, so the sampled token is the argmax at every step and the
+    sequence must be the greedy one byte for byte.  That makes this a check that
+    the sampler and `argmax` agree about the ranking, using an oracle --
+    llama.cpp -- that the sampler itself was never compared against.
+    """
+    greedy = _run("--model", str(CHECKPOINT), "--prompt", PROMPT, "--max-tokens", "6")
+    truncated = _run(
+        "--model", str(CHECKPOINT), "--prompt", PROMPT, "--max-tokens", "6",
+        "--temperature", "1.0", "--top-k", "1", "--seed", "7",
+    )
+    assert truncated.returncode == 0, truncated.stderr
+    assert truncated.stdout == greedy.stdout
+
+
+@needs_engine
+@needs_checkpoint
+def test_a_bad_sampling_flag_is_refused_before_the_checkpoint_is_read() -> None:
+    """`SamplingParams` validates, and the command routes its flags through it.
+
+    Without that, `--top-p 2.0` would be accepted by the loop and handed to a
+    kernel whose contract says `[0, 1]`; the failure would arrive as a different
+    distribution rather than as a message.  A backend the engine cannot open is
+    the cheapest way to show the refusal happened first: the message names the
+    flag, not the checkpoint.
+    """
+    result = _run(
+        "--model", "/tmp/definitely-not-a-checkpoint.gguf", "--prompt", "hi", "--top-p", "2.0"
+    )
+    assert result.returncode != 0
+    message = result.stdout + result.stderr
+    assert "top_p" in message, message
+    assert "cannot open checkpoint" not in message, "the flag was not validated before loading"

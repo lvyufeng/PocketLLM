@@ -36,7 +36,7 @@ kernel**: every backend except `reference` is a declaration with a session that 
 `BackendNotImplementedError` naming the runtime it waits for.
 
 **These are two separate answers to two separate questions, and the trap is reading either one as the
-other.** `pocketllm.kernels` declares 17 ops; the C engine implements 9 of them over its own backend
+other.** `pocketllm.kernels` declares 17 ops; the C engine implements 12 of them over its own backend
 interface, which is a *different* interface from `pocketllm.backends` and shares no code with it. A
 statement about `pocketllm devices` — which lists the *Python* backends and their stubs — says
 nothing about what `src/` can do, and `pocketllm devices` on this host does not know the C core
@@ -46,8 +46,10 @@ They meet at exactly one place: `python/pocketllm/native.py`, the `ctypes` bridg
 **`pocketllm run` now drives** — it opens a session, tokenizes, runs the graph and decodes greedily
 through the C core, and `tests/native/test_cli_run.py` checks it against llama.cpp's sequence. So
 `pocketllm run` runs a model and `pocketllm serve` does not, and the two halves are wired at one end
-rather than joined. Greedy is the whole of it: `topk_sample` and `logits_temperature` have no C
-implementation, which is why `run` offers no temperature.
+rather than joined. `run` offers `--temperature/--top-k/--top-p/--min-p/--seed` as well as greedy;
+`serve` still offers neither, because it has no decode loop to apply them in. The draw is the host's
+on both sides — `cli.py` holds a `random.Random`, `run.cpp` a `std::mt19937_64` — because the engine
+takes a uniform variate and holds no RNG of its own.
 
 So: do not describe the *Python package* as able to run a model, do not describe *the tree* as unable
 to, and do not describe the C core and the Python backends as one implementation — they are two, at

@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "kernel/backend.h"
+#include "kernel/kernels.h"
 #include "quant/blocks.h"
 #include "runtime/status.h"
 
@@ -591,6 +592,42 @@ class CudaBackend final : public Backend {
     }
     argmax_kernel<<<1, 256>>>(f(values), n, reinterpret_cast<int64_t *>(w(out)));
     check(cudaGetLastError(), "argmax");
+  }
+
+  /* The sampling stage, on the host by design -- see the note in `backend.h`.
+   *
+   * The logits are read back, the host kernel runs, and only the four-byte
+   * result returns to the device. That is a full-vocabulary transfer per token,
+   * which `Session::forward` already pays to hand the logits to its caller, so
+   * this adds no round trip the decode was not already making. */
+  void softmax(DeviceBuffer x, DeviceBuffer out, int64_t rows, int64_t cols) override {
+    const int64_t n = rows * cols;
+    std::vector<float> host(static_cast<std::size_t>(n));
+    std::vector<float> result(static_cast<std::size_t>(n));
+    copy_to_host(host.data(), x, n * 4);
+    kernel::softmax(host.data(), result.data(), rows, cols);
+    copy_to_device(out, result.data(), n * 4);
+  }
+
+  void logits_temperature(DeviceBuffer logits, DeviceBuffer out, int64_t n,
+                          float temperature) override {
+    std::vector<float> host(static_cast<std::size_t>(n));
+    std::vector<float> result(static_cast<std::size_t>(n));
+    copy_to_host(host.data(), logits, n * 4);
+    kernel::logits_temperature(host.data(), result.data(), n, temperature);
+    copy_to_device(out, result.data(), n * 4);
+  }
+
+  void topk_sample(DeviceBuffer logits, int64_t vocab, float uniform, int64_t top_k, float top_p,
+                   float min_p, DeviceBuffer order, DeviceBuffer out) override {
+    std::vector<float> host(static_cast<std::size_t>(vocab));
+    std::vector<int64_t> ranked(static_cast<std::size_t>(vocab));
+    copy_to_host(host.data(), logits, vocab * 4);
+    int64_t token = 0;
+    kernel::topk_sample(host.data(), vocab, uniform, top_k, top_p, min_p, ranked.data(), &token);
+    /* `order` is scratch the caller allocated and nothing reads it back, so it
+     * is not copied to the device; the token is what the caller wanted. */
+    copy_to_device(out, &token, sizeof(token));
   }
 
   void synchronize() override { check(cudaDeviceSynchronize(), "cudaDeviceSynchronize"); }

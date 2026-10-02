@@ -6,21 +6,29 @@
  * against, but it cannot be interrupted half a token in to say which candidate
  * it was choosing between, and that is the question a wrong first token asks.
  *
- * Greedy only.  Sampling is a separate op with a separate test; what this is
- * for is the property that is actually hard to get right, which is that the
- * distribution the model produces is the same distribution llama.cpp's does.
- * Greedy makes that a single number per step instead of a distribution
- * comparison.
+ * Greedy by default, and the sampling flags are here so the loop that a user
+ * actually runs can be watched too.  What greedy is *for* is the property that
+ * is hard to get right -- that the distribution the model produces is the same
+ * one llama.cpp's does -- and greedy makes that a single number per step
+ * instead of a distribution comparison.  Sampling is not a different model,
+ * only a different draw from it, so the two paths share everything up to the
+ * choice of token.
+ *
+ * The RNG is the host's, here as in `cli.py`: the engine takes a uniform
+ * variate and holds none of its own, so a `--seed` is this tool's
+ * `std::mt19937_64` and not a property of the library.
  */
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
 #include "gguf/reader.h"
 #include "kernel/backend.h"
+#include "kernel/kernels.h"
 #include "model/qwen3.h"
 #include "runtime/status.h"
 #include "tokenizer/bpe.h"
@@ -49,7 +57,9 @@ void print_top(const float *logits, int64_t n, int k) {
 
 int usage(const char *argv0) {
   std::fprintf(stderr,
-               "usage: %s <checkpoint.gguf> [--prompt TEXT] [--steps N] [--top K] [--device cpu|cuda]\n"
+               "usage: %s <checkpoint.gguf> [--prompt TEXT] [--steps N] [--device cpu|cuda]\n"
+               "       [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n"
+               "       [--print-top K]   # list the first position's top candidates\n"
                "       %s <checkpoint.gguf> --tokens 1 2 3   # ids, bypassing the tokenizer\n",
                argv0, argv0);
   return 2;
@@ -65,8 +75,17 @@ int main(int argc, char **argv) {
   const std::string path = argv[1];
   std::string prompt = "The capital of France is";
   int steps = kDefaultSteps;
-  int top = 5;
+  /* The diagnostic list of top candidates, renamed from `--top` now that
+   * `--top-k` is a sampling flag: two options an editor completes to `--top`
+   * is a bug reported as "my sampling does nothing". */
+  int print_top_n = 5;
   std::string device = "cpu";
+  float temperature = 0.0F;
+  int64_t top_k = 0;
+  float top_p = 1.0F;
+  float min_p = 0.0F;
+  uint64_t seed = 0;
+  bool have_seed = false;
   std::vector<int32_t> literal_tokens;
   bool have_literal = false;
 
@@ -76,8 +95,19 @@ int main(int argc, char **argv) {
       prompt = argv[++i];
     } else if (arg == "--steps" && i + 1 < argc) {
       steps = std::stoi(argv[++i]);
-    } else if (arg == "--top" && i + 1 < argc) {
-      top = std::stoi(argv[++i]);
+    } else if (arg == "--print-top" && i + 1 < argc) {
+      print_top_n = std::stoi(argv[++i]);
+    } else if (arg == "--temperature" && i + 1 < argc) {
+      temperature = std::stof(argv[++i]);
+    } else if (arg == "--top-k" && i + 1 < argc) {
+      top_k = std::stoll(argv[++i]);
+    } else if (arg == "--top-p" && i + 1 < argc) {
+      top_p = std::stof(argv[++i]);
+    } else if (arg == "--min-p" && i + 1 < argc) {
+      min_p = std::stof(argv[++i]);
+    } else if (arg == "--seed" && i + 1 < argc) {
+      seed = std::stoull(argv[++i]);
+      have_seed = true;
     } else if (arg == "--device" && i + 1 < argc) {
       device = argv[++i];
     } else if (arg == "--tokens") {
@@ -124,20 +154,47 @@ int main(int argc, char **argv) {
     backend->copy_to_host(logits_host.data(), logits_device, model->n_vocab() * 4);
     const float *logits = logits_host.data();
 
+    /* Seeded from a fixed default when `--seed` is absent, so two runs of the
+     * same command produce the same text.  A tool whose output moved between
+     * invocations would make every comparison in this file's docstring
+     * impossible to repeat. */
+    std::mt19937_64 rng(have_seed ? seed : 0x9E3779B97F4A7C15ULL);
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+    std::vector<int64_t> order(static_cast<std::size_t>(model->n_vocab()));
+
     int32_t next = 0;
     for (int step = 0; step < steps; ++step) {
-      next = 0;
-      /* Strictly greater, so a tie takes the lower id -- the same rule
-       * `pocketllm_argmax` documents, and the same one llama.cpp's greedy
-       * sampler applies. */
-      for (int64_t i = 1; i < model->n_vocab(); ++i) {
-        if (logits[i] > logits[next]) {
-          next = static_cast<int32_t>(i);
-        }
+      if (temperature > 0.0F) {
+        /* A copy, so the diagnostic below still prints the model's own logits:
+         * `print_top` is answering "what did the model prefer", and a
+         * temperature-scaled ranking changes the magnitudes it displays.  The
+         * order is the same either way -- the transform is monotone -- so this
+         * is about the numbers a reader is looking at. */
+        std::vector<float> scaled(logits, logits + model->n_vocab());
+        pocketllm::kernel::logits_temperature(scaled.data(), scaled.data(), model->n_vocab(),
+                                              temperature);
+        /* `topk_sample` writes an int64 and `next` is an int32: the cast that
+         * would compile here is a four-byte-write-past-the-end of a local, so
+         * the kernel writes into a correctly sized value and this narrows it.
+         * The vocabulary is far below `INT32_MAX`, so the narrowing is exact. */
+        int64_t sampled = 0;
+        pocketllm::kernel::topk_sample(scaled.data(), model->n_vocab(),
+                                       static_cast<float>(uniform(rng)), top_k, top_p, min_p,
+                                       order.data(), &sampled);
+        next = static_cast<int32_t>(sampled);
+      } else {
+        next = 0;
+        /* Strictly greater, so a tie takes the lower id -- the same rule
+         * `pocketllm_argmax` documents, and the same one llama.cpp's greedy
+         * sampler applies.  Reached through `kernel::argmax` rather than a loop
+         * here, so the greedy path and `pocketllm_argmax` cannot drift. */
+        int64_t best = 0;
+        pocketllm::kernel::argmax(logits, model->n_vocab(), &best);
+        next = static_cast<int32_t>(best);
       }
-      if (step == 0 && top > 0) {
-        std::fprintf(stderr, "top %d at the first generated position:\n", top);
-        print_top(logits, model->n_vocab(), top);
+      if (step == 0 && print_top_n > 0) {
+        std::fprintf(stderr, "top %d at the first generated position:\n", print_top_n);
+        print_top(logits, model->n_vocab(), print_top_n);
       }
 
       /* The ids as well as the text, on stderr, so that a test can diff the

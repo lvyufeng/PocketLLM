@@ -82,10 +82,11 @@ to `pocketllm.backends.reference`, applied one level down.
 
 ### The C surface is a strict subset of the ABI, on purpose
 
-The ABI declares 17 ops. The engine implements 9 of them as ops — `rms_norm`, `gemm`, `gemm_quant`,
-`embedding`, `embedding_quant`, `silu_mul`, `rope`, `attention`, `argmax` — and the rest are either
-*inlined into the graph* or *not needed yet*. Neither case is a missing kernel, and the distinction
-matters when reading the conformance test, which drives the 9 and deliberately skips the others.
+The ABI declares 17 ops. The engine implements 12 of them as ops — `rms_norm`, `gemm`, `gemm_quant`,
+`embedding`, `embedding_quant`, `silu_mul`, `rope`, `attention`, `argmax`, `softmax`,
+`logits_temperature`, `topk_sample` — and the rest are either *inlined into the graph* or *not
+needed yet*. Neither case is a missing kernel, and the distinction matters when reading the
+conformance test, which drives the 12 and deliberately skips the others.
 
 (`embedding_quant` is a second entry point rather than a flag on `embedding` because the two read
 different memory — a float table and packed bytes — and it exists because Qwen3 ties its output
@@ -100,10 +101,34 @@ values[i]` for arbitrary indices) has no caller. `cache_truncate` likewise: `res
 length without clearing rows, because the next append overwrites what it needs.
 
 **Not needed yet.** `layer_norm` — Qwen3 is all RMSNorm, and the only `layer_norm` string in `src/`
-is the metadata key `attention.layer_norm_rms_epsilon`, which is an RMS epsilon. `softmax`,
-`logits_temperature`, `topk_sample`: the sampler is greedy today, and the one softmax the graph
-computes is fused inside `attention` over the visible-key span — a general `axis`-parameterized
-softmax has no caller. `mul`, `moe_ffn`: no dense Qwen3 path reaches them.
+is the metadata key `attention.layer_norm_rms_epsilon`, which is an RMS epsilon. `mul`, `moe_ffn`: no
+dense Qwen3 path reaches them.
+
+### The sampling ops are the exception to the backend split
+
+`softmax`, `logits_temperature` and `topk_sample` are implemented on both backends, but unlike every
+op above they are **not two independent transcriptions** — the CUDA methods round-trip the logits to
+the host and call the same `kernel::` functions the CPU backend calls, so the two agree bit for bit.
+
+The reason is that a sampler is not a data-parallel expression: it ranks a whole distribution,
+truncates it, and inverts a cumulative sum at one draw. That is a sequential decision over the entire
+vocabulary, and the useful place to make it is the host — a device transcription would have to
+re-derive the truncation arithmetic and the tie rules, which is a second place for the token to be
+different rather than a check on the first. The transfer is off the hot path: it happens once per
+token, on a vector the caller usually has to read anyway to report the argmax.
+
+`test_the_backends_agree_with_each_other` is therefore vacuous for these three — it tests the
+transfer, not the arithmetic — and their correctness rests on the reference comparison in
+`tests/native/test_op_conformance.py` instead. The one place the C sampler and the numpy reference
+may differ is recorded there as a test: the reference accumulates its cumulative sum in float32 and
+the kernel in double, and over 151936 additions that gap moves the crossing index in a flat tail. The
+kernel is the more accurate of the two, and the test says so by recomputing the cumulative in float64
+and showing which side agrees with it.
+
+`softmax`'s conformance bound is likewise worth knowing: it is an *absolute* tolerance and not the
+relative one the other float ops use, because a sequential float32 sum over a whole vocabulary
+differs from numpy's pairwise one in the last ulps of the row total, and a relative bound there would
+be measuring the reduction order rather than the op.
 
 These are gaps in *coverage*, not disagreements about arithmetic, and they close when a model that
 needs them arrives. What is worth stating is the other kind of gap — where both sides implement the

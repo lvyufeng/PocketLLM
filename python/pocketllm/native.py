@@ -149,6 +149,24 @@ def _bind(lib: "CDLL") -> None:
     lib.pocketllm_argmax.restype = ctypes.c_int
     lib.pocketllm_argmax.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_int]
 
+    lib.pocketllm_temperature.restype = ctypes.c_int
+    lib.pocketllm_temperature.argtypes = [
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_float,
+    ]
+
+    lib.pocketllm_sample.restype = ctypes.c_int
+    lib.pocketllm_sample.argtypes = [
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_float,
+        ctypes.c_int,
+        ctypes.c_float,
+        ctypes.c_float,
+    ]
+
 
 def load(path: pathlib.Path | str | None = None) -> "CDLL":
     """Load and bind the engine library.
@@ -307,6 +325,47 @@ class Engine:
             raise ValueError("argmax needs at least one logit")
         arr = (ctypes.c_float * len(logits))(*logits)
         return int(load().pocketllm_argmax(arr, len(logits)))
+
+    @staticmethod
+    def temperature(logits: list[float], temperature: float) -> list[float]:
+        """``logits / temperature``.  Refuses a non-positive temperature.
+
+        A list in and a list out rather than an in-place array, because the
+        Python side has no buffer to scale in place -- the logits above arrive
+        as a list built by `forward` -- and a caller that wants the original
+        keeps it.
+        """
+        if not logits:
+            raise ValueError("temperature needs at least one logit")
+        arr = (ctypes.c_float * len(logits))(*logits)
+        out = (ctypes.c_float * len(logits))()
+        rc = load().pocketllm_temperature(arr, out, len(logits), temperature)
+        if rc < 0:
+            raise ValueError(f"the engine refused temperature {temperature!r}")
+        return [float(out[i]) for i in range(len(logits))]
+
+    @staticmethod
+    def sample(
+        logits: list[float],
+        uniform: float,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        min_p: float = 0.0,
+    ) -> int:
+        """One token from the truncated softmax, at the given uniform draw.
+
+        The draw is an argument.  The engine holds no RNG, so reproducibility is
+        the caller's to arrange -- `random.Random(seed)` in the CLI -- and this
+        function is a pure function of its arguments, which is what lets it be
+        compared to the reference without an oracle for a generator.
+        """
+        if not logits:
+            raise ValueError("sample needs at least one logit")
+        arr = (ctypes.c_float * len(logits))(*logits)
+        rc = load().pocketllm_sample(arr, len(logits), uniform, top_k, top_p, min_p)
+        if rc < 0:
+            raise ValueError("the engine refused the sample request")
+        return int(rc)
 
 
 def _message(err: "ctypes.Array[ctypes.c_char]", fallback: str) -> str:

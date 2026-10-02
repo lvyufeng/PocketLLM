@@ -50,6 +50,8 @@ def test_the_library_exports_exactly_the_abi(lib: "ctypes.CDLL") -> None:
         "pocketllm_forward",
         "pocketllm_reset",
         "pocketllm_argmax",
+        "pocketllm_temperature",
+        "pocketllm_sample",
     }
     for name in expected:
         assert hasattr(lib, name), f"{name} is not exported"
@@ -127,6 +129,63 @@ def test_argmax_breaks_ties_toward_the_lowest_index(lib: "ctypes.CDLL") -> None:
 def test_argmax_rejects_an_empty_input(lib: "ctypes.CDLL") -> None:
     logits = (ctypes.c_float * 1)(0.0)
     assert lib.pocketllm_argmax(logits, 0) < 0
+
+
+def test_temperature_divides_in_place(lib: "ctypes.CDLL") -> None:
+    """The transform is one pass over the logits, and `out == logits` is the
+    call the CLI makes: the buffer it just read the logits into is the buffer it
+    wants the scaled ones in."""
+    logits = (ctypes.c_float * 3)(2.0, 4.0, -2.0)
+    assert lib.pocketllm_temperature(logits, logits, 3, 2.0) == 0
+    assert [round(v, 6) for v in logits] == [1.0, 2.0, -1.0]
+
+
+def test_temperature_refuses_a_non_positive_value(lib: "ctypes.CDLL") -> None:
+    """Zero is greedy, and greedy is `pocketllm_argmax`.
+
+    The refusal has to be a negative return rather than a division by zero: a
+    caller that asked for 0.0 by mistake and got a vector of infinities would
+    see the sampler return a token, and it would be the wrong one for a reason
+    nothing in the output says.
+    """
+    logits = (ctypes.c_float * 2)(1.0, 2.0)
+    assert lib.pocketllm_temperature(logits, logits, 2, 0.0) < 0
+    assert lib.pocketllm_temperature(logits, logits, 2, -1.0) < 0
+    # And it refused rather than wrote: the buffer is what it was.
+    assert [v for v in logits] == [1.0, 2.0]
+
+
+def test_a_zero_draw_takes_the_top_token(lib: "ctypes.CDLL") -> None:
+    """`uniform = 0` is the inverse CDF at its first step, so the answer is the
+    argmax -- which is the check that the two functions agree about the order of
+    the vocabulary."""
+    logits = (ctypes.c_float * 4)(1.0, 3.0, 3.0, 2.0)
+    assert lib.pocketllm_sample(logits, 4, 0.0, 0, 1.0, 0.0) == lib.pocketllm_argmax(logits, 4)
+
+
+def test_the_sample_follows_the_truncated_distribution(lib: "ctypes.CDLL") -> None:
+    """One authored distribution, one draw, one token -- and not the argmax.
+
+    The probabilities here are far enough apart that the answer is stable under
+    any plausible association order, which is the point: this is testing the
+    crossing rule and not a float tolerance. The draw at 0.9 lands on token 2,
+    where the untruncated cumulative first reaches it.
+    """
+    logits = (ctypes.c_float * 6)(3.0, 2.0, 1.0, 0.5, -1.0, -4.0)
+    assert lib.pocketllm_sample(logits, 6, 0.9, 0, 1.0, 0.0) == 2
+
+
+def test_top_k_of_one_is_the_argmax_for_every_draw(lib: "ctypes.CDLL") -> None:
+    """The truncation is what makes a draw irrelevant: with one token kept there
+    is nothing left for the uniform to choose between."""
+    logits = (ctypes.c_float * 4)(1.0, 3.0, 3.0, 2.0)
+    for uniform in (0.0, 0.25, 0.5, 0.99):
+        assert lib.pocketllm_sample(logits, 4, uniform, 1, 1.0, 0.0) == 1
+
+
+def test_sample_rejects_an_empty_input(lib: "ctypes.CDLL") -> None:
+    logits = (ctypes.c_float * 1)(0.0)
+    assert lib.pocketllm_sample(logits, 0, 0.5, 0, 1.0, 0.0) < 0
 
 
 def test_a_file_that_is_not_a_gguf_fails_with_a_message(lib: "ctypes.CDLL", tmp_path) -> None:

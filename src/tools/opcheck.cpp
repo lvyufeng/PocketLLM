@@ -83,7 +83,12 @@ struct Tensor {
     for (int64_t d : shape) {
       n *= d;
     }
-    return shape.empty() ? 0 : n;
+    /* An empty shape is a scalar -- one element -- which is what every tensor
+     * library means by rank 0 and what the schema uses for `topk_sample`'s
+     * `uniform`. Returning 0 here made a 0-dim tensor unreachable: the parser
+     * would demand zero values for it. The product over an empty range is
+     * already 1, so the special case is the `0` and not the `1`. */
+    return n;
   }
 };
 
@@ -555,6 +560,61 @@ void run_argmax(std::ostream &out, Backend &backend, const Request &request) {
   out << "int out " << index << "\n";
 }
 
+/* ``out = softmax(x)`` over the last axis, matching the schema's `axis=-1`.
+ * A float op, so it goes through `run_and_report` and is poisonable. */
+void run_softmax(std::ostream &out, Backend &backend, const Request &request) {
+  const Tensor &x = request.require("x");
+  if (x.shape.size() != 2) {
+    throw pocketllm::Error("softmax: x must be (rows, cols)");
+  }
+  const int64_t rows = x.shape[0];
+  const int64_t cols = x.shape[1];
+  DeviceBuffer dx = upload(backend, x.floats);
+  run_and_report(out, backend, request, {rows, cols}, [&](DeviceBuffer result) {
+    backend.softmax(dx, result, rows, cols);
+  });
+  backend.release(dx);
+}
+
+void run_logits_temperature(std::ostream &out, Backend &backend, const Request &request) {
+  const Tensor &logits = request.require("logits");
+  const float temperature = request.float_param("temperature", 1.0F);
+  DeviceBuffer dlogits = upload(backend, logits.floats);
+  run_and_report(out, backend, request, logits.shape, [&](DeviceBuffer result) {
+    backend.logits_temperature(dlogits, result, logits.elements(), temperature);
+  });
+  backend.release(dlogits);
+}
+
+/* The sampler. Like `run_argmax`, its answer is a token id and not a value, so
+ * it prints `int out` and is compared exactly rather than at a tolerance -- a
+ * token one away is a different word, not a rounding. */
+void run_topk_sample(std::ostream &out, Backend &backend, const Request &request) {
+  const Tensor &logits = request.require("logits");
+  const Tensor &uniform = request.require("uniform");
+  if (uniform.floats.empty()) {
+    throw pocketllm::Error("topk_sample: uniform must carry one value");
+  }
+  const int64_t vocab = logits.elements();
+  const int64_t top_k = request.int_param("top_k", 0);
+  const float top_p = request.float_param("top_p", 1.0F);
+  const float min_p = request.float_param("min_p", 0.0F);
+  DeviceBuffer dlogits = upload(backend, logits.floats);
+  /* The scratch the ranked index list needs; the backend does not read it back
+   * and the caller does not either, but it has to exist and be `vocab` wide. */
+  DeviceBuffer order = backend.allocate(vocab * 8);
+  DeviceBuffer result = backend.allocate(8);
+  backend.topk_sample(dlogits, vocab, uniform.floats[0], top_k, top_p, min_p, order, result);
+  backend.synchronize();
+  int64_t token = -1;
+  backend.copy_to_host(&token, result, 8);
+  backend.release(dlogits);
+  backend.release(order);
+  backend.release(result);
+  out << "status ok\n";
+  out << "int out " << token << "\n";
+}
+
 using Runner = void (*)(std::ostream &, Backend &, const Request &);
 
 struct Entry {
@@ -567,7 +627,8 @@ const Entry kOps[] = {
     {"gemm_quant", run_gemm_quant}, {"embedding", run_embedding},
     {"embedding_quant", run_embedding_quant}, {"silu_mul", run_silu_mul},
     {"rope", run_rope},           {"attention", run_attention},
-    {"argmax", run_argmax},
+    {"argmax", run_argmax},       {"softmax", run_softmax},
+    {"logits_temperature", run_logits_temperature}, {"topk_sample", run_topk_sample},
 };
 
 int usage(const char *argv0) {
