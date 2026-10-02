@@ -10,12 +10,18 @@
 Run a large language model on **one accelerator** — a single GPU, an edge board, the phone in your
 pocket. One process owns one device. If the checkpoint does not fit, it is quantized further.
 
-> **Status: pre-release skeleton.** This tree defines the interfaces and ports the parts that do not
-> need a device. **No device backend ships a working implementation yet**, so there is nothing to
-> run a model on today: `pocketllm run` and `pocketllm serve` parse their arguments and then say
-> what they are missing. What is real is everything around them — the kernel ABI, the dispatch and
-> backend registry, the GGUF loader, the quantization decoders, the execution layer, the model IR,
-> and the OpenAI-compatible HTTP surface. Read [Current status](#current-status) before installing.
+> **Status: the C engine runs Qwen3-0.6B; the Python package does not run a model.**
+> `src/` (`libpocketllm.so`) reads a GGUF, tokenizes with the checkpoint's own BPE, walks the dense
+> Qwen3 graph and decodes greedily, checked token-for-token against llama.cpp on `cpu` and on a
+> `cuda` card. The Python package is the *host side* — the kernel ABI as spec, the numpy oracle, the
+> GGUF loader, the quantization decoders, the execution layer and the OpenAI-compatible HTTP surface
+> — and **no Python backend implements a kernel**: every backend except `reference` is a declaration
+> whose session raises `BackendNotImplementedError`.
+>
+> These are two halves that meet at exactly one place: `python/pocketllm/native.py`, the `ctypes`
+> bridge, which `pocketllm run` now drives — `pocketllm run --model ckpt.gguf --prompt "…"` generates
+> through the C core, greedily. `pocketllm serve` does not, and neither does any *Python* backend.
+> Read [Current status](#current-status) before installing.
 
 ## The rule
 
@@ -115,18 +121,33 @@ gemm_quant on cuda -> cuda (100)
   ...
 ```
 
-Note that `available` and `implemented` are different questions. `cuda` reports `available` on this
-host because torch is installed; it still has no kernels, which is why `pocketllm run` refuses.
+Note that `available` and `implemented` are different questions — and that this command answers both
+about the **Python** backends. `cuda` reports `available` on this host because torch is installed; it
+still has no *Python* kernels. Nothing here describes `src/`, which is a separate implementation over
+a separate interface: `pocketllm devices` does not know the C core exists, and the C core does not
+use `pocketllm.backends` at all.
 
-The two commands that load a checkpoint do not have a backend to load into yet:
+`run` reaches the C engine, so it generates — greedily, and only for an architecture the C core
+implements (Qwen3 today). It needs `libpocketllm.so` built; without it the command says so rather
+than pretending:
 
 ```bash
-pocketllm run   --model /path/to/model.gguf --prompt "hello"
-pocketllm serve --model /path/to/model.gguf
+cmake -B build -S src && cmake --build build -j8
+pocketllm run --model /path/to/qwen3-0.6b-f16.gguf --prompt "The capital of France is" --max-tokens 8
 ```
 
-Both validate their arguments first and then exit with the specific piece that is missing rather
-than pretending to serve.
+```
+The capital of France is Paris, and the capital of Italy is Rome
+```
+
+`src/tools/run.cpp` is the same thing a level lower — it links the engine's objects directly instead
+of going through `ctypes`, which is what lets it print inside the loop. It also takes `--tokens` to
+bypass the tokenizer and `--device` to pick a backend.
+
+`serve` still validates its arguments and exits with the specific piece that is missing, because
+there is no *Python* backend for it to serve from. Sampling is not offered by `run` either: the
+sampler is a declared op with no C implementation, so a `--temperature` would be a knob that does
+nothing.
 
 ### Library
 
@@ -193,10 +214,19 @@ core imports it.
 - [x] Cut the multi-card code out, hand it to RelicLLM, and rebuild on a torch-free ABI.
 - [x] Port and de-torch the GGUF loader and the quantization decoders.
 - [x] Port the serving and protocol layer.
-- [ ] **First real backend.** CUDA is the natural one — the hardware is here and the kernels exist
-      in relic-core.
+- [x] **The C core runs Qwen3-0.6B.** GGUF read, BPE tokenize, dense forward and greedy decode, on
+      `cpu` and on one `cuda` card, checked against llama.cpp.
+- [x] **Wire the host shell.** `pocketllm run` reaches the C core through `native.py` and generates.
+- [ ] **Quantized weights in the C core.** `src/quant/` handles f16 alone; a packed `q4_k` GEMM
+      (then `q6_k`, which a real `q4_k_m` file mixes in) is what lets a checkpoint that does not fit
+      in f16 be read at all.
+- [ ] **Sampling.** The engine is greedy only; `topk_sample` and `logits_temperature` are declared
+      with no C implementation, so `run` offers no temperature.
+- [ ] **`pocketllm serve`.** The HTTP surface exists but has no *Python* backend to serve from.
+- [ ] **The Python backends.** `cuda` first; each is a declaration today.
+- [ ] **`python/pocketllm/tokenizer/`** — the BPE is a stub. The C core tokenizes the checkpoint's
+      vocabulary correctly; the Python skeleton is behind it and is the one `pocketllm run` would need.
 - [ ] `architectures/xing4_0/`, rebuilt against the ABI, and a golden fixture.
-- [ ] The GGUF-vocabulary BPE tokenizer.
 - [ ] A QNN backend and an Android delivery path — the target the whole repository is named for.
 
 ## License

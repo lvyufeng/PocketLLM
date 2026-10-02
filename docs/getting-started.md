@@ -1,10 +1,12 @@
 # Getting started
 
 This page is the short route from a checkout to the point where the tooling can tell you what your
-device can do. PocketLLM is **pre-release**: the interfaces exist and the device-independent half is
-ported, but no backend implements a kernel yet, so there is nothing to run a model on. The
+device can do. PocketLLM is **pre-release**, and it has two halves at different levels of done: the
+C engine under `src/` reads a GGUF, tokenizes and runs Qwen3-0.6B, and `pocketllm run` drives it
+through the `ctypes` bridge — while the *Python* package still has no backend that implements a
+kernel, so `pocketllm serve` has nothing to serve from. The
 [repository README](https://github.com/lvyufeng/PocketLLM#current-status) carries the authoritative
-status table.
+status table, and [The C engine](architecture/c_engine.md) is the record of what `src/` does.
 
 ## Requirements
 

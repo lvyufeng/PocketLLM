@@ -16,17 +16,41 @@ This repository is one of four:
 `docs/README.md` indexes the documentation — the kernel ABI, the backend model and the device targets
 are documented there.
 
-## Current state: interfaces, not implementations
+## Current state: two halves that have not met
 
-**The tree is a pre-release skeleton.** `pocketllm.kernels` (the ABI), `pocketllm.quant`,
-`pocketllm.loader.gguf`, `pocketllm.engine`, `pocketllm.protocol`, `pocketllm.server` and
-`pocketllm.cli` are real and tested. **No device backend implements a kernel**: every backend except
-`reference` is a declaration with a session that raises `BackendNotImplementedError` naming the
-runtime it waits for. `pocketllm run` and `pocketllm serve` parse and validate their arguments and
-then exit saying what is missing.
+The tree has two implementations of the same thing, at different levels of done, and **the exact
+statement of what runs is the point of this section** — the status table in `README.md` is the
+authority and is checked against `pocketllm devices` and the registry rather than maintained by hand.
 
-Do not describe this tree as able to run a model. The status table in `README.md` is the authority,
-and it is checked against `pocketllm devices` and the registry rather than maintained by hand.
+**The C core (`src/`) runs Qwen3-0.6B.** `libpocketllm.so` reads a GGUF, tokenizes with the
+checkpoint's own BPE, walks the dense Qwen3 graph, and decodes greedily — verified token-for-token
+against llama.cpp on `cpu` and on one `cuda` card. That is real, it is tested, and it is what the
+`src/` row of the README's status table claims.
+
+**The Python package is still a skeleton, and `pocketllm run` is still a stub.** `pocketllm.kernels`
+(the ABI), `pocketllm.quant`, `pocketllm.loader.gguf`, `pocketllm.engine`, `pocketllm.protocol`,
+`pocketllm.server` and `pocketllm.cli` are real and tested, but **no Python backend implements a
+kernel**: every backend except `reference` is a declaration with a session that raises
+`BackendNotImplementedError` naming the runtime it waits for.
+
+**These are two separate answers to two separate questions, and the trap is reading either one as the
+other.** `pocketllm.kernels` declares 17 ops; the C engine implements 7 of them over its own backend
+interface, which is a *different* interface from `pocketllm.backends` and shares no code with it. A
+statement about `pocketllm devices` — which lists the *Python* backends and their stubs — says
+nothing about what `src/` can do, and `pocketllm devices` on this host does not know the C core
+exists.
+
+They meet at exactly one place: `python/pocketllm/native.py`, the `ctypes` bridge, which
+**`pocketllm run` now drives** — it opens a session, tokenizes, runs the graph and decodes greedily
+through the C core, and `tests/native/test_cli_run.py` checks it against llama.cpp's sequence. So
+`pocketllm run` runs a model and `pocketllm serve` does not, and the two halves are wired at one end
+rather than joined. Greedy is the whole of it: `topk_sample` and `logits_temperature` have no C
+implementation, which is why `run` offers no temperature.
+
+So: do not describe the *Python package* as able to run a model, do not describe *the tree* as unable
+to, and do not describe the C core and the Python backends as one implementation — they are two, at
+different levels of done, joined at one entry point. Prefer the README's status table to any prose
+here.
 
 ## Language convention
 
