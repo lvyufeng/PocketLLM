@@ -159,6 +159,30 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Werror>)
 endif()
 
+# Run one kernel over inputs a caller supplies, for checking it against the
+# Python reference.  It links the kernel objects and both backends, and no model:
+# an op is checked in isolation, on shapes the caller writes, which is the only
+# way to reach a kernel the graph happens not to exercise with a shape the graph
+# never produces.  The caller is `tests/native/test_op_conformance.py`, which
+# authors the request and owns the oracle.
+add_executable(pocketllm-opcheck
+  tools/opcheck.cpp
+  runtime/status.cpp
+  kernel/kernels.cpp
+  kernel/cpu/backend.cpp
+  kernel/registry.cpp
+  ${POCKETLLM_CUDA_SOURCES}
+)
+if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)
+  target_compile_definitions(pocketllm-opcheck PRIVATE POCKETLLM_WITH_CUDA=1)
+  set_target_properties(pocketllm-opcheck PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+endif()
+target_include_directories(pocketllm-opcheck PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(pocketllm-opcheck PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Werror>)
+endif()
+
 # `POCKETLLM_ABI_VERSION_MAJOR` is a C preprocessor macro in the header, not a
 # CMake variable, so the soname major is stated here too.  It is the one number
 # that must not drift: the header is the handshake a host checks, and the
