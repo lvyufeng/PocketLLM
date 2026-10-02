@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "kernel/kernels.h"
 #include "runtime/session.h"
 #include "runtime/status.h"
 
@@ -185,6 +186,42 @@ int pocketllm_argmax(const float *logits, int n) {
     }
   }
   return best;
+}
+
+int pocketllm_temperature(const float *logits, float *out, int n, float temperature) {
+  if (logits == nullptr || out == nullptr || n <= 0) {
+    return -1;
+  }
+  try {
+    pocketllm::kernel::logits_temperature(logits, out, n, temperature);
+    return 0;
+  } catch (const std::exception &) {
+    /* The kernel's only refusal here is a non-positive temperature, which the
+     * header documents as this function's refusal too.  Catching it rather than
+     * re-checking the predicate keeps the rule in one place -- a caller that
+     * passes 0.0 must get a negative return and not a vector of infinities. */
+    return -1;
+  }
+}
+
+int pocketllm_sample(const float *logits, int n, float uniform, int top_k, float top_p, float min_p) {
+  if (logits == nullptr || n <= 0) {
+    return -1;
+  }
+  try {
+    /* The ranked index list the sampler needs, and the same allocation shape
+     * `topk_sample` takes on the device side: it is per-call rather than
+     * per-session because this function holds no state, and at this vocabulary
+     * it is 1.2 MB against a 600 KB logit vector the caller already has.  A
+     * decode loop that cared could hold it itself and call the kernel, which is
+     * why the kernel takes it as a parameter rather than allocating. */
+    std::vector<int64_t> order(static_cast<std::size_t>(n));
+    int64_t token = 0;
+    pocketllm::kernel::topk_sample(logits, n, uniform, top_k, top_p, min_p, order.data(), &token);
+    return static_cast<int>(token);
+  } catch (const std::exception &) {
+    return -1;
+  }
 }
 
 }  // extern "C"

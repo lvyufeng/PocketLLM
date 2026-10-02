@@ -149,6 +149,24 @@ def _bind(lib: "CDLL") -> None:
     lib.pocketllm_argmax.restype = ctypes.c_int
     lib.pocketllm_argmax.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_int]
 
+    lib.pocketllm_temperature.restype = ctypes.c_int
+    lib.pocketllm_temperature.argtypes = [
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_float,
+    ]
+
+    lib.pocketllm_sample.restype = ctypes.c_int
+    lib.pocketllm_sample.argtypes = [
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_float,
+        ctypes.c_int,
+        ctypes.c_float,
+        ctypes.c_float,
+    ]
+
 
 def load(path: pathlib.Path | str | None = None) -> "CDLL":
     """Load and bind the engine library.

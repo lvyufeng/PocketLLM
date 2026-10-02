@@ -52,7 +52,7 @@ extern "C" {
  * a change to a signature in this file.  The minor version moves for an
  * additive change and a host may ignore it. */
 #define POCKETLLM_ABI_VERSION_MAJOR 1
-#define POCKETLLM_ABI_VERSION_MINOR 0
+#define POCKETLLM_ABI_VERSION_MINOR 1
 
 /* The largest error message the engine writes, including the terminator.  A
  * caller that passes a smaller buffer gets a truncated message, never an
@@ -121,6 +121,31 @@ POCKETLLM_API int pocketllm_reset(pocketllm_session *session);
  * because it is a pure function of its input, and a caller may sample outside
  * the engine. */
 POCKETLLM_API int pocketllm_argmax(const float *logits, int n);
+
+/* ``out[i] = logits[i] / temperature``, in place if `out == logits`.
+ *
+ * Refuses a `temperature <= 0` -- a temperature of zero is greedy, and greedy
+ * is `pocketllm_argmax`, not a division by zero that fills the vector with
+ * infinities.  Returns 0 on success and a negative value on failure, so a
+ * caller can tell a refusal from a buffer it should have sized itself.
+ *
+ * Like `pocketllm_argmax` this takes no session: it is a pure function of its
+ * input, and the engine holds no state for it. */
+POCKETLLM_API int pocketllm_temperature(const float *logits, float *out, int n, float temperature);
+
+/* Draw one token from the top-k/top-p/min-p truncated softmax of `logits`,
+ * given a uniform variate in `[0, 1)`.
+ *
+ * Returns the token id, or a negative value if `n` is not positive.  `top_k`
+ * of 0 means no top-k limit; `top_p` of 1.0 and `min_p` of 0.0 mean no
+ * truncation, so the three trivial arguments sample the untruncated softmax.
+ *
+ * The variate is an argument and not something the engine draws: the library
+ * holds no RNG, so a caller that wants a seed controls it, and the same
+ * `(logits, uniform)` always produces the same token.  That is also what makes
+ * this testable against the reference without an oracle for the RNG. */
+POCKETLLM_API int pocketllm_sample(const float *logits, int n, float uniform, int top_k, float top_p,
+                                   float min_p);
 
 #ifdef __cplusplus
 } /* extern "C" */
