@@ -203,7 +203,7 @@ class DeclaredBackend:
     def open(self, device: Device, *, options: Mapping[str, Any] | None = None):
         raise BackendUnavailable(
             f"{self.name}: this backend declares capabilities but has no session; "
-            f"see pocketllm/backends/{self.name}/README.md"
+            f"see python/pocketllm/backends/{self.name}/README.md"
         )
 
 
@@ -242,7 +242,7 @@ class UnimplementedSession:
         if backend.missing_dependency:
             return (
                 f"{backend.name} session on {self.device}: needs {backend.missing_dependency}; "
-                f"see pocketllm/backends/{backend.name}/README.md"
+                f"see python/pocketllm/backends/{backend.name}/README.md"
             )
         return f"{backend.name} session on {self.device}: not implemented yet"
 

@@ -182,7 +182,7 @@ end of it:
 | [relic-engine](https://github.com/lvyufeng/relic-engine) | the retired `cpp_engine` tree, kept as a frozen archive |
 
 **`relic-core` is not a dependency of this package.** The one thing this tree used to read from it —
-the GGML codebook header — is [vendored here](pocketllm/loader/gguf/vendor/README.md) with
+the GGML codebook header — is [vendored here](python/pocketllm/loader/gguf/vendor/README.md) with
 provenance, because a loader that cannot read a checkpoint without a kernel library is a loader that
 cannot run on a phone. A CUDA backend may wrap `relic_core` as an optional extra; nothing in the
 core imports it.
@@ -205,4 +205,4 @@ PocketLLM is released under the [Apache License 2.0](LICENSE).
 Model weights, tokenizer files, CUDA, PyTorch, GGUF assets and other third-party components are
 governed by their respective licenses. PocketLLM's code license grants no additional rights to
 third-party model assets. The vendored GGML header is MIT, from llama.cpp — see
-[its provenance note](pocketllm/loader/gguf/vendor/README.md).
+[its provenance note](python/pocketllm/loader/gguf/vendor/README.md).

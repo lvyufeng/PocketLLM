@@ -78,38 +78,45 @@ looking untidy.
 
 ## Repository layout
 
+The Python tree lives under `python/`, which is where the C++ engine's `src/` will sit beside it.
+That split is the design: `python/` is the *host side* — the spec, the numeric oracle and the CLI —
+and `src/` is the *device side*, the native library that does the work.
+
 | Path | What it is |
 |---|---|
-| `pocketllm/kernels/` | **The kernel ABI, and the heart of the tree.** Descriptors (`dtypes`, `device`, `buffer`, `tensor`), declarations (`schema`, `ops/*`, `registry`), and the machinery a backend is driven through (`backend`, `dispatch`, `graph`). **Stdlib-only at every level** — no numpy, no torch, no I/O — because if reading a shape needed numpy, a phone build could not be trimmed of numpy. |
-| `pocketllm/quant/` | The GGML block decoders. A **leaf**: numpy and the vendored table header, and nothing else in `pocketllm`. Loader and reference backend both need it, and neither may own it. |
-| `pocketllm/loader/gguf/` | The GGUF reader and quantized-tensor loader. numpy only — **no torch, no `relic_core`**. `vendor/ggml-common.h` is the vendored codebook table; see below. |
-| `pocketllm/backends/` | Device implementations, one directory each, plus `registry.py` (the static table and the entry-point discovery), `base.py` (`RuntimeProbe`, `DeclaredBackend`, `UnimplementedSession`) and the conformance harness's subject. `reference/` is implemented; the other six are stubs. |
-| `pocketllm/engine/` | Execution: `session.py` (device selection and policy), `planner.py` (regions), `executor.py` (the op-by-op walk), `captured.py`, `memory.py` (the arena and liveness) and `llm.py` (the `LLM`/`AsyncLLM` facade). |
-| `pocketllm/architectures/` | The model IR (`ir.py`, `cache.py`, `registry.py`) and the builders. Only `toy` ships. |
-| `pocketllm/api/`, `protocol/`, `server/`, `choices.py`, `tokenizer/`, `cli.py` | The intent types, the OpenAI-compatible HTTP surface, n-choice fan-out, the GGUF-vocabulary tokenizer skeleton, and the CLI. |
+| `python/` | The Python package tree, and the only tree `pip install` builds. Every path below is relative to it. |
+| `python/pocketllm/kernels/` | **The kernel ABI, and the heart of the tree.** Descriptors (`dtypes`, `device`, `buffer`, `tensor`), declarations (`schema`, `ops/*`, `registry`), and the machinery a backend is driven through (`backend`, `dispatch`, `graph`). **Stdlib-only at every level** — no numpy, no torch, no I/O — because if reading a shape needed numpy, a phone build could not be trimmed of numpy. It is also the **spec** the C ABI is derived from. |
+| `python/pocketllm/quant/` | The GGML block decoders. A **leaf**: numpy and the vendored table header, and nothing else in `pocketllm`. Loader and reference backend both need it, and neither may own it. |
+| `python/pocketllm/loader/gguf/` | The GGUF reader and quantized-tensor loader. numpy only — **no torch, no `relic_core`**. `vendor/ggml-common.h` is the vendored codebook table; see below. |
+| `python/pocketllm/backends/` | Device implementations, one directory each, plus `registry.py` (the static table and the entry-point discovery), `base.py` (`RuntimeProbe`, `DeclaredBackend`, `UnimplementedSession`) and the conformance harness's subject. `reference/` is implemented; the other six are stubs. |
+| `python/pocketllm/engine/` | Execution: `session.py` (device selection and policy), `planner.py` (regions), `executor.py` (the op-by-op walk), `captured.py`, `memory.py` (the arena and liveness) and `llm.py` (the `LLM`/`AsyncLLM` facade). |
+| `python/pocketllm/architectures/` | The model IR (`ir.py`, `cache.py`, `registry.py`) and the builders. Only `toy` ships. |
+| `python/pocketllm/api/`, `protocol/`, `server/`, `choices.py`, `tokenizer/`, `cli.py` | The intent types, the OpenAI-compatible HTTP surface, n-choice fan-out, the GGUF-vocabulary tokenizer skeleton, and the CLI. The last three are the **host shell** over the C core: `cli.py` and `server/` call the engine through `ctypes` rather than running a graph in Python. |
 | `tests/` | pytest suite — see **Testing** below; `tests/README.md` is its own documentation. |
 | `.mkdocs/`, `docs/`, `scripts/`, `mkdocs.yml` | The documentation site and the three scripts that keep it and the baseline honest. `.mkdocs/` holds the two **build-only** inputs — `overrides/` (`theme.custom_dir`) and `hooks/` (the `llms.txt` staleness guard); they are configuration, not content, so they sit in a dot-directory rather than at the repo root, and both paths are resolved relative to `mkdocs.yml`. |
 
-**This is the whole installable package, and the only top-level package name the wheel claims.**
-There is no `src/` tree and no second root: a wheel that claims a name another wheel also claims has
-no defined owner, and install order silently decides which tree wins.
+**`python/pocketllm` is the whole installable package, and the only top-level package name the wheel
+claims.** Its second root is not a Python one: `src/` is native source that no wheel ships and no
+`pip install` compiles, so two trees coexist without a wheel-ownership question — a wheel that claims
+a name another wheel also claims is the problem the single Python root avoids.
 
 Three invariants the layout exists to protect:
 
-- **The install is pure Python.** `pyproject.toml` declares no `ext_modules`; there is no
-  `src/csrc/` and no compile step. Every native kernel lives in relic-core — which is **not a
-  dependency of this package**. Do not reintroduce a build step here.
+- **The Python package is pure Python.** `pyproject.toml` declares no `ext_modules` and the package
+  vendors no compiled artifact. The engine is a **separate native library** (`src/`, CMake) that the
+  package loads at runtime through `ctypes`; it is not a Python extension, and no build step runs at
+  `pip install`. `tests/test_package_boundaries.py` enforces the package half of that.
 - **One process owns one device.** Nothing in this tree launches a second rank, a collective or a
   worker. `EngineArgs` has no `tensor_parallel_size`, no rank and no device-id list, and adding one
   back would resurrect a deleted feature. A checkpoint that does not fit is quantized further.
 - **The ABI imports nothing.** `pocketllm.kernels` is stdlib-only at every level, enforced by
-  `tests/test_package_boundaries.py`. The dependency directions that file encodes
-  (`kernels` → nothing, `quant` → numpy, `backends`/`loader` → kernels+quant, `engine` → the lot,
-  `architectures` → kernels) are the design, not a preference.
+  `tests/test_package_boundaries.py`, which now walks `python/pocketllm/`. The dependency directions
+  that file encodes (`kernels` → nothing, `quant` → numpy, `backends`/`loader` → kernels+quant,
+  `engine` → the lot, `architectures` → kernels) are the design, not a preference.
 
 ### The vendored GGML header
 
-`pocketllm/loader/gguf/vendor/ggml-common.h` **is** how this tree reads a codebook table. Before the
+`python/pocketllm/loader/gguf/vendor/ggml-common.h` **is** how this tree reads a codebook table. Before the
 rebuild the loader resolved it through `Path(relic_core.__file__).parent / "csrc" / ...`, which made
 reading a checkpoint require the kernel library — unacceptable for a phone install. It is resolved in
 order by `pocketllm.quant.ggml_tables.header_path()`: `$POCKETLLM_GGML_COMMON` → the vendored copy →
@@ -220,8 +227,10 @@ branches predate the rebuild and are unreachable from `main`.
 ## Testing
 
 The suite is `tests/`, which is pytest-collectable only — the `bench_*` / `probe_*` / `summarize_*`
-scripts the old tree carried are gone. There is no `conftest.py` at the root and no pytest
-configuration, so **run pytest from the repository root**:
+scripts the old tree carried are gone. The package moved to `python/`, so the import path comes from
+`[tool.pytest.ini_options] pythonpath = ["python"]` in `pyproject.toml` plus a `tests/conftest.py`
+that exports the same path to the fresh interpreters several probes spawn. Both are read from the
+root, so **run pytest from the repository root**:
 
 ```bash
 python -m pytest tests/ -q

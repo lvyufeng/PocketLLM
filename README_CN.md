@@ -76,7 +76,7 @@ pocketllm serve --model /path/to/model.gguf
 | [relic-engine](https://github.com/lvyufeng/relic-engine) | 已退役的 `cpp_engine` 树，冻结归档 |
 
 **`relic-core` 不是本包的依赖。** 本树过去从它读取的唯一内容 —— GGML 码本表头 —— 现在
-[已随树内置](pocketllm/loader/gguf/vendor/README.md)并附出处说明：一个离开内核库就读不了 checkpoint
+[已随树内置](python/pocketllm/loader/gguf/vendor/README.md)并附出处说明：一个离开内核库就读不了 checkpoint
 的加载器，就是一个上不了手机的加载器。CUDA 后端可以把 `relic_core` 作为可选 extra 包起来，
 但核心代码不导入它。
 
@@ -96,4 +96,4 @@ PocketLLM 以 [Apache License 2.0](LICENSE) 发布。
 
 模型权重、分词器文件、CUDA、PyTorch、GGUF 资产及其他第三方组件受各自许可约束；PocketLLM 的代码
 许可不授予这些第三方模型资产的额外权利。内置的 GGML 表头来自 llama.cpp，为 MIT 许可 ——
-见[出处说明](pocketllm/loader/gguf/vendor/README.md)。
+见[出处说明](python/pocketllm/loader/gguf/vendor/README.md)。

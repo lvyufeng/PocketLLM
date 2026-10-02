@@ -1,7 +1,10 @@
 # The test suite
 
-Run it from the repository root, because the modules under test live at `pocketllm/` and there is no
-`conftest.py`, no `src/` layout and no pytest configuration to shorten the import path:
+Run it from the repository root, because the modules under test live at `python/pocketllm/`: the
+import path is shortened by the `pythonpath = ["python"]` line in `pyproject.toml`'s
+`[tool.pytest.ini_options]`, and `conftest.py` at this level exports the same path to the fresh
+interpreters several probes spawn. Both only take effect when pytest finds them — that is, from the
+root:
 
 ```bash
 python -m pytest tests/ -q
@@ -12,7 +15,7 @@ python -m pytest tests/ -q
 | Directory | What it covers |
 | --- | --- |
 | `abi/` | The kernel ABI: op schemas, tensor and buffer descriptors, graph verification, dispatch resolution, the reference backend's completeness, and the guarantee that importing the package pulls in no device runtime. |
-| `backends/` | The backend registry and the conformance harness: every declared op runs on every available backend, and the numerics match the reference. `conftest.py` holds the harness. |
+| `backends/` | The backend registry and the conformance harness: every declared op runs on every available backend, and the numerics match the reference. `backends/conftest.py` holds the harness. |
 | `architectures/` | The model IR and the `toy` architecture — a graph built and verified through the same builder a real model uses. |
 | `engine/` | The execution layer: the op-by-op executor, the memory planner, region planning and capture, session lifecycle, and the `LLM` facade over them. |
 | `loader/` | The GGUF decoders — one test per quant format — and the vendored GGML header's resolution order and pinned hash. |

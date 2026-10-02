@@ -14,7 +14,7 @@ than degraded.
 It is not a tensor framework and not a thin wrapper over one. It imports **nothing** -- no numpy, no
 torch, no `relic_core`, no I/O. A tensor is *described*, not constructed by a library; a device is a
 name; an op is a record. `tests/test_package_boundaries.py` enforces this on every module under
-`pocketllm/kernels/`, and `pocketllm.kernels` is the only package in the tree with that rule.
+`python/pocketllm/kernels/`, and `pocketllm.kernels` is the only package in the tree with that rule.
 
 The reason is the mission. If the ABI needed numpy to read a shape, then a phone build could not be
 trimmed of numpy; if it needed torch, the wheel could not install on a phone at all.
@@ -87,7 +87,7 @@ Shape inference uses a small symbolic vocabulary. In a schema, `shape=("m", "k")
 dimension `m` and the second `k`; two arguments that both say `k` must agree at call time, and a
 disagreement raises `ShapeError` naming the dimension rather than merely failing.
 
-**The v1 vocabulary is 19 ops.** They are grouped by family under `pocketllm/kernels/ops/`:
+**The v1 vocabulary is 19 ops.** They are grouped by family under `python/pocketllm/kernels/ops/`:
 
 | Family | Ops |
 |---|---|

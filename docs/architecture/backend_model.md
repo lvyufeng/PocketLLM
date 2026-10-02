@@ -38,7 +38,7 @@ to update.
 
 Two mechanisms, and the split matters.
 
-**In-tree: a static table.** `pocketllm/backends/registry.py` maps a name to a module and a factory.
+**In-tree: a static table.** `python/pocketllm/backends/registry.py` maps a name to a module and a factory.
 The table holds *strings* -- importing `pocketllm.backends` loads no backend, and `get()` imports
 exactly one. A bare `pip install pocketllm` therefore imports no backend module at all.
 

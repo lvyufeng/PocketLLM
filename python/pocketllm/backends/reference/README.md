@@ -13,7 +13,7 @@ shown otherwise, and "different from what" needs an answer. `tests/backends/`
 runs every declared op on every backend and compares against this one.
 
 **It is the completeness rule.** An op may not be declared in
-`pocketllm/kernels/ops/` without an implementation here, in the same commit.
+`python/pocketllm/kernels/ops/` without an implementation here, in the same commit.
 Otherwise the op's only implementation is on hardware most people do not have,
 and there is no way to tell a wrong fast answer from a right one.
 `tests/abi/test_reference_completeness.py` fails until the kernel exists.

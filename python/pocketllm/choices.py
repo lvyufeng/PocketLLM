@@ -7,7 +7,7 @@ an adapter: implemented per backend it would be the rule written once per runtim
 runtime's rule to own -- the two backends that exist would answer it the same way, and the third
 would have to be told.
 
-Both hosts call in from here: ``pocketllm/server/openai.py`` for HTTP and ``pocketllm/engine.py``
+Both hosts call in from here: ``python/pocketllm/server/openai.py`` for HTTP and ``python/pocketllm/engine.py``
 for the library surface. One implementation, so ``LLM.chat(n=3)`` and an HTTP ``"n": 3`` cannot
 disagree about how many generations that is.
 

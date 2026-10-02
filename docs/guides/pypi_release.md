@@ -57,7 +57,7 @@ git switch main && git pull origin main
 
 ## Pre-release checklist
 
-- [ ] Bump the version in **both** `pyproject.toml` and `pocketllm/__init__.py`
+- [ ] Bump the version in **both** `pyproject.toml` and `python/pocketllm/__init__.py`
 - [ ] Update `README.md` if the release changes installation or the status table
 - [ ] Run the tests: `python -m pytest tests/ -q`, then `python scripts/check_test_baseline.py`
 - [ ] Confirm the two version strings agree:
@@ -126,7 +126,7 @@ deactivate
 ```
 
 `cd /tmp` is not incidental. `python -c` puts the working directory on `sys.path`, so run from the
-checkout the first line imports `pocketllm/` from the source tree and prints the version the tree
+checkout the first line imports `python/pocketllm/` from the source tree and prints the version the tree
 has — which is what the release is bumping, so it agrees with the artifact by construction and proves
 nothing. The line prints the module path for the same reason: it has to be under the virtualenv. The
 smoke test is run by path rather than by name, which puts the test's own directory, not the checkout,
@@ -255,7 +255,7 @@ prepared on a branch, merge it first so the tag has somewhere to land.
 
 2. **Bump the version for development**
 
-   Set the next development version in `pyproject.toml` and `pocketllm/__init__.py`, then commit on a
+   Set the next development version in `pyproject.toml` and `python/pocketllm/__init__.py`, then commit on a
    branch and merge. Skipping this makes the next release indistinguishable from the one just
    published.
 
@@ -299,7 +299,7 @@ means the non-`.py` payload did not ship. Two declarations have to agree:
 
 - `[tool.setuptools.package-data]` in `pyproject.toml` — `"pocketllm.loader.gguf" = ["vendor/*.h",
   "vendor/*.md"]`
-- `recursive-include pocketllm/loader/gguf/vendor *.h *.md` in `MANIFEST.in`
+- `recursive-include python/pocketllm/loader/gguf/vendor *.h *.md` in `MANIFEST.in`
 
 `tests/test_package_boundaries.py` fails if a non-Python file appears in the package without being
 listed, which catches the reverse mistake.

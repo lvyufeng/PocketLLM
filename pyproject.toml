@@ -47,14 +47,16 @@ Source = "https://github.com/lvyufeng/PocketLLM"
 # backend under the `pocketllm.backends` group or an architecture under
 # `pocketllm.architectures`, and the registries read both.  Declaring an empty
 # group on this side would be a promise this wheel does not keep -- the in-tree
-# backends are found through the static table in `pocketllm/backends/registry.py`,
+# backends are found through the static table in `python/pocketllm/backends/registry.py`,
 # because a bare install must import no backend at all.
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
-# `pocketllm` is the only top-level package this wheel claims.
+# The Python package lives under `python/` so the C++ engine's `src/` can be the
+# top-level tree; `pocketllm` is still the only top-level package this wheel claims.
+where = ["python"]
 include = ["pocketllm*"]
 namespaces = false
 
@@ -73,3 +75,10 @@ namespaces = false
 "pocketllm.backends.qnn" = ["README.md"]
 "pocketllm.backends.horizon" = ["README.md"]
 "pocketllm.backends.ascend" = ["README.md"]
+
+[tool.pytest.ini_options]
+# The package moved out of the repository root, so a bare `pytest tests/` from
+# the root would no longer find it.  `pythonpath` puts `python/` on `sys.path`
+# for the session.  `tests/conftest.py` does the equivalent for the fresh
+# interpreters a few probes spawn, which cannot inherit this.
+pythonpath = ["python"]

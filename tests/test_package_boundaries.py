@@ -33,7 +33,12 @@ import pathlib
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-PACKAGE = ROOT / "pocketllm"
+#: The Python tree.  It sits under ``python/`` so the C++ engine's ``src/`` can be
+#: the repository's other top-level tree.  It is also the base a path is made
+#: relative to, which is what turns ``python/pocketllm/quant/formats.py`` back into
+#: the dotted name ``pocketllm.quant.formats``.
+PYTHON = ROOT / "python"
+PACKAGE = PYTHON / "pocketllm"
 
 #: package prefix -> the ``pocketllm`` prefixes it may import.  ``None`` means
 #: "anything", used for the façade and the CLI, which are the assembly point.
@@ -79,7 +84,7 @@ def _modules() -> list[pathlib.Path]:
 
 
 def _dotted(path: pathlib.Path) -> str:
-    relative = path.relative_to(ROOT).with_suffix("")
+    relative = path.relative_to(PYTHON).with_suffix("")
     parts = list(relative.parts)
     if parts[-1] == "__init__":
         parts.pop()
@@ -234,26 +239,34 @@ def test_the_cli_imports_with_no_backend_runtime() -> None:
 
 
 def test_the_package_has_no_second_root() -> None:
-    """``pocketllm/`` is the only top-level package this wheel claims.
+    """``pocketllm`` is the only top-level package ``python/`` holds.
 
     A second root that another wheel also claims has no defined owner, and
-    install order silently decides which tree wins -- which is why the old
-    ``src/`` tree was folded in here.
+    install order silently decides which tree wins.  The check is scoped to
+    ``python/`` rather than the repository root because ``src/`` -- the C++
+    engine -- is deliberately a second top-level tree, just not a Python one.
     """
-    roots = [p.name for p in ROOT.iterdir() if p.is_dir() and (p / "__init__.py").exists()]
+    roots = [p.name for p in PYTHON.iterdir() if p.is_dir() and (p / "__init__.py").exists()]
     assert roots == ["pocketllm"], f"unexpected top-level packages: {sorted(roots)}"
 
 
 def test_the_package_does_not_vendor_a_compiled_artifact() -> None:
-    """The install is pure Python: no extension module, no shared library, no CUDA source."""
+    """The *Python package* is pure Python: no extension module, no shared library.
+
+    The engine is native code, but not this package's: it is ``src/``, built
+    out of tree into a ``libpocketllm.so`` the host shell loads through
+    ``ctypes``.  An artifact *inside* the package would instead be something
+    ``pip install`` has to produce, which is the install-time compile step this
+    tree does not have.
+    """
     offenders = [
         p.relative_to(ROOT)
         for pattern in ("*.so", "*.pyd", "*.cu", "*.cuh", "*.c", "*.cpp")
         for p in PACKAGE.rglob(pattern)
     ]
     assert not offenders, (
-        "native kernels live in relic-core, reached through the installed package; "
-        f"found in-tree: {sorted(str(o) for o in offenders)}"
+        "the package vendors a native artifact; native sources belong in the "
+        f"tree-level src/ directory: {sorted(str(o) for o in offenders)}"
     )
 
 
