@@ -1,10 +1,13 @@
 """llama.cpp as the oracle for the model's arithmetic.
 
 The tokenizer has its own oracle, and for the same reason: there is no Python
-Qwen3 in this tree to compare against.  `backends/reference` is a set of numpy
-*kernels*, not a graph, and `architectures/` ships only `toy` -- so the only
+Qwen3 in this tree to compare against, and until there is, the only
 implementation that can say what the right logits are is the one the checkpoint
-was converted for.  A second C++ implementation written from the same reading of
+was converted for.  `backends/reference` is a set of numpy *kernels*; the
+`architectures/qwen3.py` graph that now wires them into a Qwen3 forward is a
+*transcription* of `src/model/qwen3.cpp` rather than an independent authority --
+it can tell that two Python readings agree, and only llama.cpp can tell that the
+reading is right.  A second C++ implementation written from the same reading of
 the format would agree with the first exactly where that reading was right and
 disagree only where it was wrong in a different way.
 

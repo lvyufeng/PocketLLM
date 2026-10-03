@@ -5,7 +5,8 @@ An architecture is a model's *structure*: it turns a config into a
 and stops there. It names no device, allocates nothing, and imports no backend, so the same executor
 drives every architecture in this tree.
 
-Only one ships today, and it is deliberately not a model.
+Two ship today. `toy` is deliberately not a model; [`qwen3`](#qwen3) is one, written a second time
+against the ABI — the C engine's copy is the first — and checked against a transcription of it.
 
 ## `toy`
 
@@ -37,6 +38,67 @@ Two details are deliberate rather than incidental:
   inventing an op the ABI does not have.
 - **Its cache plan is empty rather than absent.** A caller that sizes memory for it gets zero, not a
   special case.
+
+## `qwen3`
+
+**Status: scaffold.** The graph builds, verifies, and runs on the reference backend with synthetic
+weights, and `tests/architectures/test_qwen3.py` checks its logits against an independent numpy
+transcription of `Qwen3Model::forward`. It is **not** runnable on a checkpoint: no loader binds a GGUF
+into it and no decode loop drives it. Calling it "Runnable" would claim a token this tree has not
+produced, so it is not called that.
+
+This is Qwen3 as the C engine implements it — the same model, written a second time as a
+`ModelSpec`:
+
+```
+tokens -> embedding
+       -> per layer:
+            rms_norm -> q/k/v gemm
+            -> reshape (rows*heads, head_dim) -> rms_norm(q_norm) -> reshape (rows, heads, head_dim)
+            -> rope  (split-half)
+            -> cache_append(k), cache_append(v)
+            -> attention -> reshape -> o gemm -> add
+            -> rms_norm -> gate/up gemm -> silu_mul -> down gemm -> add
+       -> rms_norm(output_norm) -> lm_head gemm -> logits
+```
+
+Three Qwen3-specific details are worth naming, because each produces finite, plausible, wrong output
+when it is got wrong:
+
+- **QK-norm is per head, over `head_dim`.** The projection is `heads * head_dim` wide and the norm
+  weight is `head_dim` long, so the graph reshapes to `(rows * heads, head_dim)` first — one head per
+  row, which is the view the C engine's `n * n_head_` argument produces. Reducing over the projection
+  row instead reduces over sixteen times as many values. This is why the
+  [`reshape`](../architecture/kernel_abi_v1.md#ops) op exists.
+- **Norm before RoPE**, on both q and k.
+- **RoPE is split-half (NeoX)**: it pairs index `i` with `i + d/2`, not adjacent elements.
+
+Two consequences of the ABI's shape vocabulary, stated rather than hidden:
+
+- **The graph has a fixed call width, `rows`.** `reshape` takes a literal target shape, so the
+  `(rows * heads, head_dim)` split has to know `rows` when the graph is built; there is no dynamic
+  reshape and no `slice`. `Qwen3Config(rows=1)` is a decode step, and that is the configuration a
+  decode loop uses. Prefilling a longer prompt means calling the graph once per token — which is what
+  the C engine does for every position after the first anyway. An AOT backend would want exactly this
+  split: a decode artifact at `rows=1` and a prefill artifact at a wider one.
+- **The KV cache is one input pair per layer.** Each layer gets `blk.<i>.k_cache` /
+  `blk.<i>.v_cache` of shape `(capacity, kv_heads, head_dim)`, matching the C engine's per-layer
+  slabs. A single `(layers, capacity, kv_heads, head_dim)` input cannot work: `attention` reads a 3-D
+  cache and there is no `slice` to take a layer out of a 4-D one. For Qwen3-0.6B that is 56 graph
+  inputs — unwieldy, and the alternative is a new op this tree does not need yet.
+
+```python
+from pocketllm.architectures import build
+from pocketllm.architectures.qwen3 import Qwen3Config
+
+spec = build("qwen3", Qwen3Config(context=4096))   # 0.6B geometry by default
+spec.cache.bytes_for()                              # what a phone budgets for the KV cache
+```
+
+The weights are named as GGUF names them — `token_embd.weight`, `blk.<i>.attn_q.weight`,
+`blk.<i>.attn_q_norm.weight`, `output_norm.weight` — because that is what the C engine binds, and a
+rename here would be a binding failure rather than a rebuild. A checkpoint with no `output.weight`
+ties the head to the embedding table, as the C engine does; `tie_embeddings=True` builds that.
 
 ```python
 from pocketllm.architectures import build

@@ -60,12 +60,24 @@ def _toy(config=None, **kwargs) -> ModelSpec:
     return build_toy(config, **kwargs)
 
 
+def _qwen3(config=None, **kwargs) -> ModelSpec:
+    """The same adapter for :mod:`pocketllm.architectures.qwen3`."""
+    from .qwen3 import build as build_qwen3
+
+    return build_qwen3(config, **kwargs)
+
+
 #: The in-tree architectures, by name.
 ARCHITECTURES: dict[str, ArchitectureEntry] = {
     "toy": ArchitectureEntry(
         name="toy",
         builder=_toy,
         summary="A tiny embedding + SwiGLU block; the executor's own smoke test",
+    ),
+    "qwen3": ArchitectureEntry(
+        name="qwen3",
+        builder=_qwen3,
+        summary="Qwen3 decoder layers: per-head QK-norm, split-half RoPE, SwiGLU MLP",
     ),
 }
 
