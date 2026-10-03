@@ -167,6 +167,17 @@ def add(a, b, **_attrs):
     return a.astype(np.float32) + b.astype(np.float32)
 
 
+def reshape(x, *, shape, **_attrs):
+    """Re-address ``x``'s elements with ``shape``.
+
+    The schema has already resolved the target -- including any ``-1`` -- and
+    checked the element count, so this only applies it.  ``np.reshape`` returns a
+    view where it can, which is the accuracy-preserving answer: no value moves,
+    so there is nothing to round.
+    """
+    return np.reshape(x, tuple(int(dim) for dim in shape))
+
+
 def mul(a, b, **_attrs):
     return a.astype(np.float32) * b.astype(np.float32)
 
@@ -364,6 +375,7 @@ KERNELS = {
     "silu_mul": silu_mul,
     "add": add,
     "mul": mul,
+    "reshape": reshape,
     "softmax": softmax,
     "rope": rope,
     "embedding": embedding,

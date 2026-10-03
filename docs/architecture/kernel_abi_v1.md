@@ -87,7 +87,7 @@ Shape inference uses a small symbolic vocabulary. In a schema, `shape=("m", "k")
 dimension `m` and the second `k`; two arguments that both say `k` must agree at call time, and a
 disagreement raises `ShapeError` naming the dimension rather than merely failing.
 
-**The v1 vocabulary is 19 ops.** They are grouped by family under `python/pocketllm/kernels/ops/`:
+**The v1 vocabulary is 18 ops.** They are grouped by family under `python/pocketllm/kernels/ops/`:
 
 | Family | Ops |
 |---|---|
@@ -100,6 +100,7 @@ disagreement raises `ShapeError` naming the dimension rather than merely failing
 | `embedding` | `embedding` |
 | `sample` | `topk_sample`, `argmax` |
 | `cache` | `cache_append`, `cache_truncate` |
+| `shape` | `reshape` |
 
 `gemm_quant`, `moe_ffn` and `embedding` accept quantized weights; the rest are dense. Every op is
 f32/f16/bf16.
