@@ -21,8 +21,10 @@ pocket. One process owns one device. If the checkpoint does not fit, it is quant
 > whose session raises `BackendNotImplementedError`.
 >
 > These are two halves that meet at exactly one place: `python/pocketllm/native.py`, the `ctypes`
-> bridge, which `pocketllm run` now drives — `pocketllm run --model ckpt.gguf --prompt "…"` generates
-> through the C core, greedily. `pocketllm serve` does not, and neither does any *Python* backend.
+> bridge, which both `pocketllm run` and `pocketllm serve` now drive — `pocketllm run --model
+> ckpt.gguf --prompt "…"` generates through the C core, and `pocketllm serve --model ckpt.gguf` puts
+> the same engine behind an OpenAI-compatible HTTP surface. Neither is a *Python* backend: they are
+> the C core reached from Python, which is why the backend table below is still all stubs.
 > Read [Current status](#current-status) before installing.
 
 ## The rule
@@ -41,7 +43,7 @@ this page is the design those pieces are being built toward.
 
 | Piece | State |
 |---|---|
-| `pocketllm.kernels` — the kernel ABI: descriptors, op schemas, dispatch, graph IR | **Done.** 19 ops declared; stdlib-only, no numpy |
+| `pocketllm.kernels` — the kernel ABI: descriptors, op schemas, dispatch, graph IR | **Done.** 17 ops declared; stdlib-only, no numpy |
 | `pocketllm.backends.reference` — numpy oracle, every op, host memory | **Done.** The normative implementation |
 | `pocketllm.backends.cpu` — host CPU | **Stub.** Selection and declaration only |
 | `pocketllm.backends.{cuda,mps,qnn,horizon,ascend}` | **Stubs.** Each names the runtime it waits for |
@@ -50,8 +52,8 @@ this page is the design those pieces are being built toward.
 | `pocketllm.engine` — executor, planner, memory, session lifecycle | **Done**, on the reference backend |
 | `pocketllm.architectures` — model IR and builders | **Scaffold.** `toy` only; `xing4_0` is not ported |
 | `pocketllm.tokenizer` — GGUF-vocabulary BPE | **Skeleton.** Whitespace works; BPE raises |
-| `pocketllm.protocol` / `pocketllm.server` — OpenAI-compatible HTTP | **Ported.** Importable and testable; needs a backend to serve |
-| `pocketllm.cli` | **Done** for `devices` / `backends` / `architectures` / `ops` |
+| `pocketllm.protocol` / `pocketllm.server` — OpenAI-compatible HTTP | **Done.** Driven over the C core by `server/native_backend.py`; one request at a time, no batch, no cancellation |
+| `pocketllm.cli` | **Done** for all six commands — `devices`, `backends`, `architectures`, `ops`, `run`, `serve` |
 | `src/` — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B in f16 and in `q4_k_m`.** GGUF read, BPE tokenize, forward, greedy decode, and temperature/top-k/top-p/min-p sampling; `q4_k`/`q6_k` decoded in the kernel; greedy checked token-for-token against llama.cpp on `cpu` and `cuda`; the sampler checked token-for-token against the numpy reference |
 
 There is no `main`-branch history before the seed commit: this tree was rebuilt on an orphan branch
@@ -151,8 +153,30 @@ bypass the tokenizer, `--device` to pick a backend, the same sampling flags as `
 `--min-p` and `--seed` beside it. The draw comes from the host — `random.Random(seed)` — because the
 engine takes a uniform variate and holds no RNG, so the same seed reproduces the same text.
 
-`serve` still validates its arguments and exits with the specific piece that is missing, because
-there is no *Python* backend for it to serve from.
+`serve` puts the same engine behind OpenAI-compatible HTTP, over the same checkpoint:
+
+```bash
+pocketllm serve --model ckpt.gguf --host 0.0.0.0 --port 8000
+curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages": [{"role": "user", "content": "What is the capital of France?"}]}'
+```
+
+The prompt goes through the checkpoint's **own chat template**, read out of the GGUF's
+`tokenizer.chat_template` and rendered with Jinja — that needs `jinja2`, which is deliberately not a
+dependency of this package, so a chat request without it falls back to a plain rendering the model
+was not trained on. Sampling is per request (`"temperature"`, `"top_p"`, `"top_k"`, `"min_p"`,
+`"seed"`), as is `"stop"` and `"n"`.
+
+**It serves one request at a time.** A C `Session` holds one position and one KV cache with no
+locking, while the server is a thread-per-request `ThreadingHTTPServer`, so the adapter serializes
+behind a lock and declares `supports_batch = False` rather than promising overlap the engine cannot
+provide. Measured on this host with six concurrent requests: 6/6 correct answers with the lock, 0/6
+without it — and no error either way, which is why the lock is not an optimisation to revisit.
+Cancellation is refused for the same kind of reason: `Session::forward` runs to completion, so a
+generation already started cannot be abandoned.
+
+Fields with no op behind them — `logprobs`, the penalties, `logit_bias`, `response_format`, `echo`,
+`suffix`, `best_of` — are refused with a `400` naming the parameter rather than silently ignored.
 
 ### Library
 
@@ -229,7 +253,10 @@ core imports it.
       and checked against the numpy reference; `run` and `run.cpp` take
       `--temperature/--top-k/--top-p/--min-p/--seed`, with greedy unchanged as the default. The
       draw is the host's, so the engine stays a pure function of `(logits, uniform)`.
-- [ ] **`pocketllm serve`.** The HTTP surface exists but has no *Python* backend to serve from.
+- [x] **`pocketllm serve`.** The HTTP surface is driven over the C core by a `NativeBackend`
+      adapter: one request at a time behind a lock, `supports_batch = False`, the checkpoint's own
+      chat template, and the unapplied fields refused by name. Concurrent batching needs per-request
+      KV slots in the C session and is not this step.
 - [ ] **The Python backends.** `cuda` first; each is a declaration today.
 - [ ] **`python/pocketllm/tokenizer/`** — the BPE is a stub. The C core tokenizes the checkpoint's
       vocabulary correctly; the Python skeleton is behind it and is the one `pocketllm run` would need.
