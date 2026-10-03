@@ -16,9 +16,9 @@ python -m pytest tests/ -q
 | --- | --- |
 | `abi/` | The kernel ABI: op schemas, tensor and buffer descriptors, graph verification, dispatch resolution, the reference backend's completeness, and the guarantee that importing the package pulls in no device runtime. |
 | `backends/` | The backend registry and the conformance harness: every declared op runs on every available backend, and the numerics match the reference. `backends/conftest.py` holds the harness. |
-| `architectures/` | The model IR and the `toy` architecture — a graph built and verified through the same builder a real model uses. |
+| `architectures/` | The model IR, the `toy` architecture, and `qwen3` — built, verified, driven by the decode loop, and checked both against a numpy transcription of `Qwen3Model::forward` and against the C engine and llama.cpp on a tiny synthetic checkpoint. |
 | `engine/` | The execution layer: the op-by-op executor, the memory planner, region planning and capture, session lifecycle, and the `LLM` facade over them. |
-| `loader/` | The GGUF decoders — one test per quant format — and the vendored GGML header's resolution order and pinned hash. |
+| `loader/` | The GGUF decoders — one test per quant format — the GGUF writer's format claims, and the vendored GGML header's resolution order and pinned hash. |
 | `serving/` | The ported serving layer: the OpenAI-compatible contract, chat templating, request parsing, choice fan-out, and the HTTP server against a fake backend. |
 | `test_package_boundaries.py` | The layering rules — which package may import which — plus the two subprocess checks that `import pocketllm` and `import pocketllm.cli` pull in no runtime. |
 
