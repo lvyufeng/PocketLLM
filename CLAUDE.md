@@ -29,11 +29,14 @@ and never expands. Verified token-for-token against llama.cpp on `cpu` and on on
 both checkpoints. That is real, it is tested, and it is what the `src/` row of the README's status
 table claims.
 
-**The Python package is still a skeleton, and `pocketllm run` is still a stub.** `pocketllm.kernels`
-(the ABI), `pocketllm.quant`, `pocketllm.loader.gguf`, `pocketllm.engine`, `pocketllm.protocol`,
-`pocketllm.server` and `pocketllm.cli` are real and tested, but **no Python backend implements a
+**The Python package has no device backend of its own.** `pocketllm.kernels` (the ABI),
+`pocketllm.quant`, `pocketllm.loader.gguf`, `pocketllm.engine`, `pocketllm.protocol`,
+`pocketllm.server` and `pocketllm.cli` are real and tested — and the CLI is no longer a stub, since
+`run` and `serve` both drive the C core through `native.py` — but **no Python backend implements a
 kernel**: every backend except `reference` is a declaration with a session that raises
-`BackendNotImplementedError` naming the runtime it waits for.
+`BackendNotImplementedError` naming the runtime it waits for. The serving adapter in
+`server/native_backend.py` is not an exception to that: it implements `EngineBackend`, the *serving*
+contract, over the same ctypes bridge, and never touches the kernel ABI.
 
 **These are two separate answers to two separate questions, and the trap is reading either one as the
 other.** `pocketllm.kernels` declares 17 ops; the C engine implements 12 of them over its own backend
@@ -43,18 +46,30 @@ nothing about what `src/` can do, and `pocketllm devices` on this host does not 
 exists.
 
 They meet at exactly one place: `python/pocketllm/native.py`, the `ctypes` bridge, which
-**`pocketllm run` now drives** — it opens a session, tokenizes, runs the graph and decodes greedily
-through the C core, and `tests/native/test_cli_run.py` checks it against llama.cpp's sequence. So
-`pocketllm run` runs a model and `pocketllm serve` does not, and the two halves are wired at one end
-rather than joined. `run` offers `--temperature/--top-k/--top-p/--min-p/--seed` as well as greedy;
-`serve` still offers neither, because it has no decode loop to apply them in. The draw is the host's
-on both sides — `cli.py` holds a `random.Random`, `run.cpp` a `std::mt19937_64` — because the engine
-takes a uniform variate and holds no RNG of its own.
+**`pocketllm run` and `pocketllm serve` both drive** — each opens a session, tokenizes, runs the
+graph and decodes through the C core, and `tests/native/test_cli_run.py` checks the first against
+llama.cpp's sequence. The second reaches the same engine through
+`python/pocketllm/server/native_backend.py`, the `EngineBackend` adapter over the HTTP surface. So
+both host entry points run a model, and neither is a *Python* backend: what they drive is the C core.
+Both offer `--temperature/--top-k/--top-p/--min-p/--seed` in some form — the flags on `run`, the
+per-request OpenAI fields on `serve` — and greedy is the default in both. The draw is the host's on
+every side — `cli.py` holds a `random.Random`, `run.cpp` a `std::mt19937_64`, the adapter a
+`random.Random` derived from `(seed, position)` — because the engine takes a uniform variate and
+holds no RNG of its own.
+
+**`serve` serves one request at a time, and says so.** A C `Session` holds one `position_` and one KV
+cache with no lock in `src/` or `native.py`, while the HTTP server is a thread-per-request
+`ThreadingHTTPServer`; the adapter serializes behind a lock and declares `supports_batch = False`
+rather than letting the handler promise overlap the engine cannot provide. Measured with six
+concurrent requests: 6/6 correct with the lock, 0/6 without, and **no error either way** — the
+failure is silent wrong text with a 200, which is why this is a correctness constraint and not a
+performance note. `supports_cancellation = False` for the same kind of reason: `Session::forward`
+runs to completion and nothing in the ABI observes a flag mid-call.
 
 So: do not describe the *Python package* as able to run a model, do not describe *the tree* as unable
 to, and do not describe the C core and the Python backends as one implementation — they are two, at
-different levels of done, joined at one entry point. Prefer the README's status table to any prose
-here.
+different levels of done, joined at the host shell (two entry points, one bridge). Prefer the README's
+status table to any prose here.
 
 ## Language convention
 

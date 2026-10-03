@@ -69,6 +69,22 @@ _ALLOWED: dict[str, set[str] | None] = {
     # so the layer still imports no accelerator and is still testable without one.
     "pocketllm.protocol": {"pocketllm.api", "pocketllm.loader", "pocketllm.protocol"},
     "pocketllm.server": {"pocketllm.api", "pocketllm.choices", "pocketllm.protocol", "pocketllm.server"},
+    # The one module under `server/` that drives a device, and the only reason it is not in
+    # `backends/`: `backends/` implements the *kernel ABI* and may import nothing above it, while
+    # this implements the *serving* contract and needs the ctypes bridge (`native`) to run a
+    # generation and the loader (via `protocol.templating`) to read the checkpoint's chat template
+    # out of its GGUF metadata.  That is still no accelerator: `native` is a `dlopen` and the loader
+    # is numpy-only, so the HTTP layer stays testable on a host with no card.  Scoped to this module
+    # rather than widening `pocketllm.server`, which would let any future module in the package reach
+    # a device without saying so here.
+    "pocketllm.server.native_backend": {
+        "pocketllm.api",
+        "pocketllm.choices",
+        "pocketllm.loader",
+        "pocketllm.native",
+        "pocketllm.protocol",
+        "pocketllm.server",
+    },
     "pocketllm.choices": {"pocketllm.api", "pocketllm.protocol"},
     # Skeleton: a vocabulary and a merge table.  It reads the GGUF metadata the
     # loader exposes, and nothing else.

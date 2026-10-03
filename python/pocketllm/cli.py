@@ -16,20 +16,22 @@ The commands mirror the three questions a user has:
   probe, and no runtime is imported.
 * ``backends`` -- what each backend declares, whether or not the host can open it.
 * ``run`` -- load a checkpoint and run it once, the interactive path.
+* ``serve`` -- the same engine behind OpenAI-compatible HTTP, one request at a time.
 
-``serve`` lives in :mod:`pocketllm.server`, which is the module that imports the
-HTTP layer; importing this module does not import it, so ``pocketllm devices`` on
-a phone does not pay for ``http.server`` either.
+``serve`` builds its adapter from :mod:`pocketllm.server`, which is the module that
+imports the HTTP layer; importing this module does not import either, so
+``pocketllm devices`` on a phone does not pay for ``http.server``.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 
-from .api import EngineArgs, SamplingParams, device_kinds
+from .api import BackendUnavailableError, ConfigurationError, EngineArgs, SamplingParams, device_kinds
 from .backends import registry
 
 __all__ = ["build_parser", "main"]
@@ -329,13 +331,45 @@ def _cmd_run(namespace: argparse.Namespace) -> int:
 
 
 def _cmd_serve(namespace: argparse.Namespace) -> int:
-    """Start the OpenAI-compatible server.  Needs an engine backend, none ships yet."""
+    """Load a checkpoint and serve it over the OpenAI-compatible HTTP surface.
+
+    The server is the one in :mod:`pocketllm.server.openai`, which is device-neutral and does
+    not change here; what is built is the adapter it drives.  Both imports are local because
+    this module's docstring promises that ``pocketllm devices`` on a phone does not pay for
+    ``http.server``, and that promise is kept by importing here rather than at the top.
+
+    Sampling is not a CLI flag on this path: the client names it per request, and the adapter
+    reads it from the body.  A server-wide default would be a second place the same number
+    lives.
+    """
+    from .server.native_backend import NativeBackend
+    from .server.openai import serve
+
     engine_args = _args(namespace)
-    raise SystemExit(
-        "`pocketllm serve` has no engine backend yet; "
-        f"parsed {engine_args.checkpoint_dir!r} on device {engine_args.device!r}. "
-        "The HTTP surface itself is importable as pocketllm.server.openai.serve."
+    device = _run_device(engine_args)
+    model_id = namespace.served_model_name or os.path.basename(engine_args.checkpoint_dir)
+
+    # Construction is where the checkpoint is opened and the template read, so a bad path or an
+    # unbuilt library fails here -- with the engine's own message -- rather than on the first
+    # request, after the port has been advertised as ready.
+    try:
+        backend = NativeBackend(engine_args, device)
+    except (BackendUnavailableError, ConfigurationError) as exc:
+        raise SystemExit(f"`pocketllm serve` cannot start: {exc}") from exc
+
+    health = backend.health()
+    print(
+        f"{health.message}\n"
+        f"serving {model_id!r} on http://{namespace.host}:{namespace.port} "
+        f"(one request at a time)",
+        file=sys.stderr,
+        flush=True,
     )
+    try:
+        serve(backend, host=namespace.host, port=namespace.port, model=model_id)
+    except KeyboardInterrupt:
+        print("\nstopped", file=sys.stderr)
+    return 0
 
 
 _COMMANDS = {
