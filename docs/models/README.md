@@ -21,15 +21,18 @@ A status is a claim about evidence, so each one names the evidence it stands on.
 | Architecture | Structure | Device | Status |
 |---|---|---|---|
 | [`toy`](architectures.md#toy) | Embedding, one SwiGLU block, LM head | reference (numpy) | **Scaffold** — the executor's own smoke test |
+| [`qwen3`](architectures.md#qwen3) | Qwen3 decoder: per-head QK-norm, split-half RoPE, SwiGLU MLP | reference (numpy) | **Scaffold** — the graph runs and its numerics are checked against a transcription of the C forward; no loader binds a checkpoint into it yet |
 | `xing4_0` | MLA attention, 64-expert MoE, matrix hyper-connection | not yet | **Planned** |
 
-**Every architecture here is a Python one, and none of the Python backends implements a kernel yet**,
-so a checkpoint could not be run through this table even if an architecture existed for it.
+**This table is the Python architectures, and the `reference` backend is the only implemented one.**
+Every other Python backend is a declaration with a session that raises, so a row's Device column names
+where its graph *can* run today, not where it is intended to.
 
-Qwen3-0.6B does run — but not through any of this. It is implemented in the C engine
-(`src/model/qwen3.cpp`) over a different backend interface, and it is deliberately not a row above:
-an architecture here is a `ModelSpec` graph of ABI ops for `pocketllm.engine` to execute, and Qwen3
-in C never builds one. Adding it to this matrix would claim a Python path that does not exist.
+Qwen3-0.6B does run — but through the C engine, not through the `qwen3` row above. The two are the
+same model written twice against different interfaces: `src/model/qwen3.cpp` over the C engine's
+`Backend`, and `python/pocketllm/architectures/qwen3.py` as a `ModelSpec` graph of ABI ops. The row
+exists because that second implementation is now real and tested; it is **Scaffold** and not
+**Runnable** because nothing in this tree yet reads a `.gguf` into it or drives it token by token.
 
 The previous tree's model pages — Xing4.0-29B-A4B, Ternary-Bonsai-2-27B, the DeepSeek-V4 GGUF path —
 measured code that has since been rewritten, and their numbers belong with that code; they are not

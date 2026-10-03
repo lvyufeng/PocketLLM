@@ -13,8 +13,16 @@ throughout:
 * **backend** (:mod:`pocketllm.backends`) -- the device that runs it;
 * **engine** (:mod:`pocketllm.engine`) -- the execution and serving contract.
 
-Only ``toy`` ships today.  It exists so the scaffold is *runnable*: a builder
-that has never produced a graph an executor accepted is a design, not code.
+Two ship today.  ``toy`` exists so the scaffold is *runnable*: a builder that has
+never produced a graph an executor accepted is a design, not code.  ``qwen3`` is
+the real one -- the architecture the C engine implements in ``src/model/qwen3.cpp``,
+rebuilt here as a graph, which is the first time an architecture in this tree has
+a second implementation to be checked against.
+
+Neither is *runnable on a checkpoint* yet, and the distinction is worth keeping:
+``qwen3`` builds a graph that verifies and executes on the reference backend with
+synthetic weights, but no loader binds a GGUF into it and no decode loop drives
+it.  That is what the model pages record, and why their status is ``Scaffold``.
 """
 
 from __future__ import annotations
