@@ -19,6 +19,7 @@ by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script
 - [Execution](https://lvyufeng.github.io/PocketLLM/architecture/execution/)
 - [Device targets](https://lvyufeng.github.io/PocketLLM/architecture/devices/)
 - [The C engine](https://lvyufeng.github.io/PocketLLM/architecture/c_engine/)
+- [Serving](https://lvyufeng.github.io/PocketLLM/architecture/serving/)
 
 ## Models
 
