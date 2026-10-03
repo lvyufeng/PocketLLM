@@ -31,8 +31,10 @@ where its graph *can* run today, not where it is intended to.
 Qwen3-0.6B does run — but through the C engine, not through the `qwen3` row above. The two are the
 same model written twice against different interfaces: `src/model/qwen3.cpp` over the C engine's
 `Backend`, and `python/pocketllm/architectures/qwen3.py` as a `ModelSpec` graph of ABI ops. The row
-exists because that second implementation is now real and tested; it is **Scaffold** and not
-**Runnable** because nothing in this tree yet reads a `.gguf` into it or drives it token by token.
+exists because that second implementation is now real and tested, and because the engine has a
+[decode loop](../architecture/execution.md#decode) that drives it a token at a time. It is
+**Scaffold** and not **Runnable** on the remaining half: no loader reads a `.gguf` into it, so the
+weights that decode are synthetic.
 
 The previous tree's model pages — Xing4.0-29B-A4B, Ternary-Bonsai-2-27B, the DeepSeek-V4 GGUF path —
 measured code that has since been rewritten, and their numbers belong with that code; they are not

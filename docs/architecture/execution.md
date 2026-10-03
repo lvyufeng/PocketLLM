@@ -74,6 +74,38 @@ round-trip was worth knowing about in the old tree and is worth knowing about he
 node's *outputs* are allocated. A value nothing reads is freed at its own birth. The one unavoidable
 copy is a cross-device one, and it is named in the trace.
 
+## Decode
+
+The executor runs a graph *once*. `Decoder` in `pocketllm.engine.decode` is what turns that into a
+model: append a token, advance a position, sample, feed the token back, and stop when something says
+stop. It is where [`plan_execution`](#planning) and `run_region` first get a production caller.
+
+Three decisions are worth stating, because each one is a place a decode loop usually goes wrong.
+
+**One region, or none.** An AOT backend wants the whole graph as one compiled artifact; a capture
+backend wants one replayed stream. `singleton_plan` asks the narrower question a phone poses — *can
+this backend take this whole graph at once?* — and answers with exactly one region, captured or
+eager. It does not fall back to the general plan, which would capture some regions and leave others
+eager: a loop hands one region to the backend and reads the logits out of the reply, and a partial
+plan's first region does not contain them. Which path was taken is observable: `Generation.graph_path_used`
+counts the steps that went through it.
+
+**The cache is in-place, and the bindings are not rebound.** `cache_append`'s declared semantics are
+`cache[positions[i]] = values[i]` — an in-place write, returned for composition — so the buffer the
+caller supplied *is* the updated cache. A step therefore rebinds only `tokens` and `positions`. This
+is also why the loop does not use the general multi-region plan: a region that took the cache as an
+*output* would return an executor-owned buffer that the next step would write through.
+
+**Sampling is the host's, and the RNG with it.** The engine takes a uniform variate and holds no
+generator of its own — the same split as the C engine, where `run.cpp` carries a `std::mt19937_64`
+and the library carries none. `Sampler` is *given* how to draw; with no draw supplied it decodes
+greedily through `argmax`, and a caller that set `top_k` without a variate is greedy rather than
+sampled with a fixed one.
+
+The cache is allocated per *generation*, not per decoder, and `cache_truncate` resets it between
+requests — through the op, so a backend with a device-resident cache forgets it its own way rather
+than being handed a fresh host buffer it does not recognise.
+
 ## Memory
 
 A decode step's graph is *long and thin*: every value is produced, read once or twice, and never read

@@ -42,10 +42,12 @@ Two details are deliberate rather than incidental:
 ## `qwen3`
 
 **Status: scaffold.** The graph builds, verifies, and runs on the reference backend with synthetic
-weights, and `tests/architectures/test_qwen3.py` checks its logits against an independent numpy
-transcription of `Qwen3Model::forward`. It is **not** runnable on a checkpoint: no loader binds a GGUF
-into it and no decode loop drives it. Calling it "Runnable" would claim a token this tree has not
-produced, so it is not called that.
+weights; `tests/architectures/test_qwen3.py` checks its logits against an independent numpy
+transcription of `Qwen3Model::forward`, and
+[`pocketllm.engine.decode`](../architecture/execution.md#decode) drives it token by token —
+appending, advancing the position and sampling. It is **not** runnable on a checkpoint: no loader
+binds a `.gguf` into it, so nothing here has produced a token from a real file. Calling it "Runnable"
+would claim that, and it is not claimed.
 
 This is Qwen3 as the C engine implements it — the same model, written a second time as a
 `ModelSpec`:

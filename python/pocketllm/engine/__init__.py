@@ -26,6 +26,15 @@ torch-free on ``import pocketllm``.
 from __future__ import annotations
 
 from .captured import CaptureRefused, RegionOutcome, run_region
+from .decode import (
+    STEP_INPUTS,
+    Decoder,
+    Generation,
+    Sampler,
+    cache_descriptors,
+    pick_token,
+    singleton_plan,
+)
 from .executor import Execution, ExecutionTrace, Executor, NodeResult
 from .llm import LLM, AsyncLLM
 from .memory import BufferArena, CountingSession, Liveness, MemoryPlan, plan_memory, value_liveness
@@ -37,12 +46,14 @@ __all__ = [
     "BufferArena",
     "CaptureRefused",
     "CountingSession",
+    "Decoder",
     "EngineExecutor",
     "EngineSession",
     "Execution",
     "ExecutionPlan",
     "ExecutionTrace",
     "Executor",
+    "Generation",
     "LLM",
     "Liveness",
     "MemoryPlan",
@@ -50,9 +61,14 @@ __all__ = [
     "NodeResult",
     "PlanRegion",
     "RegionOutcome",
+    "STEP_INPUTS",
+    "Sampler",
     "SessionPolicy",
+    "cache_descriptors",
+    "pick_token",
     "plan_execution",
     "plan_memory",
     "run_region",
+    "singleton_plan",
     "value_liveness",
 ]

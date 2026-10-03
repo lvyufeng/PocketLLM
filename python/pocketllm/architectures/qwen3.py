@@ -177,7 +177,7 @@ def build(config: Qwen3Config | None = None) -> ModelSpec:
         "output_norm.weight", TensorDesc((hidden,), dtype), role="final rms norm", quantizable=False
     )
 
-    #: One layout per (layer, k/v): the cache is unrolled, so the plan is too.
+    # One layout per (layer, k/v): the cache is unrolled, so the plan is too.
     cache = CachePlan(default_capacity=cfg.context)
     cache_values: list[str] = []
 
