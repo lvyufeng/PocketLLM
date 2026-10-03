@@ -45,9 +45,21 @@ Two details are deliberate rather than incidental:
 weights; `tests/architectures/test_qwen3.py` checks its logits against an independent numpy
 transcription of `Qwen3Model::forward`, and
 [`pocketllm.engine.decode`](../architecture/execution.md#decode) drives it token by token —
-appending, advancing the position and sampling. It is **not** runnable on a checkpoint: no loader
-binds a `.gguf` into it, so nothing here has produced a token from a real file. Calling it "Runnable"
-would claim that, and it is not claimed.
+appending, advancing the position and sampling.
+
+`tests/architectures/test_qwen3_oracle.py` goes further and closes the hole the transcription has.
+A transcription written from the same reading of the C source agrees with the graph wherever that
+reading is right *and* wherever it is wrong the same way, so on its own it cannot say the model is
+Qwen3. That test therefore writes a tiny synthetic checkpoint with
+`pocketllm.loader.gguf.writer` — a real GGUF with a real byte-level vocabulary, which both this
+tree's readers and llama.cpp load — and compares the graph's logits against the C engine's and
+llama.cpp's on the same weights. It is a `.gguf` bound into the graph and a token produced from a
+file, so the earlier "nothing here has produced a token from a real file" is no longer true.
+
+What is still not true, and why the status stays Scaffold: **no real checkpoint and no device**. The
+checkpoint is two layers with an eight-wide head, written by the test rather than converted from a
+model; nothing has bound `Qwen3-0.6B` into this graph, and nothing has run it anywhere but the numpy
+reference backend. Calling it "Runnable" would claim both, and neither is claimed.
 
 This is Qwen3 as the C engine implements it — the same model, written a second time as a
 `ModelSpec`:

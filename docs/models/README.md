@@ -21,7 +21,7 @@ A status is a claim about evidence, so each one names the evidence it stands on.
 | Architecture | Structure | Device | Status |
 |---|---|---|---|
 | [`toy`](architectures.md#toy) | Embedding, one SwiGLU block, LM head | reference (numpy) | **Scaffold** — the executor's own smoke test |
-| [`qwen3`](architectures.md#qwen3) | Qwen3 decoder: per-head QK-norm, split-half RoPE, SwiGLU MLP | reference (numpy) | **Scaffold** — the graph runs and its numerics are checked against a transcription of the C forward; no loader binds a checkpoint into it yet |
+| [`qwen3`](architectures.md#qwen3) | Qwen3 decoder: per-head QK-norm, split-half RoPE, SwiGLU MLP | reference (numpy) | **Scaffold** — the graph runs and its numerics are checked against both a transcription of the C forward and a tiny synthetic checkpoint the C engine and llama.cpp also read; no real checkpoint and no device yet |
 | `xing4_0` | MLA attention, 64-expert MoE, matrix hyper-connection | not yet | **Planned** |
 
 **This table is the Python architectures, and the `reference` backend is the only implemented one.**
@@ -33,8 +33,10 @@ same model written twice against different interfaces: `src/model/qwen3.cpp` ove
 `Backend`, and `python/pocketllm/architectures/qwen3.py` as a `ModelSpec` graph of ABI ops. The row
 exists because that second implementation is now real and tested, and because the engine has a
 [decode loop](../architecture/execution.md#decode) that drives it a token at a time. It is
-**Scaffold** and not **Runnable** on the remaining half: no loader reads a `.gguf` into it, so the
-weights that decode are synthetic.
+**Scaffold** and not **Runnable** on the remaining half: the only `.gguf` a loader hands it is the
+synthetic one `tests/architectures/test_qwen3_oracle.py` writes, so the weights that decode are
+synthetic and the device is the numpy reference. A real checkpoint has not been bound into it, and
+neither has a card or a phone.
 
 The previous tree's model pages — Xing4.0-29B-A4B, Ternary-Bonsai-2-27B, the DeepSeek-V4 GGUF path —
 measured code that has since been rewritten, and their numbers belong with that code; they are not
