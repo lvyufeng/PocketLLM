@@ -1,10 +1,11 @@
 # Serving from the C engine
 
-`pocketllm serve` is the one entry point in this tree that has no implementation at all: `cli.py`'s
-`_cmd_serve` parses its flags and exits, and the HTTP server it would start sits one layer away,
+`pocketllm serve` was the one entry point in this tree with no implementation at all: `cli.py`'s
+`_cmd_serve` parsed its flags and exited, while the HTTP server it would start sat one layer away,
 finished and tested. This page is the design record for closing that gap — what the missing piece
-is, why it is smaller than it looks in one direction and larger in another, and what the result
-promises.
+was, why it was smaller than it looked in one direction and larger in another, and what the result
+promises. It is written in the present tense of the design and annotated where the implementation
+changed the answer; the adapter itself is `python/pocketllm/server/native_backend.py`.
 
 ## What is already there
 
@@ -164,18 +165,65 @@ string already contains the special markers. Whether the markers arrive as liter
 or as ids to splice is a detail the adapter has to get right, and it is the kind of detail that
 produces fluent-but-wrong output, so it wants a test against a known prompt.
 
+It is settled, and the way it is settled is worth recording because both flags are counter-intuitive
+together. The adapter calls `encode(text, add_special=False, parse_special=True)`: `parse_special`
+because the rendered template *is* the text containing `<|im_start|>`, which must become one token id
+rather than a run of literal characters, and `add_special=False` because the template has already
+emitted whatever BOS its author wanted — asking for one as well would put a second at the front. On
+the real checkpoint the round trip is exact: `<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n`
+tokenizes to 15 ids and decodes back to itself, character for character.
+
 ## The shape of the change
 
 | File | Change |
 |---|---|
-| `python/pocketllm/backends/native_serve.py` | **new** — the `EngineBackend` adapter: the lock, the decode loop, the audit, the capabilities, and the ctypes calls |
+| `python/pocketllm/server/native_backend.py` | **new** — the `EngineBackend` adapter: the lock, the decode loop, the audit, the capabilities, and the ctypes calls |
 | `python/pocketllm/cli.py` | `_cmd_serve` builds the adapter from `EngineArgs` and calls `serve()` instead of raising |
 | `python/pocketllm/server/openai.py` | unchanged |
 | `python/pocketllm/api/*` | unchanged |
+| `tests/test_package_boundaries.py` | the new module's import rule, scoped to it rather than widening `pocketllm.server` |
 | `tests/serving/test_native_backend.py` | **new** — the adapter against the HTTP surface, over a socket, with a real checkpoint where one is present and skipped where it is not |
 
 The adapter is host-side and pure Python: it needs no C change, and that is deliberate. The C engine
 is finished for this purpose; the missing piece is on the Python side.
+
+### Where it went, and why not where this page first proposed
+
+The design above put the adapter in `backends/native_serve.py`. It is in
+`server/native_backend.py`, and the import table in `tests/test_package_boundaries.py` is what decides
+it rather than taste: `pocketllm.backends` may import `kernels`, `quant` and itself, while the adapter
+needs `protocol` (the chat template and the field audit) and `native` (the engine). A device backend
+implements the kernel ABI; this implements the *serving* contract. The rule is scoped to the one
+module — `"pocketllm.server.native_backend"` — rather than widening `pocketllm.server`, so a future
+module in that package cannot reach a device without someone writing it down here. `native` is a
+`dlopen` and the loader is numpy-only, so the HTTP layer stays testable without a card.
+
+### What implementing it found, which this page did not anticipate
+
+Recorded because each was a real defect rather than a refinement, and the first two are the kind that
+ship silently.
+
+**Decoding one token at a time mangles text.** A BPE split lands mid-character, and `decode` renders
+an incomplete UTF-8 sequence as U+FFFD that the next token cannot repair. On the real checkpoint,
+per-token decoding turns `한국어 텍스트` into `한국어 ���스트` and `Ünïcödé ñ` into `Ünïcödé ��` — with
+nothing raised. The loop decodes the whole generated list each step and strips a *trailing*
+replacement character, which is sound because a partial sequence can only ever sit at the end.
+
+**The end-of-text token decodes to its literal spelling.** `<|im_end|>` was being streamed as content,
+because the first draft yielded the text before checking for EOS — while the collected path broke
+first, so the two paths disagreed about the same generation. The check now precedes the yield.
+
+**`enable_thinking` had to be passed explicitly.** Qwen3's template tests
+`enable_thinking is defined and enable_thinking is false`, so an *undefined* variable is neither and
+the prompt stops at `<|im_start|>assistant\n` — leaving the model to open its own ` thinking` block, in
+which the entire answer arrives as reasoning. The serving default now matches the protocol layer's
+(`thinking_mode == "chat"`).
+
+**And the serialization claim is now measured, not argued.** Six concurrent requests on this host:
+6/6 correct answers behind the lock, 0/6 without it, and **no error either way** — the unlocked run
+returns wrong text with a 200. That is what makes the lock a correctness constraint rather than a
+performance note, and it is why the tests assert on the text and on the observed overlap rather than
+on whether anything raised.
 
 ## What it will and will not promise
 
@@ -188,16 +236,27 @@ penalties; structured outputs. Each of those is refused by name at the door rath
 
 ## Open questions
 
-1. **Jinja rendering.** `jinja2` as a dependency, a subset renderer of our own, or no templated chat
-   until one of them exists. Affects whether `--model` alone is enough to serve a chat request.
-2. **The metadata read.** A new ABI accessor for `tokenizer.chat_template`, or a host-side GGUF
-   metadata parse. The second is cheaper and keeps the ABI still; the first is where the knowledge
-   belongs.
-3. **`n` under the lock.** Keep host-side fan-out and pay the serialized cost, or refuse `n` and pay
-   in client compatibility.
-4. **Where the adapter lives.** `backends/native_serve.py` puts it beside the device backends it is
-   not; a serving adapter is a different kind of thing. `server/` is the alternative, and the answer
-   turns on whether `backends/` means "device" or "implementation of an engine contract".
+All four were carried into the implementation and resolved there, which is the reason to keep them
+written down rather than deleted — three were settled by the code and one by a rule that already
+existed.
+
+1. **Jinja rendering — resolved: optional, not a dependency.** The adapter imports `jinja2` lazily
+   and falls back to the protocol layer's plain rendering when it is absent. `pip install pocketllm`
+   is unchanged and a phone build does not carry a template engine; the cost is that a chat request
+   on a host without Jinja gets an untemplated prompt, which the model was not trained on. This is
+   the one resolution here that is a genuine trade rather than a win, and it is why the fallback is
+   documented at the point a reader would hit it.
+2. **The metadata read — resolved: host-side GGUF parse.** `pocketllm.loader.gguf.bundle` reads
+   `tokenizer.chat_template`, `tokenizer.ggml.eos_token_id` and `qwen3.context_length` from the same
+   file the engine opens. The ABI is untouched, which matters more than where the knowledge
+   "belongs": the C accessor would be a second way to ask a question the loader already answers.
+   Revisit if a non-GGUF checkpoint format arrives for this path.
+3. **`n` under the lock — resolved: honoured.** `ServedFields.choices = True` and the host fan-out
+   runs the choices serially, so a request for four choices holds the engine four times as long. A
+   field every OpenAI client assumes was worth the serialized cost; a client that asked for it can
+   see the latency and cannot see a refusal.
+4. **Where the adapter lives — resolved: `server/native_backend.py`.** Decided by
+   `tests/test_package_boundaries.py` rather than by preference; see *Where it went* above.
 
 ## The follow-on
 
