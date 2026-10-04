@@ -17,6 +17,7 @@
 
 #include "kernel/backend.h"
 #include "kernel/kernels.h"
+#include "kernel/parallel.h"
 #include "runtime/status.h"
 
 namespace pocketllm {
@@ -49,7 +50,16 @@ class CpuBackend final : public Backend {
      * directions, and both are real copies. That is not an inefficiency to
      * optimize away with a shared-pointer scheme: the graph is written as if
      * the two address spaces were distinct, and a CPU backend that aliased them
-     * would be a CPU backend that hides a bug the CUDA one would hit. */
+     * would be a CPU backend that hides a bug the CUDA one would hit.
+     *
+     * A striped copy was tried here and measured slower, on the theory that
+     * spreading a weight's first touch would spread its pages across the NUMA
+     * nodes. It does spread them -- over whatever node each pool thread happened
+     * to be scheduled on -- and the result is worse than one node: the pages are
+     * scattered, the copy pays a wake-up, and the compute threads on the node the
+     * pages *were* concentrated on lose more than the rest gain. The measurement
+     * is in the PR; the code is the plain copy because that is what it said to
+     * keep. */
     std::memcpy(reinterpret_cast<void *>(dst.handle), src, static_cast<std::size_t>(bytes));
   }
 
@@ -112,12 +122,16 @@ class CpuBackend final : public Backend {
   }
 
   int64_t attention_scratch(int64_t q_len, int64_t n_heads, int64_t max_span) const override {
-    /* One row, reused by every (query, head) pair: this backend runs them in a
-     * loop, so nothing else can be looking at it. `q_len` and `n_heads` are part
-     * of the signature for the backends where they are not irrelevant. */
-    static_cast<void>(q_len);
-    static_cast<void>(n_heads);
-    return max_span * 4;
+    /* One row per concurrent task, not one row for the whole call.  This backend
+     * used to run the `(query, head)` pairs in a serial loop and reuse a single
+     * row; it now runs them in parallel, so two tasks would otherwise interleave
+     * their scores into one softmax over a mixture of two heads -- wrong, finite
+     * and fluent, which is exactly what the CUDA backend's version of this
+     * comment guards against.  The task count comes from `parallel_tasks` with
+     * the grain `attention` uses, so the allocation and the kernel agree by
+     * construction rather than by two copies of the same formula. */
+    const int64_t tasks = parallel_tasks(q_len * n_heads, kAttentionGrain);
+    return (tasks < 1 ? 1 : tasks) * max_span * 4;
   }
 
   void attention(DeviceBuffer q, int64_t q_len, int64_t n_heads, DeviceBuffer k_cache,
