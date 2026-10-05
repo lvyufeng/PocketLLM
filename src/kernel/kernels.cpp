@@ -56,6 +56,94 @@ float dot(const float *a, const float *b, int64_t k) {
   return (s0 + s1) + (s2 + s3);
 }
 
+/* The same sum, four lanes at a time, with the *same* four accumulator chains.
+ *
+ * This exists for `attention` and it is worth being precise about why, because
+ * writing a second dot is otherwise the kind of duplication that drifts.
+ *
+ * `attention` calls a dot once per `(query, head)` unit per cache row, and at a
+ * 512-token context that is 16 units x 512 rows x 28 layers of 128-wide dots per
+ * token -- 448 MiB of streamed K per decode step, against a machine whose one
+ * core reads at a few GB/s.  The scalar loop above is correct and is the wrong
+ * shape for it: at `k = 128` the loop runs 32 times and the four partials plus
+ * the horizontal sum are the whole function.
+ *
+ * `s0..s3` are four independent accumulator chains and `i` advances by four, so
+ * lanes 0..3 of a `__m128` *are* `s0..s3` and one `_mm_loadu_ps` plus one vector
+ * `mul`/`add` pair does the four scalar statements.  The horizontal reduce below
+ * is `(s0 + s1) + (s2 + s3)` in that order, over the same lane values.
+ *
+ * **The exactness is real, and finding it out took three tries because the
+ * obvious reading of the disassembly is wrong.**  The vector form below is
+ * `_mm_mul_ps` then `_mm_add_ps`, deliberately *not* `_mm_fmadd_ps`: GCC
+ * contracts the scalar loop's `s += a[i] * b[i]` only when the multiply has a
+ * single use, which the four separate tails deny it, so the shipped `dot`
+ * rounds each product before adding it -- and an unconditional FMA does not.
+ * An earlier version of this function used `_mm_fmadd_ps` and moved the
+ * answer: over 200000 random 128-wide pairs the fused form disagrees with the
+ * shipped `dot` on 135170 of them and this one on **zero**.  A bit-level
+ * comparison is what settled it; the instruction mix in `objdump` is not
+ * evidence about rounding, because the same source emits different contraction
+ * decisions in different contexts.
+ *
+ * So `attention` gets the four lanes it could always have had without touching
+ * a single result: the score rows, the softmax and the output are identical to
+ * the pre-change engine's, which is why the llama.cpp token-for-token match
+ * (32/32 and 64/64 on the recorded prompts) survives unchanged.
+ *
+ * `k` is 128 in every attention call the graph makes, but the tail loops are
+ * kept so the function is not a trap for a shape that is not a multiple of four.
+ *
+ * `$POCKETLLM_CPU_SCALAR_DOT` forces `attention` back onto the scalar `dot`,
+ * which is how the claim above is *checked* rather than asserted: one attention
+ * call each way, compared byte for byte.  See the switch below.
+ */
+#if POCKETLLM_HAVE_AVX2
+
+/* Must `attention` take the scalar `dot` instead of the four-lane one below?
+ *
+ * The same kind of switch `$POCKETLLM_CPU_EXACT_GEMM` is, and for the same
+ * reason: "the two forms compute the same number" is a claim that gets checked
+ * rather than asserted, and the only way to check it through the public API is
+ * to be able to ask for the other form.  `tests/native/test_cpu_parallel.py`
+ * runs one attention call each way and compares the output bytes.
+ *
+ * It is not a preference knob.  A four-lane dot whose rounding differs from
+ * `dot`'s is not a slightly different answer -- the softmax turns a last-bit
+ * score difference into a different token sequence, measured at 32/32 to 1/32
+ * on the recorded prompt when this function was written with `_mm_fmadd_ps`.
+ * A function-local static so the running process cannot change it and the hot
+ * loop pays a predicted branch rather than a `getenv` per cache row. */
+bool scalar_dot_forced() {
+  static const bool forced = [] {
+    const char *from_env = std::getenv("POCKETLLM_CPU_SCALAR_DOT");
+    return from_env != nullptr && from_env[0] != '\0' && from_env[0] != '0';
+  }();
+  return forced;
+}
+
+__attribute__((optimize("fp-contract=off"))) inline float dot4(const float *a, const float *b,
+                                                               int64_t k) {
+  if (scalar_dot_forced()) {
+    return dot(a, b, k);
+  }
+  __m128 acc = _mm_setzero_ps();
+  int64_t i = 0;
+  for (; i + 4 <= k; i += 4) {
+    acc = _mm_add_ps(_mm_mul_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i)), acc);
+  }
+  float lanes[4];
+  _mm_storeu_ps(lanes, acc);
+  float tail = 0.0F;
+  for (; i < k; ++i) {
+    tail += a[i] * b[i];
+  }
+  return ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])) + tail;
+}
+#else
+inline float dot4(const float *a, const float *b, int64_t k) { return dot(a, b, k); }
+#endif
+
 /* ``sum_i row[i] * dequant_q4_k(block, i)`` for one Q4_K super-block.
  *
  * The arithmetic is `dequant_q4_k`'s, term for term and in the same order, so
@@ -935,7 +1023,7 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_ca
                    float max_score = -INFINITY;
                    for (int64_t s = 0; s < span; ++s) {
                      const float *kvec = k_cache + (first_key + s) * cache_row + kv_head * d;
-                     const float score = dot(qvec, kvec, d) * scale;
+                     const float score = dot4(qvec, kvec, d) * scale;
                      row_scores[s] = score;
                      if (score > max_score) {
                        max_score = score;

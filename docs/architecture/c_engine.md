@@ -297,6 +297,48 @@ selects it on one that has AVX2 — which is how the fast path's error is measur
 checkpoint rather than only asserted, and what the tests use to compare the two paths on identical
 input.
 
+### The attention score dot, four lanes wide and bit-exact
+
+Decode's cost is not the GEMM once the context is long. At a 512-token context one decode step runs
+16 `(token, head)` units × 512 cache rows × 28 layers of 128-wide dots in the attention score pass —
+448 MiB of streamed K against a machine whose one core reads a few GB/s. That pass was calling the
+scalar `dot`, and a per-pass diagnostic measured it at **2054 us of a 512-row attention call, 1.02
+GB/s** — 6× slower than a four-lane `__m128` form over the same bytes (344 us, 6.09 GB/s), on 54% of
+the kernel's time.
+
+The scalar `dot` is four independent accumulator chains (`s0..s3`) advancing by four, so lanes 0..3 of
+a `__m128` *are* those chains and one vector `mul`/`add` pair replaces four scalar statements. The
+horizontal reduce is `(s0 + s1) + (s2 + s3)`, the same order over the same lane values:
+`kernels.cpp`'s `dot4`. End to end at the model's own shape — 22 threads pinned to node 0, 512 tokens
+of history, the same harness interrupted only by the kernel — the whole attention op falls from
+**4321 us/token to 2240** (154.33 → 80.01 us/call over 28 calls), and a decode step's backend time
+from 13727 to 11440 us/token.
+
+**The first version of this was `_mm_fmadd_ps` and it was wrong in a way no tolerance caught.** The
+shipped scalar loop, compiled as part of a TU with a hundred other functions, does *not* contract its
+multiply-add: GCC contracts `s += a[i] * b[i]` only when the multiply has a single use, which the
+four separate tails deny it — the shipped `dot` therefore rounds each product before adding it, and an
+unconditional FMA does not. The disassembly is not evidence about this and reading it led the first
+draft astray. What settled it was a bit-level experiment: 200 000 random 128-wide pairs through an
+isolated copy of the shipped source, through the same source in the full TU (observed via
+`gemm(m=n=1, k=128)`, the one public path that is exactly one `dot`), and through both candidate
+roundings. The shipped function matched "round each product, then add" with **0** mismatches in
+200 000 and the fused form with **135 170**.
+
+The consequence of getting it wrong had already been measured: the FMA form moved the model's greedy
+completion from 32/32 tokens matching llama.cpp to **1/32**, and the logits error against the f64
+oracle at the 2-token prompt was still under `QUANTIZED_RTOL`. A softmax amplifies a last-bit score
+difference into a token choice and *hides* it from every bounding test the suite had.
+
+So the vector form is `_mm_mul_ps` into `_mm_add_ps` with `__attribute__((optimize("fp-contract=off")))`,
+which reproduces the scalar `dot` bit for bit — verified end to end, not just per dot: float32 logits
+identical to the pre-change build at 8 prompt lengths × 2 thread counts, and 64/64 tokens matching
+llama.cpp on the recorded prompts. `$POCKETLLM_CPU_SCALAR_DOT` forces `attention` back onto the scalar
+`dot`, which is how the *claim* is checked through the public API rather than asserted — one attention
+call each way, `memcmp`-identical. That switch exists because the test that would have caught the FMA
+draft does not otherwise exist: a float64 oracle at `2 * d * eps` of the output's scale passed the FMA
+build with the measured figure at **2% of the bound**.
+
 ### The activation scratch is the shape's size, not a fixed one
 
 The integer path needs somewhere to put the quantized activations, and that buffer used to be a
@@ -359,7 +401,31 @@ That row is between 2.0 and 2.5× and it is a *reversion check*, not an arithmet
 integer path was always correct, it was simply not being reached. The single-thread column is the
 tell — 7.25 against 17.72 is the exact-path ratio, unmoved by any thread count.
 
-**This still does not beat llama.cpp, and saying so is the point of the table.** Decode is now 88%
+**The four-lane score dot, interleaved A/B against the pre-change engine**, both pinned to NUMA
+node 0, median of the runs shown, `qwen3-0.6b-q4_k_m.gguf`, 22 threads, `llama-bench` on the same
+checkpoint and affinity as the other column:
+
+| test | before | after | llama.cpp | after/llama |
+|---|---:|---:|---:|---:|
+| pp32 | 296.03 | 305.79 | 801.40 | 0.38 |
+| tg128 | 89.90 | **95.62** | 94.85 | **1.01** |
+| pp512 | 189.20 | **278.47** | 793.06 | 0.35 |
+| tg128 after 512-token prefill | 49.02 | **61.17** | 93.25 | 0.66 |
+| tg512 (long decode) | 67.59 | **78.53** | 86.35 | 0.91 |
+
+The 1.47× at `tg128`-after-`pp512` is the context effect the section above names: the score dot's
+cost grows with the span while the GEMM budget is fixed, so the longer the prompt the larger the
+share of decode this fixes. Short-context decode was already within a few percent of llama.cpp and
+is now marginally ahead on this measurement — but that row is a near-tie, not a win, and the honest
+reading of the table is that decode at short context is at parity and the *gap that remains* is
+prefill.
+
+**What the score dot moved, and what it left.** Prefill is 0.35 of llama.cpp's at `pp512` and 0.38 at
+`pp32`, and that is the whole of what is left. The score dot is an attention fix, and attention is
+decode's term; the prefill gap is unchanged by it, at 0.35 either side of the change (`189.20` →
+`278.47` is a 1.47× on our own column and still under llama.cpp's `793.06`).
+
+**Still does not beat llama.cpp, and saying so is the point of the table.** Decode is 88%
 of llama.cpp's at one thread (16.11 vs 18.36), 86% at 8 and 95% at 22 — up from 30%, 39% and 61%.
 The single-thread ratio is the one that moved the most, because the integer path is a per-core
 efficiency fix and llama.cpp has nothing else on this host. Prefill at `pp512` is 172.73 against
@@ -373,10 +439,10 @@ it ran on (measured at ~66% node0), so most of a two-socket pool reads across th
 Placement is the next lever, and it is not in this change.
 
 **Decode also degrades with context length where llama.cpp's holds**: at 22 threads and 1024 tokens
-of history ours is 0.56 of llama.cpp's (43.44 vs 77.44), against 0.92 at 64 tokens. Attention's score
+of history ours was 0.56 of llama.cpp's (43.44 vs 77.44), against 0.92 at 64 tokens. Attention's score
 pass grows linearly in the span while its weight grows against a fixed GEMM budget, and the per-unit
-dot is the scalar one — the `(token, head)` split that this section measures is orthogonal to that,
-which is why the context table is not the same comparison.
+dot was the scalar one — the four-lane dot above is what that sentence was pointing at, and it moves
+the long-context row to 0.91 at 512 tokens of history (`tg512`: 78.53 against 86.35).
 
 ## Building
 
