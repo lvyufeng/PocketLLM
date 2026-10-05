@@ -363,6 +363,106 @@ def test_a_large_activation_row_keeps_the_integer_path(m: int, k: int) -> None:
 
 
 # --------------------------------------------------------------------------
+# 2b. The attention score dot, which has to be exact or the tokens move.
+# --------------------------------------------------------------------------
+
+
+def _decode_attention_case(span: int, seed: int):
+    """A decode-shaped attention call: one query head set against `span` keys.
+
+    The shape is the model's -- `q_len = 1`, 16 query heads over 8 KV heads,
+    `d = 128`, `q_offset = span - 1` -- because the property under test is a
+    property of *this* shape, where the score dot runs `d = 128` wide for every
+    one of `span` cache rows.  A case with `d = 4` would fit in one vector and
+    prove nothing.
+    """
+    rng = np.random.default_rng(seed)
+    heads, kv_heads, d = 16, 8, 128
+    q = rng.standard_normal((1, heads, d), dtype=np.float32)
+    k_cache = rng.standard_normal((span, kv_heads, d), dtype=np.float32)
+    v_cache = rng.standard_normal((span, kv_heads, d), dtype=np.float32)
+    scale = 1.0 / np.sqrt(d)
+    tensors = {"q": q, "k_cache": k_cache, "v_cache": v_cache}
+    params = {"q_offset": span - 1, "scale": f"{scale:.9g}"}
+    return tensors, params
+
+
+#: The spans the attention exactness cases run at.  A short one exercises the
+#: path a 5-token prompt takes; 512 is the long end of what llama.cpp's oracle in
+#: `test_quantized_forward.py` can be asked for, and it is where the score dot
+#: was `0.63x` of the pre-change throughput.
+ATTENTION_SPANS = [8, 512]
+
+
+@pytest.mark.parametrize("span", ATTENTION_SPANS)
+@needs_tools
+def test_attention_is_independent_of_the_thread_count(span: int) -> None:
+    """The attention output, at one thread and at eight, is the same *bytes*.
+
+    The same rule the rest of this file holds every op to, applied to the
+    kernel that grew a vectorized inner loop: the partition splits `(token,
+    head)` units, never a unit's own chain of passes, so more cores must not
+    move a single bit.  It is a statement about the *scheduling* and it is
+    deliberately exact -- the alternative, a tolerance, would read a stale
+    scratch row as a rounding.
+
+    It is not the guard for the vector dot's arithmetic, and reading it as one
+    would be a mistake: one thread and eight run the same code, so a change to
+    `dot4`'s rounding moves both runs together and this comparison passes.  The
+    case below is the one that checks the arithmetic.
+    """
+    tensors, params = _decode_attention_case(span, seed=20261005 + span)
+    request = write_request("attention", tensors, params)
+    single = run_op(request, threads=1)
+    eight = run_op(request, threads=8)
+    assert np.array_equal(single, eight), (
+        f"span={span}: the attention output moved with the thread count -- "
+        f"worst |difference| {float(np.max(np.abs(single - eight)))}"
+    )
+    # And the output is not a constant the comparison would pass trivially.
+    assert float(np.max(np.abs(single))) > 0.0
+
+
+@pytest.mark.parametrize("span", ATTENTION_SPANS)
+@needs_tools
+def test_the_attention_score_dot_is_the_scalar_order(span: int) -> None:
+    """The four-lane score dot produces the scalar dot's bytes, not its value.
+
+    The thread-count comparison above is bit-exact *by construction* -- the
+    partition never splits a unit, so one thread and eight run the same code --
+    and that means it would pass just as happily if the vectorized dot's
+    rounding were the thing that moved.  This is the case that would not.
+
+    Two runs of one request, differing only in `$POCKETLLM_CPU_SCALAR_DOT`,
+    which is the switch `attention` exposes for exactly this: with it unset the
+    score pass runs the four-lane `dot4`, with it set it runs the scalar `dot`.
+    They must agree *exactly*.  The bound they are held to is not a tolerance --
+    a tolerance is what let the FMA variant through.  An earlier draft of this
+    test compared the kernel against a float64 oracle at `2 * d * eps` on the
+    output's scale, and the `_mm_fmadd_ps` variant -- which moved the model's
+    greedy completion from 32/32 tokens matching llama.cpp to 1/32 -- passed it
+    with the measured figure at 2% of the bound.  The softmax spreads one
+    last-bit score difference over a whole row of `d` outputs, where it stays
+    under any sensible budget and still changes which token wins.
+
+    So the claim is checked where it is true or false rather than where it is
+    measurable: same input, both roundings, `memcmp`.  The scalar form is the
+    reference because it is the one the pre-change engine shipped and the one
+    llama.cpp's token match was recorded against.
+    """
+    tensors, params = _decode_attention_case(span, seed=20261005 + span)
+    request = write_request("attention", tensors, params)
+    vectorized = run_op(request, threads=1)
+    scalar = run_op(request, threads=1, env={"POCKETLLM_CPU_SCALAR_DOT": "1"})
+    assert np.array_equal(vectorized, scalar), (
+        f"span={span}: the four-lane score dot does not reproduce the scalar "
+        f"order -- worst |difference| {float(np.max(np.abs(vectorized - scalar)))}"
+    )
+    # And the comparison is not between two constants.
+    assert float(np.max(np.abs(scalar))) > 0.0
+
+
+# --------------------------------------------------------------------------
 # 3. The token sequence, at one thread and at eight.
 # --------------------------------------------------------------------------
 
