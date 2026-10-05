@@ -33,13 +33,21 @@
 #define POCKETLLM_KERNEL_PARALLEL_H
 
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define POCKETLLM_PAUSE() _mm_pause()
+#elif defined(__aarch64__)
+#define POCKETLLM_PAUSE() __builtin_arm_yield()
+#else
+#define POCKETLLM_PAUSE() ((void)0)
+#endif
 
 namespace pocketllm {
 namespace kernel {
@@ -92,13 +100,57 @@ inline int64_t partition_size(int64_t total, int64_t min_per_task, int64_t threa
  * One parallel call is in flight at a time.  That is not a limitation to work
  * around: the engine's whole design is one session driving one device from one
  * thread, so two kernels are never running at once and a kernel never nests a
- * parallel call inside another.  The mutex is there for the worker bookkeeping,
- * not for concurrent callers, and `job_` is a reference into the caller's frame
- * that outlives the call because the caller blocks at a barrier until every
- * worker has *left* the job -- not merely until every chunk has run.  A worker
- * between its last chunk and its next claim is still reading the job, so the
- * caller cannot return while one is in that window or the next job's
- * `next_chunk_` reset would race it.
+ * parallel call inside another.  The mutex serialises *callers* and is held
+ * across the whole call -- `run_ranges` says why it has to be -- and `job_` is
+ * a reference into the caller's frame that outlives the call because the caller
+ * blocks at a barrier until every worker has *left* the job -- not merely until
+ * every chunk has run.  A worker between its last chunk and its next claim is
+ * still reading the job, so the caller cannot return while one is in that
+ * window or the next job's `next_chunk_` reset would race it.
+ *
+ * ## Sleeping is what it used to do, and it was the whole cost
+ *
+ * The first version of this pool had the workers wait on a condition variable
+ * and the caller notify at the end of the job.  That is the textbook shape and
+ * it is wrong for this workload by an order of magnitude.  A decode token is
+ * 198 `parallel_for` calls -- 28 layers of seven GEMMs plus the embedding and
+ * the head -- and the individual calls are short: at 22 threads a 1024x1024
+ * projection is on the order of a hundred microseconds.  A futex round trip
+ * (wait, notify, wake, return) costs roughly ten to thirty of those microseconds
+ * on this host, so the pool spent most of a token waking up threads that had
+ * just gone to sleep.
+ *
+ * The measured numbers, `tg64` on `qwen3-0.6b-q4_k_m.gguf`, threads pinned to
+ * one socket, median of three:
+ *
+ *     condvar barrier, t=8    22.96 tok/s
+ *     condvar barrier, t=22   22.56 tok/s     <- no scaling at all
+ *     spin barrier,    t=8    31.23 tok/s
+ *     spin barrier,    t=22   56.10 tok/s     <- 2.5x
+ *
+ * The flat condvar scaling is the tell: if the barrier costs the same whether
+ * eight threads or twenty-two have to be woken through the same kernel object,
+ * then adding threads adds no throughput and every core past the first is
+ * paying for a wake-up it does not need.
+ *
+ * So the workers spin.  `generation_` is the only thing they read while idle,
+ * and the caller's next job bumps it within microseconds -- often before the
+ * worker has finished its pause loop.  The barrier at the end of the job spins
+ * on `arrived_in_job_` the same way.
+ *
+ * The cost is stated rather than hidden: while a job is in flight, the pool's
+ * cores are at 100% even when the job is tiny, where the condvar version let
+ * them idle.  For a batch server sharing a machine that would be a reason not to
+ * do this -- and `$POCKETLLM_CPU_THREADS` is the polite setting there.  For one
+ * session driving one device from one thread, the machine is the session's and
+ * the idle time was the cost of the wake-ups that are no longer happening.
+ *
+ * A fallback to the sleeping path on a long spin is deliberately *not* here.
+ * The spin is bounded by the work remaining: the caller reaches the barrier
+ * only after running `work()` itself, so the longest a worker can still be busy
+ * is one chunk, which is a fixed fraction of a job.  There is no unbounded wait
+ * for a fallback to protect against -- if a worker is descheduled mid-chunk the
+ * caller waits for it either way, and the version that sleeps would too.
  */
 class ThreadPool {
  public:
@@ -130,34 +182,62 @@ class ThreadPool {
       return;
     }
 
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      /* A reference into the caller's frame: valid because the caller blocks
-       * below until every worker has left this job, and the caller's frame
-       * cannot unwind while it is blocked here. */
-      job_ = [&fn, total, chunks](int64_t chunk) {
-        const int64_t lo = total * chunk / chunks;
-        const int64_t hi = total * (chunk + 1) / chunks;
-        fn(lo, hi, chunk);
-      };
-      chunks_ = chunks;
-      next_chunk_.store(0, std::memory_order_relaxed);
-      /* Not every worker necessarily takes a chunk on every job -- one can be
-       * descheduled across the whole call -- so the barrier counts arrivals at
-       * the *end* of the job rather than chunks claimed.  Every worker that is
-       * running tells `end_job`; the caller knows the count. */
-      workers_left_ = static_cast<int64_t>(workers_.size());
-      arrived_in_job_ = 0;
-      ++generation_;
-    }
-    cv_.notify_all();
+    /* The lock is held across the whole call, and what it buys is worth stating
+     * precisely because it is not the obvious thing.
+     *
+     * The barrier below already guarantees that no worker is inside the body
+     * when the caller returns: a worker publishes its arrival after its claim
+     * loop has run dry, so "arrived" implies "out of the job", and the caller
+     * does not leave until every worker has arrived.  Holding `job_`'s captures
+     * -- references into the caller's frame -- across the barrier is safe on
+     * that basis alone.
+     *
+     * What the lock adds is that no *second* job can be published while this one
+     * is outstanding.  Without it, a worker that was descheduled through an
+     * entire job could wake to see the generation two ahead, join the newer job,
+     * and never arrive for the older one -- and the older job's caller, which is
+     * spinning on the arrival count, would wait for an arrival that can no
+     * longer come.  That is a hang rather than a wrong number, and it is the
+     * reason the publish and the barrier are one critical section instead of
+     * two.
+     *
+     * The engine has one caller and one session by design, so in practice the
+     * lock is uncontended; it costs two futex-free acquisitions per kernel call.
+     * */
+    std::lock_guard<std::mutex> lock(mutex_);
+    /* A reference into the caller's frame: valid because the caller blocks at
+     * the barrier below until every worker has left this job, and the caller's
+     * frame cannot unwind while it is blocked there. */
+    job_ = [&fn, total, chunks](int64_t chunk) {
+      const int64_t lo = total * chunk / chunks;
+      const int64_t hi = total * (chunk + 1) / chunks;
+      fn(lo, hi, chunk);
+    };
+    chunks_ = chunks;
+    next_chunk_.store(0, std::memory_order_relaxed);
+    /* Not every worker necessarily takes a chunk on every job -- one can be
+     * descheduled across the whole call -- so the barrier counts arrivals at
+     * the *end* of the job rather than chunks claimed.  Every worker that is
+     * running tells the barrier; the caller knows the count. */
+    workers_left_ = static_cast<int64_t>(workers_.size());
+    arrived_in_job_.store(0, std::memory_order_relaxed);
+    /* The publish is the generation bump, and it must be the *last* store of
+     * the job's state: a worker that sees the new generation reads everything
+     * above it, and the release ordering is what makes that true without a
+     * second lock on the reader side. */
+    ++generation_;
 
     /* This thread is a worker too -- one core would otherwise sit idle for the
      * whole call, which is a fifth of the budget on a four-core phone. */
     work();
 
-    std::unique_lock<std::mutex> lock(mutex_);
-    done_cv_.wait(lock, [this] { return arrived_in_job_ == workers_left_; });
+    /* The barrier spins rather than sleeping -- see the class comment for the
+     * measurement that decided this.  A worker publishes its arrival with
+     * release ordering after its last chunk, so observing the count also
+     * observes the chunk's writes. */
+    while (arrived_in_job_.load(std::memory_order_acquire) != workers_left_) {
+      POCKETLLM_PAUSE();
+    }
   }
 
  private:
@@ -172,11 +252,8 @@ class ThreadPool {
   }
 
   ~ThreadPool() {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      stop_ = true;
-    }
-    cv_.notify_all();
+    stop_.store(true, std::memory_order_relaxed);
+    ++generation_;
     for (std::thread &worker : workers_) {
       if (worker.joinable()) {
         worker.join();
@@ -204,48 +281,53 @@ class ThreadPool {
   }
 
   /* A background worker's turn: take whatever chunks are left, then tell the
-   * barrier it is out of the job.  The decrement happens before the next
-   * `cv_.wait`, so the worker cannot be asleep in `wait` while still counted as
-   * running -- `run_ranges` would hang waiting for an arrival that will not
-   * come until the *next* job wakes it. */
+   * barrier it is out of the job.  The arrival is published *after* the last
+   * chunk, with release ordering, so the caller returning from the barrier
+   * cannot observe the arrival before the memory that chunk wrote.  The worker
+   * then goes straight back to the spin loop rather than to a wait: the caller's
+   * next job is usually tens of microseconds away, and sleeping and waking costs
+   * more than the wait. */
   void run_worker_job() {
     work();
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      ++arrived_in_job_;
-      done_cv_.notify_all();
-    }
+    arrived_in_job_.fetch_add(1, std::memory_order_release);
   }
 
   void worker_main() {
     uint64_t seen = 0;
     for (;;) {
-      {
-        std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [this, seen] { return stop_ || generation_ != seen; });
-        if (stop_) {
+      while (generation_.load(std::memory_order_acquire) == seen) {
+        if (stop_.load(std::memory_order_relaxed)) {
           return;
         }
-        seen = generation_;
+        POCKETLLM_PAUSE();
       }
+      /* The generation may have moved because the pool is stopping rather than
+       * because a job is pending -- the destructor bumps it to wake the
+       * spinners.  Without this second check a worker would wake, read the
+       * *previous* job's `chunks_` and `job_`, and call a body that captures a
+       * frame which is being destroyed. */
+      if (stop_.load(std::memory_order_relaxed)) {
+        return;
+      }
+      seen = generation_;
       run_worker_job();
     }
   }
 
   std::vector<std::thread> workers_;
   std::mutex mutex_;
-  std::condition_variable cv_;
-  std::condition_variable done_cv_;
+  /* Held only while a job's state is published and while the pool is stopping;
+   * the workers never touch it, which is what lets the barrier be a spin. */
   std::function<void(int64_t)> job_;
   std::atomic<int64_t> next_chunk_{0};
   int64_t chunks_ = 0;
   /* Job barrier: how many background workers this job started with, and how
    * many have finished it.  The caller contributes no arrival -- it runs
-   * `work()` to completion itself and then waits for the rest. */
+   * `work()` to completion itself and then spins until the rest arrive. */
   int64_t workers_left_ = 0;
-  int64_t arrived_in_job_ = 0;
-  uint64_t generation_ = 0;
-  bool stop_ = false;
+  std::atomic<int64_t> arrived_in_job_{0};
+  std::atomic<uint64_t> generation_{0};
+  std::atomic<bool> stop_{false};
 };
 
 }  // namespace detail

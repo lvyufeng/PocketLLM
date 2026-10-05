@@ -183,6 +183,35 @@ independent-output axis splits it across that pool.
 whole reason this library exists is an edge and mobile target where the loader should have to find
 as little as possible. A `std::thread` pool needs nothing beyond libstdc++ and pthread.
 
+**The workers spin, and that was the single largest fix in this path.** The pool originally had its
+workers wait on a condition variable and the caller notify at the end of each job — the textbook
+shape, and wrong for this workload by an order of magnitude. A decode token is about 198 `parallel_for`
+calls (28 layers of seven GEMMs plus the embedding and the head) and each is *short*: a 1024×1024
+projection is on the order of a hundred microseconds at 22 threads. A futex round trip costs ten to
+thirty of those microseconds on this host, so most of a token went into waking threads that had just
+gone to sleep. The tell is the scaling: the condvar pool gained nothing at all from the first eight
+threads to twenty-two (`tg64`: 22.96 → 22.56 tok/s), because every added thread paid the same wake-up
+cost. Replacing the wait with a spin on a generation counter and the notify with a spin on an arrival
+count took the same two points to **31.23** and **56.10** tok/s.
+
+The cost is stated rather than hidden: while a job is in flight the pool's cores are at 100% even
+when the job is tiny, where the sleeping version let them idle. For a batch server sharing a machine
+that is a reason not to do this, and `$POCKETLLM_CPU_THREADS` is the polite setting there. For one
+session driving one device from one thread — this engine's whole model — the machine is the session's,
+and the idle time was the wake-ups that are no longer happening. There is deliberately no fallback
+to sleeping on a long spin: the caller enters the barrier only after running its own share of the
+work, so the longest a worker can still be busy is one chunk, and a worker descheduled mid-chunk
+would be waited for either way.
+
+The publish of a job and the barrier that ends it are one critical section, and the reason is worth
+stating because it is not the obvious one. The barrier alone already guarantees the caller's frame
+outlives the job — a worker publishes its arrival with release ordering after its last chunk, so
+"arrived" implies "out of the job". What the lock adds is that no *second* job can be published
+while one is outstanding: without it, a worker descheduled through a whole job could wake to see the
+next generation, join the newer job, and never arrive for the older one — and the older job's caller,
+spinning on the arrival count, would wait for an arrival that can no longer come. That is a hang,
+not a wrong number, which is why it is a lock rather than an argument.
+
 **The one rule is that a reduction is never split.** Every call site splits an axis whose iterations
 touch disjoint memory — the output column of a GEMM, the token of a gather, the element of an
 elementwise op — and leaves each output's accumulation over `k` whole inside one task. Splitting `k`
@@ -224,22 +253,32 @@ the shifted softmax depends on neither being there.
 
 Measured on the project's x86 host (2× Xeon E5-2696 v4, 88 hardware threads, two NUMA nodes), on
 `qwen3-0.6b-q4_k_m.gguf`, `pp32`/`tg32`, median of five. `llama-bench` on the same checkpoint and
-thread counts is the other column.
+thread counts is the other column. The PocketLLM rows are pinned with `taskset` to the first N
+hardware threads of one socket, which is the placement the pool is designed for; the llama.cpp rows
+are `llama-bench`'s own default affinity at the same thread count.
 
 | threads | PocketLLM pp32 | PocketLLM tg32 | llama.cpp pp32 | llama.cpp tg32 |
 |---:|---:|---:|---:|---:|
-| 1 | 8.81 | 6.12 | 69.61 | 18.84 |
-| 8 | 52.11 | 15.48 | 383.71 | 72.34 |
-| 22 | 115.05 | 18.22 | 729.21 | 79.44 |
-| 44 | 114.79 | 16.12 | 982.01 | 83.02 |
+| 1 | 8.62 | 6.07 | 66.89 | 20.47 |
+| 8 | 52.51 | 29.21 | 393.07 | 74.66 |
+| 22 | 131.95 | 48.73 | 721.71 | 80.19 |
+| 44 | 230.66 | 46.04 | — | — |
 
-**This does not yet beat llama.cpp, and saying so is the point of the table.** Decode starts at a
-third of llama.cpp's on one thread and stays there — the gap is per-core kernel efficiency, not core
-count, because more threads hardly move it. Scaling also stops at the socket boundary (22 threads,
-one node): past that the weights are all on the node the loader first touched, and remote reads cost
-more than the extra cores return. The two obvious levers, a first-touch-parallel loader and a
-quantized-activation (integer) dot the way llama.cpp does it, are follow-up work; neither is in this
-change.
+**The same table measured before the spin barrier**, for the size of that one change: decode at 8
+threads went 15.48 → 29.21 and at 22 threads 18.22 → 48.73 tok/s (2.7×), while prefill barely moved
+(52.11 → 52.51 at 8), which is what the diagnosis predicts — prefill's kernel calls are long enough
+that a futex round trip is noise, and decode's are not.
+
+**This still does not beat llama.cpp, and saying so is the point of the table.** Decode is now 46%
+of llama.cpp's at 8 threads and 61% at 22, up from 20% and 23% — the threading and barrier work is
+done, and what is left is per-core kernel efficiency at one thread (6.07 vs 20.47, a third), which no
+amount of parallelism can repair. The scaling curve is now healthy up to 22: a 24% gain from 8
+threads to 22 on the same socket (~29 → 49 tok/s). Note where it stops: T=44 reaches 44 cores but
+decode goes *down* (48.73 → 46.04) while prefill rises 75%, so the remaining decode gap is not
+limited by how many cores are thrown at it — it is the per-core kernel. The two levers that remain
+are a quantized-activation (integer) dot the way llama.cpp does it, and the NUMA placement of the
+weights (the loader's `memcpy` first-touches the model onto whichever node it runs on, measured at
+~66% node0). Neither is in this change.
 
 ## Building
 
