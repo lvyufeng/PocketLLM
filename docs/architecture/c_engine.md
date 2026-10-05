@@ -297,6 +297,23 @@ selects it on one that has AVX2 — which is how the fast path's error is measur
 checkpoint rather than only asserted, and what the tests use to compare the two paths on identical
 input.
 
+### The activation scratch is the shape's size, not a fixed one
+
+The integer path needs somewhere to put the quantized activations, and that buffer used to be a
+fixed 1024 `Q8KBlock`s on the function's frame — 299 KiB, which is 4–16 blocks of decode and 6144
+blocks of a 512-token prefill. A shape past the cap took the exact path instead. The fallback is
+*correct*, so nothing failed and nothing was reported: **every prefill longer than 256 tokens was
+running the slower kernel, and the only symptom was throughput.** `pp512` on 22 cores measures 98
+t/s on the exact path against 180 t/s on the integer one, so this was the largest single term in the
+prefill gap.
+
+The buffer is now the shape's size: the stack array when the shape fits (the decode shapes are the
+hot path, and 197 GEMM calls per token cannot pay a heap round trip for a 4-block array), a `nothrow`
+heap allocation when it does not, and the exact path only if that allocation fails. The test that
+would have caught it is in `tests/native/test_cpu_parallel.py`: the default run and a
+`$POCKETLLM_CPU_EXACT_GEMM=1` run give *different* answers by construction, so a shape that agrees
+with the forced-exact run is a shape where the integer path was skipped.
+
 ### What it measures
 
 Measured on the project's x86 host (2× Xeon E5-2696 v4, 88 hardware threads, two NUMA nodes), on
@@ -328,16 +345,32 @@ Before the spin barrier, decode at 8 threads was 15.48 and at 22 threads 18.22 t
 barely moved — which is what that diagnosis predicts, since prefill's kernel calls are long enough
 that a futex round trip is noise and decode's are not.
 
+**Prefill at 512 tokens, where the scratch cap was the whole story.** The same engine, the fixed cap
+against the shape's-size buffer, interleaved in one run, median of three:
+
+| threads | fixed cap pp512 | shape-sized pp512 |
+|---:|---:|---:|
+| 1 | 7.25 | 17.72 |
+| 8 | 39.97 | 78.35 |
+| 22 | 96.58 | 172.73 |
+| 44 | 112.23 | 207.18 |
+
+That row is between 2.0 and 2.5× and it is a *reversion check*, not an arithmetic change: the
+integer path was always correct, it was simply not being reached. The single-thread column is the
+tell — 7.25 against 17.72 is the exact-path ratio, unmoved by any thread count.
+
 **This still does not beat llama.cpp, and saying so is the point of the table.** Decode is now 88%
 of llama.cpp's at one thread (16.11 vs 18.36), 86% at 8 and 95% at 22 — up from 30%, 39% and 61%.
 The single-thread ratio is the one that moved the most, because the integer path is a per-core
-efficiency fix and llama.cpp has nothing else on this host. What is left is not a kernel: at 22 and
-44 threads llama.cpp climbs (81.32 → 82.60) while ours falls (77.31 → 72.31), and its prefill
-scales to 982.98 where ours reaches 422.49, on the same cores and the same checkpoint. That shape —
-falling above one socket, on a 456 MB weight set read every token — is where the weights *live*:
-one allocation, first-touched by the loader on whichever node it ran on (measured at ~66% node0),
-so most of a two-socket pool reads across the interconnect. Placement is the next lever, and it is
-not in this change.
+efficiency fix and llama.cpp has nothing else on this host. Prefill at `pp512` is 172.73 against
+llama.cpp's 743.76 at the same 22 threads, and 207.18 against 1254.39 at 44 — still under 0.2, and
+the largest remaining term by far.
+What is left is not a kernel: at 22 and 44 threads llama.cpp climbs (81.32 → 82.60 on decode) while
+ours falls (77.31 → 72.31), and its prefill scales to four to six times ours, on the same cores and
+the same checkpoint. That shape — falling above one socket, on a 456 MB weight set read every
+token — is where the weights *live*: one allocation, first-touched by the loader on whichever node
+it ran on (measured at ~66% node0), so most of a two-socket pool reads across the interconnect.
+Placement is the next lever, and it is not in this change.
 
 **Decode also degrades with context length where llama.cpp's holds**: at 22 threads and 1024 tokens
 of history ours is 0.56 of llama.cpp's (43.44 vs 77.44), against 0.92 at 64 tokens. Attention's score

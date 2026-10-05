@@ -154,14 +154,20 @@ def write_request(op: str, tensors: dict, params: dict | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run_op(request: str, *, device: str = "cpu", threads: int = 1) -> np.ndarray:
-    """One op through `opcheck`, at a chosen thread count, as an array."""
+def run_op(
+    request: str, *, device: str = "cpu", threads: int = 1, env: dict | None = None
+) -> np.ndarray:
+    """One op through `opcheck`, at a chosen thread count, as an array.
+
+    ``env`` is layered over ``_thread_env`` for the one caller that needs to
+    change *which* kernel runs rather than how many cores run it
+    (``$POCKETLLM_CPU_EXACT_GEMM``)."""
     result = subprocess.run(
         [str(opcheck_path()), "--request", "/dev/stdin", "--device", device],
         input=request,
         capture_output=True,
         text=True,
-        env=_thread_env(threads),
+        env=dict(_thread_env(threads), **(env or {})),
         timeout=300,
     )
     values: list[float] = []
@@ -308,6 +314,52 @@ def test_gemm_quant_is_independent_of_the_thread_count(fmt: str, type_id: int) -
     blocks = packed_row(rng, rows=24, cols=768, fmt=fmt)
     request = write_request("gemm_quant", {"x": x, "w_blocks": blocks}, {"type_id": type_id})
     np.testing.assert_array_equal(run_op(request, threads=1), run_op(request, threads=8))
+
+
+#: Activation rows a prefill reaches past, and the widths it reaches them at.
+#:
+#: `gemm_quant` quantizes the activation into a scratch whose size used to be a
+#: fixed 1024 blocks (299 KiB); a shape past that silently took the *exact* path
+#: instead.  The exact path is correct and only slower, which is why a wrong cap
+#: never failed -- it just stopped using the fast kernel above a 256-token
+#: prefill.  These are the shapes that cross the boundary, as `(m, k)`: `m` rows
+#: of `k` weights, so `m * k / 256` blocks.
+PREFILL_SHAPES = [(256, 3072), (512, 1024), (512, 3072), (1024, 3072)]
+
+
+@pytest.mark.parametrize("m,k", PREFILL_SHAPES)
+@needs_tools
+def test_a_large_activation_row_keeps_the_integer_path(m: int, k: int) -> None:
+    """A shape past the old stack cap still runs the int8 path, not the fallback.
+
+    The two paths give *different answers* on purpose -- the integer one
+    quantizes the activation to int8 and the exact one keeps it in float32 --
+    and `$POCKETLLM_CPU_EXACT_GEMM` selects the second.  So the fast path is
+    measurably in use exactly when the default run differs from the forced-exact
+    run, and a cap that is too small shows up as the two agreeing.
+
+    The comparison is `run_op`'s existing entry point at `m` rows of `k`
+    weights; `k = 1024` and `k = 3072` are the two widths this graph's layers
+    project against, and `m` is the prefill length.
+    """
+    rng = np.random.default_rng(20261005)
+    x = rng.standard_normal((m, k), dtype=np.float32)
+    blocks = packed_row(rng, rows=16, cols=k, fmt="q4_k")
+    request = write_request("gemm_quant", {"x": x, "w_blocks": blocks}, {"type_id": 12})
+    integer = run_op(request, threads=1)
+    exact = run_op(request, threads=1, env={"POCKETLLM_CPU_EXACT_GEMM": "1"})
+    assert not np.array_equal(integer, exact), (
+        f"m={m} k={k}: the default and the forced-exact run agree, so the "
+        f"activation scratch did not fit and the integer path was skipped"
+    )
+    # The same global bound the other quantized comparisons use: the int8
+    # activation's error is absolute, so an output near zero carries a large
+    # relative error while the tensor-wide error stays a percent of the scale.
+    scale = float(np.max(np.abs(exact)))
+    worst = float(np.max(np.abs(integer - exact)))
+    assert worst <= QUANTIZED_RTOL * scale, (
+        f"m={m} k={k}: max |int - exact| = {worst} over a scale of {scale}"
+    )
 
 
 # --------------------------------------------------------------------------
