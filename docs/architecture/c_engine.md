@@ -317,10 +317,10 @@ The single-thread ratio is the one that moved the most, because the integer path
 efficiency fix and llama.cpp has nothing else on this host. What is left is not a kernel: at 22 and
 44 threads llama.cpp climbs (79.63 → 84.00) while ours falls (55.70 → 48.56), and its prefill
 scales to 995.42 where ours reaches 372.50, on the same cores and the same checkpoint. That shape —
-falling above one socket, on a model whose weights are a single 456 MB allocation — is the NUMA
-placement the loader does not yet control: `memcpy` first-touches the weights onto whichever node
-runs it, measured at ~66% node0, so most of the pool reads across the interconnect every token.
-Placement is the next lever, and it is not in this change.
+falling above one socket, on a 456 MB weight set read every token — is where the weights *live*:
+one allocation, first-touched by the loader on whichever node it ran on (measured at ~66% node0),
+so most of a two-socket pool reads across the interconnect. Placement is the next lever, and it is
+not in this change.
 
 ## Building
 
