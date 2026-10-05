@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -713,15 +715,41 @@ void gemm_quant(const float *x, const uint8_t *blocks, const float *bias, float 
    * inside the loop would repeat it per output column, which is the whole cost
    * the integer path exists to avoid.
    *
-   * The buffer is on this function's frame because the graph's shapes are
-   * small -- the widest call is `m=32, k=3072`, 384 blocks -- and this is not
-   * on a recursion path.  A shape that does not fit takes the exact path
-   * instead: correct, only slower, and the check is here rather than an
-   * assumption because `gemm_quant` is reachable from the ABI with shapes this
-   * graph does not produce. */
-  constexpr int64_t kMaxStackBlocks = 1024; /* 299 KiB of activation blocks */
-  const bool quantize_activations = !exact_gemm_forced() && m * row_blocks <= kMaxStackBlocks;
-  alignas(64) quant::Q8KBlock q8[kMaxStackBlocks];
+   * **The scratch is the shape's size, and it used to be a fixed 1024 blocks.**
+   * A `Q8KBlock` is 292 bytes, so 1024 of them is 299 KiB; a decode reaches 4-16
+   * blocks and a 512-token prefill reaches 6144, so the fixed cap was a decode
+   * size and every prefill longer than 256 tokens fell through to the exact
+   * path. The fallback is *correct* and therefore silent -- nothing fails, only
+   * slows -- which is why it went unnoticed. It is the largest single term in
+   * the prefill gap: at `pp512` on 22 cores the integer path is ~180 t/s and
+   * the exact path ~98 t/s on the same prompt.
+   *
+   * The decode shapes keep taking the stack buffer, because they are the hot
+   * path and a 197-call-per-token decode cannot pay a heap round trip per GEMM
+   * for a 4-block array. Above `kStackBlocks` the scratch is a heap allocation
+   * sized to the shape, so one `q8` pointer is chosen and the walk below is
+   * written once.
+   *
+   * The allocation is `nothrow` and a failure falls back to the exact path:
+   * `gemm_quant` is reachable from the ABI with shapes this graph does not
+   * produce, and a `bad_alloc` on the token path would be a worse answer than a
+   * slower one. */
+  constexpr int64_t kStackBlocks = 1024; /* 299 KiB of activation blocks */
+  const bool exact = exact_gemm_forced();
+  const int64_t total_blocks = m * row_blocks;
+  const bool use_int = !exact && total_blocks > 0;
+  alignas(64) quant::Q8KBlock stack_q8[kStackBlocks];
+  std::unique_ptr<quant::Q8KBlock[]> heap_q8;
+  quant::Q8KBlock *q8 = stack_q8;
+  if (use_int && total_blocks > kStackBlocks) {
+    heap_q8.reset(new (std::nothrow) quant::Q8KBlock[static_cast<std::size_t>(total_blocks)]);
+    if (heap_q8 != nullptr) {
+      q8 = heap_q8.get();
+    } else {
+      q8 = nullptr;
+    }
+  }
+  const bool quantize_activations = use_int && q8 != nullptr;
   if (quantize_activations) {
     quant::quantize_row_q8_k(x, q8, m * k);
   }
