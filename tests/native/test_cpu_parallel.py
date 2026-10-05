@@ -365,6 +365,44 @@ def test_the_activation_quantizer_is_independent_of_the_thread_count(m: int, k: 
     assert float(np.max(np.abs(single))) > 0.0
 
 
+@pytest.mark.parametrize("fmt,type_id", [("q4_k", 12), ("q6_k", 14)])
+@needs_tools
+def test_the_four_row_weight_walk_is_the_one_row_walk_four_times(
+    fmt: str, type_id: int
+) -> None:
+    """Rows batched four at a time, against the same rows one at a time.
+
+    `gemm_quant` walks a weight row once per four activation rows when `m`
+    allows it, which is a change of *schedule* and must not be one of
+    arithmetic: each of the four rows accumulates its blocks in the order
+    `dot_row_q8k` accumulates them, with the same per-block float multiply and
+    the same horizontal reduce.  That is the property the token-for-token
+    llama.cpp match rests on, so it is pinned here rather than left to the
+    conformance tolerance, which a reassociated sum would pass.
+
+    A six-row call exercises both paths against the same packed weights: rows
+    0-3 go through the batched walk and rows 4-5 through the one-row kernel.
+    Six one-row calls are the reference.  A batched kernel that dropped the
+    activation's own scale -- the mistake this test was written after making --
+    differs by a factor of `y.d` per block and fails loudly here.
+    """
+    rng = np.random.default_rng(20261006)
+    rows, k = 6, 1024
+    x = rng.standard_normal((rows, k), dtype=np.float32)
+    blocks = packed_row(rng, rows=16, cols=k, fmt=fmt)
+    batched = run_op(
+        write_request("gemm_quant", {"x": x, "w_blocks": blocks}, {"type_id": type_id}),
+        threads=1,
+    )
+    for r in range(rows):
+        alone = run_op(
+            write_request("gemm_quant", {"x": x[r : r + 1], "w_blocks": blocks}, {"type_id": type_id}),
+            threads=1,
+        )
+        np.testing.assert_array_equal(batched[r : r + 1], alone)
+    assert float(np.max(np.abs(batched))) > 0.0
+
+
 @pytest.mark.parametrize("m,k", PREFILL_SHAPES)
 @needs_tools
 def test_a_large_activation_row_keeps_the_integer_path(m: int, k: int) -> None:
