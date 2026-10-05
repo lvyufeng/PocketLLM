@@ -319,6 +319,38 @@ that included `kernel/parallel.h` would drag the thread pool into an install tha
 The serial `quantize_row_q8_k` is still there for callers with no pool to hand — it is the definition
 the parallel schedule is checked against.
 
+### Four rows per weight walk
+
+With the quantizer parallelized, the GEMM is a walk over weight blocks, and the pairing is still
+one activation row to one weight row: `dot_row_q8k` reads each weight block once per output row, so
+a 512-token prefill reads the same 590 KB weight panel 512 times. `dot_4rows_q8k` walks the weight
+block once and applies its decoded nibbles to four activation rows at a time, keeping four
+independent integer accumulators and four float accumulators live across the same walk.
+
+**Measured at 1.58× to 1.80× on the kernel, and bit-exact.** The `/tmp` probe (`rows4.cpp`: copies
+of both kernels, a synthetic panel, one core, both measured back to back in one process) puts
+`m=512 n=1024 k=1024` at 1.80× on a quiet machine and 1.58× on a loaded one, with the one-row column
+moving by 2× between the two — which is why the ratio is the number quoted here and not a GFLOP/s
+figure; the run-to-run spread on this shared host is larger than the effect of most changes. The
+end-to-end A/B below is the firmer measurement. The `worst` column of the probe is **0**, which is
+the important half: four rows through the batched kernel are the same bytes as four `dot_row_q8k`
+calls.
+
+That is a requirement rather than a happy property, and it drove the implementation. Every row's
+integer accumulation is over the same values in the same order, its float multiply is per block
+(`y.d * wd`, the activation's scale folded in exactly where the one-row kernel folds it), and its
+horizontal reduce is the same expression. The first draft of the q6_k branch multiplied by the
+weight's `d` alone and left out the activation's `y.d`; the test written with the kernel reported it
+as a 537-thousand error on its first run. `tests/native/test_cpu_parallel.py` now pins the
+equivalence directly: a six-row `gemm_quant` against six one-row calls, rows 0–3 through the batched
+walk and rows 4–5 through the one-row kernel, compared byte for byte. The conformance tolerance
+would have passed a reassociated sum; this would not.
+
+The dispatch lives in `gemm_quant` and is shape-driven: `m / 4` groups take the batched path and the
+`m % 4` tail takes `dot_row_q8k`. At decode `m` is 1, so every call takes the one-row path and the
+batched kernel costs a decode nothing — which is why the change is a prefill change and the decode
+column of the A/B is flat.
+
 ### The attention score dot, four lanes wide and bit-exact
 
 Decode's cost is not the GEMM once the context is long. At a 512-token context one decode step runs
@@ -501,6 +533,41 @@ What is left is the row dot itself: our `dot_row_q8k` is a one-output-per-block-
 31.9 GFLOP/s per core, against llama.cpp's repacked 8×8 GEMM at 42.2 on the same shape, and prefill's
 weight traffic is the part of the problem that only a several-rows-at-a-time kernel can turn into
 reuse.
+
+**The four-row weight walk, interleaved A/B against the pre-change engine**, same harness and
+affinity as the table above, `pp512`, median of three:
+
+| threads | before | after | llama.cpp | after/before | after/llama |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 24.62 | 34.46 | 65.06 | 1.40 | 0.53 |
+| 8 | 130.80 | 173.00 | 381.71 | 1.32 | 0.45 |
+| 22 | 318.50 | 415.08 | 791.98 | 1.30 | 0.52 |
+| 44 | 531.59 | 718.78 | 1259.03 | 1.35 | 0.57 |
+| 88 | 499.97 | 693.08 | 966.43 | 1.39 | 0.72 |
+
+The op-level profile at `pp512` says where it comes from: `gemm_quant` over 197 calls is **79.9 ms
+per call to 49.3 ms** at one thread, **13.8 to 8.1** at eight, **5.65 to 3.17** at 22 — a 1.62×,
+1.71× and 1.78× on the GEMM, which is the kernel's own 1.58× plus the better cache behaviour the
+panel reuse buys. Attention is unmoved (5.20 s → 5.14 s at 22 threads, drift) and so are the small
+ops, which is what a change confined to the row dot should look like. Prefill wall time at 22
+threads goes 1.65 s → 1.16 s.
+
+The one-thread column is the one that says this is a kernel change and not a scheduling one. The
+parallel quantizer's A/B had a flat one-thread column because a lone worker already ran the whole
+serial loop; here the single thread is doing *less work* — one weight decode for four rows instead
+of four — and it moves 1.40×, which is the kernel's arithmetic and nothing else.
+
+Decode is unmoved within noise at every thread count (`tg64` at 22 threads on the quiet host: 101.0
+before, 98.7 after, 96.2 for llama.cpp, against a ±4 run-to-run spread), and that is by construction:
+`m` is 1, so the dispatcher routes every decode GEMM to the one-row kernel. The batched path exists
+for prefill and costs decode a branch.
+
+**Prefill is now 0.52 of llama.cpp's at its best thread count** — up from 0.40, and still the whole
+of the gap. The remaining terms are the ones the profile names: at 22 threads `gemm_quant` is 625 ms
+of a 1161 ms prefill and attention is 514 ms of it, so the two are 98% of the wall, and llama.cpp's
+repacked 8×8 GEMM is still 1.3× the kernel ours is. The next lever is the one the pairing argument
+above points at: a four-row walk still spends its time in the weight *decode*, and an 8×8 form (which
+is what llama.cpp's repack is) amortizes the decode over eight rows rather than four.
 
 ## Building
 
