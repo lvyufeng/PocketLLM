@@ -155,8 +155,24 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_ca
 /* How many ``(token, head)`` units one attention task owns before it is worth
  * waking a thread.  Shared with the CPU backend, which sizes the score-row
  * scratch from the same partition the kernel takes; if the two used different
- * grains the buffer would be sized for a partition that does not happen. */
-constexpr int64_t kAttentionGrain = 32;
+ * grains the buffer would be sized for a partition that does not happen.
+ *
+ * **This is 1, and the number it replaced was 32.**  A grain of 32 was read off
+ * the wrong axis: the job is ``q_len * n_heads`` units wide, and 32 of them is a
+ * whole decode step -- `q_len` is 1 and there are 16 heads, so the largest
+ * partition `partition_size` can return is one task, and attention ran on one
+ * core out of twenty-two.  At ``q_len = 1`` the unit count is 16 whatever the
+ * grain is, so any grain below 16 splits into all 16 units and hands one to each
+ * thread; only at 32 or above does it collapse to a single task.
+ *
+ * The unit is self-contained -- one output row, one private score row, no
+ * coupling to any other unit -- so the split is safe at any grain, and it is
+ * *bit-exact*: the per-unit arithmetic is untouched, only which core does it.
+ * `tests/native/test_cpu_parallel.py` holds that to the token sequence.
+ *
+ * The kernel reads its own comment for why the unit is the right task and not a
+ * finer slice of it. */
+constexpr int64_t kAttentionGrain = 1;
 
 /* The index of the largest of `n` values, ties going to the lowest index.
  *

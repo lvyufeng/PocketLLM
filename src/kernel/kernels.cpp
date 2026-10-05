@@ -881,7 +881,13 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_ca
    * the classic race whose symptom is fluent, finite, wrong output.  The
    * per-task region is `scores + chunk * max_span`; nothing else is shared, and
    * the dot, the max scan and the weighted sum inside a unit stay serial so the
-   * arithmetic is the same as the single-threaded path. */
+   * arithmetic is the same as the single-threaded path.
+   *
+   * The unit is also the *whole* of a task's work: there is nothing finer to
+   * split, because the three passes inside it are chained -- `max_score` is
+   * needed before the exponentials and `total` before the weighted sum -- so a
+   * second thread on the same unit could only wait.  `kAttentionGrain` is 1 for
+   * that reason; see its comment in the header. */
   parallel_for(q_len * n_heads, kAttentionGrain,
                [&](int64_t lo, int64_t hi, int64_t chunk) {
                  float *const row_scores = scores + chunk * max_span;

@@ -235,6 +235,18 @@ tempted. Because the partition is a fixed contiguous split of an independent axi
 *bit-identical* to the single-threaded kernel, and `tests/native/test_cpu_parallel.py` holds that
 exactly by running each op at one thread and at eight and diffing the bytes.
 
+**The other half of the rule is that the split has to be worth making, and the call site that forgot
+is the cautionary example.** `attention` splits `(token, head)` with a grain of `kAttentionGrain`,
+and a grain of 32 is larger than the whole job: `partition_size` caps the chunk count at the thread
+count *and* at `ceil(total / min_per_task)`, so a decode step (`q_len = 1`, 16 heads) collapses to one
+task and runs on one core of twenty-two. The grain means "the smallest span worth waking a thread
+for", and reading it off a prefill-sized job — where 16 units is below any sensible wake-up cost — is
+what set it to 32. It is now 1: every `(token, head)` unit is a task. The change is worth 1.6× on
+decode at 22 threads (`tg32` 48.45 → 77.31) and exactly nothing at one thread, which is what
+identifies it as a partition and not an arithmetic change. The `attention` comment states the other
+constraint on the same number: the unit is the whole of a task's work and cannot be sliced finer,
+because its three passes are chained through `max_score` and `total`.
+
 The thread count is `$POCKETLLM_CPU_THREADS`, falling back to every hardware thread, clamped to
 `[1, 256]`. The default is all cores because the requirement is speed with nothing to configure and
 the result does not depend on the count; `=1` reproduces a single-threaded number, and on a shared
@@ -289,15 +301,20 @@ input.
 
 Measured on the project's x86 host (2× Xeon E5-2696 v4, 88 hardware threads, two NUMA nodes), on
 `qwen3-0.6b-q4_k_m.gguf`, `pp32`/`tg32`, median of five. `llama-bench` on the same checkpoint and
-thread counts is the other column, at its own default affinity; the PocketLLM rows are the pool's
-default placement, with the one-socket pinned figures recorded below the table.
+thread counts is the other column, at its own default affinity. The three PocketLLM columns are the
+same run, round-robin so machine drift lands on all of them: `before` is `kAttentionGrain = 32`,
+`after` is the same engine with the grain at 1 and nothing else changed.
 
-| threads | PocketLLM pp32 | PocketLLM tg32 | llama.cpp pp32 | llama.cpp tg32 |
-|---:|---:|---:|---:|---:|
-| 1 | 29.60 | 16.62 | 68.69 | 20.25 |
-| 8 | 142.18 | 49.73 | 387.60 | 74.60 |
-| 22 | 290.05 | 55.70 | 720.28 | 79.63 |
-| 44 | 372.50 | 48.56 | 995.42 | 84.00 |
+| threads | before pp32 | after pp32 | llama.cpp pp32 | before tg32 | after tg32 | llama.cpp tg32 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 29.91 | 29.88 | 69.52 | 16.63 | 16.11 | 18.36 |
+| 8 | 143.21 | 153.35 | 396.49 | 50.70 | 63.33 | 74.02 |
+| 22 | 293.03 | 293.12 | 719.25 | 48.45 | 77.31 | 81.32 |
+| 44 | 397.08 | 422.49 | 982.98 | 48.86 | 72.31 | 82.60 |
+
+Decode at 22 threads goes from 0.60 of llama.cpp to 0.95 on this one line, and the single-thread
+column is unmoved at 0.97 — which is what says the change is the partition and not the arithmetic:
+at one thread there is no partition to get wrong.
 
 The PocketLLM rows here are taken with the pool spread over both sockets; pinned to one socket the
 same build measures 29.34 / 15.36 at one thread, 147.72 / 47.71 at eight and 279.30 / 55.45 at
@@ -311,16 +328,22 @@ Before the spin barrier, decode at 8 threads was 15.48 and at 22 threads 18.22 t
 barely moved — which is what that diagnosis predicts, since prefill's kernel calls are long enough
 that a futex round trip is noise and decode's are not.
 
-**This still does not beat llama.cpp, and saying so is the point of the table.** Decode is now 82%
-of llama.cpp's at one thread (16.62 vs 20.25), 67% at 8 and 70% at 22 — up from 30%, 39% and 61%.
+**This still does not beat llama.cpp, and saying so is the point of the table.** Decode is now 88%
+of llama.cpp's at one thread (16.11 vs 18.36), 86% at 8 and 95% at 22 — up from 30%, 39% and 61%.
 The single-thread ratio is the one that moved the most, because the integer path is a per-core
 efficiency fix and llama.cpp has nothing else on this host. What is left is not a kernel: at 22 and
-44 threads llama.cpp climbs (79.63 → 84.00) while ours falls (55.70 → 48.56), and its prefill
-scales to 995.42 where ours reaches 372.50, on the same cores and the same checkpoint. That shape —
+44 threads llama.cpp climbs (81.32 → 82.60) while ours falls (77.31 → 72.31), and its prefill
+scales to 982.98 where ours reaches 422.49, on the same cores and the same checkpoint. That shape —
 falling above one socket, on a 456 MB weight set read every token — is where the weights *live*:
 one allocation, first-touched by the loader on whichever node it ran on (measured at ~66% node0),
 so most of a two-socket pool reads across the interconnect. Placement is the next lever, and it is
 not in this change.
+
+**Decode also degrades with context length where llama.cpp's holds**: at 22 threads and 1024 tokens
+of history ours is 0.56 of llama.cpp's (43.44 vs 77.44), against 0.92 at 64 tokens. Attention's score
+pass grows linearly in the span while its weight grows against a fixed GEMM budget, and the per-unit
+dot is the scalar one — the `(token, head)` split that this section measures is orthogonal to that,
+which is why the context table is not the same comparison.
 
 ## Building
 
