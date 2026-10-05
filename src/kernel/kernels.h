@@ -124,12 +124,21 @@ void rope_neox(float *x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t s
  * ``[position][kv_head][d]`` with a row stride of ``n_head_kv * d``. Attention
  * is grouped: query head ``h`` reads KV head ``h / group``.
  *
- * `scores` is caller-owned scratch of at least ``q_offset + q_len - first_key``
- * floats, passed in rather than allocated so the score row is reused across
- * heads and tokens. */
+ * `scores` is caller-owned scratch holding ``q_offset + q_len - first_key``
+ * floats per *concurrent* task, which the backend sizes through its own
+ * ``attention_scratch``.  This kernel runs ``(token, head)`` units in parallel
+ * and each task writes its own row, so the buffer is several rows, not one;
+ * a caller that sized it from the old one-row contract would under-allocate
+ * the moment more than one thread is in play. */
 void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_cache,
                const float *v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
                int64_t q_offset, float scale, float *out, float *scores);
+
+/* How many ``(token, head)`` units one attention task owns before it is worth
+ * waking a thread.  Shared with the CPU backend, which sizes the score-row
+ * scratch from the same partition the kernel takes; if the two used different
+ * grains the buffer would be sized for a partition that does not happen. */
+constexpr int64_t kAttentionGrain = 32;
 
 /* The index of the largest of `n` values, ties going to the lowest index.
  *

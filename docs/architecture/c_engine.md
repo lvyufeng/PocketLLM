@@ -74,9 +74,11 @@ to `pocketllm.backends.reference`, applied one level down.
   the last row of the activation through exactly that, and the KV cache addresses layer slabs through
   it.
 - **`attention_scratch` is a query, not a constant.** How much scratch a call needs is a property of
-  *how the backend is parallelized*: the CPU runs the `(query, head)` pairs in a loop and reuses one
-  score row, while a GPU runs them as concurrent blocks and needs one row each. The graph cannot know
-  which, so it asks.
+  *how the backend is parallelized*: the CPU now runs the `(query, head)` pairs across its thread pool
+  and needs one score row per concurrent task, and a GPU runs them as concurrent blocks and needs one
+  row each. The graph cannot know which, so it asks. Both backends size the buffer from the same
+  partition the kernel takes — `parallel_tasks` for the CPU, the block count for the card — so the
+  allocation and the kernel cannot disagree.
 - **`argmax` is an operation.** A caller that only wants the next token transfers four bytes instead
   of the whole logit vector — 600 KB at this vocabulary.
 
@@ -170,6 +172,75 @@ on their argmax and their greedy sequence, not elementwise. Both sequences match
 differ from the f16 sequence from the second token on: quantizing to 4.5 bits per weight is lossy
 enough to change the continuation, which is the format working rather than a kernel failing.
 
+### The CPU kernels use the whole machine
+
+The CPU backend is not one core. `kernel/parallel.h` is a persistent `std::thread` pool — created
+once, on first use, because the graph makes roughly two hundred kernel calls per token and
+spawning threads per call would cost more than the arithmetic — and every kernel that has an
+independent-output axis splits it across that pool.
+
+**Not OpenMP.** `-fopenmp` would make `libgomp` a runtime dependency of `libpocketllm.so`, and the
+whole reason this library exists is an edge and mobile target where the loader should have to find
+as little as possible. A `std::thread` pool needs nothing beyond libstdc++ and pthread.
+
+**The one rule is that a reduction is never split.** Every call site splits an axis whose iterations
+touch disjoint memory — the output column of a GEMM, the token of a gather, the element of an
+elementwise op — and leaves each output's accumulation over `k` whole inside one task. Splitting `k`
+and summing partials would be faster and is forbidden: it changes the association order, so the
+result would move with the thread count. `gemm_quant`'s comment says so where someone would be
+tempted. Because the partition is a fixed contiguous split of an independent axis, the output is
+*bit-identical* to the single-threaded kernel, and `tests/native/test_cpu_parallel.py` holds that
+exactly by running each op at one thread and at eight and diffing the bytes.
+
+The thread count is `$POCKETLLM_CPU_THREADS`, falling back to every hardware thread, clamped to
+`[1, 256]`. The default is all cores because the requirement is speed with nothing to configure and
+the result does not depend on the count; `=1` reproduces a single-threaded number, and on a shared
+host it is the polite setting. `build/pocketllm-bench` prints the count it resolved, so a table row
+is never ambiguous about how many cores produced it.
+
+### The vectorized packed GEMM
+
+`gemm_quant` is where the FLOPs are — more than 99% of them, at both prefill and decode — so it is
+where the work went. The scalar path `dot_q4_k_block_scalar`/`dot_q6_k_block_scalar` decodes one
+super-block and returns its contribution, and the GEMM sums those. Both facts are wrong for a
+vector kernel: a per-block dot ends in a horizontal reduce, and a 256-weight accumulator is only
+sixteen FMAs deep. The AVX2 path folds every block of a row into two lane-wise accumulators and
+reduces once per output element instead of once per 256 weights, which is why `dot_row` takes the
+whole row and walks the blocks itself.
+
+The *decode* is unchanged and stays exact: the group's `d * scale` and `dmin * minimum` are hoisted
+out of the 256-weight walk and computed once per 32 weights, and every weight the vector path reads
+is the weight `dequant_q4_k`/`dequant_q6_k` produces. Only the association of the sum moves — the
+sum is reassociated and `a * b + c` contracts into an FMA, both of which move the last bits. That was
+the accepted trade for `-march=native`, and it is why the safety net is not bit-identity but three
+things: the existing tolerance tests, unmodified; a check that the AVX2 decode agrees with the scalar
+decode to `1e-6` relative, far below the percent a wrong nibble would move; and the llama.cpp token
+match, which is what catches a last-bit change that flips an `argmax`.
+
+`-ffast-math` is deliberately absent. It would add full reassociation and `-ffinite-math-only`, and
+the shifted softmax depends on neither being there.
+
+### What it measures
+
+Measured on the project's x86 host (2× Xeon E5-2696 v4, 88 hardware threads, two NUMA nodes), on
+`qwen3-0.6b-q4_k_m.gguf`, `pp32`/`tg32`, median of five. `llama-bench` on the same checkpoint and
+thread counts is the other column.
+
+| threads | PocketLLM pp32 | PocketLLM tg32 | llama.cpp pp32 | llama.cpp tg32 |
+|---:|---:|---:|---:|---:|
+| 1 | 8.81 | 6.12 | 69.61 | 18.84 |
+| 8 | 52.11 | 15.48 | 383.71 | 72.34 |
+| 22 | 115.05 | 18.22 | 729.21 | 79.44 |
+| 44 | 114.79 | 16.12 | 982.01 | 83.02 |
+
+**This does not yet beat llama.cpp, and saying so is the point of the table.** Decode starts at a
+third of llama.cpp's on one thread and stays there — the gap is per-core kernel efficiency, not core
+count, because more threads hardly move it. Scaling also stops at the socket boundary (22 threads,
+one node): past that the weights are all on the node the loader first touched, and remote reads cost
+more than the extra cores return. The two obvious levers, a first-touch-parallel loader and a
+quantized-activation (integer) dot the way llama.cpp does it, are follow-up work; neither is in this
+change.
+
 ## Building
 
 Out of tree, so the Python package stays free of build artifacts:
@@ -192,7 +263,19 @@ which is what CMake's search finds, so the build agrees with the toolchain witho
 that would be wrong on the next machine.
 
 CPU warnings are errors, scoped to `CXX` with a generator expression so nvcc — which spells `-Werror`
-differently — is unaffected.
+differently — is unaffected. `-march=native` is set for the same reason `-O3` is: this is a
+build-host choice, and a shipped or mobile build would pin a target architecture instead of taking
+the one it is compiled on.
+
+### Measuring it: `pocketllm-bench`
+
+`pocketllm-run` prints generated text and nothing else, so there was no number to review a
+performance change against. `build/pocketllm-bench` mirrors `llama-bench`'s shape and its test names —
+`pp<N>` for a prefill over `N` tokens with the cache dropped first, `tg<N>` for `N` single-token
+decodes against a warm cache — so the two tables can be read side by side. It times with
+`steady_clock`, warms up, and reports the median of `--reps`, and it emits each row both as a
+Markdown table and as a `bench pp <N> <rate>` line a test can parse. The prompt is synthetic token
+ids rather than text, because tokenization is not what is being measured.
 
 ## Where the host meets it
 

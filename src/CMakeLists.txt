@@ -60,6 +60,33 @@ if(POCKETLLM_CUDA)
   endif()
 endif()
 
+# Warning-as-errors and the kernel options, stated once.
+#
+# The three targets that link `kernel/` -- the library, `pocketllm-run` and
+# `pocketllm-opcheck` -- each carried their own copy of these options, which is
+# how a flag gets added to two of the three.  An INTERFACE library carries them
+# instead, so an option added here reaches every kernel target and neither of the
+# two (`pocketllm-gguf-dump`, `pocketllm-tokenize`) that compiles no kernel.
+#
+# `-march=native` is a build-host choice and is deliberately allowed to change
+# the last bits of a reduction: it enables AVX2 and FMA, and GCC's default
+# `-ffp-contract=fast` then fuses `a*b+c` into `vfmadd` where the SSE2 baseline
+# could not.  `-ffast-math` is *not* here -- it would add full reassociation and
+# `-ffinite-math-only`, which the shifted softmax depends on not having.
+add_library(pocketllm-kernel-options INTERFACE)
+find_package(Threads REQUIRED)
+target_link_libraries(pocketllm-kernel-options INTERFACE Threads::Threads)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  # CXX only: `-Werror` is spelled differently for nvcc, and the CUDA file is
+  # built by the same targets.  The host keeps warnings-as-errors, and the
+  # optimisation flags are host flags -- nvcc does its own.
+  target_compile_options(pocketllm-kernel-options INTERFACE
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Werror -O3 -march=native>)
+endif()
+# The include root, so a kernel target can `#include "kernel/parallel.h"` without
+# repeating the directory.
+target_include_directories(pocketllm-kernel-options INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+
 add_library(pocketllm SHARED
   c_api.cpp
   abi/spec.cpp
@@ -87,12 +114,7 @@ target_include_directories(pocketllm
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  # CXX only: `-Werror` is spelled differently for nvcc, and the CUDA file is
-  # built by the same target.  The host half keeps warnings-as-errors.
-  target_compile_options(pocketllm PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Werror>)
-endif()
+target_link_libraries(pocketllm PRIVATE pocketllm-kernel-options)
 
 # An internal tool, not part of the ABI: it prints a checkpoint's directory as
 # JSON so the reader test can diff the C parse against the Python reader's on a
@@ -151,13 +173,7 @@ if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)
   target_compile_definitions(pocketllm-run PRIVATE POCKETLLM_WITH_CUDA=1)
   set_target_properties(pocketllm-run PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 endif()
-target_include_directories(pocketllm-run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  # CXX only for the same reason as the library above: this target carries the
-  # CUDA translation unit.
-  target_compile_options(pocketllm-run PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Werror>)
-endif()
+target_link_libraries(pocketllm-run PRIVATE pocketllm-kernel-options)
 
 # Run one kernel over inputs a caller supplies, for checking it against the
 # Python reference.  It links the kernel objects and both backends, and no model:
@@ -177,11 +193,31 @@ if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)
   target_compile_definitions(pocketllm-opcheck PRIVATE POCKETLLM_WITH_CUDA=1)
   set_target_properties(pocketllm-opcheck PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 endif()
-target_include_directories(pocketllm-opcheck PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(pocketllm-opcheck PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Werror>)
+target_link_libraries(pocketllm-opcheck PRIVATE pocketllm-kernel-options)
+
+# Measure the engine's own throughput, as `llama-bench` measures llama.cpp's.
+# Same object list as `pocketllm-run` -- it needs the model and both backends --
+# and the same CUDA guard, so a CUDA build links here too.
+add_executable(pocketllm-bench
+  tools/bench.cpp
+  abi/spec.cpp
+  gguf/reader.cpp
+  runtime/status.cpp
+  tokenizer/unicode_data.cpp
+  tokenizer/unicode.cpp
+  tokenizer/pretokenize.cpp
+  tokenizer/bpe.cpp
+  kernel/kernels.cpp
+  kernel/cpu/backend.cpp
+  kernel/registry.cpp
+  model/qwen3.cpp
+  ${POCKETLLM_CUDA_SOURCES}
+)
+if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)
+  target_compile_definitions(pocketllm-bench PRIVATE POCKETLLM_WITH_CUDA=1)
+  set_target_properties(pocketllm-bench PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 endif()
+target_link_libraries(pocketllm-bench PRIVATE pocketllm-kernel-options)
 
 # `POCKETLLM_ABI_VERSION_MAJOR` is a C preprocessor macro in the header, not a
 # CMake variable, so the soname major is stated here too.  It is the one number
