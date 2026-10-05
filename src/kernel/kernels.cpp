@@ -803,6 +803,23 @@ void gemm_quant(const float *x, const uint8_t *blocks, const float *bias, float 
    * inside the loop would repeat it per output column, which is the whole cost
    * the integer path exists to avoid.
    *
+   * **The quantization runs on the pool, and that is the second largest term in
+   * the prefill gap.**  It used to be a serial loop on the caller's thread,
+   * which made it the one part of a prefill GEMM that did not scale: at `m=512,
+   * k=1024` it is 2048 independent blocks of 256 weights and measured 1087 us
+   * serial against a 4244 us call -- a fifth of the GEMM on one core while
+   * twenty-one sat at the barrier.  The blocks are independent by construction
+   * (each writes its own `d`, `qs` and `bsums`, and reads only its own 256
+   * floats), so running them on the pool is a change of scheduling and not of
+   * arithmetic: the same body, byte for byte, at 55 us.
+   *
+   * That byte-for-byte part is load-bearing rather than incidental.  The
+   * quantized activation is an operand of the token-for-token llama.cpp match,
+   * so a "parallel" version that split a block's reduction or reassociated its
+   * scale would change the model.  `quantize_q8_block` is one whole block's
+   * arithmetic and the loop below runs it per block, so the schedule cannot
+   * reach inside one.
+   *
    * **The scratch is the shape's size, and it used to be a fixed 1024 blocks.**
    * A `Q8KBlock` is 292 bytes, so 1024 of them is 299 KiB; a decode reaches 4-16
    * blocks and a 512-token prefill reaches 6144, so the fixed cap was a decode
@@ -839,7 +856,14 @@ void gemm_quant(const float *x, const uint8_t *blocks, const float *bias, float 
   }
   const bool quantize_activations = use_int && q8 != nullptr;
   if (quantize_activations) {
-    quant::quantize_row_q8_k(x, q8, m * k);
+    /* One block per task at the floor, which is where the measurement above was
+     * taken: a block is 256 floats of work, so eight to a task is the point past
+     * which a chunk stops being worth waking a worker for. */
+    parallel_for(total_blocks, /*min_per_task=*/8, [&](int64_t lo, int64_t hi, int64_t) {
+      for (int64_t b = lo; b < hi; ++b) {
+        quant::quantize_q8_block(x + b * quant::kQ8KWeights, q8[b]);
+      }
+    });
   }
 #endif
 

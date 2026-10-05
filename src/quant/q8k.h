@@ -78,8 +78,65 @@ inline int nearest_int(float value) {
   return (bits & 0x007FFFFF) - 0x00400000;
 }
 
+/* One 256-weight block, quantized in place.
+ *
+ * This is the whole of the quantizer's arithmetic, and it is written once
+ * because two callers need it in two schedules.  `quantize_row_q8_k` below runs
+ * it over a serial loop; the kernel layer runs the same body over its thread
+ * pool, which is a change of *decoration* and not of arithmetic -- each block
+ * owns its output and reads only its own 256 floats, so the two schedules
+ * produce byte-identical results.  They have to: the quantized activation is an
+ * operand of the token-for-token llama.cpp match, and a schedule that picked
+ * different bytes would be a different model.
+ *
+ * The body is kept here rather than in the kernel layer deliberately.  Nothing
+ * in `quant/` may depend on the thread pool -- this directory is the leaf the
+ * loader and the reference backend both need, and a leaf that wanted
+ * `kernel/parallel.h` would drag the pool into an install that does not use
+ * it.  So the *block* lives here and the *loop over blocks* lives where the
+ * pool already is. */
+inline void quantize_q8_block(const float *row, Q8KBlock &block) {
+  float max = 0.0F;
+  float amax = 0.0F;
+  for (int j = 0; j < kQ8KWeights; ++j) {
+    const float magnitude = std::fabs(row[j]);
+    if (magnitude > amax) {
+      amax = magnitude;
+      max = row[j];
+    }
+  }
+  if (amax == 0.0F) {
+    block.d = 0.0F;
+    std::memset(block.qs, 0, sizeof(block.qs));
+    std::memset(block.bsums, 0, sizeof(block.bsums));
+    return;
+  }
+
+  const float iscale = -127.0F / max;
+  for (int j = 0; j < kQ8KWeights; ++j) {
+    /* The clamp is defensive: `|iscale * x[j]| <= 127` by construction, so the
+     * only way past it is a rounding at the top of the range. */
+    const int value = nearest_int(iscale * row[j]);
+    block.qs[j] = static_cast<int8_t>(value > 127 ? 127 : value);
+  }
+  for (int j = 0; j < kQ8KWeights / 16; ++j) {
+    int sum = 0;
+    for (int i = 0; i < 16; ++i) {
+      sum += block.qs[j * 16 + i];
+    }
+    block.bsums[j] = static_cast<int16_t>(sum);
+  }
+  block.d = 1.0F / iscale;
+}
+
 /* Quantize `k` floats -- a whole multiple of 256 -- into `out`, one
- * :c:type:`Q8KBlock` per 256.
+ * :c:type:`Q8KBlock` per 256, on the calling thread alone.
+ *
+ * The kernel layer does not use this form; it uses the parallel schedule in
+ * `kernel/kernels.cpp`, which is this loop's body on the pool.  This one is
+ * kept because it is the definition the parallel schedule is checked against,
+ * and because a caller with no pool to hand -- a tool, a test, a host that has
+ * one core to give -- should not have to start one to quantize a row.
  *
  * The scale is `-127 / max`, where `max` is the *signed* element of the largest
  * magnitude.  The negation is not a sign convention: it makes the largest-magnitude
@@ -93,40 +150,7 @@ inline int nearest_int(float value) {
 inline void quantize_row_q8_k(const float *x, Q8KBlock *out, int64_t k) {
   const int64_t n_blocks = k / kQ8KWeights;
   for (int64_t b = 0; b < n_blocks; ++b) {
-    const float *row = x + b * kQ8KWeights;
-    Q8KBlock &block = out[b];
-
-    float max = 0.0F;
-    float amax = 0.0F;
-    for (int j = 0; j < kQ8KWeights; ++j) {
-      const float magnitude = std::fabs(row[j]);
-      if (magnitude > amax) {
-        amax = magnitude;
-        max = row[j];
-      }
-    }
-    if (amax == 0.0F) {
-      block.d = 0.0F;
-      std::memset(block.qs, 0, sizeof(block.qs));
-      std::memset(block.bsums, 0, sizeof(block.bsums));
-      continue;
-    }
-
-    const float iscale = -127.0F / max;
-    for (int j = 0; j < kQ8KWeights; ++j) {
-      /* The clamp is defensive: `|iscale * x[j]| <= 127` by construction, so the
-       * only way past it is a rounding at the top of the range. */
-      const int value = nearest_int(iscale * row[j]);
-      block.qs[j] = static_cast<int8_t>(value > 127 ? 127 : value);
-    }
-    for (int j = 0; j < kQ8KWeights / 16; ++j) {
-      int sum = 0;
-      for (int i = 0; i < 16; ++i) {
-        sum += block.qs[j * 16 + i];
-      }
-      block.bsums[j] = static_cast<int16_t>(sum);
-    }
-    block.d = 1.0F / iscale;
+    quantize_q8_block(x + b * kQ8KWeights, out[b]);
   }
 }
 

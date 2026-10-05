@@ -329,6 +329,44 @@ PREFILL_SHAPES = [(256, 3072), (512, 1024), (512, 3072), (1024, 3072)]
 
 @pytest.mark.parametrize("m,k", PREFILL_SHAPES)
 @needs_tools
+def test_the_activation_quantizer_is_independent_of_the_thread_count(m: int, k: int) -> None:
+    """A prefill shape's `gemm_quant`, one thread against eight, byte for byte.
+
+    The quantizer used to run on the caller's thread before the parallel walk,
+    which made it the one part of a prefill GEMM that did not scale; it now runs
+    one block per task, alongside the walk.  The property that makes that
+    legitimate is that a block owns its output and reads only its own 256
+    floats, so splitting the loop over blocks cannot move a byte -- and the bytes
+    are load-bearing, because the quantized activation is an operand of the
+    token-for-token llama.cpp match.  A schedule that reassociated a block's
+    scale would be a different model, not a slower one.
+
+    The existing `test_gemm_quant_is_independent_of_the_thread_count` covers the
+    same rule at `m=3, k=768`, which is nine blocks and barely one task's worth.
+    These are the shapes where the quantizer is actually split: 1024 to 12288
+    blocks, eight tasks at eight threads, and the same comparison is what says
+    the split is invisible.
+
+    One thread is the serial reference: the pool hands a lone worker the whole
+    range, so its bytes are the pre-change quantizer's by construction.  The
+    comparison is exact on purpose.  It is not the guard for the quantizer's
+    *arithmetic* -- both runs execute the same `quantize_q8_block`, so a change
+    to its rounding moves both together and this passes.  The case below is what
+    holds the arithmetic, against the bound the conformance file uses.
+    """
+    rng = np.random.default_rng(20261005 + m)
+    x = rng.standard_normal((m, k), dtype=np.float32)
+    blocks = packed_row(rng, rows=16, cols=k, fmt="q4_k")
+    request = write_request("gemm_quant", {"x": x, "w_blocks": blocks}, {"type_id": 12})
+    single = run_op(request, threads=1)
+    eight = run_op(request, threads=8)
+    np.testing.assert_array_equal(single, eight)
+    # And the comparison is not between two constants.
+    assert float(np.max(np.abs(single))) > 0.0
+
+
+@pytest.mark.parametrize("m,k", PREFILL_SHAPES)
+@needs_tools
 def test_a_large_activation_row_keeps_the_integer_path(m: int, k: int) -> None:
     """A shape past the old stack cap still runs the int8 path, not the fallback.
 
