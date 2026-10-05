@@ -25,6 +25,29 @@
  * comparison is between two implementations of the same computation and not
  * between two prompt-formatting conventions.
  *
+ * ## Flash attention is pinned off, and that is not a default left unset
+ *
+ * `llama_context_default_params()` sets `flash_attn_type = AUTO`, and AUTO
+ * resolves to *enabled* wherever the backend has a kernel -- including on the
+ * CPU path this oracle pins itself to. That is not a cosmetic choice of kernel:
+ * flash attention computes the softmax over the attention span with a running
+ * maximum and a rescaled merge, which is a different reduction from the one
+ * shift a plain softmax uses, and the two disagree far enough to flip a
+ * near-tie. Measured on this checkpoint, llama.cpp with flash attention on and
+ * off produces greedy sequences that differ at the second token --
+ * `[..., 11, 323, ...]` against `[..., 13, 576, ...]` -- where the top-2 margin
+ * is 0.0925 against 0.0196 and the logits move by up to 1.16. It is
+ * near-invisible on f16 (0.0004 of the logit spread), which is why the f16
+ * tests never saw it.
+ *
+ * The engine's CPU attention kernel applies one shift per score row
+ * (`src/kernel/kernels.cpp`), so an oracle left on AUTO would be comparing a
+ * full-softmax answer against a flash one and reporting the difference as the
+ * engine's error. Pinning the convention here makes the oracle ask the question
+ * the CPU kernel answers; `--flash-attn on` is the other side of it, which the
+ * CUDA backend's block-reduced attention lands on and
+ * `test_quantized_forward.py` names per backend.
+ *
  * Output is `{"n_vocab": N, "tokens": [...], "logits": [f, ...]}` on stdout,
  * one line, so a Python caller can read it without a parser in C. The logits
  * are printed with `%.9g`, which round-trips a float exactly -- a shortened
@@ -42,7 +65,10 @@
 namespace {
 
 int usage(const char *argv0) {
-  std::fprintf(stderr, "usage: %s <model.gguf> <token> [<token> ...] [--steps N]\n", argv0);
+  std::fprintf(stderr,
+               "usage: %s <model.gguf> <token> [<token> ...] [--steps N] "
+               "[--flash-attn on|off|auto]\n",
+               argv0);
   return 2;
 }
 
@@ -71,9 +97,24 @@ int main(int argc, char **argv) {
   const char *model_path = argv[1];
   std::vector<llama_token> tokens;
   int steps = 0;
+  /* The full-softmax convention by default -- see the file header for what the
+   * two conventions disagree about and why the CPU path needs this one. */
+  llama_flash_attn_type flash_attn = LLAMA_FLASH_ATTN_TYPE_DISABLED;
   for (int i = 2; i < argc; ++i) {
     if (std::string(argv[i]) == "--steps" && i + 1 < argc) {
       steps = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
+    } else if (std::string(argv[i]) == "--flash-attn" && i + 1 < argc) {
+      const std::string mode = argv[++i];
+      if (mode == "on") {
+        flash_attn = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+      } else if (mode == "off") {
+        flash_attn = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+      } else if (mode == "auto") {
+        flash_attn = LLAMA_FLASH_ATTN_TYPE_AUTO;
+      } else {
+        std::fprintf(stderr, "--flash-attn takes on, off or auto, not '%s'\n", mode.c_str());
+        return 2;
+      }
     } else {
       tokens.push_back(static_cast<llama_token>(std::strtol(argv[i], nullptr, 10)));
     }
@@ -119,6 +160,7 @@ int main(int argc, char **argv) {
   cparams.n_threads_batch = 1;
   cparams.offload_kqv = false;
   cparams.no_perf = true;
+  cparams.flash_attn_type = flash_attn;
 
   llama_context *ctx = llama_init_from_model(model, cparams);
   if (ctx == nullptr) {

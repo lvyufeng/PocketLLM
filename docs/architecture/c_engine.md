@@ -163,14 +163,28 @@ perfectly. The authority that closes that hole is llama.cpp, which wrote the for
 the file, and it is reached end-to-end rather than per op in
 `tests/native/test_quantized_forward.py`.
 
-That file also records where llama.cpp is *not* an oracle. Its `q4_K` dot product does not decode the
-weight and multiply it by a float activation: it quantizes the activation to int8 (`block_q8_K`) and
-does an integer product. The extra step is an error of its own, and on a one-token prompt it is a
-large one — measured, llama.cpp's q4_k answer sits 3.53 (mean absolute) from its own f16 answer,
-while ours sits 3.77 away and lands closer to the f16 truth. So the two quantized results are compared
-on their argmax and their greedy sequence, not elementwise. Both sequences match exactly, and both
-differ from the f16 sequence from the second token on: quantizing to 4.5 bits per weight is lossy
-enough to change the continuation, which is the format working rather than a kernel failing.
+That file also records where llama.cpp is *not* an oracle, and the answer changed when the CPU kernel
+gained its integer path. Both engines now run the same `q4_K` arithmetic — llama.cpp's dot quantizes
+the activation to int8 (`block_q8_K`) and ours does too, since `src/quant/q8k.h` — so the GEMM is no
+longer the difference. Two others are, and they are named rather than absorbed into a tolerance:
+
+- **The attention reduction.** llama.cpp's `flash_attn_type` default is `AUTO`, which enables flash
+  attention on the CPU path, and a flash kernel's running maximum with a rescaled merge is different
+  arithmetic from one shift per score row. On this checkpoint the difference is not last-bit:
+  llama.cpp's own greedy sequence changes at the second token when flash attention is switched off,
+  its logits move by up to 1.16, and the top-2 margin deciding that token is 0.0925 against 0.0196.
+  On f16 the same switch moves 0.0004 of the logit spread, which is why the f16 tests never saw it.
+  `tests/native/llama_oracle.py` pins the mode by name for this reason, and
+  `tests/native/test_quantized_forward.py` records which mode each backend is compared against: the
+  CPU's attention lands on the full-softmax token, the card's on the flash one.
+- **The activation quantization's error.** It is absolute, so a logit near zero carries a large
+  relative error while staying a percent of the range — which is why the quantized comparison is a
+  bound on the error relative to the logit spread and not elementwise.
+
+So the two quantized results are compared on their argmax, their logits at that global bound, and
+their greedy sequence. Both sequences match their own convention exactly, and both differ from the
+f16 sequence from the second token on: quantizing to 4.5 bits per weight is lossy enough to change
+the continuation, which is the format working rather than a kernel failing.
 
 ### The CPU kernels use the whole machine
 
@@ -249,36 +263,64 @@ match, which is what catches a last-bit change that flips an `argmax`.
 `-ffast-math` is deliberately absent. It would add full reassociation and `-ffinite-math-only`, and
 the shifted softmax depends on neither being there.
 
+### The integer activation path
+
+The AVX2 path above still decodes a weight to float for every weight it reads. llama.cpp does not:
+its `q4_K` and `q6_K` dots quantize the *activation* to int8 once per 256-weight block
+(`block_q8_K`) and take the integer route through both operands — unpack the weight to 4 or 6
+unsigned bits, multiply against the signed activation byte with `_mm256_maddubs_epi16`, fold the
+block's scale in with `_mm256_madd_epi16`, and apply one float multiply per block. `src/quant/q8k.h`
+is that block and the quantizer for it, a term-for-term port of `quantize_row_q8_K_ref`, and
+`dot_row_q8k` in `kernels.cpp` is the integer dot: `bsums` is what lets a weight's per-group
+*minimum* be applied with one `madd` per block instead of a per-weight subtraction.
+
+The cost is a real precision change and it is stated rather than buried: an activation element picks
+up up to half a step of its block's scale, and the measured effect is 0.5–0.7% of the output's
+magnitude on the conformance shapes, against a `QUANTIZED_RTOL` of 0.05. It is also *the same*
+error llama.cpp carries, which is what makes the two engines' quantized logits comparable at a bound
+of a few percent of the logit range where they used to be comparable only in ordering.
+
+The exact path is not dead code: a build without AVX2 uses it, and `$POCKETLLM_CPU_EXACT_GEMM`
+selects it on one that has AVX2 — which is how the fast path's error is measurable on a real
+checkpoint rather than only asserted, and what the tests use to compare the two paths on identical
+input.
+
 ### What it measures
 
 Measured on the project's x86 host (2× Xeon E5-2696 v4, 88 hardware threads, two NUMA nodes), on
 `qwen3-0.6b-q4_k_m.gguf`, `pp32`/`tg32`, median of five. `llama-bench` on the same checkpoint and
-thread counts is the other column. The PocketLLM rows are pinned with `taskset` to the first N
-hardware threads of one socket, which is the placement the pool is designed for; the llama.cpp rows
-are `llama-bench`'s own default affinity at the same thread count.
+thread counts is the other column, at its own default affinity; the PocketLLM rows are the pool's
+default placement, with the one-socket pinned figures recorded below the table.
 
 | threads | PocketLLM pp32 | PocketLLM tg32 | llama.cpp pp32 | llama.cpp tg32 |
 |---:|---:|---:|---:|---:|
-| 1 | 8.62 | 6.07 | 66.89 | 20.47 |
-| 8 | 52.51 | 29.21 | 393.07 | 74.66 |
-| 22 | 131.95 | 48.73 | 721.71 | 80.19 |
-| 44 | 230.66 | 46.04 | — | — |
+| 1 | 29.60 | 16.62 | 68.69 | 20.25 |
+| 8 | 142.18 | 49.73 | 387.60 | 74.60 |
+| 22 | 290.05 | 55.70 | 720.28 | 79.63 |
+| 44 | 372.50 | 48.56 | 995.42 | 84.00 |
 
-**The same table measured before the spin barrier**, for the size of that one change: decode at 8
-threads went 15.48 → 29.21 and at 22 threads 18.22 → 48.73 tok/s (2.7×), while prefill barely moved
-(52.11 → 52.51 at 8), which is what the diagnosis predicts — prefill's kernel calls are long enough
-that a futex round trip is noise, and decode's are not.
+The PocketLLM rows here are taken with the pool spread over both sockets; pinned to one socket the
+same build measures 29.34 / 15.36 at one thread, 147.72 / 47.71 at eight and 279.30 / 55.45 at
+twenty-two, so the placement moves decode by under 2% — less than the run-to-run spread on this host,
+which is why the columns are quoted from the same run.
 
-**This still does not beat llama.cpp, and saying so is the point of the table.** Decode is now 46%
-of llama.cpp's at 8 threads and 61% at 22, up from 20% and 23% — the threading and barrier work is
-done, and what is left is per-core kernel efficiency at one thread (6.07 vs 20.47, a third), which no
-amount of parallelism can repair. The scaling curve is now healthy up to 22: a 24% gain from 8
-threads to 22 on the same socket (~29 → 49 tok/s). Note where it stops: T=44 reaches 44 cores but
-decode goes *down* (48.73 → 46.04) while prefill rises 75%, so the remaining decode gap is not
-limited by how many cores are thrown at it — it is the per-core kernel. The two levers that remain
-are a quantized-activation (integer) dot the way llama.cpp does it, and the NUMA placement of the
-weights (the loader's `memcpy` first-touches the model onto whichever node it runs on, measured at
-~66% node0). Neither is in this change.
+**The same table measured before the integer activation path**, for the size of that one change:
+at one thread 8.62 → 29.60 prefill and 6.07 → 16.62 decode (3.4× and 2.7×) — the single-thread
+column was always the diagnostic, and it is the column that closed most of the gap.
+Before the spin barrier, decode at 8 threads was 15.48 and at 22 threads 18.22 tok/s, while prefill
+barely moved — which is what that diagnosis predicts, since prefill's kernel calls are long enough
+that a futex round trip is noise and decode's are not.
+
+**This still does not beat llama.cpp, and saying so is the point of the table.** Decode is now 82%
+of llama.cpp's at one thread (16.62 vs 20.25), 67% at 8 and 70% at 22 — up from 30%, 39% and 61%.
+The single-thread ratio is the one that moved the most, because the integer path is a per-core
+efficiency fix and llama.cpp has nothing else on this host. What is left is not a kernel: at 22 and
+44 threads llama.cpp climbs (79.63 → 84.00) while ours falls (55.70 → 48.56), and its prefill
+scales to 995.42 where ours reaches 372.50, on the same cores and the same checkpoint. That shape —
+falling above one socket, on a model whose weights are a single 456 MB allocation — is the NUMA
+placement the loader does not yet control: `memcpy` first-touches the weights onto whichever node
+runs it, measured at ~66% node0, so most of the pool reads across the interconnect every token.
+Placement is the next lever, and it is not in this change.
 
 ## Building
 

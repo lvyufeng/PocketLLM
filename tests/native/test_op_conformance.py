@@ -870,9 +870,19 @@ def test_the_backends_agree_with_each_other(case: str) -> None:
     and the answer is only meaningful if the two already agree on the arithmetic
     they share.
 
-    The tolerance is tighter than the reference comparison because there is no
-    third party in between: two float32 evaluations of the same expression
-    differ by association order and nothing else.
+    For a dense case the tolerance is tighter than the reference comparison
+    because there is no third party in between: two float32 evaluations of the
+    same expression differ by association order and nothing else.  A packed
+    `gemm_quant` is not that, and pretending otherwise would be the dishonest
+    half of this file.  The CPU kernel quantizes its *activation* to int8 and
+    takes the integer route (`src/quant/q8k.h`); the card kernel decodes each
+    weight to float and multiplies the float activation.  Those are two
+    different computations that both decode the same blocks, and their
+    difference is the activation quantization's own error -- an absolute error
+    that is a percent of the output's scale, which is what
+    :data:`QUANTIZED_RTOL` bounds.  What this case can still catch is a card
+    kernel that mis-reads a nibble, and that moves a weight by a large fraction
+    of its range, far past the bound.
     """
     if "cuda" not in BACKENDS:
         pytest.skip(_cuda_reason or "cuda is not available")
@@ -889,10 +899,11 @@ def test_the_backends_agree_with_each_other(case: str) -> None:
         return
     host = np.array(host_result["values"], dtype=np.float64).reshape(wanted.shape)
     card = np.array(card_result["values"], dtype=np.float64).reshape(wanted.shape)
-    spread = float(np.max(np.abs(host))) or 1.0
+    scale = float(np.max(np.abs(host))) or 1.0
     worst = float(np.max(np.abs(host - card)))
-    assert worst <= BACKEND_RTOL * spread, (
-        f"{case}: max |cpu - cuda| = {worst} over a scale of {spread}"
+    bound = QUANTIZED_RTOL if case in QUANTIZED_CASES else BACKEND_RTOL
+    assert worst <= bound * scale, (
+        f"{case}: max |cpu - cuda| = {worst} over a scale of {scale}"
     )
 
 
