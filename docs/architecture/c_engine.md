@@ -297,6 +297,28 @@ selects it on one that has AVX2 — which is how the fast path's error is measur
 checkpoint rather than only asserted, and what the tests use to compare the two paths on identical
 input.
 
+### The activation quantizer runs on the pool too
+
+Quantizing the activation is the integer path's entry fee, and it used to be paid on one core: the
+loop ran on the caller's thread before the parallel walk, so it was the one part of a prefill GEMM
+that did not scale. At `m=512, k=1024` that is 2048 independent 256-weight blocks, measured at
+**1087 us against a 4244 us call** — a fifth of the GEMM on one core while twenty-one sat at the
+barrier. It is now a `parallel_for` over blocks and measures **55.6 us**, 19.5× on the term.
+
+The block is the unit and it stays whole. `quantize_q8_block` is one block's arithmetic — the max
+scan, the `-127 / max` scale, the rounding, the `bsums` — and the kernel layer's loop runs it per
+block, so the schedule cannot reach inside one. That is what makes the change legitimate rather than
+merely faster: each block owns its `d`, `qs` and `bsums` and reads only its own 256 floats, so the
+bytes are the serial loop's bytes, and they have to be. The quantized activation is an operand of the
+token-for-token llama.cpp match; a schedule that reassociated a block's scale would be a different
+model, not a slower one.
+
+The split is: the *block* lives in `src/quant/q8k.h` and the *loop over blocks* lives in
+`kernel/kernels.cpp`. `quant/` is the leaf the loader and the reference backend both need, and a leaf
+that included `kernel/parallel.h` would drag the thread pool into an install that does not use it.
+The serial `quantize_row_q8_k` is still there for callers with no pool to hand — it is the definition
+the parallel schedule is checked against.
+
 ### The attention score dot, four lanes wide and bit-exact
 
 Decode's cost is not the GEMM once the context is long. At a 512-token context one decode step runs
@@ -443,6 +465,42 @@ of history ours was 0.56 of llama.cpp's (43.44 vs 77.44), against 0.92 at 64 tok
 pass grows linearly in the span while its weight grows against a fixed GEMM budget, and the per-unit
 dot was the scalar one — the four-lane dot above is what that sentence was pointing at, and it moves
 the long-context row to 0.91 at 512 tokens of history (`tg512`: 78.53 against 86.35).
+
+**The activation quantizer on the pool, interleaved A/B against the pre-change engine**,
+`pp512`, `qwen3-0.6b-q4_k_m.gguf`, median of three, both engines and `llama-bench` round-robin in one
+run so machine drift lands on every column. Up to 22 threads both are pinned to NUMA node 0; 44 and
+88 run on the default affinity because that is the only way to reach those counts.
+
+| threads | before | after | llama.cpp | after/before | after/llama |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 24.98 | 24.68 | 65.74 | 0.99 | 0.38 |
+| 8 | 124.50 | 131.55 | 385.36 | 1.06 | 0.34 |
+| 22 | 273.28 | 315.75 | 793.29 | 1.16 | 0.40 |
+| 44 | 401.37 | 536.15 | 1221.34 | 1.34 | 0.44 |
+| 88 | 412.00 | 530.50 | 1018.79 | 1.29 | 0.52 |
+
+The one-thread column is flat to 1%, and that is the tell: at one thread the pool hands a lone worker
+the whole block range, so the parallel schedule *is* the serial loop and there is nothing for the
+change to move. Everything above it is the fifth of a `gemm_quant` call that used to run on one core
+while the rest of the pool spun at the barrier, and the gain grows with the thread count because that
+is exactly what it was not doing.
+
+Decode is unmoved within noise (`tg64` at 22 threads: 96.4 before, 98.1 after, ±4 run to run): a
+decode GEMM is 4–16 blocks, below the point where a split pays for a barrier, and the pool runs it
+serially on the caller either way.
+
+**Prefill is still 0.40 of llama.cpp's at its best thread count, and that is the remaining gap.**
+The quantizer was a fifth of the *GEMM's* serial work, not a fifth of the whole prefill: `gemm_quant`
+is 70% of the op sum and the op sum is 85% of the wall, so a 1.16× on the GEMM carries to ~1.16 on
+the total, which is the measured figure. The op-level profile says the same thing more precisely —
+`gemm_quant` at `pp512`, 22 threads, 197 calls: **6.98 ms per call before, 5.14 ms after**, on a
+prefill that is 1.92 s before and 1.54 s after — and it also says the change did not touch a byte of
+attention (518.4 ms → 509.1 ms, drift) or the small ops.
+
+What is left is the row dot itself: our `dot_row_q8k` is a one-output-per-block-walk kernel at
+31.9 GFLOP/s per core, against llama.cpp's repacked 8×8 GEMM at 42.2 on the same shape, and prefill's
+weight traffic is the part of the problem that only a several-rows-at-a-time kernel can turn into
+reuse.
 
 ## Building
 
