@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -16,6 +18,7 @@
 
 #include "kernel/parallel.h"
 #include "quant/blocks.h"
+#include "quant/q8k.h"
 #include "runtime/status.h"
 
 namespace pocketllm {
@@ -275,6 +278,281 @@ float dot_row_avx2(int type_id, const float *row, const uint8_t *blocks, int64_t
          ((lanes[2] + lanes[6]) + (lanes[3] + lanes[7]));
 }
 
+/* The exact-float row dot, when it must be reachable from the same build the
+ * integer one is in -- see `gemm_quant` for what selects each. */
+#if !POCKETLLM_HAVE_AVX2
+#define POCKETLLM_Q8K_HAVE_INT 0
+#else
+#define POCKETLLM_Q8K_HAVE_INT 1
+#endif
+
+#if POCKETLLM_Q8K_HAVE_INT
+
+/* The broadcast tables the integer dot needs, one byte-selector per scale.  A
+ * `_mm256_shuffle_epi8` with these replicates one byte of a packed (scale, min)
+ * word across the lanes its 16 or 32 weights occupy, which is what lets the
+ * per-group scale be applied with an exact integer `madd` instead of a float
+ * multiply per weight.  Both are llama.cpp's tables, byte for byte -- an entry
+ * off by one here applies the *neighbouring* group's scale, which is a small,
+ * plausible, wrong answer rather than a crash. */
+inline __m256i get_scale_shuffle_k4(int i) {
+  static const uint8_t kShuffle[256] = {
+      0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,
+      0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,
+      2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,
+      2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,
+      4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,
+      4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,
+      6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,
+      6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,
+      8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,
+      8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,
+      10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11,
+      10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11,
+      12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13,
+      12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13,
+      14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15,
+      14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15};
+  return _mm256_loadu_si256(reinterpret_cast<const __m256i *>(kShuffle) + i);
+}
+
+/* The sixteen-scale variant: one 16-byte entry per 32-weight run, for q6_k's
+ * per-16-weight scales.  Same table as llama.cpp's `get_scale_shuffle`. */
+inline __m128i get_scale_shuffle_k6(int i) {
+  static const uint8_t kShuffle[128] = {
+      0,  0,  0,  0,  0,  0,  0,  0,  1,  1,  1,  1,  1,  1,  1,  1,
+      2,  2,  2,  2,  2,  2,  2,  2,  3,  3,  3,  3,  3,  3,  3,  3,
+      4,  4,  4,  4,  4,  4,  4,  4,  5,  5,  5,  5,  5,  5,  5,  5,
+      6,  6,  6,  6,  6,  6,  6,  6,  7,  7,  7,  7,  7,  7,  7,  7,
+      8,  8,  8,  8,  8,  8,  8,  8,  9,  9,  9,  9,  9,  9,  9,  9,
+      10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+      12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13,
+      14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15};
+  return _mm_loadu_si128(reinterpret_cast<const __m128i *>(kShuffle) + i);
+}
+
+/* Interpret a byte of Q4_K's six-bit (scale, min) pairs as llama.cpp's kernel
+ * does before it can be shuffled: the eight pairs arrive as twelve packed
+ * bytes, and the unpack rewrites them into four 32-bit words holding the eight
+ * scales and eight minima as bytes.  That layout is what the `madd` against
+ * `bsums` and the shuffle tables index, so a decoder that produced the same
+ * numbers in a different arrangement would be correct and still wrong here. */
+inline void unpack_scale_min_k4(const uint8_t *scales, uint32_t *out) {
+  constexpr uint32_t kMask6 = 0x3f3f3f3f;
+  constexpr uint32_t kMask4 = 0x0f0f0f0f;
+  constexpr uint32_t kMask2 = 0x03030303;
+  std::memcpy(out, scales, 12);
+  out[3] = ((out[2] >> 4) & kMask4) | (((out[1] >> 6) & kMask2) << 4);
+  const uint32_t aux = out[1] & kMask6;
+  out[1] = (out[2] & kMask4) | (((out[0] >> 6) & kMask2) << 4);
+  out[2] = aux;
+  out[0] &= kMask6;
+}
+
+/* ``sum_k row[k] * dequant(row_blocks, k)`` with the activation in int8, and
+ * the activation blocks already quantized by the caller.
+ *
+ * This is llama.cpp's `ggml_vec_dot_q4_K_q8_K`/`_q6_K_q8_K`, ported onto this
+ * tree's block metadata.  The shape of the computation is what makes it fast:
+ *
+ *   - The activation is already quantized (one `Q8KBlock` per 256 weights, and
+ *     the caller quantized the whole row once), so nothing on the right-hand
+ *     side of the dot costs a decode per weight.
+ *   - The weight, unpacked to 4 or 6 unsigned bits, is multiplied against the
+ *     *signed* activation byte by `_mm256_maddubs_epi16`, which is a single
+ *     instruction for 32 exact 8x8 -> 16-bit products.  `_mm256_madd_epi16`
+ *     then folds the group scale in (also exact) and pairs the products into
+ *     int32.  Every product inside the dot is an exact integer; the only float
+ *     arithmetic is one multiply per block for the weight's `d` and its
+ *     activation's `d`.
+ *   - The Q4_K group *minimum* is `-(dmin * min) * sum(q8)`, and `sum(q8)` over
+ *     the group is exactly what `bsums` holds.  So the whole minimum correction
+ *     is one `madd` per block over the sixteen bsums rather than a per-weight
+ *     subtraction; that is the reason the activation block carries `bsums` at
+ *     all.
+ *   - Q6_K is offset by 32 per weight, so the same correction is applied once
+ *     per block: `sum_i w_i` over a 256-weight block is `d * sum(scale_group *
+ *     sum(q8)_group)`, and the subtraction is `<< 5` of that, because 32 is a
+ *     power of two.
+ *
+ * `acc_m` (the q4_k minimum term) accumulates in float and is folded in at the
+ * end; `acc` accumulates the block scales.  Both are per-*row* accumulators --
+ * one horizontal reduce for the whole row, as the float path does.
+ *
+ * The integer products are exact, so the result is bit-identical to llama.cpp's
+ * AVX2 path modulo the one float multiply per block plus the horizontal sums --
+ * and since both engines quantize the activation and the weights identically,
+ * the two agree far more closely than the float path agreed with either. */
+float dot_row_q8k(int type_id, const uint8_t *q8_blocks, const uint8_t *blocks, int64_t k) {
+  const int block_bytes = quant::block_bytes_of(type_id);
+  const int64_t n_blocks = k / quant::kBlockWeights;
+  const quant::Q8KBlock *q8 = reinterpret_cast<const quant::Q8KBlock *>(q8_blocks);
+
+  const __m256i m4 = _mm256_set1_epi8(0x0F);
+  const __m256i m3 = _mm256_set1_epi8(0x03);
+  __m256 acc = _mm256_setzero_ps();
+  __m128 acc_m = _mm_setzero_ps();
+
+  if (type_id == quant::kGgmlQ4K) {
+    for (int64_t b = 0; b < n_blocks; ++b) {
+      const uint8_t *block = blocks + b * block_bytes;
+      const quant::Q8KBlock &y = q8[b];
+      const float d = y.d * quant::as_half(block, 0);
+      const float dmin = -y.d * quant::as_half(block, 2);
+
+      /* The eight (scale, min) pairs are six bits each packed into twelve
+       * bytes; this is `get_scale_min_k4` written as the word-at-a-time
+       * unpacking llama.cpp uses, so the result lands in one 256-bit register
+       * that the shuffle tables below can index per 32-weight group.  The
+       * splat into both 128-bit halves is what the scale shuffle reads. */
+      uint32_t utmp[4];
+      unpack_scale_min_k4(block + 4, utmp);
+
+      const __m256i mins_and_scales = _mm256_cvtepu8_epi16(
+          _mm_set_epi32(static_cast<int>(utmp[3]), static_cast<int>(utmp[2]),
+                        static_cast<int>(utmp[1]), static_cast<int>(utmp[0])));
+
+      /* The minimum term: `dmin * sum_g min_g * sum(q8 over g)`.  The bsums
+       * pair up into eight groups of two so that one `madd` covers all eight
+       * groups at once. */
+      const __m256i q8sums = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(y.bsums));
+      const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0),
+                                         _mm256_extracti128_si256(q8sums, 1));
+      const __m128i prod =
+          _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+      acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
+
+      const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+      const __m256i scales = _mm256_inserti128_si256(_mm256_castsi128_si256(sc128), sc128, 1);
+
+      const uint8_t *q4 = block + 16;
+      const int8_t *q8s_ptr = y.qs;
+      __m256i sumi = _mm256_setzero_si256();
+      for (int j = 0; j < 4; ++j) {
+        /* Each 32-byte packed run carries two 32-weight groups: the low nibbles
+         * are group `2j` and the high nibbles group `2j + 1`, each with its own
+         * scale.  `get_scale_shuffle_k4` broadcasts the right six-bit scale
+         * across the sixteen positions its group's products occupy. */
+        const __m256i scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j));
+        const __m256i scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j + 1));
+
+        const __m256i q4bits = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q4));
+        q4 += 32;
+        const __m256i q4l = _mm256_and_si256(q4bits, m4);
+        const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
+
+        const __m256i q8l = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q8s_ptr));
+        q8s_ptr += 32;
+        __m256i p16l = _mm256_maddubs_epi16(q4l, q8l);
+        p16l = _mm256_madd_epi16(scale_l, p16l);
+
+        const __m256i q8h = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q8s_ptr));
+        q8s_ptr += 32;
+        __m256i p16h = _mm256_maddubs_epi16(q4h, q8h);
+        p16h = _mm256_madd_epi16(scale_h, p16h);
+
+        sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16l, p16h));
+      }
+      acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+    }
+  } else {
+    for (int64_t b = 0; b < n_blocks; ++b) {
+      const uint8_t *block = blocks + b * block_bytes;
+      const quant::Q8KBlock &y = q8[b];
+      const float d = y.d * quant::as_half(block, 208);
+
+      /* The (q - 32) offset, applied once per block rather than per weight.
+       * `scales_16` widens the sixteen signed byte scales; `madd` pairs each
+       * with the two 16-element bsum groups it multiplies, and the `<< 5`
+       * multiplies the whole thing by 32. */
+      const __m256i q8sums = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(y.bsums));
+      const __m128i scales = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block + 192));
+      const __m256i scales_16 = _mm256_cvtepi8_epi16(scales);
+      const __m256i q8sclsub = _mm256_slli_epi32(_mm256_madd_epi16(q8sums, scales_16), 5);
+
+      const uint8_t *ql = block;
+      const uint8_t *qh = block + 128;
+      const int8_t *q8s_ptr = y.qs;
+      __m256i sumi = _mm256_setzero_si256();
+      for (int j = 0; j < 2; ++j) {
+        /* 128 weights per iteration: both 64-byte `ql` spans and the whole
+         * 32-byte `qh` span of this half, assembled into four 32-byte runs of
+         * six-bit weights.  `qh` holds two bits per weight at four different
+         * bit offsets, one per run -- the shifts below are those offsets. */
+        const __m256i q4bits1 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(ql));
+        const __m256i q4bits2 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(ql + 32));
+        const __m256i q4bitsH = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(qh));
+
+        const __m256i q4h_0 = _mm256_slli_epi16(_mm256_and_si256(q4bitsH, m3), 4);
+        const __m256i q4h_1 = _mm256_slli_epi16(_mm256_and_si256(q4bitsH, _mm256_set1_epi8(12)), 2);
+        const __m256i q4h_2 = _mm256_and_si256(q4bitsH, _mm256_set1_epi8(48));
+        const __m256i q4h_3 = _mm256_srli_epi16(_mm256_and_si256(q4bitsH, _mm256_set1_epi8(-64)), 2);
+
+        const __m256i q4_0 = _mm256_or_si256(_mm256_and_si256(q4bits1, m4), q4h_0);
+        const __m256i q4_1 = _mm256_or_si256(_mm256_and_si256(q4bits2, m4), q4h_1);
+        const __m256i q4_2 = _mm256_or_si256(
+            _mm256_and_si256(_mm256_srli_epi16(q4bits1, 4), m4), q4h_2);
+        const __m256i q4_3 = _mm256_or_si256(
+            _mm256_and_si256(_mm256_srli_epi16(q4bits2, 4), m4), q4h_3);
+
+        const __m256i q8_0 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q8s_ptr));
+        const __m256i q8_1 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q8s_ptr + 32));
+        const __m256i q8_2 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q8s_ptr + 64));
+        const __m256i q8_3 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q8s_ptr + 96));
+        q8s_ptr += 128;
+
+        __m256i p16_0 = _mm256_maddubs_epi16(q4_0, q8_0);
+        __m256i p16_1 = _mm256_maddubs_epi16(q4_1, q8_1);
+        __m256i p16_2 = _mm256_maddubs_epi16(q4_2, q8_2);
+        __m256i p16_3 = _mm256_maddubs_epi16(q4_3, q8_3);
+
+        /* The sixteen scales of the block are one per 16 weights in position
+         * order, so run `is` reads scale `is` -- the shuffle broadcasts it. */
+        const int is = 4 * j;
+        p16_0 = _mm256_madd_epi16(
+            _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle_k6(is + 0))), p16_0);
+        p16_1 = _mm256_madd_epi16(
+            _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle_k6(is + 1))), p16_1);
+        p16_2 = _mm256_madd_epi16(
+            _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle_k6(is + 2))), p16_2);
+        p16_3 = _mm256_madd_epi16(
+            _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle_k6(is + 3))), p16_3);
+
+        sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16_0, p16_1));
+        sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16_2, p16_3));
+
+        ql += 64;
+        qh += 32;
+      }
+      sumi = _mm256_sub_epi32(sumi, q8sclsub);
+      acc = _mm256_fmadd_ps(_mm256_broadcast_ss(&d), _mm256_cvtepi32_ps(sumi), acc);
+    }
+  }
+
+  /* The minimum term lives in four int32 lanes of `acc_m`; fold them into one
+   * and add it to the horizontal sum of `acc`. */
+  acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+  acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+
+  alignas(32) float lanes[8];
+  _mm256_store_ps(lanes, acc);
+  const float total = ((lanes[0] + lanes[4]) + (lanes[1] + lanes[5])) +
+                      ((lanes[2] + lanes[6]) + (lanes[3] + lanes[7]));
+  return total + _mm_cvtss_f32(acc_m);
+}
+
+/* Is the integer path selected at all?  A build without AVX2 cannot run it, and
+ * `$POCKETLLM_CPU_EXACT_GEMM` turns it off on one that can, so the exact and
+ * quantized paths can be compared on the same input.  Read once, on first use:
+ * the answer cannot change under a running process and the per-call `getenv`
+ * would be a lock on the token path. */
+inline bool exact_gemm_forced() {
+  const char *from_env = std::getenv("POCKETLLM_CPU_EXACT_GEMM");
+  return from_env != nullptr && from_env[0] != '\0' && from_env[0] != '0';
+}
+
+#endif /* POCKETLLM_Q8K_HAVE_INT */
+
 #endif /* POCKETLLM_HAVE_AVX2 */
 
 /* One row of `type_id` weights dotted against `row`.  The caller has checked
@@ -427,6 +705,27 @@ void gemm_quant(const float *x, const uint8_t *blocks, const float *bias, float 
    * with the type id, and the disagreement would read a row from the middle of
    * its neighbour. */
   const int64_t row_bytes = (k / per_block) * block_bytes;
+  const int64_t row_blocks = k / per_block;
+
+#if POCKETLLM_Q8K_HAVE_INT
+  /* Quantize every row of the activation once, before the parallel walk: the
+   * result is read by every one of the `n` outputs on that row, so doing it
+   * inside the loop would repeat it per output column, which is the whole cost
+   * the integer path exists to avoid.
+   *
+   * The buffer is on this function's frame because the graph's shapes are
+   * small -- the widest call is `m=32, k=3072`, 384 blocks -- and this is not
+   * on a recursion path.  A shape that does not fit takes the exact path
+   * instead: correct, only slower, and the check is here rather than an
+   * assumption because `gemm_quant` is reachable from the ABI with shapes this
+   * graph does not produce. */
+  constexpr int64_t kMaxStackBlocks = 1024; /* 299 KiB of activation blocks */
+  const bool quantize_activations = !exact_gemm_forced() && m * row_blocks <= kMaxStackBlocks;
+  alignas(64) quant::Q8KBlock q8[kMaxStackBlocks];
+  if (quantize_activations) {
+    quant::quantize_row_q8_k(x, q8, m * k);
+  }
+#endif
 
   /* The parallel axis is `j`, because at decode `m` is 1 and `j` is the only
    * axis wide enough to fill the machine -- and the only one that is safe: the
@@ -443,13 +742,22 @@ void gemm_quant(const float *x, const uint8_t *blocks, const float *bias, float 
       const int64_t r = index / n;
       const int64_t j = index - r * n;
       const float *row = x + r * k;
-      const uint8_t *row_blocks = blocks + j * row_bytes;
+      const uint8_t *row_blocks_ptr = blocks + j * row_bytes;
       /* The whole row's dot in one call: the AVX2 path folds all `k / 256`
        * blocks into one set of accumulators and reduces once, rather than
        * reducing per block.  The decode stays hoisted per block, so the two
        * halves of the saving -- cheaper decode and fewer horizontal sums -- are
        * both here. */
-      float total = dot_row(type_id, row, row_blocks, k);
+#if POCKETLLM_Q8K_HAVE_INT
+      float total =
+          quantize_activations
+              ? dot_row_q8k(type_id,
+                            reinterpret_cast<const uint8_t *>(q8 + r * row_blocks),
+                            row_blocks_ptr, k)
+              : dot_row(type_id, row, row_blocks_ptr, k);
+#else
+      float total = dot_row(type_id, row, row_blocks_ptr, k);
+#endif
       if (bias != nullptr) {
         total += bias[j];
       }

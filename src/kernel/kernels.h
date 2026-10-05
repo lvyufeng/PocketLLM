@@ -63,11 +63,29 @@ void gemm(const float *x, const float *w, const float *bias, float *out, int64_t
  * block width; a shape that is not is refused by the caller rather than padded
  * here, because a silent tail would be a weight read from the wrong place.
  *
- * The decode is per *weight* and the value is consumed by the dot product
- * immediately, so no row is ever materialized: the reference backend reaches
- * the same answer by decoding the whole matrix with numpy first, and this does
- * it without the f32 copy. The tolerance they are compared at is
- * :data:`QUANTIZED_RTOL` on the test side. */
+ * ## Two ways to compute it, and the argument for the fast one
+ *
+ * The default path quantizes the *activations* to int8 once per row (see
+ * `quant/q8k.h`) and takes the integer route through both operands: unpack the
+ * weight to 4 or 6 unsigned bits, multiply against the signed activation byte
+ * with `_mm256_maddubs_epi16`, fold the block scale in with `_mm256_madd_epi16`,
+ * and apply one float multiply per 256 weights. Every product inside the dot is
+ * then exact 8-bit integer arithmetic, and the per-weight decode and float
+ * multiply of the exact path are gone. That is the algorithm llama.cpp runs,
+ * and it is the reason its one-thread decode was three times ours.
+ *
+ * Its cost is a real precision change and not a last-bit one: an activation
+ * element picks up up to half a step of its block's scale, measured at 0.5-0.6%
+ * of the output's magnitude on the conformance shapes -- an order inside the
+ * `QUANTIZED_RTOL` of 0.05 the tests hold it to, and *the same* error
+ * llama.cpp's logits carry, which is what makes the two engines comparable
+ * elementwise where `test_quantized_forward.py` records they were not.
+ *
+ * The exact path is not dead code. A build without AVX2 uses it, and
+ * `$POCKETLLM_CPU_EXACT_GEMM` selects it on a build with one -- which is how
+ * the fast path's error is measurable on a real checkpoint rather than only
+ * asserted, and what `tests/native/test_cpu_parallel.py` turns on to compare
+ * the two paths on identical input. */
 void gemm_quant(const float *x, const uint8_t *blocks, const float *bias, float *out, int64_t m,
                 int64_t n, int64_t k, int type_id, bool accumulate = false);
 

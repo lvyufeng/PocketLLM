@@ -14,7 +14,9 @@ pocket. One process owns one device. If the checkpoint does not fit, it is quant
 > `src/` (`libpocketllm.so`) reads a GGUF, tokenizes with the checkpoint's own BPE, walks the Qwen3
 > graph and decodes greedily — on `f32`/`f16` weights, and on packed `q4_k`/`q6_k` that are decoded
 > inside the kernel and never widened. Checked token-for-token against llama.cpp on `cpu` and on a
-> `cuda` card, for both a 1.4 GB f16 checkpoint and the 456 MB `q4_k_m` one quantized from it.
+> `cuda` card, for both a 1.4 GB f16 checkpoint and the 456 MB `q4_k_m` one quantized from it — each
+> backend against the attention convention it implements, since llama.cpp's default flash-attention
+> mode and its full-softmax mode are different arithmetic and pick different tokens at a near-tie.
 > The Python package is the *host side* — the kernel ABI as spec, the numpy oracle, the
 > GGUF loader, the quantization decoders, the execution layer and the OpenAI-compatible HTTP surface
 > — and **no Python backend implements a kernel**: every backend except `reference` is a declaration
@@ -54,7 +56,7 @@ this page is the design those pieces are being built toward.
 | `pocketllm.tokenizer` — GGUF-vocabulary BPE | **Skeleton.** Whitespace works; BPE raises |
 | `pocketllm.protocol` / `pocketllm.server` — OpenAI-compatible HTTP | **Done.** Driven over the C core by `server/native_backend.py`; one request at a time, no batch, no cancellation |
 | `pocketllm.cli` | **Done** for all six commands — `devices`, `backends`, `architectures`, `ops`, `run`, `serve` |
-| `src/` — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B in f16 and in `q4_k_m`.** GGUF read, BPE tokenize, forward, greedy decode, and temperature/top-k/top-p/min-p sampling; `q4_k`/`q6_k` decoded in the kernel; greedy checked token-for-token against llama.cpp on `cpu` and `cuda`; the sampler checked token-for-token against the numpy reference. The CPU `gemm_quant` is threaded and AVX2-vectorized, and `build/pocketllm-bench` measures it — see [the C engine page](https://lvyufeng.github.io/PocketLLM/architecture/c_engine/) for the numbers and the comparison |
+| `src/` — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B in f16 and in `q4_k_m`.** GGUF read, BPE tokenize, forward, greedy decode, and temperature/top-k/top-p/min-p sampling; `q4_k`/`q6_k` decoded in the kernel; greedy checked token-for-token against llama.cpp on `cpu` and `cuda` (each backend against the attention convention it implements — see the [the C engine page](https://lvyufeng.github.io/PocketLLM/architecture/c_engine/#the-packed-weights)); the sampler checked token-for-token against the numpy reference. The CPU `gemm_quant` is threaded, AVX2-vectorized, and quantizes its activations to int8 the way llama.cpp does, and `build/pocketllm-bench` measures it — see [the C engine page](https://lvyufeng.github.io/PocketLLM/architecture/c_engine/) for the numbers and the comparison |
 
 There is no `main`-branch history before the seed commit: this tree was rebuilt on an orphan branch
 and the previous one is preserved as `legacy`. See [Where the code lives now](#where-the-code-lives-now).
