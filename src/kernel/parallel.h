@@ -157,6 +157,12 @@ namespace detail {
  * caller uses to size per-task scratch; the two must agree or a buffer is sized
  * for a partition that does not happen.  It takes the thread count as an
  * argument so it is callable before the pool exists. */
+/* Which chunk this thread runs.  Zero everywhere by default, which is the
+ * caller's slot; a background worker writes its own index once, in
+ * `worker_main`, and never again.  `thread_local` is what lets `run_ranges`
+ * hand out a chunk by index without an atomic claim -- see `run_worker_job`. */
+inline thread_local int64_t t_chunk_index = 0;
+
 inline int64_t partition_size(int64_t total, int64_t min_per_task, int64_t threads) {
   if (total <= 0 || threads <= 0) {
     return 0;
@@ -179,7 +185,7 @@ inline int64_t partition_size(int64_t total, int64_t min_per_task, int64_t threa
  * blocks at a barrier until every worker has *left* the job -- not merely until
  * every chunk has run.  A worker between its last chunk and its next claim is
  * still reading the job, so the caller cannot return while one is in that
- * window or the next job's `next_chunk_` reset would race it.
+ * window or the next job's publication would race it.
  *
  * ## Sleeping is what it used to do, and it was the whole cost
  *
@@ -220,7 +226,7 @@ inline int64_t partition_size(int64_t total, int64_t min_per_task, int64_t threa
  *
  * A fallback to the sleeping path on a long spin is deliberately *not* here.
  * The spin is bounded by the work remaining: the caller reaches the barrier
- * only after running `work()` itself, so the longest a worker can still be busy
+ * only after running its own chunk, so the longest a worker can still be busy
  * is one chunk, which is a fixed fraction of a job.  There is no unbounded wait
  * for a fallback to protect against -- if a worker is descheduled mid-chunk the
  * caller waits for it either way, and the version that sleeps would too.
@@ -287,7 +293,6 @@ class ThreadPool {
       fn(lo, hi, chunk);
     };
     chunks_ = chunks;
-    next_chunk_.store(0, std::memory_order_relaxed);
     /* Not every worker necessarily takes a chunk on every job -- one can be
      * descheduled across the whole call -- so the barrier counts arrivals at
      * the *end* of the job rather than chunks claimed.  Every worker that is
@@ -300,9 +305,10 @@ class ThreadPool {
      * second lock on the reader side. */
     ++generation_;
 
-    /* This thread is a worker too -- one core would otherwise sit idle for the
-     * whole call, which is a fifth of the budget on a four-core phone. */
-    work();
+    /* This thread takes chunk zero -- see `run_worker_job` for why the chunks
+     * are handed out by index rather than claimed, and why the caller runs one
+     * rather than draining the queue. */
+    job_(0);
 
     /* The barrier spins rather than sleeping -- see the class comment for the
      * measurement that decided this.  A worker publishes its arrival with
@@ -319,6 +325,7 @@ class ThreadPool {
     workers_.reserve(static_cast<std::size_t>(wanted));
     /* ``wanted - 1`` background threads: the calling thread is the last
      * executor, so a pool of N uses N cores rather than N+1. */
+    next_worker_index_.store(0, std::memory_order_relaxed);
     for (int64_t i = 1; i < wanted; ++i) {
       workers_.emplace_back([this] { worker_main(); });
     }
@@ -337,21 +344,24 @@ class ThreadPool {
   ThreadPool(const ThreadPool &) = delete;
   ThreadPool &operator=(const ThreadPool &) = delete;
 
-  /* Claim and run chunks until none are left.  Calling `fetch_add` past the
-   * last chunk is how a worker learns there is nothing more to do; because the
-   * claim is atomic, no chunk is run twice and none is skipped even if a worker
-   * wakes late.  When the chunks run out the worker still has to reach the job
-   * barrier, or the caller's frame would be torn down while it was reading the
-   * claim counter. */
-  void work() {
-    for (;;) {
-      const int64_t chunk = next_chunk_.fetch_add(1, std::memory_order_relaxed);
-      if (chunk >= chunks_) {
-        return;
-      }
-      job_(chunk);
-    }
-  }
+  /* Run this thread's chunk.  Which one is `chunk_index()`, and the point of the
+   * index is that there is nothing to claim.
+   *
+   * The first version handed chunks out through an atomic `fetch_add` -- the
+   * textbook work-stealing queue -- and it was paying for a property the pool
+   * cannot use.  `partition_size` floors the chunk count at the thread count and
+   * caps it there, so a job hands out *at most one chunk per thread*: the claim
+   * loop could never run twice for any worker, and stealing was impossible.  All
+   * the atomic did was put every worker on one cache line at the start of every
+   * job -- measured as the pool's cost on decode, where the ops are small enough
+   * for that to dominate: at 44 threads against 22, `rms_norm` went 0.57x,
+   * `rope` 0.37x and `silu_mul` 0.34x, all *slower* with twice the cores.
+   *
+   * The index is `thread_local`, written once when the worker starts, so a job's
+   * per-worker cost is the barrier and nothing else.  The mapping is the same
+   * partition `partition_size` describes: chunk *i* is
+   * `[total*i/chunks, total*(i+1)/chunks)`.  The caller's thread is chunk zero
+   * by never having set the variable. */
 
   /* A background worker's turn: take whatever chunks are left, then tell the
    * barrier it is out of the job.  The arrival is published *after* the last
@@ -361,11 +371,15 @@ class ThreadPool {
    * next job is usually tens of microseconds away, and sleeping and waking costs
    * more than the wait. */
   void run_worker_job() {
-    work();
+    const int64_t chunk = t_chunk_index;
+    if (chunk < chunks_) {
+      job_(chunk);
+    }
     arrived_in_job_.fetch_add(1, std::memory_order_release);
   }
 
   void worker_main() {
+    t_chunk_index = next_worker_index_.fetch_add(1, std::memory_order_relaxed) + 1;
     uint64_t seen = 0;
     for (;;) {
       while (generation_.load(std::memory_order_acquire) == seen) {
@@ -392,11 +406,15 @@ class ThreadPool {
   /* Held only while a job's state is published and while the pool is stopping;
    * the workers never touch it, which is what lets the barrier be a spin. */
   std::function<void(int64_t)> job_;
-  std::atomic<int64_t> next_chunk_{0};
+  /* Only read by a worker to decide whether its index is inside this job; the
+   * assignment itself needs no atomic -- see `run_worker_job`. */
   int64_t chunks_ = 0;
+  /* Drains once, as the workers start, so `t_chunk_index` is stable for the
+   * life of the pool. */
+  std::atomic<int64_t> next_worker_index_{0};
   /* Job barrier: how many background workers this job started with, and how
    * many have finished it.  The caller contributes no arrival -- it runs
-   * `work()` to completion itself and then spins until the rest arrive. */
+   * own chunk itself and then spins until the rest arrive. */
   int64_t workers_left_ = 0;
   std::atomic<int64_t> arrived_in_job_{0};
   std::atomic<uint64_t> generation_{0};
