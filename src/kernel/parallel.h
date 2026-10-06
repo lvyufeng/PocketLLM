@@ -40,6 +40,16 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <dirent.h>
+
+#include <cctype>
+#include <cstdio>
+#include <cstring>
+#include <set>
+#include <string>
+#endif
+
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #define POCKETLLM_PAUSE() _mm_pause()
@@ -52,16 +62,75 @@
 namespace pocketllm {
 namespace kernel {
 
+/* The machine's physical core count, or 0 when it cannot be read.
+ *
+ * Linux exposes the topology in `sysfs`: one `topology/thread_siblings_list`
+ * per logical CPU lists that CPU's siblings, so the distinct lists are the
+ * cores.  This is deliberately *not* `hardware_concurrency`, which counts
+ * logical CPUs -- and on this host that is the difference between 44 and 88.
+ *
+ * The reason the distinction matters is specific to how this pool works: the
+ * workers spin, so every thread the pool holds is at 100% for the duration of a
+ * job.  Two hyperthread siblings that both spin are fighting over one core's
+ * issue ports and one core's share of the memory pipeline, and the cost shows
+ * up in the arithmetic they are supposed to be doing.  Measured on
+ * `qwen3-0.6b-q4_k_m.gguf` at the shipped default, threads against throughput:
+ *
+ *     threads   pp512   tg64
+ *        22      521     74.2      one socket's cores
+ *        44      939     72.4      both sockets' cores   <- physical
+ *        88      862     54.5      every hardware thread <- hardware_concurrency
+ *
+ * Prefill is 9% faster at 44 than at 88 and decode is 33% faster, so the
+ * default this function returns is the number of *cores*, not the number of
+ * CPUs. */
+inline int64_t physical_core_count() {
+#if defined(__linux__)
+  DIR *dir = opendir("/sys/devices/system/cpu");
+  if (dir == nullptr) {
+    return 0;
+  }
+  std::set<int> seen;
+  int cores = 0;
+  struct dirent *entry = nullptr;
+  while ((entry = readdir(dir)) != nullptr) {
+    if (std::strncmp(entry->d_name, "cpu", 3) != 0 || !std::isdigit(entry->d_name[3])) {
+      continue;
+    }
+    /* `thread_siblings_list` is this CPU's sibling set as a ranges list such as
+     * `0-21,44-65`; the first number is enough to identify the core, because
+     * every CPU in one core's file names the same set. */
+    const std::string path = std::string("/sys/devices/system/cpu/") + entry->d_name +
+                             "/topology/thread_siblings_list";
+    FILE *file = std::fopen(path.c_str(), "r");
+    if (file == nullptr) {
+      continue;
+    }
+    int first = 0;
+    const int scanned = std::fscanf(file, "%d", &first);
+    std::fclose(file);
+    if (scanned == 1 && seen.insert(first).second) {
+      ++cores;
+    }
+  }
+  closedir(dir);
+  return cores;
+#else
+  return 0;
+#endif
+}
+
 /* How many threads the CPU kernels should use.
  *
  * `$POCKETLLM_CPU_THREADS` wins when it is set and parses to a positive number,
  * which is the escape hatch for reproducing a single-threaded number
  * (``POCKETLLM_CPU_THREADS=1``) and for staying a good citizen on a shared
- * host.  Otherwise every hardware thread is used: the requirement this exists
- * to meet is speed without the caller having to configure anything, and because
- * the result is independent of the thread count there is no correctness reason
- * to be conservative.  Clamped to [1, 256] so a typo cannot start a thousand
- * threads. */
+ * host.  Otherwise it is the physical core count (`physical_core_count`
+ * above), falling back to `hardware_concurrency` when the topology is not
+ * readable: the requirement this exists to meet is speed without the caller
+ * having to configure anything, and the spin-pool measurement above is why the
+ * count is cores rather than CPUs.  Clamped to [1, 256] so a typo cannot start
+ * a thousand threads. */
 inline int64_t cpu_thread_count() {
   const char *from_env = std::getenv("POCKETLLM_CPU_THREADS");
   if (from_env != nullptr) {
@@ -70,6 +139,10 @@ inline int64_t cpu_thread_count() {
     if (end != from_env && parsed > 0) {
       return parsed > 256 ? 256 : static_cast<int64_t>(parsed);
     }
+  }
+  const int64_t cores = physical_core_count();
+  if (cores > 0) {
+    return cores > 256 ? 256 : cores;
   }
   const unsigned hardware = std::thread::hardware_concurrency();
   return hardware == 0 ? 1 : static_cast<int64_t>(hardware);
