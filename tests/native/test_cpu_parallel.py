@@ -780,24 +780,34 @@ def test_the_tiled_attention_weighted_sum_is_the_row_at_a_time_one(q_len: int) -
     them, splitting the walk into a shared prefix -- where every row of the tile
     sees the key -- and a per-row causal tail.
 
-    **It is bit-exact, and that is a stronger claim than this kernel had to
-    make.**  The plan accepted a last-bit change from the weighted sum's
-    tiling, on the same reasoning as the score dot's: `dst[x] +=` over the keys
-    is an accumulation and a differently-interleaved one could contract
-    differently.  It does not.  Row `r` still adds its own terms in key order,
-    one `+=` per key, with the same weight -- the tiling moves *which row* is
-    being accumulated between two loads of the same V vector, not the order
-    within any row's sum.  The probe that checked it (`/tmp/prof/attnwsum.cpp`,
-    `Rv = 4` against the shipped loop at `q_len` 1 through 512) reports
-    `relerr 0.00e+00` and this test holds the same thing to the byte.
+    **The tiling itself is bit-exact and the tolerance here is not for it.**
+    The plan accepted a last-bit change from the weighted sum's tiling, on the
+    same reasoning as the score dot's: `dst[x] +=` over the keys is an
+    accumulation and a differently-interleaved one could contract differently.
+    It does not.  Row `r` still adds its own terms in key order, one `+=` per
+    key, with the same weight -- the tiling moves *which row* is being
+    accumulated between two loads of the same V vector, not the order within any
+    row's sum.  Held to `array_equal` against the shipped loop at `q_len` 1
+    through 512, that is `relerr 0.00e+00`.
 
-    So the bar is equality and not a tolerance.  `$POCKETLLM_CPU_SCALAR_VSUM`
-    routes the call back to the row-at-a-time loop, and the two runs must be
-    `array_equal` on the same input.  If that ever stops holding the tiling has
-    either reassociated a row's sum or, worse, dropped a row's region -- which is
-    the bug the first draft of this kernel had: it gave every row only its own
-    private slice of the keys and produced fluent output 0.8 of its own scale
-    off, at a 1.58x speedup that made it look like a win.
+    What is no longer bit-exact is the *softmax*, and it is the flash attention
+    path that changed it: `attention` now folds each key's weight into a running
+    max, denominator and weighted sum in one pass over the keys instead of
+    materializing a normalized score row and sweeping it.  A key that raises the
+    running max rescales what has already accumulated, so a row's terms meet in
+    blocks of `kFlashBlock` rather than one at a time, and the sum is a
+    different tree over the same values.  The difference is a last bit --
+    measured at `5.96e-07` on these shapes -- and it is the price the fused pass
+    charges for the parallelism.
+
+    So the bar is a tolerance, and a tight one: `1e-5` of the output's own
+    scale.  (A per-element relative bound is not usable -- the output has
+    near-zero entries and the ratio there is noise, which says nothing about the
+    sum that produced them.)  The bug this
+    test was written for was not a rounding -- the first draft of the tiling
+    gave every row only its own private slice of the keys and produced fluent
+    output 0.8 of its own scale off, at a 1.58x speedup that made it look like a
+    win.  Four orders of magnitude separate that from what is admitted here.
 
     A `q_len` that is not a multiple of the row count is here for the ragged
     tile, where `jn < kAttentionRows` and the tail loop is the whole of the
@@ -807,10 +817,11 @@ def test_the_tiled_attention_weighted_sum_is_the_row_at_a_time_one(q_len: int) -
     request = write_request("attention", tensors, params)
     tiled = run_op(request, threads=1)
     untiled = run_op(request, threads=1, env={"POCKETLLM_CPU_SCALAR_VSUM": "1"})
-    assert np.array_equal(tiled, untiled), (
+    scale = float(np.max(np.abs(untiled)))
+    worst = float(np.max(np.abs(tiled - untiled))) / scale
+    assert worst <= 1e-5, (
         f"q_len={q_len}: the tiled weighted sum does not reproduce the "
-        f"row-at-a-time one -- worst |difference| "
-        f"{float(np.max(np.abs(tiled - untiled)))}"
+        f"row-at-a-time one -- worst |difference| {worst} of the output scale"
     )
     # And the comparison is not between two constants.
     assert float(np.max(np.abs(untiled))) > 0.0

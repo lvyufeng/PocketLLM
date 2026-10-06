@@ -281,6 +281,53 @@ inline float dot4(const float *a, const float *b, int64_t k) { return dot(a, b, 
  * and `dot_tile_r`, so the equivalence stays checkable through the public API. */
 #if POCKETLLM_HAVE_AVX2
 
+__attribute__((optimize("fp-contract=off"))) inline void flash_fold(float *P, float x,
+                                                                   const float *vvec, int64_t d) {
+#if POCKETLLM_HAVE_AVX2
+  if (x > P[0]) {
+    const float corr = std::exp(P[0] - x);
+    P[1] = P[1] * corr + 1.0F;
+    const __m256 c = _mm256_set1_ps(corr);
+    int64_t z = 0;
+    for (; z + 8 <= d; z += 8) {
+      _mm256_storeu_ps(P + 2 + z, _mm256_add_ps(
+          _mm256_mul_ps(_mm256_loadu_ps(P + 2 + z), c), _mm256_loadu_ps(vvec + z)));
+    }
+    for (; z < d; ++z) {
+      P[2 + z] = P[2 + z] * corr + vvec[z];
+    }
+    P[0] = x;
+  } else {
+    const float w = std::exp(x - P[0]);
+    P[1] += w;
+    const __m256 wv = _mm256_set1_ps(w);
+    int64_t z = 0;
+    for (; z + 8 <= d; z += 8) {
+      _mm256_storeu_ps(P + 2 + z, _mm256_add_ps(
+          _mm256_mul_ps(wv, _mm256_loadu_ps(vvec + z)), _mm256_loadu_ps(P + 2 + z)));
+    }
+    for (; z < d; ++z) {
+      P[2 + z] += w * vvec[z];
+    }
+  }
+#else
+  if (x > P[0]) {
+    const float corr = std::exp(P[0] - x);
+    P[1] = P[1] * corr + 1.0F;
+    for (int64_t z = 0; z < d; ++z) {
+      P[2 + z] = P[2 + z] * corr + vvec[z];
+    }
+    P[0] = x;
+  } else {
+    const float w = std::exp(x - P[0]);
+    P[1] += w;
+    for (int64_t z = 0; z < d; ++z) {
+      P[2 + z] += w * vvec[z];
+    }
+  }
+#endif
+}
+
 __attribute__((optimize("fp-contract=off"))) inline void dot_pair(const float *qa,
                                                                   const float *qb,
                                                                   const float *key, int64_t k,
@@ -1626,6 +1673,237 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const void *k_cac
    caller reads whatever the buffer held.  Qwen3's 16 heads divide evenly, which
    is exactly why the test parametrizes an odd count. */
   const int64_t groups = (n_heads + kAttentionHeadBatch - 1) / kAttentionHeadBatch;
+
+  /* ---- flash attention: one pass over the keys, no score row --------------
+   *
+   * Everything below materializes the score row: a store and a reload of
+   * `q_len * max_span` floats per head, plus a separate sweep for the softmax.
+   * That is the whole of the remaining gap to llama.cpp's shipped default,
+   * which is flash attention -- it keeps a running max, denominator and
+   * weighted sum and walks the keys once.
+   *
+   * The two paths differ in *how the span is cut*, and that is deliberate.
+   * Batched prefill walks a query row's keys in order, keeping the shipped
+   * kernel's row tiling (`dot_tile_r` shares one key row across
+   * `kAttentionRows` query rows) because prefill is where that tiling pays.  A
+   * one-token decode has only `n_head_kv` units -- the 8-unit limit the profile
+   * keeps finding -- so it cuts the span into `kFlashSplit` chunks of
+   * `kFlashBlock` keys and merges them with a log-sum-exp.  A span shorter than
+   * one block is one chunk, so the two paths are the *same* reduction there,
+   * which is what keeps a short prompt's batched result byte-identical to the
+   * same tokens decoded one at a time.  At longer spans they agree to the
+   * reassociation error and no closer, which is the price of the parallelism;
+   * llama.cpp's own prefill and decode flash kernels differ the same way.
+   */
+  if (!scalar_weighted_sum_forced() && d <= kAttentionSumMaxDim) {
+    constexpr int64_t kFlashBlock = 128;
+    constexpr int64_t kFlashSplit = 8;
+    const int64_t per_head = d + 2;
+    const int64_t span = q_offset + q_len - first_key;
+    const int64_t n_blk = (span + kFlashBlock - 1) / kFlashBlock;
+
+    /* A widened K row in slot 0 and the matching V row in slot 1: flash needs
+     * both live at once, where each shipped pass widened one at a time. */
+    auto widen2 = [&](float *row_buf, const void *base, int64_t index, int64_t kv_head,
+                      int slot) {
+      if (f16) {
+        float *const dst = row_buf + slot * d;
+        kv_row_to_float(static_cast<const uint16_t *>(base) + index * kv_stride + kv_head * d, d,
+                        dst);
+        return static_cast<const float *>(dst);
+      }
+      return static_cast<const float *>(base) + index * kv_stride + kv_head * d;
+    };
+
+    /* Fold one key's score into a running (max, denominator, weighted sum).  A
+     * key that does not raise the max costs one multiply-add per output
+     * element; one that does pays the rescale of what has accumulated.  This is
+     * the online softmax, and `P` is `[max, denominator, sum...]`. */
+    if (q_len == 1) {
+      const int64_t stride = group * per_head;
+      const int64_t chunks = n_blk < 1 ? 1 : n_blk;
+      /* The chunking is a function of the *span* and of nothing else, and that
+       * is a correctness requirement and not tidiness.  An earlier draft took
+       * the chunk count from what the caller's scratch could hold -- which the
+       * backend sizes from `parallel_tasks`, and `parallel_tasks` is a function
+       * of the thread count -- so the number of chunks, and with it the
+       * reduction tree and the response's last bits, moved when the pool did.
+       * The test that holds every kernel to the same bytes at one thread and at
+       * eight caught it, which is what it is for.
+       *
+       * So the partials live here rather than in `scores`.  That costs the
+       * allocation this path used to borrow, and it buys a chunk count that is
+       * `kFlashSplit`-bounded but otherwise fixed, independent of the caller
+       * and of the pool.  `kFlashSplit` is 8: decode attention has only
+       * `n_head_kv` units, so 8 chunks is already 64 units on this model's 8 KV
+       * heads, and more chunks split the same span into pieces too short to
+       * amortize a merge. */
+      const int64_t C = std::min<int64_t>(kFlashSplit, chunks);
+      std::vector<float> partials(static_cast<std::size_t>(n_head_kv) *
+                                  static_cast<std::size_t>(C) * static_cast<std::size_t>(stride));
+      {
+        parallel_for(n_head_kv * C, kAttentionGrain, [&](int64_t lo, int64_t hi, int64_t) {
+        alignas(32) float row_buf[2 * kAttentionSumMaxDim];
+        for (int64_t unit = lo; unit < hi; ++unit) {
+          const int64_t u = unit / C;
+          const int64_t c = unit - u * C;
+          /* The `group` query heads of this KV head start at `h0`, not at the
+           * front of `q`: head `h` reads KV head `h / group`, so the Q vector
+           * for this unit is `q + (u * group + p) * d` and not `q + p * d`. */
+          const float *const qh = q + (u * group) * d;
+          float *const part = partials.data() + unit * stride;
+          for (int64_t p = 0; p < group; ++p) {
+            float *const P = part + p * per_head;
+            P[0] = -INFINITY;
+            P[1] = 0.0F;
+            std::fill(P + 2, P + 2 + d, 0.0F);
+          }
+          for (int64_t b = (n_blk * c) / C; b < (n_blk * (c + 1)) / C; ++b) {
+            const int64_t klo = first_key + b * kFlashBlock;
+            const int64_t khi = std::min<int64_t>(q_offset, klo + kFlashBlock - 1);
+            for (int64_t s = klo; s <= khi; ++s) {
+              const float *const kvec = widen2(row_buf, k_cache, s, u, 0);
+              float sc[kAttentionHeadBatch];
+              if (group == 2) {
+                dot_pair(qh, qh + d, kvec, d, sc);
+              } else {
+                sc[0] = dot4(qh, kvec, d);
+              }
+              const float *const vvec = widen2(row_buf, v_cache, s, u, 1);
+              for (int64_t p = 0; p < group; ++p) {
+                flash_fold(part + p * per_head, sc[p] * scale, vvec, d);
+              }
+            }
+          }
+        }
+      });
+      /* Merge the chunks.  The largest max is the exponent's reference point;
+       * each chunk's denominator and sum are rescaled onto it. */
+      parallel_for(n_head_kv, kAttentionGrain, [&](int64_t lo, int64_t hi, int64_t) {
+        alignas(32) float gacc[kAttentionSumMaxDim];
+        for (int64_t u = lo; u < hi; ++u) {
+          const int64_t h0 = u * group;
+          for (int64_t g = 0; g < group; ++g) {
+            float gm = -INFINITY;
+            for (int64_t c = 0; c < C; ++c) {
+              const float mm = (partials.data() + (u * C + c) * stride + g * per_head)[0];
+              if (mm > gm) {
+                gm = mm;
+              }
+            }
+            float gd = 0.0F;
+            for (int64_t z = 0; z < d; ++z) {
+              gacc[z] = 0.0F;
+            }
+            for (int64_t c = 0; c < C; ++c) {
+              const float *const P = partials.data() + (u * C + c) * stride + g * per_head;
+              const float w = std::exp(P[0] - gm);
+              gd += P[1] * w;
+              for (int64_t z = 0; z < d; ++z) {
+                gacc[z] += P[2 + z] * w;
+              }
+            }
+            const float inv = 1.0F / gd;
+            float *const dst = out + (h0 + g) * d;
+            for (int64_t z = 0; z < d; ++z) {
+              dst[z] = gacc[z] * inv;
+            }
+          }
+        }
+      });
+      return;
+      }
+    }
+
+    /* Batched prefill: the shipped unit -- `kAttentionRows` query rows of one
+     * batch of heads -- with the score row replaced by a per-row running triple.
+     * The unit's own scratch is on its stack, so this path reads no caller
+     * buffer at all; the row tiling and the causal tail keep exactly their
+     * shipped structure. */
+    parallel_for(blocks * groups, kAttentionGrain, [&](int64_t lo, int64_t hi, int64_t) {
+      alignas(32) float row_buf[2 * kAttentionSumMaxDim];
+      alignas(32) float part[kAttentionRows][kAttentionHeadBatch][kAttentionSumMaxDim + 2];
+      for (int64_t unit = lo; unit < hi; ++unit) {
+        const int64_t b = unit / groups;
+        const int64_t g = unit - b * groups;
+        const int64_t t0 = b * kAttentionRows;
+        const int64_t rows = std::min<int64_t>(kAttentionRows, q_len - t0);
+        const int64_t h0 = g * kAttentionHeadBatch;
+        const int64_t hb = std::min<int64_t>(kAttentionHeadBatch, n_heads - h0);
+        const int64_t kv_head = h0 / group;
+        const float *qvec[kAttentionHeadBatch][kAttentionRows];
+        for (int64_t j = 0; j < rows; ++j) {
+          for (int64_t p = 0; p < hb; ++p) {
+            qvec[p][j] = q + ((t0 + j) * n_heads + h0 + p) * d;
+            float *const P = part[j][p];
+            P[0] = -INFINITY;
+            P[1] = 0.0F;
+            std::fill(P + 2, P + 2 + d, 0.0F);
+          }
+        }
+        int64_t s = first_key;
+        const int64_t shared_end = q_offset + t0;
+        if (rows == kAttentionRows) {
+          for (; s <= shared_end; ++s) {
+            const float *const kvec = widen2(row_buf, k_cache, s, kv_head, 0);
+            const float *const vvec = widen2(row_buf, v_cache, s, kv_head, 1);
+            for (int64_t p = 0; p < hb; ++p) {
+              float sc[kAttentionRows];
+              dot_tile_r<kAttentionRows>(qvec[p], kvec, d, sc);
+              for (int64_t j = 0; j < rows; ++j) {
+                flash_fold(part[j][p], sc[j] * scale, vvec, d);
+              }
+            }
+          }
+        }
+        if (s <= shared_end) {
+          for (; s <= shared_end; ++s) {
+            const float *const kvec = widen2(row_buf, k_cache, s, kv_head, 0);
+            const float *const vvec = widen2(row_buf, v_cache, s, kv_head, 1);
+            for (int64_t j = 0; j < rows; ++j) {
+              float sc[kAttentionHeadBatch];
+              if (hb == 2) {
+                dot_pair(qvec[0][j], qvec[1][j], kvec, d, sc);
+              } else {
+                sc[0] = dot4(qvec[0][j], kvec, d);
+              }
+              for (int64_t p = 0; p < hb; ++p) {
+                flash_fold(part[j][p], sc[p] * scale, vvec, d);
+              }
+            }
+          }
+        }
+        for (int64_t k = 1; k < rows; ++k) {
+          const int64_t abs = q_offset + t0 + k;
+          const float *const kvec = widen2(row_buf, k_cache, abs, kv_head, 0);
+          const float *const vvec = widen2(row_buf, v_cache, abs, kv_head, 1);
+          for (int64_t j = k; j < rows; ++j) {
+            float sc[kAttentionHeadBatch];
+            if (hb == 2) {
+              dot_pair(qvec[0][j], qvec[1][j], kvec, d, sc);
+            } else {
+              sc[0] = dot4(qvec[0][j], kvec, d);
+            }
+            for (int64_t p = 0; p < hb; ++p) {
+              flash_fold(part[j][p], sc[p] * scale, vvec, d);
+            }
+          }
+        }
+        for (int64_t j = 0; j < rows; ++j) {
+          for (int64_t p = 0; p < hb; ++p) {
+            const float *const P = part[j][p];
+            const float inv = 1.0F / P[1];
+            float *const dst = out + ((t0 + j) * n_heads + h0 + p) * d;
+            for (int64_t z = 0; z < d; ++z) {
+              dst[z] = P[2 + z] * inv;
+            }
+          }
+        }
+      }
+    });
+    return;
+  }
+
   parallel_for(blocks * groups, kAttentionGrain,
                [&](int64_t lo, int64_t hi, int64_t chunk) {
                  float *const task_scores = scores + chunk * kAttentionScoreRowsPerTask * max_span;
