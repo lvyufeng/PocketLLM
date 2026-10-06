@@ -417,6 +417,13 @@ def test_the_four_row_weight_walk_is_the_one_row_walk_four_times(
     Six one-row calls are the reference.  A batched kernel that dropped the
     activation's own scale -- the mistake this test was written after making --
     differs by a factor of `y.d` per block and fails loudly here.
+
+    The horizontal reduce is part of that equivalence and is the term that moves
+    most easily: the batched kernel pairs lane `i` with lane `i+4` before it
+    reduces, so `_mm_hadd_ps` on the raw 256-bit accumulator is *not* the same
+    sum (it pairs within each 128-bit half).  Reducing as `hadd(lo + hi, ...)`
+    is; this test is what caught the first form, which reassociated the sum and
+    failed the one-row comparison below on four prefill shapes.
     """
     rng = np.random.default_rng(20261006)
     rows, k = 6, 1024
