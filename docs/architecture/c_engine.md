@@ -393,6 +393,103 @@ call each way, `memcmp`-identical. That switch exists because the test that woul
 draft does not otherwise exist: a float64 oracle at `2 * d * eps` of the output's scale passed the FMA
 build with the measured figure at **2% of the bound**.
 
+### Four query rows per key walk
+
+The four-lane dot made the score pass fast per element; it did not change how many times the key is
+read. The score matrix is `q_len × span` over the same `span` key vectors, so a row-at-a-time walk
+loads each key row `q_len` times, and at prefill the pairs are a triangular half-matrix. Attention
+was **18.3 ms per call and 44% of a 1161 ms `pp512`** at 22 threads once the four-row GEMM landed —
+the largest single term in the prefill gap, and the one whose per-element cost had already been
+optimized as far as lanes could take it.
+
+`dot_tile` walks `kAttentionRows = 4` query rows of one head against one key vector, so the key is
+loaded once for four rows. The partition changed with it: a task is now `(4 tokens, head)` rather
+than `(token, head)`, and its score scratch is four rows rather than one.
+
+**Bit-exactness here is a lane structure, not a rounding budget.** A natural four-query kernel gives
+each row its own `__m256` — eight lanes per row, an eight-lane horizontal reduce — and that is a
+different last bit from `dot4`'s four-lane chain, which is exactly the difference the FMA draft
+proved fatal (32/32 tokens → 1/32). So the two `__m256` accumulators here hold *two queries each*:
+rows 0–1 in the low and high halves of the first, rows 2–3 in the second, loaded at the offsets
+`dot4` would load them, combined with the same `_mm_mul_ps`→`_mm_add_ps` and reduced with `dot4`'s
+own `((l0 + l1) + (l2 + l3)) + tail`. Every lane is `dot4`'s lane; only which queries share a
+register has changed. The probe's per-lane check (`tilecheck.cpp`: four known query rows against one
+key, `dot_tile` versus four `dot4` calls) reports 4/4 identical, and the shape sweep — **15 chunk
+lengths, 1 through 513** (`1..9, 17, 64, 100, 511, 512, 513`), each at two spans and three thread
+counts, base engine against tiled engine, both through the public `attention` op — reports **0
+mismatching bytes** across 90 base-against-tiled calls.
+
+The causal tail is not special-cased. A block of four queries shares only the keys up to
+`q_offset + t0`; after that row `j` still needs `j` more keys, so the tail runs `dot4` one row at a
+time rather than adding a second, ragged tiled kernel — the shipped one-row path, unchanged, and
+exactly one tiled code path to be right. A `q_len` that is not a multiple of four, and a decode step
+(`q_len = 1`, one block, zero shared keys) both fall through to it, which is why decode is unmoved by
+construction rather than by measurement.
+
+**Where the rows-per-walk number comes from.** A dedicated probe (`/tmp/prof/attnrow.cpp`; one
+kernel templated on the row count so R = 1, 2, 4 and 8 differ in a bound and not in an
+implementation) sweeps both the tiling and the chunk length, all three passes running in every
+variant, interleaved best-of-five so drift lands on every column:
+
+| chunk | R=1 | R=2 | R=4 | R=8 |
+|---:|---:|---:|---:|---:|
+| 1 | 6.5 us | 0.92× | 0.99× | 0.94× |
+| 8 | 11.8 us | 1.41× | 1.19× | 1.26× |
+| 32 | 79.3 us | 1.19× | 1.39× | 1.29× |
+| 128 | 1117 us | 1.21× | 1.34× | 1.32× |
+| 512 | 16945 us | 1.20× | **1.42×** | 1.42× |
+| 2048 | 330740 us | 1.16× | 1.44× | **1.60×** |
+
+R = 4 is the knee for the shape the benchmarks use, and two effects rather than one produce it. More
+rows reuse each key load — the region a block shares is walked once instead of once per row — and more
+rows also lengthen the causal *tail*, the `R - 1` keys past the shared region that run `dot4` one row
+at a time at R = 1 efficiency. The reuse term grows with `q_len` and the tail term does not, which is
+why the ordering flips: at `q_len = 512` the two are even (both R = 4 and R = 8 measure 1.42×), at 128
+and below R = 4 leads (1.34× to 1.32×), and at 2048 the reuse wins out and R = 8 leads 1.60× to 1.44×.
+R = 2 leaves a sixth of the win on the table at every chunk. Decode is flat across all of them because
+a chunk of one is a single block, so every R takes the same serial path.
+
+That the tail is the trade-off is a claim about where the time goes, not a measured decomposition of
+it — what the table measures is the two ends, and the crossover between them. Either choice is
+defensible at 512; R = 4 is the one that is also the best at the short chunks, which are the ones a
+decode-and-short-prompt session actually pays.
+
+The first version of this probe read as a **1.35× win on an output wrong by 3.1**: it advanced one
+`s` across the rows of a block and so skipped the keys `t0+1 .. t0+j-1` for every row past the first.
+The timings were real and the arithmetic was not, which is why the probe's bit-exactness line is
+printed before the timings and the tiled kernel's own test is a byte comparison rather than a
+tolerance. The probe ran every chunk at 22 threads pinned to node 0, best of five, which is where the
+`q_len = 1` row's 6.5 us comes from: one block per head is 16 units against a pool of 22, so a decode
+call barely occupies half the machine whatever the tiling.
+
+**End to end, interleaved A/B against the pre-change engine**, `pp512`, both pinned to NUMA node 0,
+`llama-bench` round-robin in the same run, median of three:
+
+| threads | before | after | llama.cpp | after/before | after/llama |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 35.34 | 38.67 | 65.32 | 1.09 | 0.59 |
+| 8 | 173.76 | 198.96 | 382.63 | 1.15 | 0.52 |
+| 22 | 417.06 | 480.73 | 792.38 | 1.15 | 0.61 |
+| 44 | 705.75 | 798.46 | 1247.77 | 1.13 | 0.64 |
+| 88 | 618.86 | 772.21 | 965.90 | 1.25 | 0.80 |
+
+Decode is the control and it holds within this host's spread (`tg64` at 22 threads: 95.98 before,
+98.30 after, 97.81 for llama.cpp, ±4 run to run), which is what the construction predicts: `q_len`
+is 1, so there is one block per head, no shared keys, and the tiled path is never entered.
+
+**Prefill is 0.61 of llama.cpp's at 22 threads** (480.73 against 792.38), up from 0.52, and 0.59 at
+one — the single-thread column moved too, which says this is arithmetic the kernel does less of
+rather than a schedule.
+
+The arithmetic behind the 1.15× is worth stating because it was checked before it was measured. The
+base profile has `gemm_quant` at 625 ms and attention at 514 ms of a 1161 ms `pp512`, and the probe
+says the tiling is 1.42× on the *whole* attention call; 1161 − 514 + 514/1.42 = **1009 ms, or
+1.151×** — which is the 1.15× the A/B measured on its own (417.06 → 480.73). The ms columns are a
+projection on the profile's run and not a re-profile: the post-change engine was timed end to end,
+not re-instrumented. What is left at 22 threads is `gemm_quant` at 625 ms and attention at ~362
+projected, so the score pass is no longer the larger half and the four-row GEMM — 1.3× behind
+llama.cpp's repacked 8×8 form — is.
+
 ### The activation scratch is the shape's size, not a fixed one
 
 The integer path needs somewhere to put the quantized activations, and that buffer used to be a
@@ -562,12 +659,16 @@ before, 98.7 after, 96.2 for llama.cpp, against a ±4 run-to-run spread), and th
 `m` is 1, so the dispatcher routes every decode GEMM to the one-row kernel. The batched path exists
 for prefill and costs decode a branch.
 
-**Prefill is now 0.52 of llama.cpp's at its best thread count** — up from 0.40, and still the whole
-of the gap. The remaining terms are the ones the profile names: at 22 threads `gemm_quant` is 625 ms
-of a 1161 ms prefill and attention is 514 ms of it, so the two are 98% of the wall, and llama.cpp's
-repacked 8×8 GEMM is still 1.3× the kernel ours is. The next lever is the one the pairing argument
-above points at: a four-row walk still spends its time in the weight *decode*, and an 8×8 form (which
-is what llama.cpp's repack is) amortizes the decode over eight rows rather than four.
+**Prefill is now 0.61 of llama.cpp's at its best thread count**, up from 0.52 — the four-query tiling
+above is what closed the last third of that and attention's share of the wall with it, and the two
+sections are adjacent for that reason. The remaining term is the GEMM: at 22 threads `gemm_quant` is
+625 ms of the prefill and llama.cpp's repacked 8×8 form is still 1.3× the kernel ours is. That is the
+next lever the pairing argument above points at: a four-row walk still spends its time in the weight
+*decode*, and an 8×8 form (which is what llama.cpp's repack is) amortizes the decode over eight rows
+rather than four. **It is an argument and not a measurement** — unlike the attention tiling above,
+where the probe's R=8 column is the measurement of what eight rows per walk would buy, nothing has
+built the 8×8 GEMM and the comparison is between our two adjacent stages, not between our kernel and
+llama.cpp's.
 
 ## Building
 

@@ -122,16 +122,23 @@ class CpuBackend final : public Backend {
   }
 
   int64_t attention_scratch(int64_t q_len, int64_t n_heads, int64_t max_span) const override {
-    /* One row per concurrent task, not one row for the whole call.  This backend
-     * used to run the `(query, head)` pairs in a serial loop and reuse a single
-     * row; it now runs them in parallel, so two tasks would otherwise interleave
-     * their scores into one softmax over a mixture of two heads -- wrong, finite
-     * and fluent, which is exactly what the CUDA backend's version of this
-     * comment guards against.  The task count comes from `parallel_tasks` with
-     * the grain `attention` uses, so the allocation and the kernel agree by
-     * construction rather than by two copies of the same formula. */
-    const int64_t tasks = parallel_tasks(q_len * n_heads, kAttentionGrain);
-    return (tasks < 1 ? 1 : tasks) * max_span * 4;
+    /* `kAttentionRows` rows per concurrent task, not one row for the whole call
+     * and not one per task.  This backend used to run the `(query, head)` pairs
+     * in a serial loop and reuse a single row; it now runs them in parallel, so
+     * two tasks would otherwise interleave their scores into one softmax over a
+     * mixture of two heads -- wrong, finite and fluent, which is exactly what
+     * the CUDA backend's version of this comment guards against.  The tiling
+     * added a second factor: one task now scores `kAttentionRows` query rows of
+     * one head, so the region is `kAttentionRows` rows and the row *stride* is
+     * the same `max_span` the kernel uses.
+     *
+     * Both the task count and the rows-per-task come from the kernel's own
+     * definitions -- `parallel_tasks` with the grain and row count `attention`
+     * uses -- so the allocation and the partition agree by construction rather
+     * than by two copies of the same formula. */
+    const int64_t blocks = (q_len + kAttentionRows - 1) / kAttentionRows;
+    const int64_t tasks = parallel_tasks(blocks * n_heads, kAttentionGrain);
+    return (tasks < 1 ? 1 : tasks) * kAttentionRows * max_span * 4;
   }
 
   void attention(DeviceBuffer q, int64_t q_len, int64_t n_heads, DeviceBuffer k_cache,

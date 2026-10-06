@@ -144,6 +144,80 @@ __attribute__((optimize("fp-contract=off"))) inline float dot4(const float *a, c
 inline float dot4(const float *a, const float *b, int64_t k) { return dot(a, b, k); }
 #endif
 
+/* ``kAttentionRows`` query rows against one key vector, one `dot4` per row.
+ *
+ * The score pass is `q_len * span` dots over `span` key vectors, so the key row
+ * is loaded `q_len` times per head; at prefill the pairs are a triangular
+ * half-matrix and that re-read is the cost.  This loads it once for four rows.
+ *
+ * **The lane structure is the whole design, and reading the code as "just four
+ * accumulators" is how a last-bit change gets in.**  `dot4` is one `__m128`
+ * chain advancing by four, reduced `((l0 + l1) + (l2 + l3)) + tail`.  A
+ * four-query kernel that gave each row its own `__m256` would have eight lanes
+ * per row and a different reduce -- a different last bit, and the score-dot
+ * section on the C engine page records what a last bit costs here: the FMA
+ * variant of `dot4` moved the model's greedy completion from 32/32 tokens
+ * matching llama.cpp to 1/32, because the softmax turns a score's last bit into
+ * a different argmax.
+ *
+ * So each `__m256` accumulator holds *two* queries' four-lane chains: rows
+ * `2p` and `2p+1` in the low and high halves of `acc[p]`, loaded at the offsets
+ * `dot4` would load them, combined with the same `_mm_add_ps(_mm_mul_ps(...))`
+ * and never a fused multiply-add.  Every lane is `dot4`'s lane; only which
+ * queries share a register has changed.
+ *
+ * 128 is the head width the graph calls this with, but the tail loops are kept
+ * so the function is not a trap for a width that is not a multiple of four.
+ * `$POCKETLLM_CPU_SCALAR_DOT` routes it to four scalar `dot` calls, like
+ * `dot4`, so the equivalence stays checkable through the public API. */
+#if POCKETLLM_HAVE_AVX2
+
+__attribute__((optimize("fp-contract=off"))) inline void dot_tile(const float *const *q4,
+                                                                 const float *key, int64_t k,
+                                                                 float out[4]) {
+  if (scalar_dot_forced()) {
+    for (int p = 0; p < 4; ++p) {
+      out[p] = dot(q4[p], key, k);
+    }
+    return;
+  }
+  /* Two 256-bit registers, each carrying two queries' `__m128` chains. */
+  __m256 acc01 = _mm256_setzero_ps();
+  __m256 acc23 = _mm256_setzero_ps();
+  int64_t i = 0;
+  for (; i + 4 <= k; i += 4) {
+    const __m128 kk = _mm_loadu_ps(key + i);
+    /* The same four key values in both halves, so each query's low half sees
+     * exactly the vector `dot4` would load at this offset. */
+    const __m256 kv = _mm256_insertf128_ps(_mm256_castps128_ps256(kk), kk, 1);
+    const __m256 a01 = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_loadu_ps(q4[0] + i)),
+                                            _mm_loadu_ps(q4[1] + i), 1);
+    const __m256 a23 = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_loadu_ps(q4[2] + i)),
+                                            _mm_loadu_ps(q4[3] + i), 1);
+    acc01 = _mm256_add_ps(_mm256_mul_ps(a01, kv), acc01);
+    acc23 = _mm256_add_ps(_mm256_mul_ps(a23, kv), acc23);
+  }
+  alignas(32) float lanes01[8];
+  alignas(32) float lanes23[8];
+  _mm256_store_ps(lanes01, acc01);
+  _mm256_store_ps(lanes23, acc23);
+  const float *lanes[4] = {lanes01, lanes01 + 4, lanes23, lanes23 + 4};
+  for (int p = 0; p < 4; ++p) {
+    float tail = 0.0F;
+    for (int64_t j = i; j < k; ++j) {
+      tail += q4[p][j] * key[j];
+    }
+    out[p] = ((lanes[p][0] + lanes[p][1]) + (lanes[p][2] + lanes[p][3])) + tail;
+  }
+}
+#else
+inline void dot_tile(const float *const *q4, const float *key, int64_t k, float out[4]) {
+  for (int p = 0; p < 4; ++p) {
+    out[p] = dot(q4[p], key, k);
+  }
+}
+#endif
+
 /* ``sum_i row[i] * dequant_q4_k(block, i)`` for one Q4_K super-block.
  *
  * The arithmetic is `dequant_q4_k`'s, term for term and in the same order, so
@@ -1333,16 +1407,18 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_ca
   const int64_t group = n_heads / n_head_kv;
   const int64_t cache_row = n_head_kv * d;
   /* The score row for a query at position `q_offset + q_len - 1` is the widest
-   * any row can be, and it is what spaces the per-task scratch regions apart.
-   * `attention_scratch_rows` and the callers that size the buffer use the same
-   * quantity. */
+   * any row can be, and it is what spaces the rows within a per-task scratch
+   * region apart.  `attention_scratch` and the callers that size the buffer use
+   * the same quantity. */
   const int64_t max_span = q_offset + q_len - first_key;
+  const int64_t blocks = (q_len + kAttentionRows - 1) / kAttentionRows;
 
-  /* Over `(token, head)`.  Each unit owns one output row and one score row, so
-   * the scratch is private to the task that writes it -- `scores` is a shared
-   * buffer handed in by the caller, and two tasks writing the same row would be
-   * the classic race whose symptom is fluent, finite, wrong output.  The
-   * per-task region is `scores + chunk * max_span`; nothing else is shared, and
+  /* Over `(block of kAttentionRows tokens, head)`.  Each unit owns one output
+   * row per token it covers and one score row per token too, so the scratch is
+   * private to the task that writes it -- `scores` is a shared buffer handed in
+   * by the caller, and two tasks writing the same row would be the classic race
+   * whose symptom is fluent, finite, wrong output.  The per-task region is
+   * `scores + chunk * kAttentionRows * max_span`; nothing else is shared, and
    * the dot, the max scan and the weighted sum inside a unit stay serial so the
    * arithmetic is the same as the single-threaded path.
    *
@@ -1350,51 +1426,114 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_ca
    * split, because the three passes inside it are chained -- `max_score` is
    * needed before the exponentials and `total` before the weighted sum -- so a
    * second thread on the same unit could only wait.  `kAttentionGrain` is 1 for
-   * that reason; see its comment in the header. */
-  parallel_for(q_len * n_heads, kAttentionGrain,
+   * that reason; see its comment in the header.
+   *
+   * The score pass is where the tiling pays: the keys a whole block can see
+   * (`s <= q_offset + t0`) are walked once for `kAttentionRows` query rows, in
+   * `dot_tile`, which produces exactly the `dot4` results a row-at-a-time walk
+   * would.  The causal *tail* -- the `kAttentionRows - 1` keys after that,
+   * which only the later rows of the block can see -- takes `dot4` one row at a
+   * time rather than a second, ragged tiled kernel, so there is exactly one
+   * tiled code path to be right and the tail is the same code the whole kernel
+   * used to be.
+   *
+   * A `q_len` that is not a multiple of `kAttentionRows` is not a special case:
+   * the last block covers fewer rows, the shared region is the one those rows
+   * share, and every one of them is handled -- including the single-row block a
+   * decode step runs, which is the shipped one-`dot4`-per-row path. */
+  parallel_for(blocks * n_heads, kAttentionGrain,
                [&](int64_t lo, int64_t hi, int64_t chunk) {
-                 float *const row_scores = scores + chunk * max_span;
+                 float *const task_scores = scores + chunk * kAttentionRows * max_span;
                  for (int64_t unit = lo; unit < hi; ++unit) {
-                   const int64_t t = unit / n_heads;
-                   const int64_t h = unit - t * n_heads;
-                   /* Causal: the query at absolute position `q_offset + t` sees
-                    * cache rows `first_key .. q_offset + t`. `first_key` is where
-                    * the cache's live span begins, which is always 0 today -- a
-                    * sliding-window variant would move it and nothing else here
-                    * would change. */
-                   const int64_t end = q_offset + t;
-                   const int64_t span = end - first_key + 1;
-                   const float *qvec = q + (t * n_heads + h) * d;
+                   const int64_t b = unit / n_heads;
+                   const int64_t h = unit - b * n_heads;
+                   const int64_t t0 = b * kAttentionRows;
+                   const int64_t rows = std::min<int64_t>(kAttentionRows, q_len - t0);
                    const int64_t kv_head = h / group;
+                   /* Causal: the query at absolute position `q_offset + t0 + j`
+                    * sees cache rows `first_key .. q_offset + t0 + j`.
+                    * `first_key` is where the cache's live span begins, which is
+                    * always 0 today -- a sliding-window variant would move it and
+                    * nothing else here would change. */
+                   const float *qvec[kAttentionRows];
+                   float *row_scores[kAttentionRows];
+                   float max_score[kAttentionRows];
+                   for (int64_t j = 0; j < rows; ++j) {
+                     qvec[j] = q + ((t0 + j) * n_heads + h) * d;
+                     row_scores[j] = task_scores + j * max_span;
+                     max_score[j] = -INFINITY;
+                   }
 
-                   float max_score = -INFINITY;
-                   for (int64_t s = 0; s < span; ++s) {
-                     const float *kvec = k_cache + (first_key + s) * cache_row + kv_head * d;
-                     const float score = dot4(qvec, kvec, d) * scale;
-                     row_scores[s] = score;
-                     if (score > max_score) {
-                       max_score = score;
+                   /* The keys every row of the block can see, `kAttentionRows` at
+                    * a time. */
+                   int64_t s = first_key;
+                   const int64_t shared_end = q_offset + t0;
+                   if (rows == kAttentionRows) {
+                     for (; s <= shared_end; ++s) {
+                       const float *kvec = k_cache + s * cache_row + kv_head * d;
+                       float sc[kAttentionRows];
+                       dot_tile(qvec, kvec, d, sc);
+                       for (int64_t j = 0; j < rows; ++j) {
+                         const float score = sc[j] * scale;
+                         row_scores[j][s - first_key] = score;
+                         if (score > max_score[j]) {
+                           max_score[j] = score;
+                         }
+                       }
+                     }
+                   }
+                   if (s <= shared_end) {
+                     /* The ragged block -- the tail of the chunk, or a decode
+                      * step -- or the one-row decode. The rows see different
+                      * spans here, so each takes `dot4` over the keys it shares
+                      * with the rest. */
+                     for (; s <= shared_end; ++s) {
+                       const float *kvec = k_cache + s * cache_row + kv_head * d;
+                       for (int64_t j = 0; j < rows; ++j) {
+                         const float score = dot4(qvec[j], kvec, d) * scale;
+                         row_scores[j][s - first_key] = score;
+                         if (score > max_score[j]) {
+                           max_score[j] = score;
+                         }
+                       }
+                     }
+                   }
+                   /* The remainder of each row's span, past what the whole block
+                    * shares: row `j` still needs `q_offset + t0 + 1 .. q_offset +
+                    * t0 + j`, which is `j` keys. */
+                   for (int64_t k = 1; k < rows; ++k) {
+                     const int64_t abs = q_offset + t0 + k;
+                     const float *kvec = k_cache + abs * cache_row + kv_head * d;
+                     for (int64_t j = k; j < rows; ++j) {
+                       const float score = dot4(qvec[j], kvec, d) * scale;
+                       row_scores[j][abs - first_key] = score;
+                       if (score > max_score[j]) {
+                         max_score[j] = score;
+                       }
                      }
                    }
 
-                   /* Shifted by the max, as the reference `softmax` is: the
-                    * exponentials of a 1000-scale score row would otherwise all
-                    * be zero and the row would normalize to 0/0. */
-                   float total = 0.0F;
-                   for (int64_t s = 0; s < span; ++s) {
-                     const float w = std::exp(row_scores[s] - max_score);
-                     row_scores[s] = w;
-                     total += w;
-                   }
+                   for (int64_t j = 0; j < rows; ++j) {
+                     const int64_t span = q_offset + t0 + j - first_key + 1;
+                     /* Shifted by the max, as the reference `softmax` is: the
+                      * exponentials of a 1000-scale score row would otherwise all
+                      * be zero and the row would normalize to 0/0. */
+                     float total = 0.0F;
+                     for (int64_t i = 0; i < span; ++i) {
+                       const float w = std::exp(row_scores[j][i] - max_score[j]);
+                       row_scores[j][i] = w;
+                       total += w;
+                     }
 
-                   float *dst = out + (t * n_heads + h) * d;
-                   std::fill(dst, dst + d, 0.0F);
-                   const float inv_total = 1.0F / total;
-                   for (int64_t s = 0; s < span; ++s) {
-                     const float weight = row_scores[s] * inv_total;
-                     const float *vvec = v_cache + (first_key + s) * cache_row + kv_head * d;
-                     for (int64_t i = 0; i < d; ++i) {
-                       dst[i] += weight * vvec[i];
+                     float *dst = out + ((t0 + j) * n_heads + h) * d;
+                     std::fill(dst, dst + d, 0.0F);
+                     const float inv_total = 1.0F / total;
+                     for (int64_t i = 0; i < span; ++i) {
+                       const float weight = row_scores[j][i] * inv_total;
+                       const float *vvec = v_cache + (first_key + i) * cache_row + kv_head * d;
+                       for (int64_t x = 0; x < d; ++x) {
+                         dst[x] += weight * vvec[x];
+                       }
                      }
                    }
                  }

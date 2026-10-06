@@ -470,6 +470,28 @@ def _decode_attention_case(span: int, seed: int):
 ATTENTION_SPANS = [8, 512]
 
 
+def _prefill_attention_case(q_len: int, seed: int):
+    """A prefill-shaped attention call: a *chunk* of queries, one forward pass.
+
+    The decode case above has ``q_len = 1``, which is the shape where the
+    four-row tiling collapses to the one-row kernel: a single block covers one
+    query, so the shared-key region is that query's whole span and `dot_tile`
+    never runs.  The tiling is a prefill work and this is the shape that
+    exercises it -- both the region every row of a block shares and the
+    triangular tail after it, since a block's last row sees `kAttentionRows - 1`
+    keys its first row cannot.
+    """
+    rng = np.random.default_rng(seed)
+    heads, kv_heads, d = 16, 8, 128
+    q = rng.standard_normal((q_len, heads, d), dtype=np.float32)
+    k_cache = rng.standard_normal((q_len, kv_heads, d), dtype=np.float32)
+    v_cache = rng.standard_normal((q_len, kv_heads, d), dtype=np.float32)
+    scale = 1.0 / np.sqrt(d)
+    tensors = {"q": q, "k_cache": k_cache, "v_cache": v_cache}
+    params = {"q_offset": 0, "scale": f"{scale:.9g}"}
+    return tensors, params
+
+
 @pytest.mark.parametrize("span", ATTENTION_SPANS)
 @needs_tools
 def test_attention_is_independent_of_the_thread_count(span: int) -> None:
@@ -536,6 +558,70 @@ def test_the_attention_score_dot_is_the_scalar_order(span: int) -> None:
     )
     # And the comparison is not between two constants.
     assert float(np.max(np.abs(scalar))) > 0.0
+
+
+#: The chunk lengths the four-row tiling is checked at.  512 is the prefill the
+#: benchmarks use and a multiple of `kAttentionRows`, so every block is full;
+#: 6 is not, so the last block covers two rows and the ragged path -- and the
+#: triangular tail a short block leaves -- is what is under test; 1 is a decode
+#: step, where the tiling must be invisible.
+ATTENTION_CHUNKS = [1, 6, 512]
+
+
+@pytest.mark.parametrize("q_len", ATTENTION_CHUNKS)
+@needs_tools
+def test_the_tiled_attention_score_is_the_one_row_dot(q_len: int) -> None:
+    """Four queries scored per key walk, and the same bytes as one at a time.
+
+    The kernel now scores `kAttentionRows` query rows of one head against a key
+    vector in a single walk, with the key loaded once instead of four times.
+    The 256-bit registers hold two queries' four-lane accumulator chains side by
+    side, so every lane is the lane `dot4` would have computed -- including the
+    reduce, which is `dot4`'s `((l0 + l1) + (l2 + l3)) + tail` and not an
+    eight-lane horizontal sum.
+
+    This is the check that keeps it that way, and it has to be a byte
+    comparison for the same reason the score dot's is: `$POCKETLLM_CPU_SCALAR_DOT`
+    routes both forms to the scalar `dot`, so the two runs differ in whether the
+    tiling ran, not in the rounding of anything else.  A `q_len` that is not a
+    multiple of the row count is included on purpose -- the ragged block and the
+    causal tail are where a tiling kernel goes wrong, and a first version of this
+    one did: it advanced a single `s` across the rows and quietly skipped the
+    keys `t0+1 .. t0+j-1` of every row past the first, which is an output wrong
+    by 3.1 that still looked like a 1.35x win.
+    """
+    tensors, params = _prefill_attention_case(q_len, seed=20261005 + q_len)
+    request = write_request("attention", tensors, params)
+    tiled = run_op(request, threads=1)
+    scalar = run_op(request, threads=1, env={"POCKETLLM_CPU_SCALAR_DOT": "1"})
+    assert np.array_equal(tiled, scalar), (
+        f"q_len={q_len}: the four-row score tiling does not reproduce the "
+        f"one-row dot -- worst |difference| {float(np.max(np.abs(tiled - scalar)))}"
+    )
+    # And the comparison is not between two constants.
+    assert float(np.max(np.abs(scalar))) > 0.0
+
+
+@pytest.mark.parametrize("q_len", ATTENTION_CHUNKS)
+@needs_tools
+def test_the_tiled_attention_is_independent_of_the_thread_count(q_len: int) -> None:
+    """And the tiled form is bit-identical at one thread and at eight.
+
+    The per-task scratch region grew from one row to `kAttentionRows` rows when
+    the tiling arrived, and the CPU backend sizes it from the same two constants
+    the kernel partitions by.  A backend that still allocated two rows would
+    have two tasks interleaving their score rows -- fluent, finite, wrong output
+    that only this comparison (or a token) would catch.
+    """
+    tensors, params = _prefill_attention_case(q_len, seed=20261005 + q_len)
+    request = write_request("attention", tensors, params)
+    one = run_op(request, threads=1)
+    eight = run_op(request, threads=8)
+    assert np.array_equal(one, eight), (
+        f"q_len={q_len}: the tiled attention output moved with the thread count "
+        f"-- worst |difference| {float(np.max(np.abs(one - eight)))}"
+    )
+    assert float(np.max(np.abs(one))) > 0.0
 
 
 # --------------------------------------------------------------------------
