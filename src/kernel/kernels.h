@@ -192,41 +192,44 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const void *k_cac
  * CPU backend's `attention_scratch` use this constant, so the score-row
  * allocation and the partition the kernel takes cannot disagree.
  *
- * **It is 4, and the number is measured, not chosen.** The whole attention
- * call at ``q_len = 512``, d = 128, 16 heads, 22 threads, one core, interleaved
- * best-of-five, as a function of the tiling:
+ * **It is 8, and the number is measured, not chosen.** The whole attention
+ * call at ``q_len = 512``, d = 128, 16 heads, 44 threads, interleaved
+ * best-of-five against R = 4 and R = 16 on the same host:
  *
- *     R=1 (the shipped kernel)  16945 us   1.00x
- *     R=2                       14178 us   1.20x
- *     R=4                       11933 us   1.42x
- *     R=8                       11966 us   1.42x
+ *     R=4    146.6 / 143.5 / 143.0 / 146.6 us   <- what "four rows" shipped as
+ *     R=8    130.2 / 122.5 / 129.9 / 133.8 us   <- 1.12x, the shipped value
+ *     R=16   146.3 us                            <- the score pass regressed
  *
- * R=4 ties R=8 at the prefill shape the graph actually calls -- 1.42x each --
- * and R=4 ties or beats it at every chunk at or below 512. Two effects trade off
- * there and neither is being explained away: more rows reuse each key load (a
- * block's shared region is walked once instead of once per row), but more rows
- * also lengthen the causal *tail*, which runs one row at a time at R=1
- * efficiency and costs proportional to R-1. At ``q_len = 2048`` the reuse wins
- * and R=8 is 1.60x to R=4's 1.44x; the crossover is between 512 and 2048, and
- * 512 -- the shape ``pp512`` measures -- is where the constant is chosen. At a
- * decode step (``q_len = 1``) every R collapses to the same serial block, so
- * the constant costs nothing there. The full sweep is in
- * ``docs/architecture/c_engine.md`` under "Four query rows per key walk".
+ * The attention call is bandwidth-bound, so the quantity that decides R is how
+ * many times the K and V slabs are streamed, and that is
+ * ``q_len / R * n_heads / kAttentionHeadBatch`` -- 1024 slab-lengths at R = 4
+ * against 512 at R = 8. The measured split of the call at R = 4 is score 66 ms,
+ * softmax 16 ms, weighted sum 79 ms, and R = 8 moves both streamed passes in
+ * the same direction: score 53 ms and weighted sum 58 ms, for 131 ms against
+ * 161 ms. **R = 16 is where the score pass turns around and gives the win back**
+ * -- 85 ms, worse than R = 4's 66 -- and the cause is register pressure rather
+ * than traffic: `dot_tile_r` holds one `__m256` accumulator per two query rows,
+ * so 16 rows is 8 live accumulator registers plus the key vector and the query
+ * loads, which overflows what AVX2 has and spills. The weighted sum keeps
+ * improving at 16 rows (58 -> 46 ms), which is why the constant is a compromise
+ * and why 8 -- where both passes are better than at 4 -- is the one that ships.
+ * The full sweep is in ``docs/architecture/c_engine.md`` under "Eight query rows
+ * per key walk".
  *
  * **`kAttentionGrain = 1` is now measured in blocks.** The unit changed from
  * ``(token, head)`` to ``(kAttentionRows tokens, head)`` when the tiling
  * arrived, and a grain of 1 is still right: every block is one output row per
  * token it covers, so the smallest useful grain on the new unit is one.
  *
- * The tiling is *bit-exact* to the one-row kernel. The 256-bit registers hold
- * two queries' four-lane accumulator chains side by side -- the same
- * `_mm_mul_ps`/`_mm_add_ps` at the same offsets, never a fused multiply-add --
- * so every lane is the lane `dot4` would have computed, and the per-row reduce
- * is `dot4`'s. `tests/native/test_cpu_parallel.py` holds that to the bytes.
+ * The tiling is *bit-exact* to the one-row kernel, and the row count is not
+ * part of that argument: `dot_tile_r<R>` pairs rows two at a time and gives each
+ * pair its own accumulator, so a row's four lanes and their reduce are the ones
+ * it has at every R. Widening the tile changes how many rows share a walk, not
+ * what any row computes. `tests/native/test_cpu_parallel.py` holds that to the bytes.
  * The tail rows of a causal block (``s`` past the last key every row can see)
  * take `dot4` one row at a time rather than a second tiled kernel, so there is
  * exactly one tiled code path to be right. */
-constexpr int64_t kAttentionRows = 4;
+constexpr int64_t kAttentionRows = 8;
 
 /* How many attention tasks one thread owns before it is worth waking another.
  * Shared with the CPU backend, which sizes the score-row scratch from the same

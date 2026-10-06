@@ -278,7 +278,7 @@ inline float dot4(const float *a, const float *b, int64_t k) { return dot(a, b, 
  * and it is *this* function's job to be indistinguishable from `dot4`.
  *
  * `$POCKETLLM_CPU_SCALAR_DOT` routes it to two scalar `dot` calls, like `dot4`
- * and `dot_tile`, so the equivalence stays checkable through the public API. */
+ * and `dot_tile_r`, so the equivalence stays checkable through the public API. */
 #if POCKETLLM_HAVE_AVX2
 
 __attribute__((optimize("fp-contract=off"))) inline void dot_pair(const float *qa,
@@ -321,16 +321,19 @@ inline void dot_pair(const float *qa, const float *qb, const float *key, int64_t
 }
 #endif
 
-/* ``kAttentionRows`` query rows against one key vector, one `dot4` per row.
+/* ``R`` query rows against one key vector, one `dot4` per row.
  *
  * The score pass is `q_len * span` dots over `span` key vectors, so the key row
- * is loaded `q_len` times per head; at prefill the pairs are a triangular
- * half-matrix and that re-read is the cost.  This loads it once for four rows.
+ * is loaded `q_len / R` times per head; the call is bandwidth-bound, so the
+ * load count *is* the cost.  `R` is `kAttentionRows` at the one call site; it is
+ * a template parameter rather than a constant so a caller that wanted a
+ * different block for a different reason -- the weighted sum below, say -- could
+ * ask for one without a second copy of this code.
  *
- * **The lane structure is the whole design, and reading the code as "just four
+ * **The lane structure is the whole design, and reading the code as "just R
  * accumulators" is how a last-bit change gets in.**  `dot4` is one `__m128`
  * chain advancing by four, reduced `((l0 + l1) + (l2 + l3)) + tail`.  A
- * four-query kernel that gave each row its own `__m256` would have eight lanes
+ * query-row kernel that gave each row its own `__m256` would have eight lanes
  * per row and a different reduce -- a different last bit, and the score-dot
  * section on the C engine page records what a last bit costs here: the FMA
  * variant of `dot4` moved the model's greedy completion from 32/32 tokens
@@ -341,58 +344,72 @@ inline void dot_pair(const float *qa, const float *qb, const float *key, int64_t
  * `2p` and `2p+1` in the low and high halves of `acc[p]`, loaded at the offsets
  * `dot4` would load them, combined with the same `_mm_add_ps(_mm_mul_ps(...))`
  * and never a fused multiply-add.  Every lane is `dot4`'s lane; only which
- * queries share a register has changed.
+ * queries share a register has changed.  **And the row count is not part of
+ * that argument**: rows are paired, and a pair's arithmetic does not know how
+ * many other pairs exist, so `R = 8` produces the same bytes a row at a time
+ * would and so would any other even `R`.  What an even larger `R` does cost is
+ * registers -- one live `__m256` per two rows -- and `kAttentionRows` is 8
+ * because 16 is where that shows up.
  *
  * 128 is the head width the graph calls this with, but the tail loops are kept
  * so the function is not a trap for a width that is not a multiple of four.
- * `$POCKETLLM_CPU_SCALAR_DOT` routes it to four scalar `dot` calls, like
- * `dot4`, so the equivalence stays checkable through the public API. */
+ * `$POCKETLLM_CPU_SCALAR_DOT` routes it to scalar `dot` calls, like `dot4`, so
+ * the equivalence stays checkable through the public API. */
 #if POCKETLLM_HAVE_AVX2
 
-__attribute__((optimize("fp-contract=off"))) inline void dot_tile(const float *const *q4,
-                                                                 const float *key, int64_t k,
-                                                                 float out[4]) {
+template <int64_t R>
+__attribute__((optimize("fp-contract=off"))) inline void dot_tile_r(const float *const *q,
+                                                                    const float *key, int64_t k,
+                                                                    float out[R]) {
+  static_assert(R % 2 == 0, "dot_tile_r holds two query rows per __m256");
   if (scalar_dot_forced()) {
-    for (int p = 0; p < 4; ++p) {
-      out[p] = dot(q4[p], key, k);
+    for (int64_t p = 0; p < R; ++p) {
+      out[p] = dot(q[p], key, k);
     }
     return;
   }
-  /* Two 256-bit registers, each carrying two queries' `__m128` chains. */
-  __m256 acc01 = _mm256_setzero_ps();
-  __m256 acc23 = _mm256_setzero_ps();
+  /* One 256-bit register per *pair* of queries, each carrying the pair's two
+   * `__m128` chains. */
+  __m256 acc[R / 2];
+  for (int64_t p = 0; p < R / 2; ++p) {
+    acc[p] = _mm256_setzero_ps();
+  }
   int64_t i = 0;
   for (; i + 4 <= k; i += 4) {
     const __m128 kk = _mm_loadu_ps(key + i);
     /* The same four key values in both halves, so each query's low half sees
      * exactly the vector `dot4` would load at this offset. */
     const __m256 kv = _mm256_insertf128_ps(_mm256_castps128_ps256(kk), kk, 1);
-    const __m256 a01 = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_loadu_ps(q4[0] + i)),
-                                            _mm_loadu_ps(q4[1] + i), 1);
-    const __m256 a23 = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_loadu_ps(q4[2] + i)),
-                                            _mm_loadu_ps(q4[3] + i), 1);
-    acc01 = _mm256_add_ps(_mm256_mul_ps(a01, kv), acc01);
-    acc23 = _mm256_add_ps(_mm256_mul_ps(a23, kv), acc23);
+    for (int64_t p = 0; p < R / 2; ++p) {
+      const __m256 a = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_loadu_ps(q[2 * p] + i)),
+                                            _mm_loadu_ps(q[2 * p + 1] + i), 1);
+      acc[p] = _mm256_add_ps(_mm256_mul_ps(a, kv), acc[p]);
+    }
   }
-  alignas(32) float lanes01[8];
-  alignas(32) float lanes23[8];
-  _mm256_store_ps(lanes01, acc01);
-  _mm256_store_ps(lanes23, acc23);
-  const float *lanes[4] = {lanes01, lanes01 + 4, lanes23, lanes23 + 4};
-  for (int p = 0; p < 4; ++p) {
+  alignas(32) float lanes[R / 2][8];
+  for (int64_t p = 0; p < R / 2; ++p) {
+    _mm256_store_ps(lanes[p], acc[p]);
+  }
+  for (int64_t p = 0; p < R; ++p) {
+    /* Row `p`'s chain is `p % 2`'s half of pair `p / 2`. */
+    const float *l = lanes[p / 2] + (p % 2) * 4;
     float tail = 0.0F;
     for (int64_t j = i; j < k; ++j) {
-      tail += q4[p][j] * key[j];
+      tail += q[p][j] * key[j];
     }
-    out[p] = ((lanes[p][0] + lanes[p][1]) + (lanes[p][2] + lanes[p][3])) + tail;
+    out[p] = ((l[0] + l[1]) + (l[2] + l[3])) + tail;
   }
 }
+
 #else
-inline void dot_tile(const float *const *q4, const float *key, int64_t k, float out[4]) {
-  for (int p = 0; p < 4; ++p) {
-    out[p] = dot(q4[p], key, k);
+
+template <int64_t R>
+inline void dot_tile_r(const float *const *q, const float *key, int64_t k, float out[R]) {
+  for (int64_t p = 0; p < R; ++p) {
+    out[p] = dot(q[p], key, k);
   }
 }
+
 #endif
 
 /* ``sum_i row[i] * dequant_q4_k(block, i)`` for one Q4_K super-block.
@@ -1580,7 +1597,7 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const void *k_cac
    *
    * The score pass is where the tiling pays: the keys a whole block can see
    * (`s <= q_offset + t0`) are walked once for `kAttentionRows` query rows, in
-   * `dot_tile`, which produces exactly the `dot4` results a row-at-a-time walk
+   * `dot_tile_r`, which produces exactly the `dot4` results a row-at-a-time walk
    * would.  The causal *tail* -- the `kAttentionRows - 1` keys after that,
    * which only the later rows of the block can see -- takes `dot4` one row at a
    * time rather than a second, ragged tiled kernel, so there is exactly one
@@ -1668,7 +1685,7 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const void *k_cac
                        const float *kvec = widen(k_cache, s, kv_head, 0);
                        for (int64_t p = 0; p < hb; ++p) {
                          float sc[kAttentionRows];
-                         dot_tile(qvec[p], kvec, d, sc);
+                         dot_tile_r<kAttentionRows>(qvec[p], kvec, d, sc);
                          for (int64_t j = 0; j < rows; ++j) {
                            const float score = sc[j] * scale;
                            row_scores[p][j][s - first_key] = score;
@@ -1962,7 +1979,7 @@ void topk_sample(const float *logits, int64_t vocab, float uniform, int64_t top_
  *
  * **This is how the f16 cache is read, and the decision to materialize rather
  * than to write a second family of dot kernels is the design.**  Every score
- * kernel in this file -- `dot`, `dot4`, `dot_pair`, `dot_tile` -- is the result
+ * kernel in this file -- `dot`, `dot4`, `dot_pair`, `dot_tile_r` -- is the result
  * of a measured correctness argument about lane structure, and the score dot is
  * the one place a last-bit change flips tokens (see `dot4`).  A parallel
  * `_f16` family would double that surface and put two kernels under one
@@ -1974,7 +1991,7 @@ void topk_sample(const float *logits, int64_t vocab, float uniform, int64_t top_
  * and the widened row is 512 bytes -- which is L1-resident five times over, so
  * the row is streamed from the cache once and then read and re-read out of L1
  * by whatever tiling the kernel uses.  `dot_pair` reads a key row twice (once
- * per query head) and `dot_tile` reads it once for four rows; both were
+ * per query head) and `dot_tile_r` reads it once for `kAttentionRows` rows; both were
  * reading the same 512-byte row in the f32 case already, so this is the access
  * pattern the kernels were written against, not a new one.
  *

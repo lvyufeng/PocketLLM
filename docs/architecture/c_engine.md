@@ -467,9 +467,11 @@ was **18.3 ms per call and 44% of a 1161 ms `pp512`** at 22 threads once the fou
 the largest single term in the prefill gap, and the one whose per-element cost had already been
 optimized as far as lanes could take it.
 
-`dot_tile` walks `kAttentionRows = 4` query rows of one head against one key vector, so the key is
-loaded once for four rows. The partition changed with it: a task is now `(4 tokens, head)` rather
-than `(token, head)`, and its score scratch is four rows rather than one.
+`dot_tile` walks `kAttentionRows` query rows of one head against one key vector, so the key is
+loaded once for all of them. The partition changed with it: a task is now `(kAttentionRows tokens,
+head)` rather than `(token, head)`, and its score scratch is that many rows rather than one. The
+constant shipped as 4 when this tiling landed and is **8** today — see "Eight query rows per key
+walk" below for the measurement that moved it.
 
 **Bit-exactness here is a lane structure, not a rounding budget.** A natural four-query kernel gives
 each row its own `__m256` — eight lanes per row, an eight-lane horizontal reduce — and that is a
@@ -614,6 +616,60 @@ engine is using flash attention, median of two): **681.0 t/s against our 501.5, 
 and the remaining term is `gemm_quant`, whose `n = 1024, k = 1024` shape is 305 ms of the ~1070 ms
 call on 22 threads — the four-row GEMM behind llama.cpp's eight-row repacked form.
 
+### Eight query rows per key walk
+
+Both tiled passes are bandwidth-bound, and the quantity they are bound by is how many times the K
+and V slabs are streamed: `q_len / R × n_heads / kAttentionHeadBatch` slab-lengths, where `R` is
+`kAttentionRows`. Everything above is the story of `R = 4`; **`R = 8` halves the traffic again**, and
+the measurement below is what moved the constant.
+
+The split of the whole call at `pp512`, 44 threads, one host, by truncating the kernel after each
+pass (`$ATTN_PASS` on a scratch copy of the tree — the shipped binary has no such switch):
+
+| | score | softmax | weighted sum | total |
+|---|---:|---:|---:|---:|
+| `R = 4` | 66 ms | 16 ms | 79 ms | 161 ms |
+| `R = 8` | 53 ms | 16 ms | 58 ms | 127 ms |
+| `R = 16` | 85 ms | 16 ms | 46 ms | 147 ms |
+
+`R = 8` moves both streamed passes the right way — score 1.25×, weighted sum 1.36× — for **1.27× on
+the call**. `R = 16` is where the score pass turns around and gives the win back, and the cause is
+registers rather than traffic: `dot_tile_r` holds one live `__m256` per *pair* of query rows, so 16
+rows is 8 accumulators plus the key vector and the query loads, which spills. The weighted sum keeps
+improving at 16 rows because it trades against a different pressure — a tile row's accumulator is a
+`kAttentionSumMaxDim`-wide slice of stack, not a register — which is why the constant is a compromise
+and 8 is the value where neither pass has regressed.
+
+**Bit-exactness is not weakened by the row count, and the reason is the pairing.** `dot_tile_r<R>`
+gives each *pair* of rows its own accumulator, loads each pair's two four-lane halves exactly where
+`dot4` loads them, and combines them with the same `_mm_mul_ps` → `_mm_add_ps`; a pair's arithmetic
+does not know how many other pairs exist. So a row's result is the same at `R = 4`, `R = 8` or any
+other even `R`, and `test_the_tiled_attention_score_is_the_one_row_dot` — which runs the shipped
+kernel against `$POCKETLLM_CPU_SCALAR_DOT` and calls `np.array_equal` — passes unchanged.
+
+**End to end, interleaved, `--reps 5`, median of four rounds**, both engines at their default 44
+threads, `-fa 0` on llama.cpp so neither is using flash attention:
+
+| | ours | llama.cpp `-fa 0` | ratio |
+|---|---:|---:|---:|
+| `pp512` | 966 | 839 | **1.15×** |
+| `tg64` | 56.6 | 62.9 | 0.90× |
+
+**Prefill now leads llama.cpp like-for-like.** That is a reversal of the position recorded above —
+0.74× at 22 threads in an earlier session — and it is the tile plus the physical-core default plus an
+unloaded host, not one of them alone. Against llama.cpp's *shipped* default (`-fa auto`, which is
+flash attention on) it is still behind on both: `pp512` 966 against 1238, `tg64` 56.6 against 72.6.
+
+**Decode is the number this change does not move, and that is a construction argument, not a
+measurement.** A decode step is `q_len = 1`: one block per head, no shared key region, so the tiled
+path is never entered and the single row takes the shipped one-row `dot4`. What decode is short of is
+not tile width but *tasks* — 16 heads over 44 threads — and a decode attention call gets **slower**
+past about 8 threads (`/tmp/prof/dattn.cpp`, span 512: 99.9 us at 8 threads, 105.0 at 22, 111.4 at
+44, 170.5 at 88). llama.cpp shows the same shape on this host (`tg64` 93.4 t/s at 22 threads against
+73.0 at 44), which is the signature of two sockets and a resident weight buffer rather than of either
+kernel. Widening a decode's tile is therefore the next piece of work, and it needs `q_len > 1` to do
+anything at all.
+
 ### Two query heads per walk over a key row
 
 The two passes at the two ends of the attention call had each been tiled over *query rows* — four
@@ -674,8 +730,8 @@ own column:
 
 The 1.53× on the attention call becomes 1.10× on the step because attention is a little over half of a
 decode token at that context — the GEMMs share the token with it. Prefill is flat, which is what the
-construction predicts and not a disappointment: at `pp512` each head already scores four query rows per
-key walk, so the batching's *second* read of the K row is amortized over four rows rather than one, and
+construction predicts and not a disappointment: at `pp512` each head already scores `kAttentionRows`
+query rows per key walk, so the batching's *second* read of the K row is amortized over all of them, and
 attention is a much smaller share of a prefill step than of a decode step.
 
 **The measurement this section does not have, and why.** An earlier revision of this page quoted a
@@ -721,7 +777,7 @@ kernel then reads a cache row it has already been verified against.
 
 It is also where the bytes go. A head row is 128 halves = 256 bytes, and the widened row is 512
 bytes: L1-resident five times over. `dot_pair` reads a key row twice (once per query head) and
-`dot_tile` reads it once for four rows; both were already reading a 512-byte row in the f32 case, so
+`dot_tile_r` reads it once for `kAttentionRows` rows; both were already reading a 512-byte row in the f32 case, so
 this is the access pattern the kernels were written against. A single-core probe that widens a row and
 then runs the real score loop measures **393 us against 410 us at span 512** — the conversion costs 4%
 and saves half the bytes, and the trade only improves as the cache grows.
