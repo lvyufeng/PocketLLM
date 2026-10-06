@@ -1674,6 +1674,33 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const void *k_cac
    is exactly why the test parametrizes an odd count. */
   const int64_t groups = (n_heads + kAttentionHeadBatch - 1) / kAttentionHeadBatch;
 
+  /* Deal the query blocks from both ends, and this is a load-balance fix rather
+   * than a preference.
+   *
+   * Attention is causal, so block `b` walks `q_offset + b * kAttentionRows`
+   * shared keys -- its cost grows with the block index, roughly linearly.  The
+   * unit index used to be `b * groups + g`, so a contiguous split of it gave the
+   * first worker the cheapest block and the last worker the most expensive one,
+   * and `parallel_for` caps its chunk count at the thread count, so there is no
+   * over-decomposition for the pool's work-stealing to even out.  The result was
+   * measured: `attention` reached 8.6x on 22 cores where the GEMM reached
+   * 13.6x, 39% of the ideal against the GEMM's 62%, which made it 24% of prefill
+   * and the worst-scaling op in the tree.
+   *
+   * Ordering the blocks `0, blocks-1, 1, blocks-2, ...` makes the cumulative
+   * cost linear in the unit index -- the first half of the sequence pairs a
+   * cheap block with an expensive one, so any contiguous range carries about its
+   * share -- and every worker then gets a similar total.  The mapping is a
+   * permutation of which worker runs which unit; each unit's arithmetic, its
+   * private scratch and the set of outputs it writes are untouched, so the
+   * result is bit-identical and the thread-count test still holds.  A decode is
+   * one block, so `blocks == 1` leaves it exactly where it was. */
+  auto block_of = [blocks, groups](int64_t unit, int64_t &g) {
+    const int64_t p = unit / groups;
+    g = unit - p * groups;
+    return (p & 1) != 0 ? (blocks - 1 - (p >> 1)) : (p >> 1);
+  };
+
   /* ---- flash attention: one pass over the keys, no score row --------------
    *
    * Everything below materializes the score row: a store and a reload of
@@ -1824,8 +1851,8 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const void *k_cac
       alignas(32) float row_buf[2 * kAttentionSumMaxDim];
       alignas(32) float part[kAttentionRows][kAttentionHeadBatch][kAttentionSumMaxDim + 2];
       for (int64_t unit = lo; unit < hi; ++unit) {
-        const int64_t b = unit / groups;
-        const int64_t g = unit - b * groups;
+        int64_t g = 0;
+        const int64_t b = block_of(unit, g);
         const int64_t t0 = b * kAttentionRows;
         const int64_t rows = std::min<int64_t>(kAttentionRows, q_len - t0);
         const int64_t h0 = g * kAttentionHeadBatch;
@@ -1923,8 +1950,8 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const void *k_cac
                    return static_cast<const float *>(base) + index * kv_stride + kv_head * d;
                  };
                  for (int64_t unit = lo; unit < hi; ++unit) {
-                   const int64_t b = unit / groups;
-                   const int64_t g = unit - b * groups;
+                   int64_t g = 0;
+                   const int64_t b = block_of(unit, g);
                    const int64_t t0 = b * kAttentionRows;
                    const int64_t rows = std::min<int64_t>(kAttentionRows, q_len - t0);
                    /* The batch is `kAttentionHeadBatch` consecutive query heads
