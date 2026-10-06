@@ -142,20 +142,67 @@ void rope_neox(float *x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t s
  * ``[position][kv_head][d]`` with a row stride of ``n_head_kv * d``. Attention
  * is grouped: query head ``h`` reads KV head ``h / group``.
  *
- * `scores` is caller-owned scratch holding ``q_offset + q_len - first_key``
- * floats per *concurrent* task, which the backend sizes through its own
- * ``attention_scratch``.  This kernel runs ``(token, head)`` units in parallel
- * and each task writes its own row, so the buffer is several rows, not one;
- * a caller that sized it from the old one-row contract would under-allocate
- * the moment more than one thread is in play. */
+ * `scores` is caller-owned scratch holding ``kAttentionRows * (q_offset + q_len
+ * - first_key)`` floats per *concurrent* task, which the backend sizes through
+ * its own ``attention_scratch``.  This kernel runs ``(q_len / kAttentionRows,
+ * head)`` blocks in parallel and each task writes its own ``kAttentionRows``
+ * rows, so the buffer is several rows per task, not one; a caller that sized it
+ * from the one-row-per-task contract would under-allocate the moment more than
+ * one thread is in play. */
 void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_cache,
                const float *v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
                int64_t q_offset, float scale, float *out, float *scores);
 
-/* How many ``(token, head)`` units one attention task owns before it is worth
- * waking a thread.  Shared with the CPU backend, which sizes the score-row
- * scratch from the same partition the kernel takes; if the two used different
- * grains the buffer would be sized for a partition that does not happen.
+/* How many *query rows of one head* one attention task scores in a single walk
+ * over the key vector.
+ *
+ * The score pass is ``q_len * span`` dots per head over the same ``span`` key
+ * vectors -- at prefill that is a triangular half-matrix, and the key row is
+ * read once per query row. Tiling `kAttentionRows` query rows of the same head
+ * against one key row reads it once for all of them. Both the kernel and the
+ * CPU backend's `attention_scratch` use this constant, so the score-row
+ * allocation and the partition the kernel takes cannot disagree.
+ *
+ * **It is 4, and the number is measured, not chosen.** The whole attention
+ * call at ``q_len = 512``, d = 128, 16 heads, 22 threads, one core, interleaved
+ * best-of-five, as a function of the tiling:
+ *
+ *     R=1 (the shipped kernel)  16945 us   1.00x
+ *     R=2                       14178 us   1.20x
+ *     R=4                       11933 us   1.42x
+ *     R=8                       11966 us   1.42x
+ *
+ * R=4 ties R=8 at the prefill shape the graph actually calls -- 1.42x each --
+ * and R=4 ties or beats it at every chunk at or below 512. Two effects trade off
+ * there and neither is being explained away: more rows reuse each key load (a
+ * block's shared region is walked once instead of once per row), but more rows
+ * also lengthen the causal *tail*, which runs one row at a time at R=1
+ * efficiency and costs proportional to R-1. At ``q_len = 2048`` the reuse wins
+ * and R=8 is 1.60x to R=4's 1.44x; the crossover is between 512 and 2048, and
+ * 512 -- the shape ``pp512`` measures -- is where the constant is chosen. At a
+ * decode step (``q_len = 1``) every R collapses to the same serial block, so
+ * the constant costs nothing there. The full sweep is in
+ * ``docs/architecture/c_engine.md`` under "Four query rows per key walk".
+ *
+ * **`kAttentionGrain = 1` is now measured in blocks.** The unit changed from
+ * ``(token, head)`` to ``(kAttentionRows tokens, head)`` when the tiling
+ * arrived, and a grain of 1 is still right: every block is one output row per
+ * token it covers, so the smallest useful grain on the new unit is one.
+ *
+ * The tiling is *bit-exact* to the one-row kernel. The 256-bit registers hold
+ * two queries' four-lane accumulator chains side by side -- the same
+ * `_mm_mul_ps`/`_mm_add_ps` at the same offsets, never a fused multiply-add --
+ * so every lane is the lane `dot4` would have computed, and the per-row reduce
+ * is `dot4`'s. `tests/native/test_cpu_parallel.py` holds that to the bytes.
+ * The tail rows of a causal block (``s`` past the last key every row can see)
+ * take `dot4` one row at a time rather than a second tiled kernel, so there is
+ * exactly one tiled code path to be right. */
+constexpr int64_t kAttentionRows = 4;
+
+/* How many attention tasks one thread owns before it is worth waking another.
+ * Shared with the CPU backend, which sizes the score-row scratch from the same
+ * partition the kernel takes; if the two used different grains the buffer
+ * would be sized for a partition that does not happen.
  *
  * **This is 1, and the number it replaced was 32.**  A grain of 32 was read off
  * the wrong axis: the job is ``q_len * n_heads`` units wide, and 32 of them is a
