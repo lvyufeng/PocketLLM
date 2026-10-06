@@ -1162,6 +1162,26 @@ and the engine are doing the same thing at the same speed; when they are not, th
 instrument. The same lesson is why the thread-count trap above is called out separately: two of the
 three "measurements" that framed this stage were artefacts of the harness.
 
+### The default is one NUMA node's cores, and that is a decode choice
+
+Using every core spans both sockets, and the measurement says that is the wrong default for this
+target. Paired `pp512`/`tg64`, one node (22 cores) against both (44), six runs interleaved:
+
+| | one node | both |
+|---|---|---|
+| prefill `pp512` | 502–535 | 752–865 |
+| decode `tg64` | 77.4–80.6 | 69.1–72.5 |
+| **decode ratio** | | **1.08–1.12× better on one node** |
+
+Decode is latency-bound on a weight stream the remote node reaches across the interconnect; prefill
+has the arithmetic to hide it and is ~20% faster on the whole machine. **On a single-node machine —
+which is every phone and most edge boards, the hardware this engine is for — there is no tradeoff: the
+cost does not exist.** The default is therefore one node's cores, `$POCKETLLM_CPU_THREADS` sets the old
+behaviour (`=44` here) or any other count, and `numa_node_count()` reads the nodes from
+`/sys/devices/system/node` with no `libnuma` dependency. The count is cores-per-node rather than a core
+*mask*: the scheduler places the pool's threads, and pinning would be a second policy to get wrong (and
+the wrong one on a machine where another process owns a node).
+
 ### The pool hands out a chunk by index, not by atomic claim
 
 The pool used an atomic `fetch_add` on a claim counter — the textbook work-stealing queue — and it was

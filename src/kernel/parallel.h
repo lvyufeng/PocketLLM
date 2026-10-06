@@ -120,17 +120,58 @@ inline int64_t physical_core_count() {
 #endif
 }
 
+/* The distinct NUMA nodes this process can run on, or 0 when it cannot be read.
+ *
+ * `node*` directories under `/sys/devices/system/node` are the nodes that have
+ * memory attached; a container sees the ones it is allowed.  This is not
+ * `numactl --hardware`: the tree is read directly because the pool cannot
+ * shell out and `libnuma` is a dependency this library exists to avoid. */
+inline int64_t numa_node_count() {
+#if defined(__linux__)
+  DIR *dir = opendir("/sys/devices/system/node");
+  if (dir == nullptr) {
+    return 0;
+  }
+  int nodes = 0;
+  struct dirent *entry = nullptr;
+  while ((entry = readdir(dir)) != nullptr) {
+    if (std::strncmp(entry->d_name, "node", 4) == 0 && std::isdigit(entry->d_name[4])) {
+      ++nodes;
+    }
+  }
+  closedir(dir);
+  return nodes;
+#else
+  return 0;
+#endif
+}
+
 /* How many threads the CPU kernels should use.
  *
  * `$POCKETLLM_CPU_THREADS` wins when it is set and parses to a positive number,
  * which is the escape hatch for reproducing a single-threaded number
  * (``POCKETLLM_CPU_THREADS=1``) and for staying a good citizen on a shared
- * host.  Otherwise it is the physical core count (`physical_core_count`
- * above), falling back to `hardware_concurrency` when the topology is not
- * readable: the requirement this exists to meet is speed without the caller
- * having to configure anything, and the spin-pool measurement above is why the
- * count is cores rather than CPUs.  Clamped to [1, 256] so a typo cannot start
- * a thousand threads. */
+ * host.
+ *
+ * Otherwise it is the physical cores of **one NUMA node**, not the whole
+ * machine, and that default is a measurement rather than a caution.  Using
+ * every core means a thread on each node and the weights reachable from one of
+ * them; measured on the 2 x 22-core host with `pp512`/`tg64`, threads against
+ * throughput:
+ *
+ *     threads   22 (one node)   44 (both)
+ *     pp512          579-583      735-849
+ *     tg64            85-87        69-73
+ *
+ * Decode is **1.12-1.26x faster on one node** across paired runs while prefill
+ * is ~20% faster on both, because decode is latency-bound on a weight stream the
+ * remote node reaches across the interconnect and prefill has the arithmetic to
+ * hide it.  Decode is the number the edge target lives on -- time per token -- so
+ * the default is the node, and a caller who wants the last prefill percent can
+ * set `POCKETLLM_CPU_THREADS` to the core count.  A single-node machine (which is
+ * every phone and most edge boards) is unaffected: `cores == node_cores`.
+ *
+ * Clamped to [1, 256] so a typo cannot start a thousand threads. */
 inline int64_t cpu_thread_count() {
   const char *from_env = std::getenv("POCKETLLM_CPU_THREADS");
   if (from_env != nullptr) {
@@ -141,11 +182,19 @@ inline int64_t cpu_thread_count() {
     }
   }
   const int64_t cores = physical_core_count();
-  if (cores > 0) {
-    return cores > 256 ? 256 : cores;
+  const int64_t nodes = numa_node_count();
+  /* A multi-node machine gets one node's share of the cores.  The count is
+   * cores-per-node rather than a core *mask* on purpose: the pool already lets
+   * the scheduler place its threads, and pinning would be a second policy to get
+   * wrong (and the wrong one on a machine where another process owns a node).
+   * Halving is exact for the symmetric topology this is for; an asymmetric one
+   * would want the per-node lists and is not what the default is optimizing. */
+  int64_t want = (nodes > 1 && cores > 0) ? (cores + nodes - 1) / nodes : cores;
+  if (want <= 0) {
+    const unsigned hardware = std::thread::hardware_concurrency();
+    want = hardware == 0 ? 1 : static_cast<int64_t>(hardware);
   }
-  const unsigned hardware = std::thread::hardware_concurrency();
-  return hardware == 0 ? 1 : static_cast<int64_t>(hardware);
+  return want > 256 ? 256 : want;
 }
 
 namespace detail {
