@@ -624,6 +624,54 @@ def test_the_tiled_attention_is_independent_of_the_thread_count(q_len: int) -> N
     assert float(np.max(np.abs(one))) > 0.0
 
 
+@pytest.mark.parametrize("q_len", ATTENTION_CHUNKS)
+@needs_tools
+def test_the_tiled_attention_weighted_sum_is_the_row_at_a_time_one(q_len: int) -> None:
+    """Four output rows per walk over a V row, and the same bytes as one.
+
+    The weighted sum is the second term of the attention call and it had been
+    left alone when the score pass got its tiling: for every query row it
+    streamed the whole V slab doing `dst[x] += weight * vvec[x]`.  The tiling
+    now holds `kAttentionRows` accumulators and walks a V row once for all of
+    them, splitting the walk into a shared prefix -- where every row of the tile
+    sees the key -- and a per-row causal tail.
+
+    **It is bit-exact, and that is a stronger claim than this kernel had to
+    make.**  The plan accepted a last-bit change from the weighted sum's
+    tiling, on the same reasoning as the score dot's: `dst[x] +=` over the keys
+    is an accumulation and a differently-interleaved one could contract
+    differently.  It does not.  Row `r` still adds its own terms in key order,
+    one `+=` per key, with the same weight -- the tiling moves *which row* is
+    being accumulated between two loads of the same V vector, not the order
+    within any row's sum.  The probe that checked it (`/tmp/prof/attnwsum.cpp`,
+    `Rv = 4` against the shipped loop at `q_len` 1 through 512) reports
+    `relerr 0.00e+00` and this test holds the same thing to the byte.
+
+    So the bar is equality and not a tolerance.  `$POCKETLLM_CPU_SCALAR_VSUM`
+    routes the call back to the row-at-a-time loop, and the two runs must be
+    `array_equal` on the same input.  If that ever stops holding the tiling has
+    either reassociated a row's sum or, worse, dropped a row's region -- which is
+    the bug the first draft of this kernel had: it gave every row only its own
+    private slice of the keys and produced fluent output 0.8 of its own scale
+    off, at a 1.58x speedup that made it look like a win.
+
+    A `q_len` that is not a multiple of the row count is here for the ragged
+    tile, where `jn < kAttentionRows` and the tail loop is the whole of the
+    difference between the rows.
+    """
+    tensors, params = _prefill_attention_case(q_len, seed=20261005 + q_len)
+    request = write_request("attention", tensors, params)
+    tiled = run_op(request, threads=1)
+    untiled = run_op(request, threads=1, env={"POCKETLLM_CPU_SCALAR_VSUM": "1"})
+    assert np.array_equal(tiled, untiled), (
+        f"q_len={q_len}: the tiled weighted sum does not reproduce the "
+        f"row-at-a-time one -- worst |difference| "
+        f"{float(np.max(np.abs(tiled - untiled)))}"
+    )
+    # And the comparison is not between two constants.
+    assert float(np.max(np.abs(untiled))) > 0.0
+
+
 # --------------------------------------------------------------------------
 # 3. The token sequence, at one thread and at eight.
 # --------------------------------------------------------------------------
