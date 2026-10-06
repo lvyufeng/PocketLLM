@@ -142,13 +142,22 @@ void rope_neox(float *x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t s
  * ``[position][kv_head][d]`` with a row stride of ``n_head_kv * d``. Attention
  * is grouped: query head ``h`` reads KV head ``h / group``.
  *
- * `scores` is caller-owned scratch holding ``kAttentionRows * (q_offset + q_len
- * - first_key)`` floats per *concurrent* task, which the backend sizes through
- * its own ``attention_scratch``.  This kernel runs ``(q_len / kAttentionRows,
- * head)`` blocks in parallel and each task writes its own ``kAttentionRows``
- * rows, so the buffer is several rows per task, not one; a caller that sized it
- * from the one-row-per-task contract would under-allocate the moment more than
- * one thread is in play. */
+ * `scores` is caller-owned scratch holding ``kAttentionScoreRowsPerTask *
+ * (q_offset + q_len - first_key)`` floats per *concurrent* task, which the
+ * backend sizes through its own ``attention_scratch``.  This kernel runs
+ * ``(q_len / kAttentionRows, n_heads / kAttentionHeadBatch)`` units in parallel
+ * and each unit writes ``kAttentionHeadBatch * kAttentionRows`` rows, so the
+ * buffer is several rows per task, not one; a caller that sized it from the
+ * one-row-per-task contract would under-allocate the moment more than one
+ * thread is in play.
+ *
+ * **The size depends on the head batch and the task count, not on `n_heads`.**
+ * A previous version of this comment said the buffer was ``n_heads`` rows wide,
+ * which happened to be true when the batch was one head and over-allocated by
+ * the group factor once batched heads share a task.  The one thing that must
+ * not drift is `kAttentionScoreRowsPerTask` matching what `attention` indexes:
+ * the backend's `attention_scratch` and any caller that sizes the buffer are
+ * derived from the same two constants the kernel is. */
 void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_cache,
                const float *v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
                int64_t q_offset, float scale, float *out, float *scores);
@@ -220,6 +229,47 @@ constexpr int64_t kAttentionRows = 4;
  * The kernel reads its own comment for why the unit is the right task and not a
  * finer slice of it. */
 constexpr int64_t kAttentionGrain = 1;
+
+/* How many query heads `attention` scores against one key row in a single walk.
+ *
+ * Grouped attention has ``group = n_heads / n_head_kv`` query heads reading each
+ * KV head, and the score pass walks every key row once *per query head*.  A
+ * decode step pays that in full: `span` key rows, `group` times each, and the K
+ * cache is not in L2 at any useful context.  Scoring `kAttentionHeadBatch` heads
+ * together halves the traffic, and the K row is what the pass is bound by -- `d`
+ * floats are used out of a `n_head_kv * d` stride, so the walk streams 4096
+ * bytes to read 512 per head.
+ *
+ * **Pairing is safe where tiling rows is not, and the difference is whether the
+ * rows share a producer.**  Two heads of one KV group score *different* query
+ * vectors against the *same* key vector, so both of the batching rewrites are
+ * exact: the key load is reused, and no two lanes share an accumulator.  Two
+ * query rows of one head have overlapping but unequal spans, and hoisting either
+ * the key load or the weight lookup past the row loop changes which products are
+ * summed in what order -- the last-bit change the softmax turns into a different
+ * token.  See `kAttentionRows`, which is why the row tiling is confined to the
+ * region a whole tile shares.
+ *
+ * 2 is the shipped value: it is a property of the model (``group`` is 2 for
+ * Qwen3-0.6B), not a tuning knob, and any `group` is handled by the pairing
+ * loop.  `$POCKETLLM_CPU_SCALAR_DOT` routes every lane to the scalar `dot`,
+ * which is the equivalence check `tests/native/test_cpu_parallel.py` runs. */
+constexpr int64_t kAttentionHeadBatch = 2;
+
+/* How many score rows of *one concurrent task* the caller's scratch has to hold.
+ *
+ * The kernel's attention unit is ``(a block of kAttentionRows query tokens, a
+ * batch of kAttentionHeadBatch query heads sharing one KV head)``, and each unit
+ * writes one score row per (batched head, token) pair into its own private
+ * region.  A caller that sizes the buffer from this constant and the same
+ * partition the kernel takes cannot under-allocate; one that reasons from
+ * ``n_heads`` alone can, and the failure is a silent cross-task overwrite rather
+ * than a crash.
+ *
+ * It lives here rather than in `kernels.cpp` because the CPU backend's
+ * `attention_scratch` needs it and the kernel needs it -- the same reason
+ * `kAttentionRows` is here. */
+constexpr int64_t kAttentionScoreRowsPerTask = kAttentionRows * kAttentionHeadBatch;
 
 /* The index of the largest of `n` values, ties going to the lowest index.
  *

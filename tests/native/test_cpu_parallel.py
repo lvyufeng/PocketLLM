@@ -504,7 +504,7 @@ def _decode_attention_case(span: int, seed: int):
 ATTENTION_SPANS = [8, 512]
 
 
-def _prefill_attention_case(q_len: int, seed: int):
+def _prefill_attention_case(q_len: int, seed: int, n_heads: int = 16, n_head_kv: int = 8):
     """A prefill-shaped attention call: a *chunk* of queries, one forward pass.
 
     The decode case above has ``q_len = 1``, which is the shape where the
@@ -516,10 +516,10 @@ def _prefill_attention_case(q_len: int, seed: int):
     keys its first row cannot.
     """
     rng = np.random.default_rng(seed)
-    heads, kv_heads, d = 16, 8, 128
-    q = rng.standard_normal((q_len, heads, d), dtype=np.float32)
-    k_cache = rng.standard_normal((q_len, kv_heads, d), dtype=np.float32)
-    v_cache = rng.standard_normal((q_len, kv_heads, d), dtype=np.float32)
+    d = 128
+    q = rng.standard_normal((q_len, n_heads, d), dtype=np.float32)
+    k_cache = rng.standard_normal((q_len, n_head_kv, d), dtype=np.float32)
+    v_cache = rng.standard_normal((q_len, n_head_kv, d), dtype=np.float32)
     scale = 1.0 / np.sqrt(d)
     tensors = {"q": q, "k_cache": k_cache, "v_cache": v_cache}
     params = {"q_offset": 0, "scale": f"{scale:.9g}"}
@@ -631,6 +631,57 @@ def test_the_tiled_attention_score_is_the_one_row_dot(q_len: int) -> None:
     assert np.array_equal(tiled, scalar), (
         f"q_len={q_len}: the four-row score tiling does not reproduce the "
         f"one-row dot -- worst |difference| {float(np.max(np.abs(tiled - scalar)))}"
+    )
+    # And the comparison is not between two constants.
+    assert float(np.max(np.abs(scalar))) > 0.0
+
+
+#: `(n_heads, n_head_kv)` pairs the head batching is checked at.  16/8 is the
+#: shipped shape and the one the pairing exists for; 16/16 has one query head
+#: per KV head, so no two heads share a key vector and `dot_pair` is never
+#: entered; 8/4 keeps a group of two but at a head count the batch divides
+#: evenly; 3/1 is the one that matters most -- `n_heads` is not a multiple of
+#: `kAttentionHeadBatch`, so the last unit carries a single head and the `hb`
+#: guard is what runs.  (3/1 and not 6/4: grouping is `n_heads / n_head_kv` by
+#: integer division, so 6 heads over 4 KV heads leaves `group == 1` and heads
+#: 4 and 5 reading a KV head the cache does not have.  The odd head count has
+#: to come from an odd *group*, not from a non-divisor.)
+ATTENTION_HEAD_SHAPES = [(16, 8), (16, 16), (8, 4), (3, 1)]
+
+
+@pytest.mark.parametrize(("n_heads", "n_head_kv"), ATTENTION_HEAD_SHAPES)
+@needs_tools
+def test_the_batched_attention_score_is_the_per_head_dot(n_heads: int, n_head_kv: int) -> None:
+    """Scoring two heads of one KV group per key walk, byte for byte.
+
+    The score pass walked every key row once *per query head*; grouped attention
+    has `n_heads / n_head_kv` heads reading each KV head, so a KV head's row was
+    loaded that many times.  The batched form scores `kAttentionHeadBatch` of
+    those heads against one load of the key vector, each in the low or high half
+    of one `__m256` whose lanes are `dot4`'s -- the same offsets, the same
+    `_mm_add_ps(_mm_mul_ps(...))`, never a fused multiply-add -- so the results
+    are two `dot4` calls and not an approximation of them.
+
+    `$POCKETLLM_CPU_SCALAR_DOT` is the switch that makes this checkable: it
+    routes every score lane to the scalar `dot`, so the two runs differ only in
+    whether the batching ran.
+
+    The head shapes are the point.  `n_heads` not a multiple of the batch is the
+    case a batching kernel gets wrong -- the last unit covers one head, not
+    zero and not two -- and `n_head_kv == n_heads` is the case where the pairing
+    loop must not run at all.  A version that assumed `n_heads % batch == 0`
+    would read past the last group here, and the `v_cache` index it would build
+    from the next KV head is a plausible number rather than a segfault.
+    """
+    tensors, params = _prefill_attention_case(q_len=6, seed=20261006 + n_heads * 31 + n_head_kv,
+                                              n_heads=n_heads, n_head_kv=n_head_kv)
+    request = write_request("attention", tensors, params)
+    batched = run_op(request, threads=1)
+    scalar = run_op(request, threads=1, env={"POCKETLLM_CPU_SCALAR_DOT": "1"})
+    assert np.array_equal(batched, scalar), (
+        f"n_heads={n_heads} n_head_kv={n_head_kv}: the batched score pass does "
+        f"not reproduce the per-head dot -- worst |difference| "
+        f"{float(np.max(np.abs(batched - scalar)))}"
     )
     # And the comparison is not between two constants.
     assert float(np.max(np.abs(scalar))) > 0.0
