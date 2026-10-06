@@ -670,6 +670,22 @@ past about 8 threads (`/tmp/prof/dattn.cpp`, span 512: 99.9 us at 8 threads, 105
 kernel. Widening a decode's tile is therefore the next piece of work, and it needs `q_len > 1` to do
 anything at all.
 
+**The default thread count is a trade between the two halves and it favours prefill on purpose.**
+The same host, interleaved, at the shipped default (44, the physical core count) against one socket
+(22):
+
+| threads | `pp512` | `tg64` |
+|---:|---:|---:|
+| 22 | 562 | **88.3** |
+| 44 | **962** | 76.6 |
+
+Prefill is 1.7× better at 44 and decode is 1.17× better at 22, and `$POCKETLLM_CPU_THREADS` is the
+knob for whichever a session wants. The default stays at the core count because prefill is the
+first-token latency and the larger effect. That decode prefers *one* socket is not a property of this
+kernel — llama.cpp reproduces it here — and the fix is memory placement (first-touching the weights
+across both sockets, or a per-socket split of the pool) rather than an arithmetic change, so it is
+recorded as open rather than done.
+
 ### Two query heads per walk over a key row
 
 The two passes at the two ends of the attention call had each been tiled over *query rows* — four
