@@ -309,6 +309,22 @@ measuring this engine:
 - **The thread count and the core count are two different numbers, and the interesting comparison is
   at matched core counts.** The table in "What it measures" is laid out that way for this reason.
 
+### RMSNorm's reduction belongs to the row
+
+The AVX2 RMSNorm computes its sum of squares with four independent eight-lane accumulators over
+32 elements at a time, then folds the remaining vectors and scalar tail into a fixed reduction
+within the row. That removes the sequential float sum's long dependency chain. The mean, epsilon,
+reciprocal square root and weighted output expression are unchanged; without AVX2 the RMSNorm
+branch retains the scalar sum.
+
+This changes the last bits relative to the old sequential sum, **not the result with the batch size
+or thread count**. The pool still partitions whole rows, and a head normalized in place during
+prefill uses exactly the same reduction as that head during decode. No global fast-math flag or
+model tolerance changes accompany it. `tests/native/test_cpu_parallel.py` checks vector and
+32-element boundaries, unaligned rows, scalar tails, zero and small rows, a float64 reference, and
+exact agreement between a row alone and in a batch at one and eight threads. The forward tests
+continue to require exact incremental/batched agreement and llama.cpp's greedy token sequence.
+
 ### The vectorized packed GEMM
 
 `gemm_quant` is where the FLOPs are — more than 99% of them, at both prefill and decode — so it is

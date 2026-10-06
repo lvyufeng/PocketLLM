@@ -1295,7 +1295,38 @@ void rms_norm(const float *x, const float *weight, float *out, int64_t n_tokens,
       const float *row = x + r * d;
       float *dst = out + r * d;
       float sum = 0.0F;
-      for (int64_t i = 0; i < d; ++i) {
+      int64_t i = 0;
+#if POCKETLLM_HAVE_AVX2
+      /* Independent lane sums remove the scalar reduction's dependency chain.
+       * The tree is fixed per row, not per batch or pool size, so prefill and
+       * decode normalize the same row identically. The scalar tail also covers
+       * head widths that are not multiples of eight. */
+      __m256 s0 = _mm256_setzero_ps();
+      __m256 s1 = _mm256_setzero_ps();
+      __m256 s2 = _mm256_setzero_ps();
+      __m256 s3 = _mm256_setzero_ps();
+      for (; i + 32 <= d; i += 32) {
+        const __m256 x0 = _mm256_loadu_ps(row + i);
+        const __m256 x1 = _mm256_loadu_ps(row + i + 8);
+        const __m256 x2 = _mm256_loadu_ps(row + i + 16);
+        const __m256 x3 = _mm256_loadu_ps(row + i + 24);
+        s0 = _mm256_add_ps(s0, _mm256_mul_ps(x0, x0));
+        s1 = _mm256_add_ps(s1, _mm256_mul_ps(x1, x1));
+        s2 = _mm256_add_ps(s2, _mm256_mul_ps(x2, x2));
+        s3 = _mm256_add_ps(s3, _mm256_mul_ps(x3, x3));
+      }
+      __m256 sums = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
+      for (; i + 8 <= d; i += 8) {
+        const __m256 v = _mm256_loadu_ps(row + i);
+        sums = _mm256_add_ps(sums, _mm256_mul_ps(v, v));
+      }
+      __m128 lanes = _mm_add_ps(_mm256_castps256_ps128(sums),
+                               _mm256_extractf128_ps(sums, 1));
+      lanes = _mm_hadd_ps(lanes, lanes);
+      lanes = _mm_hadd_ps(lanes, lanes);
+      sum = _mm_cvtss_f32(lanes);
+#endif
+      for (; i < d; ++i) {
         sum += row[i] * row[i];
       }
       /* The mean is over `d` -- the row -- and the reciprocal square root is
