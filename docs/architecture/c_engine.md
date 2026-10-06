@@ -585,6 +585,90 @@ engine is using flash attention, median of two): **681.0 t/s against our 501.5, 
 and the remaining term is `gemm_quant`, whose `n = 1024, k = 1024` shape is 305 ms of the ~1070 ms
 call on 22 threads — the four-row GEMM behind llama.cpp's eight-row repacked form.
 
+### Two query heads per walk over a key row
+
+The two passes at the two ends of the attention call had each been tiled over *query rows* — four
+queries scored against one key row, four outputs accumulated from one V row. What neither addressed is
+the axis that decode actually spends its time on: **grouped attention reads each KV head's key row once
+per query head, and there are two query heads per KV head.** At 464 rows of context a decode step runs
+16 units × ~464 rows × 28 layers of 128-wide dots, and every one of those key rows is loaded *twice*
+for the two heads that share it.
+
+The K cache makes that second load expensive rather than free. A KV head's row is `n_head_kv * d` =
+1024 floats apart, of which `d` = 128 — 512 bytes of 4096 — belong to the head being scored, so the
+walk streams a quarter of its bytes usefully and the row that was just read is four kilobytes of
+distance away, not in the same cache line. Scoring two heads of one group together loads the key once
+for both.
+
+**Batching heads is exact where tiling rows is not, and the difference is whether the two things share
+a producer.** Two heads of one KV group score *different* query vectors against the *same* key vector:
+the key load is genuinely shared, and no two lanes share an accumulator, so the batch splits without
+touching any sum. Two query *rows* of one head are the opposite case — their spans overlap only
+partially, and hoisting the key load or the weight lookup past the row loop changes which products are
+summed in what order, which is the last-bit change the softmax turns into a different token. So the
+row tiling stays confined to the region a whole tile shares, which is what `dot_tile` is, and the head
+batch needs no such region.
+
+The kernel is `dot_pair`: one `__m256` holds query `h0`'s four lanes in the low half and `h1`'s in the
+high half, advanced by four at exactly the offsets `dot4` loads, combined with `_mm_mul_ps` into
+`_mm_add_ps` and never a fused multiply-add, each half reduced `((l0 + l1) + (l2 + l3)) + tail`. Every
+lane is a `dot4` lane, so the two results are bit-identical to two `dot4` calls — the same property the
+four-lane dot was built to have, and for the same reason.
+
+A single-core microbenchmark (`/tmp/prof/score2.cpp`, 28 layers × 16 heads, one core, best of three,
+span = 1025) isolates the effect:
+
+| body | us | vs shipped |
+|---|---:|---:|
+| shipped — head outer, strided | 17295 | 1.00× |
+| kv head outer, K row loaded once for both heads | **11617** | **1.49×** |
+| the same heads, two plain `dot4` calls | 15144 | 1.14× |
+| contiguous K, no stride (the ceiling) | 11291 | 1.53× |
+
+Two things in that table are worth keeping. Loading the key once for both heads gets 1.49× of a 1.53×
+ceiling, so the strided walk *was* the cost and the paired kernel takes nearly all of it. And **the two
+plain `dot4` calls reach only 1.14×**: the point is not that the key row is in L1 for the second read —
+it is — but that the second read still issues the loads. The sharing has to be in the register, not in
+the cache.
+
+**End to end, where the effect is the decode term it targets.** The instrument is `pocketllm-bench` on
+`qwen3-0.6b-q4_k_m.gguf`, both binaries built from the same tree and run interleaved, 44 threads. The
+per-op probe over one decode token with 512 rows of context puts the whole attention op at **51.1 ms
+against 33.4 ms — 1.53×**, stable to 2% over six interleaved repetitions even with the machine under
+load, because the figure is a sum of measured op times rather than a wall clock. Carried to the bench's
+own column:
+
+| test | before | after | after/before |
+|---|---:|---:|---:|
+| `tg64` after a 512-token prefill, 44 threads | 52.0 | **47.2** | **1.10** |
+| `pp512`, 44 threads | 501676 us | 493876 us | 1.02 |
+
+The 1.53× on the attention call becomes 1.10× on the step because attention is a little over half of a
+decode token at that context — the GEMMs share the token with it. Prefill is flat, which is what the
+construction predicts and not a disappointment: at `pp512` each head already scores four query rows per
+key walk, so the batching's *second* read of the K row is amortized over four rows rather than one, and
+attention is a much smaller share of a prefill step than of a decode step.
+
+**The measurement this section does not have, and why.** An earlier revision of this page quoted a
+`tg64`/`pp512` table taken in one window. It was removed rather than kept: this host is shared, it spent
+most of the session at load 30–175 from other users' jobs, and an interleaved A/B only means something
+when the two arms see comparable machines. The figures above are the ones that survived six interleaved
+repetitions each with the load printed beside them; where a number was not reproducible across those
+repetitions it is not on this page.
+
+**The bug the test found before the benchmark did.** The unit count was written
+`groups = n_heads / kAttentionHeadBatch`, which is integer division: at Qwen3's 16 heads it is 8 and
+nothing is wrong. At an odd head count it truncates, the final unit is never scheduled, and **that
+head's output is never written at all** — the caller reads whatever the buffer held. `n_heads` is only
+guaranteed to be even for this checkpoint, so the guard is `(n_heads + 1) / 2` and the test
+parametrizes head shapes that are not multiples of the batch, including 3 heads over 1 KV head. The
+unwritten values were in the `3e-41` denormal range and the test's first form — an even head count —
+would have passed.
+
+The same rounding appears in the CPU backend's `attention_scratch`, which sizes the per-task score
+region from the partition the kernel takes and now derives both the unit count and the rows-per-unit
+from `kAttentionHeadBatch` rather than assuming one head per task.
+
 ### The activation scratch is the shape's size, not a fixed one
 
 The integer path needs somewhere to put the quantized activations, and that buffer used to be a

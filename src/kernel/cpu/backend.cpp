@@ -135,10 +135,18 @@ class CpuBackend final : public Backend {
      * Both the task count and the rows-per-task come from the kernel's own
      * definitions -- `parallel_tasks` with the grain and row count `attention`
      * uses -- so the allocation and the partition agree by construction rather
-     * than by two copies of the same formula. */
+     * than by two copies of the same formula.
+     *
+     * The unit count is `blocks * (n_heads / kAttentionHeadBatch)`, not
+     * `blocks * n_heads`: each unit scores a batch of heads sharing one KV head,
+     * so a caller that kept the per-head count would size for twice the tasks
+     * the kernel takes.  Over-allocating is not the danger here -- the other
+     * direction is -- but the two numbers have to be the same one for the
+     * "agree by construction" claim to mean anything. */
     const int64_t blocks = (q_len + kAttentionRows - 1) / kAttentionRows;
-    const int64_t tasks = parallel_tasks(blocks * n_heads, kAttentionGrain);
-    return (tasks < 1 ? 1 : tasks) * kAttentionRows * max_span * 4;
+    const int64_t heads = (n_heads + kAttentionHeadBatch - 1) / kAttentionHeadBatch;
+    const int64_t tasks = parallel_tasks(blocks * heads, kAttentionGrain);
+    return (tasks < 1 ? 1 : tasks) * kAttentionScoreRowsPerTask * max_span * 4;
   }
 
   void attention(DeviceBuffer q, int64_t q_len, int64_t n_heads, DeviceBuffer k_cache,
