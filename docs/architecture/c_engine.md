@@ -257,6 +257,20 @@ identifies it as a partition and not an arithmetic change. The `attention` comme
 constraint on the same number: the unit is the whole of a task's work and cannot be sliced finer,
 because its three passes are chained through `max_score` and `total`.
 
+**It turned out not to be a one-off, which is the part worth keeping.** An audit of every grain
+against the *decode* shape rather than the prefill one found a second site: `silu_mul` carried a grain
+of 4096, and the hidden width is 3072, so at decode the whole op was one element short of a task and
+`expf` ran on the caller's thread alone — 28 times a token, 600 µs of a 16 ms one. The grain is now
+64: the elementwise term falls to ~256 µs and the token is ~8% faster at ctx 512 (`tg64` 58.5 →
+63.3 t/s at 22 threads). Like the `attention` fix it is bit-exact — the outputs are disjoint, so a
+different partition writes the same bytes — and it changes nothing at one thread, which is again what
+identifies it as scheduling and not arithmetic. **The general form: a grain is "worth waking a thread
+for" read off a prefill-sized job, and every op whose decode size is smaller than its prefill size has
+to be checked, not assumed.** `gemm_quant`'s activation quantization is the counterexample that must be
+*left* alone: its grain of 8 keeps four to eight blocks serial deliberately, and lowering it to 2 was
+measured 5 µs *slower* per call on 112 calls a token, because the pool wake on so small a job costs
+more than the work it distributes.
+
 The thread count is `$POCKETLLM_CPU_THREADS`, falling back to the **physical core count**, clamped to
 `[1, 256]`. `=1` reproduces a single-threaded number, and on a shared host it is the polite setting.
 `build/pocketllm-bench` prints the count it resolved, so a table row is never ambiguous about how
@@ -647,18 +661,29 @@ does not know how many other pairs exist. So a row's result is the same at `R = 
 other even `R`, and `test_the_tiled_attention_score_is_the_one_row_dot` — which runs the shipped
 kernel against `$POCKETLLM_CPU_SCALAR_DOT` and calls `np.array_equal` — passes unchanged.
 
-**End to end, interleaved, `--reps 5`, median of four rounds**, both engines at their default 44
-threads, `-fa 0` on llama.cpp so neither is using flash attention:
+**End to end, interleaved, `--reps 5`, both engines at their default 44 threads, `-fa 0` on llama.cpp
+so neither is using flash attention — and, importantly, both at the same KV depth.**
 
-| | ours | llama.cpp `-fa 0` | ratio |
+**The depth has to be matched or the comparison is not one, and for a long time it was not.**
+`llama-bench`'s `tg64` runs at depth 0 unless `-d <n>` is given, while `build/pocketllm-bench`
+prefills `--pp N` *before* decoding, so our decode has always been measured at the context the
+prefill created. Decode cost is a function of context — ours, measured by prefill length, is `pp0`
+90.3, `pp128` 88.3, `pp256` 76.9, `pp512` 63.3 t/s — so the earlier "decode trails" rows were our
+ctx-512 decode against llama.cpp's ctx-0 decode. The row below uses `-d 512` on llama-bench so both
+engines decode at the depth ours actually reaches.
+
+| depth 512 | ours | llama.cpp `-fa 0` | ratio |
 |---|---:|---:|---:|
-| `pp512` | 966 | 839 | **1.15×** |
-| `tg64` | 56.6 | 62.9 | 0.90× |
+| `pp512` | 955 | 661 | **1.44×** |
+| `tg64` | 55.1 | 44.0 | **1.25×** |
 
-**Prefill now leads llama.cpp like-for-like.** That is a reversal of the position recorded above —
-0.74× at 22 threads in an earlier session — and it is the tile plus the physical-core default plus an
-unloaded host, not one of them alone. Against llama.cpp's *shipped* default (`-fa auto`, which is
-flash attention on) it is still behind on both: `pp512` 966 against 1238, `tg64` 56.6 against 72.6.
+**Against the same algorithm and the same depth, both halves lead** — and they lead at 22 threads
+too (`pp512` 565 against 466, 1.21×; `tg64` 60.1 against 53.5, 1.12×), so the result is not an
+artifact of one thread count. Against llama.cpp's *shipped* default (`-fa auto`, which is flash
+attention on) it leads prefill — 955 against 908, 1.05× — and trails decode: `tg64` 55.1 against
+75.5, 0.73×. That deficit is flash attention and nothing else — an online softmax that fuses the
+score, softmax and weighted-sum passes so the score row is never materialized — and this engine does
+not implement it.
 
 **Decode is the number this change does not move, and that is a construction argument, not a
 measurement.** A decode step is `q_len = 1`: one block per head, no shared key region, so the tiled

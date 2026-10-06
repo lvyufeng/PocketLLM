@@ -1506,8 +1506,20 @@ void embedding_quant(const int32_t *tokens, int64_t n_tokens, const uint8_t *blo
 }
 
 void silu_mul(const float *gate, const float *up, float *out, int64_t n) {
-  /* Elementwise: every output depends on its own index only. */
-  parallel_for(n, /*min_per_task=*/4096, [&](int64_t lo, int64_t hi, int64_t) {
+  /* Elementwise: every output depends on its own index only, so the grain is a
+   * scheduling choice and not a numeric one -- the output is byte-identical at
+   * every thread count, which is what `test_cpu_parallel.py` checks.
+   *
+   * The grain is 64 and it used to be 4096, which was a *prefill* size: the
+   * hidden width is 3072, so at decode the whole op was one element short of a
+   * task and ran on the caller's thread alone. `expf` is tens of cycles, so that
+   * made a 3072-element map a ~20 us serial term on a token that calls it 28
+   * times -- 600 us of a 16 ms token. Measured at 22 threads, ctx 512, the
+   * decode term per token: 4096 -> 600 us, 256 -> 220, 64 -> 256, with the
+   * end-to-end token moving with it. 64 and 256 are within noise of each other
+   * and 64 is the one that still fills the pool on a narrower shape, so it is
+   * the one that ships. */
+  parallel_for(n, /*min_per_task=*/64, [&](int64_t lo, int64_t hi, int64_t) {
     for (int64_t i = lo; i < hi; ++i) {
       const float g = gate[i];
       /* `expf` is called with the value the reference passes -- not a clamped
