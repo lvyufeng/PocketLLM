@@ -1162,6 +1162,53 @@ and the engine are doing the same thing at the same speed; when they are not, th
 instrument. The same lesson is why the thread-count trap above is called out separately: two of the
 three "measurements" that framed this stage were artefacts of the harness.
 
+### The pool hands out a chunk by index, not by atomic claim
+
+The pool used an atomic `fetch_add` on a claim counter — the textbook work-stealing queue — and it was
+paying for a property it cannot use. `partition_size` **floors the chunk count at the thread count and
+caps it there**, so a job hands out at most one chunk per thread: the claim loop could never run more
+than once for any worker and stealing was impossible. All the atomic did was put every worker on one
+cache line at the start of every job.
+
+That is invisible on a prefill and not on a decode. A decode walks ~200 kernel calls per token and the
+ops are small — a 1024×1024 projection is ~100 µs — so the rendezvous is a large fraction of the call.
+Measured as the ratio of per-op time at 44 threads to 22, from `timed` on the same checkpoint:
+
+| op | t22 → t44 |
+|---|---|
+| `gemm_quant m512 …` (prefill) | **1.5–1.8×** |
+| `gemm_quant m1 …` (decode) | 0.8–1.0× |
+| `rms_norm`, `rope`, `silu_mul` | **0.34–0.57×** |
+
+The small ops are *slower* with twice the cores. So the chunk is now derived from the thread —
+`thread_local t_chunk_index`, written once when the worker starts — and the job's per-worker cost is
+the barrier and nothing else. The partition is the same one `partition_size` describes, so each unit's
+arithmetic is untouched and the output stays **bit-identical at every thread count**; `tests/native/`
+still passes whole (378 tests).
+
+Paired A/B, interleaved and load-annotated, against the claim-counter build:
+
+| | prefill `pp512` | decode `tg64` |
+|---|---|---|
+| 22 threads | 0.99, 1.01, 1.03, 1.02 | 1.04, 1.05, 1.03, 1.00 |
+| 44 threads | 1.09, 0.97, 1.32, 1.03 | 1.03, 1.05, 1.30, 1.09, 1.12, 1.10, 1.30, 1.16, 1.03, 1.03 |
+
+Decode is a gain at both thread counts and never below 1.00 in ten pairs at 44; prefill is a wash at
+22 and noisy-but-positive at 44. **The `rms_norm`/`rope`/`silu_mul` regressions above are the direct
+evidence** — those ops have too few outputs to fill 44 threads at their grain, which is exactly where a
+44-way contended claim hurts most and an index costs nothing.
+
+**What is *not* the cost, checked and refuted.** Two plausible explanations for the 44-thread deficit
+were measured and died:
+
+- **NUMA.** 22 threads pinned to socket 1 alone (`0-21` vs `22-43`) gave 574 against 589 t/s — the
+  weights are not remote to either socket. And 22 threads *spread* 11+11 across both sockets gave 0.92×
+  of 22 on one socket, so cross-socket barrier traffic is not the cost either.
+- **The barrier.** The `timed` probe's "unaccounted" time — wall minus the sum of op times, which is
+  where every `parallel_for`'s barrier lives — is **3.2% of a decode token**. There was a hypothesis
+  that the ~400 spin barriers per prefill forward were the gap; the profile says that is not where the
+  time is.
+
 ## Building
 
 Out of tree, so the Python package stays free of build artifacts:
