@@ -262,6 +262,38 @@ def test_rms_norm_and_elementwise_are_independent_of_the_thread_count() -> None:
     np.testing.assert_array_equal(run_op(silu, threads=1), run_op(silu, threads=8))
 
 
+@pytest.mark.parametrize(
+    "width", [1, 7, 8, 9, 31, 32, 33, 39, 63, 64, 65, 127, 128, 129, 1024, 1031]
+)
+@needs_tools
+def test_rms_norm_vector_tails_and_row_determinism(width: int) -> None:
+    """The vector reduction owns one row, including its scalar tail.
+
+    Head and hidden widths exercise different loop sizes. Odd widths also leave
+    later rows unaligned, and a large last element makes dropping the tail
+    visible. A row must be identical alone, in a batch, and at every pool size.
+    """
+    rng = np.random.default_rng(20261006 + width)
+    x = rng.standard_normal((64, width), dtype=np.float32)
+    x[0] = 0
+    x[1] *= 1e-4
+    x[2] *= 100
+    x[17, -1] = 17
+    weight = rng.standard_normal(width, dtype=np.float32)
+    eps = 1e-6
+    request = write_request("rms_norm", {"x": x, "weight": weight}, {"eps": eps})
+    one = run_op(request, threads=1)
+    np.testing.assert_array_equal(one, run_op(request, threads=8))
+
+    row = write_request("rms_norm", {"x": x[17:18], "weight": weight}, {"eps": eps})
+    for threads in THREAD_COUNTS:
+        np.testing.assert_array_equal(one[17:18], run_op(row, threads=threads))
+
+    values = x.astype(np.float64)
+    expected = values / np.sqrt(np.mean(values * values, axis=1, keepdims=True) + eps) * weight
+    np.testing.assert_allclose(one, expected, rtol=SIMD_RTOL, atol=1e-7)
+
+
 # --------------------------------------------------------------------------
 # 2. The vectorized GEMM matches the reference, and the thread count does not
 #    move it.
