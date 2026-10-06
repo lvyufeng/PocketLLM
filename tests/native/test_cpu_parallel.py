@@ -403,6 +403,40 @@ def test_the_four_row_weight_walk_is_the_one_row_walk_four_times(
     assert float(np.max(np.abs(batched))) > 0.0
 
 
+@pytest.mark.parametrize("fmt,type_id", [("q4_k", 12), ("q6_k", 14)])
+@pytest.mark.parametrize("m", [16, 18])
+@needs_tools
+def test_the_eight_row_walk_is_the_four_row_walk(fmt: str, type_id: int, m: int) -> None:
+    """The shipped eight-row tile is bit-identical to the four-row one.
+
+    `gemm_quant` walks a weight row once per *eight* activation rows by default;
+    `$POCKETLLM_CPU_GEMM_RPW=4` walks it once per four.  The two are the same
+    kernel templated on the row count, and the row count is a scheduling choice
+    and not an arithmetic one: each row accumulates its blocks in the order
+    `dot_row_q8k` accumulates them, with the same per-block float multiply and
+    the same horizontal reduce.
+
+    That matters because eight is the shipping default and four was the
+    llama.cpp-verified one, so this is what says the change of tile did not change
+    the model.  The four-row run is the reference and not the one-row kernel
+    because the eight-row template inherits the four-row template's body line for
+    line -- the case above already ties that one to the one-row kernel.
+
+    `m=18` is not a multiple of either row count, so both the full tiles and the
+    ragged tail (rows 16-17, which fall through to the one-row kernel) are
+    compared on the same weights.
+    """
+    rng = np.random.default_rng(20261006 + m)
+    k = 1024
+    x = rng.standard_normal((m, k), dtype=np.float32)
+    blocks = packed_row(rng, rows=16, cols=k, fmt=fmt)
+    request = write_request("gemm_quant", {"x": x, "w_blocks": blocks}, {"type_id": type_id})
+    eight = run_op(request, threads=1)
+    four = run_op(request, threads=1, env={"POCKETLLM_CPU_GEMM_RPW": "4"})
+    np.testing.assert_array_equal(eight, four)
+    assert float(np.max(np.abs(four))) > 0.0
+
+
 @pytest.mark.parametrize("m,k", PREFILL_SHAPES)
 @needs_tools
 def test_a_large_activation_row_keeps_the_integer_path(m: int, k: int) -> None:
