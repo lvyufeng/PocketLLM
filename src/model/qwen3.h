@@ -181,6 +181,13 @@ class Qwen3Model {
    * token. That is exactly the bug this dimension was added to fix. */
   kernel::DeviceBuffer k_cache_, v_cache_;
   int64_t cache_capacity_ = 0;
+  /* The cache's element width, taken from the backend once at load rather than
+   * from a constant here: a graph that named f16 would be a graph that decides
+   * for the card too, and the card keeps an f32 cache deliberately -- see
+   * `Backend::preferred_kv_dtype`.  Read once and stored because it also
+   * decides every offset in the slabs, and asking the backend per layer would
+   * be thirty virtual calls a token for a value that cannot change. */
+  kernel::KVDtype kv_dtype_ = kernel::KVDtype::kF32;
 
   Weight tok_embd_;
   Weight output_;

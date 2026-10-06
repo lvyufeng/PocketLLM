@@ -48,6 +48,24 @@
  * CUDA backend's block-reduced attention lands on and
  * `test_quantized_forward.py` names per backend.
  *
+ * ## The K/V cache width is asked for, not left on its default
+ *
+ * The same argument one level down.  `llama_context_default_params()` leaves
+ * `type_k`/`type_v` at `GGML_TYPE_F16`, which is also what its own CLI defaults
+ * to (`-ctk f16 -ctv f16`) -- and `-ctk f32 -ctv f32` is the other convention.
+ * The engine's cache width is a backend's decision too
+ * (`Backend::preferred_kv_dtype`), so an oracle that is not asked which width
+ * to use is an oracle comparing two different computations.
+ *
+ * Measured on this checkpoint, llama.cpp's two cache widths move the logits by
+ * up to 1.70, which is **5.7% of the logit spread** -- larger than the engine's
+ * own agreement with either of them (3.7% against f16, 4.7% against f32).  So
+ * the width is not a detail to be left unset; `--kv-type` is what keeps each
+ * comparison on one basis.
+ *
+ * The default is f16, llama.cpp's and the engine's, so that a caller that says
+ * nothing is comparing like for like.
+ *
  * Output is `{"n_vocab": N, "tokens": [...], "logits": [f, ...]}` on stdout,
  * one line, so a Python caller can read it without a parser in C. The logits
  * are printed with `%.9g`, which round-trips a float exactly -- a shortened
@@ -67,7 +85,7 @@ namespace {
 int usage(const char *argv0) {
   std::fprintf(stderr,
                "usage: %s <model.gguf> <token> [<token> ...] [--steps N] "
-               "[--flash-attn on|off|auto]\n",
+               "[--flash-attn on|off|auto] [--kv-type f16|f32]\n",
                argv0);
   return 2;
 }
@@ -100,9 +118,21 @@ int main(int argc, char **argv) {
   /* The full-softmax convention by default -- see the file header for what the
    * two conventions disagree about and why the CPU path needs this one. */
   llama_flash_attn_type flash_attn = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+  /* llama.cpp's default and the engine's -- see the header. */
+  ggml_type kv_type = GGML_TYPE_F16;
   for (int i = 2; i < argc; ++i) {
     if (std::string(argv[i]) == "--steps" && i + 1 < argc) {
       steps = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
+    } else if (std::string(argv[i]) == "--kv-type" && i + 1 < argc) {
+      const std::string width = argv[++i];
+      if (width == "f16") {
+        kv_type = GGML_TYPE_F16;
+      } else if (width == "f32") {
+        kv_type = GGML_TYPE_F32;
+      } else {
+        std::fprintf(stderr, "--kv-type takes f16 or f32, not '%s'\n", width.c_str());
+        return 2;
+      }
     } else if (std::string(argv[i]) == "--flash-attn" && i + 1 < argc) {
       const std::string mode = argv[++i];
       if (mode == "on") {
@@ -161,6 +191,8 @@ int main(int argc, char **argv) {
   cparams.offload_kqv = false;
   cparams.no_perf = true;
   cparams.flash_attn_type = flash_attn;
+  cparams.type_k = kv_type;
+  cparams.type_v = kv_type;
 
   llama_context *ctx = llama_init_from_model(model, cparams);
   if (ctx == nullptr) {

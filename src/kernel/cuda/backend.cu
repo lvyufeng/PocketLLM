@@ -565,11 +565,43 @@ class CudaBackend final : public Backend {
     return q_len * n_heads * max_span * 4;
   }
 
+  /* The card keeps an f32 cache.  `attention_kernel` reads `const float *` and
+   * widening an f16 cache on the device would be a third kernel to keep in step
+   * for a byte count that is not this backend's bottleneck -- the card is
+   * nowhere near bandwidth-bound at this model size, so the trade the CPU
+   * backend makes (half the bytes for a rounded element) buys nothing here and
+   * costs precision.  Declaring it is what keeps the graph honest: it asks,
+   * rather than assuming, and nothing in `qwen3.cpp` names a width. */
+  KVDtype preferred_kv_dtype() const override { return KVDtype::kF32; }
+
+  /* The card never takes the f16 arm -- `preferred_kv_dtype` is f32 -- so this
+   * is the device-to-device copy the graph asks for and nothing else.  The
+   * conversion is refused rather than implemented so that a future change that
+   * flips the preferred dtype fails here, at the first token, with a name
+   * instead of quietly storing the wrong layout. */
+  void kv_append(DeviceBuffer dst, DeviceBuffer src, int64_t n, int64_t n_head_kv, int64_t d,
+                 int64_t elem) override {
+    if (elem != 4) {
+      throw Error("cuda kv_append: the cache is f32 here -- see preferred_kv_dtype");
+    }
+    (void)n_head_kv;
+    (void)d;
+    check(cudaMemcpy(reinterpret_cast<void *>(dst.handle),
+                     reinterpret_cast<const void *>(src.handle),
+                     static_cast<std::size_t>(n) * static_cast<std::size_t>(n_head_kv * d) * 4,
+                     cudaMemcpyDeviceToDevice),
+          "kv_append");
+  }
+
   void attention(DeviceBuffer q, int64_t q_len, int64_t n_heads, DeviceBuffer k_cache,
                  DeviceBuffer v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
-                 int64_t q_offset, float scale, DeviceBuffer out, DeviceBuffer scores) override {
+                 int64_t q_offset, float scale, DeviceBuffer out, DeviceBuffer scores,
+                 KVDtype kv_dtype) override {
     if (q_len <= 0) {
       return;
+    }
+    if (kv_dtype != KVDtype::kF32) {
+      throw Error("cuda attention: the cache is f32 here -- see preferred_kv_dtype");
     }
     /* The stride every block indexes its row with, and it has to be the number
      * `attention_scratch` was asked about. Both sides compute it the same way

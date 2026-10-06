@@ -35,6 +35,7 @@ not a pass.
 
 from __future__ import annotations
 
+import os
 import pathlib
 
 import pytest
@@ -271,8 +272,19 @@ def test_the_backends_agree_with_each_other(tokens: list[int]) -> None:
     if "cuda" not in BACKENDS:
         pytest.skip(_cuda_reason or "cuda is not available")
 
-    with native.Engine.open(str(CHECKPOINT), "cpu") as engine:
-        host = engine.forward(tokens)
+    # The two backends now keep their caches at *different* widths on purpose --
+    # f16 on the host and f32 on the card (see `preferred_kv_dtype`) -- and this
+    # test is about the kernels, not about that trade.  So the host is put on
+    # the card's basis for this one comparison, which is what the environment
+    # switch exists for.  Left at the shipped widths the bound below would be
+    # measuring a rounded cache and failing at 3e-4 of the spread, which is the
+    # rounding rather than a disagreement about arithmetic.
+    os.environ["POCKETLLM_CPU_KV_F32"] = "1"
+    try:
+        with native.Engine.open(str(CHECKPOINT), "cpu") as engine:
+            host = engine.forward(tokens)
+    finally:
+        del os.environ["POCKETLLM_CPU_KV_F32"]
     with native.Engine.open(str(CHECKPOINT), "cuda") as engine:
         card = engine.forward(tokens)
 

@@ -594,6 +594,65 @@ def test_the_attention_score_dot_is_the_scalar_order(span: int) -> None:
     assert float(np.max(np.abs(scalar))) > 0.0
 
 
+KV_DTYPES = [(1, 16, 8), (4, 16, 8), (8, 16, 8), (3, 3, 1)]
+
+
+@pytest.mark.parametrize(("q_len", "n_heads", "n_head_kv"), KV_DTYPES)
+@needs_tools
+def test_the_f16_cache_is_the_f32_cache_rounded(
+    q_len: int, n_heads: int, n_head_kv: int
+) -> None:
+    """An f16 K/V cache is the f32 one with each element rounded to f16.
+
+    This is the whole correctness claim of the f16 path, and it is stated as an
+    equality rather than a tolerance on purpose.  The f16 cache is loaded by
+    *widening each row to f32 first* (`kv_row_to_float`) and then handing it to
+    the same score and weighted-sum kernels an f32 cache gets, so the only way
+    the two can differ is the rounding of the cached value -- and a rounded
+    value is itself a float, which the f32 path reproduces exactly when the
+    input is pre-rounded.  So: round k and v through f16 in numpy, run the f32
+    cache, and the two outputs must be *equal*, not merely close.
+
+    A tolerance here would hide the failure this is written to catch.  A kernel
+    that read the f16 buffer as f32 -- the obvious way to get this wrong -- is
+    finite and roughly right, and would pass any tolerance loose enough to
+    cover the rounding; it would be wrong in the last bits of every score, and
+    the softmax turns that into a different token.  Equality is available, so
+    equality is asked for.
+
+    The shapes cover the two arms of the walk: `q_len = 1` is decode, where the
+    four-row tiling collapses to single rows, and the rest are prefill, where
+    the shared-key region and its triangular tail both run.  `(3, 1)` is the
+    grouped case where a KV head feeds three query heads.
+    """
+    tensors, params = _prefill_attention_case(
+        q_len=q_len, seed=20261007 + q_len * 17 + n_heads * 31 + n_head_kv, n_heads=n_heads,
+        n_head_kv=n_head_kv,
+    )
+    # Both runs are given the *same* rounded cache.  Only then is the
+    # comparison about the kernel rather than about the input: an f32 run on the
+    # unrounded cache would differ by the rounding itself, which is the one
+    # difference this test is trying to remove.
+    rounded = {
+        name: (
+            np.asarray(array).astype(np.float16).astype(np.float32)
+            if name in {"k_cache", "v_cache"}
+            else array
+        )
+        for name, array in tensors.items()
+    }
+    as_f32 = run_op(write_request("attention", rounded, params), threads=1)
+    as_f16 = run_op(write_request("attention", rounded, dict(params, kv_dtype=1)), threads=1)
+
+    assert np.array_equal(as_f16, as_f32), (
+        f"q_len={q_len} n_heads={n_heads} n_head_kv={n_head_kv}: the f16 cache "
+        f"does not reproduce the rounded f32 one -- worst |difference| "
+        f"{float(np.max(np.abs(as_f16 - as_f32)))}"
+    )
+    # And the values are not all zero, which would make the comparison vacuous.
+    assert float(np.max(np.abs(as_f32))) > 0.0
+
+
 #: The chunk lengths the four-row tiling is checked at.  512 is the prefill the
 #: benchmarks use and a multiple of `kAttentionRows`, so every block is full;
 #: 6 is not, so the last block covers two rows and the ragged path -- and the

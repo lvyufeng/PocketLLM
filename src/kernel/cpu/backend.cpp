@@ -151,9 +151,33 @@ class CpuBackend final : public Backend {
 
   void attention(DeviceBuffer q, int64_t q_len, int64_t n_heads, DeviceBuffer k_cache,
                  DeviceBuffer v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
-                 int64_t q_offset, float scale, DeviceBuffer out, DeviceBuffer scores) override {
+                 int64_t q_offset, float scale, DeviceBuffer out, DeviceBuffer scores,
+                 KVDtype kv_dtype) override {
     kernel::attention(w(q), q_len, n_heads, f(k_cache), f(v_cache), n_head_kv, d, first_key,
-                      q_offset, scale, w(out), w(scores));
+                      q_offset, scale, w(out), w(scores), kv_dtype);
+  }
+
+  /* The append is a device-to-device copy either way; only the last step of it
+   * differs.  `elem == 4` is the memcpy this used to be, kept as its own branch
+   * so the f32 path has not moved.  The conversion walks one head row at a time
+   * because the two sides index rows with different strides -- see the
+   * interface comment for what a flat walk costs. */
+  void kv_append(DeviceBuffer dst, DeviceBuffer src, int64_t n, int64_t n_head_kv, int64_t d,
+                 int64_t elem) override {
+    const float *const from = f(src);
+    if (elem == 4) {
+      std::memcpy(w(dst), from,
+                  static_cast<std::size_t>(n) * static_cast<std::size_t>(n_head_kv * d) * 4);
+      return;
+    }
+    uint16_t *const to = reinterpret_cast<uint16_t *>(w(dst));
+    const int64_t kv_width = n_head_kv * d;
+    for (int64_t row = 0; row < n; ++row) {
+      for (int64_t h = 0; h < n_head_kv; ++h) {
+        kernel::float_to_kv_row(from + row * kv_width + h * d, d,
+                                to + row * kv_width + h * d);
+      }
+    }
   }
 
   void argmax(DeviceBuffer values, int64_t n, DeviceBuffer out) override {
@@ -186,6 +210,23 @@ class CpuBackend final : public Backend {
   void synchronize() override {}
 
   std::string describe() const override { return "cpu (host memory)"; }
+
+  /* f16 -- the shipped width, and llama.cpp's.  `$POCKETLLM_CPU_KV_F32=1` puts
+   * this backend back on the f32 cache, which is how a test asks for the *other*
+   * convention by name rather than by rebuilding: the one case that needs it is
+   * the cross-backend agreement test, which compares the CPU against the card
+   * and the card is f32.  Without the switch that test would be measuring the
+   * two cache widths against each other and reporting the difference as the
+   * backends disagreeing.
+   *
+   * The reading is a function-local static for the same reason
+   * `$POCKETLLM_CPU_SCALAR_DOT` is: the process cannot change it mid-run, so a
+   * session cannot open two engines that disagree about their own cache. */
+  KVDtype preferred_kv_dtype() const override {
+    const char *from_env = std::getenv("POCKETLLM_CPU_KV_F32");
+    const bool as_f32 = from_env != nullptr && from_env[0] != '\0' && from_env[0] != '0';
+    return as_f32 ? KVDtype::kF32 : KVDtype::kF16;
+  }
 
  private:
   /* Two spellings of the same cast, because the compiler cannot pick a function
