@@ -53,6 +53,28 @@ bool scalar_weighted_sum_forced() {
   return forced;
 }
 
+/* How many activation rows `gemm_quant` walks a weight row with, 4 or 8.
+ *
+ * **8 is the shipped answer and this is the escape hatch back to 4.**  An
+ * environment variable rather than a constant because the two row counts are
+ * bit-identical to each other (see `dot_Rrows_q8k`, and
+ * `tests/native/test_cpu_parallel.py` holds it to the bytes) and differ only in
+ * speed -- so the switch is how that claim stays checkable and how the row count
+ * is re-measured on a different host without an edit.  Read once, on first use:
+ * the answer cannot change under a running process, and the per-call `getenv`
+ * would be a lock on the token path. */
+int64_t gemm_rows_per_walk() {
+  static const int64_t rpw = [] {
+    const char *from_env = std::getenv("POCKETLLM_CPU_GEMM_RPW");
+    if (from_env == nullptr) {
+      return int64_t{8};
+    }
+    const long parsed = std::strtol(from_env, nullptr, 10);
+    return parsed == 4 ? int64_t{4} : int64_t{8};
+  }();
+  return rpw;
+}
+
 /* The widest head dimension the tiled weighted sum holds on the stack.
  *
  * `attention`'s last pass keeps one accumulator row per tile row while it walks
@@ -756,69 +778,75 @@ inline bool exact_gemm_forced() {
   return from_env != nullptr && from_env[0] != '\0' && from_env[0] != '0';
 }
 
+#endif /* POCKETLLM_Q8K_HAVE_INT */
 
-/* Four activation rows against one weight row, in one walk over the weights.
+/* One weight row against `R` activation rows, R = 4 or 8.
  *
- * `dot_row_q8k` above computes one output element per walk, and at prefill that
- * is where the time goes: the weight row is 288 bytes per 256 weights and it is
- * read from L2/L3 once per *activation row*, so a 512-token prefill re-reads a
- * 590 KB panel 512 times.  Walking once and keeping four rows' accumulators
- * alive together shares the weight decode and, more importantly, gives the
- * pipeline four independent chains where it had one.
+ * The four-row kernel was a hand-written copy of this; this template is that
+ * bound and the body made a template on R, so the dispatcher can choose the row
+ * count without a second hand-written kernel.  The row count is a template
+ * parameter and not a runtime loop bound for the reason the four copies exist at
+ * all: each row needs its own `__m256i` accumulator in a register, and an
+ * indexed array of them would be spilled to the stack, which costs more than the
+ * wider walk saves.
  *
- * **Measured: 1.58x to 1.80x on the kernel, and the ratio is the honest number on
- * this host rather than the absolute rate.** A probe in `/tmp` (copies of both
- * kernels, synthetic data, one core, the two measured back to back in one
- * process) puts `m=512 n=1024 k=1024` at 1.80x on a quiet machine and 1.58x while
- * a test suite is running; the same run's one-row column moves by 2x between
- * those conditions, which is why the ratio is quoted and not the GFLOP/s. The
- * end-to-end A/B is the figure that matters and it is firmer: inside the engine
- * `gemm_quant` at `pp512` goes 1.62x at one thread, 1.71x at eight and 1.78x at
- * twenty-two, and the prefill wall time 1.40x -- see the C engine page.
+ * **It is bit-identical to R calls to `dot_row_q8k`, and that is a requirement
+ * and not a happy accident** -- the same property the four-row kernel carried, for
+ * same reason: the prefill activation is an operand of the token-for-token
+ * llama.cpp match, so a reassociated row would be a different model.  The row
+ * count changes how many rows share one weight decode; it does not move a
+ * reduce, change a per-block scale's order or touch the offset term.
+ * `tests/native/test_cpu_parallel.py` holds R=4 and R=8 to the one-row kernel's
+ * bytes.
  *
- * **It is bit-identical to four `dot_row_q8k` calls, and that is a requirement
- * and not a happy accident.** Every row's integer accumulation is over the same
- * values in the same order, its float accumulate is per block (`acc_i` over
- * `n_blocks`), and its horizontal reduce is the same expression as the one at
- * the bottom of `dot_row_q8k` -- which is asserted, element for element, by
- * `tests/native/test_cpu_parallel.py`, because the prefill activation is an
- * operand of the token-for-token llama.cpp match and a reassociated row would be
- * a different model.  The first draft of the q6_k branch multiplied by the
- * weight's `d` alone and left out the activation's `y.d`; the test added with
- * this kernel reported it as a 537-thousand error on the first run.  The per-row
- * minimum term and the per-row offset are written out the way the one-row kernel
- * writes them for exactly this reason -- do not "tidy" the four copies into a
- * loop over a vector of pointers.
+ * ## R = 8 is the shipped row count, and where the number comes from
  *
- * The two types are kept apart rather than merged behind a branch: they are
- * different kernels that share an output shape, and a `if (type_id == ...)` in
- * the block loop is not a simplification of anything. */
-void dot_4rows_q8k(int type_id, const quant::Q8KBlock *q8, int64_t q8_stride,
-                   const uint8_t *blocks, int64_t k, float out[4]) {
+ * The tempting next step after the four-row tile is an eight-row one: it halves
+ * the number of times the `n x k` weight panel is streamed, and llama.cpp's
+ * repacked kernel is an eight-row form.  A block-templated probe on one core
+ * (`/tmp/prof/gemmrow.cpp`) measured R=8 *ahead* of R=4 by 5-8% at every shape.
+ *
+ * **A single-core ratio does not settle it, and the first attempt to transfer it
+ * went the wrong way.**  A second probe put the same two kernels behind the
+ * engine's own `parallel_for` and reported R=8 *behind* R=4 at 22 threads -- but
+ * that probe's traversal ran 6x slower than the engine's own GEMM, so it was
+ * measuring its own memory behaviour and not the kernel's.  The number that
+ * decides it is the engine's, on a quiet host, at the thread count that matters:
+ *
+ *     pp512, q4_k_m, all 88 hardware threads, interleaved, median of 6
+ *       R=4   905 t/s
+ *       R=8   978 t/s     (+8%)
+ *
+ * R=8 is ahead by a clear margin with the machine full, which is the opposite of
+ * what register pressure predicts (the tile wants ~29 of the 32 AVX2 registers
+ * at R=8 against 17 at R=4) and the reason it has to be measured rather than
+ * reasoned about.  The row count is a compile-time bound in the dispatcher, so
+ * changing it is a one-line experiment: see `gemm_rows_per_walk`.
+ *
+ * **Check the host load first.**  This machine is shared, and a loaded host turns
+ * every one of these numbers into noise -- an early run of this very comparison
+ * read 26 t/s at 44 threads against 500 at 22, which was contention and not
+ * arithmetic. */
+template <int R>
+void dot_Rrows_q8k(int type_id, const quant::Q8KBlock *q8, int64_t q8_stride,
+                   const uint8_t *blocks, int64_t k, float out[R]) {
   const int block_bytes = quant::block_bytes_of(type_id);
   const int64_t n_blocks = k / quant::kBlockWeights;
   const __m256i m4 = _mm256_set1_epi8(0x0F);
   const __m256i m03 = _mm256_set1_epi8(0x03);
 
-  __m256 acc0 = _mm256_setzero_ps();
-  __m256 acc1 = _mm256_setzero_ps();
-  __m256 acc2 = _mm256_setzero_ps();
-  __m256 acc3 = _mm256_setzero_ps();
-  /* The q4_k minimum term, one per row -- a float accumulator that `dot_row_q8k`
-   * calls `acc_m`.  It is deliberately not shared with anything: the q6_k path
-   * keeps its offset in int32 instead, and the two are different quantities. */
-  __m128 mn0 = _mm_setzero_ps();
-  __m128 mn1 = _mm_setzero_ps();
-  __m128 mn2 = _mm_setzero_ps();
-  __m128 mn3 = _mm_setzero_ps();
+  __m256 acc[R];
+  __m128 mn[R];
+  for (int i = 0; i < R; ++i) {
+    acc[i] = _mm256_setzero_ps();
+    mn[i] = _mm_setzero_ps();
+  }
+  __m256i a[R];
+  __m256i off[R];
 
   if (type_id == quant::kGgmlQ4K) {
     for (int64_t b = 0; b < n_blocks; ++b) {
       const uint8_t *block = blocks + b * block_bytes;
-      const quant::Q8KBlock &y0 = q8[0 * q8_stride + b];
-      const quant::Q8KBlock &y1 = q8[1 * q8_stride + b];
-      const quant::Q8KBlock &y2 = q8[2 * q8_stride + b];
-      const quant::Q8KBlock &y3 = q8[3 * q8_stride + b];
       const float wd = quant::as_half(block, 0);
       const float wdmin = quant::as_half(block, 2);
 
@@ -833,34 +861,21 @@ void dot_4rows_q8k(int type_id, const quant::Q8KBlock *q8, int64_t q8_stride,
 
       /* The minimum term, written once per row as `dot_row_q8k` writes it: the
        * bsums pair up into eight groups of two for one `madd`, four lanes. */
-      {
-        const __m128i b0 = _mm_hadd_epi16(
-            _mm_loadu_si128(reinterpret_cast<const __m128i *>(y0.bsums)),
-            _mm_loadu_si128(reinterpret_cast<const __m128i *>(y0.bsums + 8)));
-        mn0 = _mm_fmadd_ps(_mm_set1_ps(-y0.d * wdmin), _mm_cvtepi32_ps(_mm_madd_epi16(mins128, b0)), mn0);
-        const __m128i b1 = _mm_hadd_epi16(
-            _mm_loadu_si128(reinterpret_cast<const __m128i *>(y1.bsums)),
-            _mm_loadu_si128(reinterpret_cast<const __m128i *>(y1.bsums + 8)));
-        mn1 = _mm_fmadd_ps(_mm_set1_ps(-y1.d * wdmin), _mm_cvtepi32_ps(_mm_madd_epi16(mins128, b1)), mn1);
-        const __m128i b2 = _mm_hadd_epi16(
-            _mm_loadu_si128(reinterpret_cast<const __m128i *>(y2.bsums)),
-            _mm_loadu_si128(reinterpret_cast<const __m128i *>(y2.bsums + 8)));
-        mn2 = _mm_fmadd_ps(_mm_set1_ps(-y2.d * wdmin), _mm_cvtepi32_ps(_mm_madd_epi16(mins128, b2)), mn2);
-        const __m128i b3 = _mm_hadd_epi16(
-            _mm_loadu_si128(reinterpret_cast<const __m128i *>(y3.bsums)),
-            _mm_loadu_si128(reinterpret_cast<const __m128i *>(y3.bsums + 8)));
-        mn3 = _mm_fmadd_ps(_mm_set1_ps(-y3.d * wdmin), _mm_cvtepi32_ps(_mm_madd_epi16(mins128, b3)), mn3);
+      for (int i = 0; i < R; ++i) {
+        const quant::Q8KBlock &y = q8[i * q8_stride + b];
+        const __m128i bs = _mm_hadd_epi16(
+            _mm_loadu_si128(reinterpret_cast<const __m128i *>(y.bsums)),
+            _mm_loadu_si128(reinterpret_cast<const __m128i *>(y.bsums + 8)));
+        mn[i] = _mm_fmadd_ps(_mm_set1_ps(-y.d * wdmin),
+                             _mm_cvtepi32_ps(_mm_madd_epi16(mins128, bs)), mn[i]);
       }
 
       const uint8_t *q4 = block + 16;
-      const int8_t *p0 = y0.qs;
-      const int8_t *p1 = y1.qs;
-      const int8_t *p2 = y2.qs;
-      const int8_t *p3 = y3.qs;
-      __m256i s0 = _mm256_setzero_si256();
-      __m256i s1 = _mm256_setzero_si256();
-      __m256i s2 = _mm256_setzero_si256();
-      __m256i s3 = _mm256_setzero_si256();
+      const int8_t *p[R];
+      for (int i = 0; i < R; ++i) {
+        p[i] = q8[i * q8_stride + b].qs;
+        a[i] = _mm256_setzero_si256();
+      }
       for (int j = 0; j < 4; ++j) {
         const __m256i scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j));
         const __m256i scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j + 1));
@@ -869,11 +884,11 @@ void dot_4rows_q8k(int type_id, const quant::Q8KBlock *q8, int64_t q8_stride,
         const __m256i q4l = _mm256_and_si256(q4bits, m4);
         const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
 
-        /* Four rows against the same decoded nibbles, in the one-row kernel's
-         * exact expression.  The macro is here because writing it four times by
-         * hand is four chances to type the wrong pointer, not because the four
-         * rows are interchangeable. */
-#define POCKETLLM_ROW_ACC(SUMI, PTR)                                                     \
+        /* `R` rows against the same decoded nibbles, in the one-row kernel's
+         * exact expression.  The macro is here because writing it eight times by
+         * hand is eight chances to type the wrong pointer, not because the rows
+         * are interchangeable. */
+#define POCKETLLM_TILE_ACC(SUMI, PTR)                                                    \
   {                                                                                      \
     const __m256i q8l = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(PTR));       \
     __m256i p16l = _mm256_maddubs_epi16(q4l, q8l);                                        \
@@ -883,64 +898,40 @@ void dot_4rows_q8k(int type_id, const quant::Q8KBlock *q8, int64_t q8_stride,
     p16h = _mm256_madd_epi16(scale_h, p16h);                                              \
     SUMI = _mm256_add_epi32(SUMI, _mm256_add_epi32(p16l, p16h));                          \
   }
-        POCKETLLM_ROW_ACC(s0, p0)
-        POCKETLLM_ROW_ACC(s1, p1)
-        POCKETLLM_ROW_ACC(s2, p2)
-        POCKETLLM_ROW_ACC(s3, p3)
-#undef POCKETLLM_ROW_ACC
-        p0 += 64;
-        p1 += 64;
-        p2 += 64;
-        p3 += 64;
+        for (int i = 0; i < R; ++i) {
+          POCKETLLM_TILE_ACC(a[i], p[i])
+          p[i] += 64;
+        }
+#undef POCKETLLM_TILE_ACC
       }
-      acc0 = _mm256_fmadd_ps(_mm256_set1_ps(y0.d * wd), _mm256_cvtepi32_ps(s0), acc0);
-      acc1 = _mm256_fmadd_ps(_mm256_set1_ps(y1.d * wd), _mm256_cvtepi32_ps(s1), acc1);
-      acc2 = _mm256_fmadd_ps(_mm256_set1_ps(y2.d * wd), _mm256_cvtepi32_ps(s2), acc2);
-      acc3 = _mm256_fmadd_ps(_mm256_set1_ps(y3.d * wd), _mm256_cvtepi32_ps(s3), acc3);
+      for (int i = 0; i < R; ++i) {
+        const quant::Q8KBlock &y = q8[i * q8_stride + b];
+        acc[i] = _mm256_fmadd_ps(_mm256_set1_ps(y.d * wd), _mm256_cvtepi32_ps(a[i]), acc[i]);
+      }
     }
   } else {
     for (int64_t b = 0; b < n_blocks; ++b) {
       const uint8_t *block = blocks + b * block_bytes;
-      const quant::Q8KBlock &y0 = q8[0 * q8_stride + b];
-      const quant::Q8KBlock &y1 = q8[1 * q8_stride + b];
-      const quant::Q8KBlock &y2 = q8[2 * q8_stride + b];
-      const quant::Q8KBlock &y3 = q8[3 * q8_stride + b];
       const float wd = quant::as_half(block, 208);
 
-      /* The sixteen signed byte scales, widened once: they are read by the
-       * offset term below, by the shuffle in the run loop, and nowhere else. */
       const __m128i scales = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block + 192));
       const __m256i scales_16 = _mm256_cvtepi8_epi16(scales);
 
-      /* The (q - 32) offset, once per block per row.  This is an int32 lane
-       * vector and not a float accumulator -- `dot_row_q8k` keeps it in a
-       * `__m256i` for the same reason -- so it is a separate value from the
-       * q4_k minimum term above rather than the same `mn0..mn3`. */
-      __m256i off0;
-      __m256i off1;
-      __m256i off2;
-      __m256i off3;
-      {
-        const __m256i s0sums = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(y0.bsums));
-        const __m256i s1sums = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(y1.bsums));
-        const __m256i s2sums = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(y2.bsums));
-        const __m256i s3sums = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(y3.bsums));
-        off0 = _mm256_slli_epi32(_mm256_madd_epi16(s0sums, scales_16), 5);
-        off1 = _mm256_slli_epi32(_mm256_madd_epi16(s1sums, scales_16), 5);
-        off2 = _mm256_slli_epi32(_mm256_madd_epi16(s2sums, scales_16), 5);
-        off3 = _mm256_slli_epi32(_mm256_madd_epi16(s3sums, scales_16), 5);
+      /* The (q - 32) offset, once per block per row -- an int32 lane vector and
+       * not a float accumulator, the type `dot_row_q8k` keeps it in. */
+      for (int i = 0; i < R; ++i) {
+        const quant::Q8KBlock &y = q8[i * q8_stride + b];
+        const __m256i ssums = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(y.bsums));
+        off[i] = _mm256_slli_epi32(_mm256_madd_epi16(ssums, scales_16), 5);
       }
 
       const uint8_t *ql = block;
       const uint8_t *qh = block + 128;
-      const int8_t *p0 = y0.qs;
-      const int8_t *p1 = y1.qs;
-      const int8_t *p2 = y2.qs;
-      const int8_t *p3 = y3.qs;
-      __m256i a0 = _mm256_setzero_si256();
-      __m256i a1 = _mm256_setzero_si256();
-      __m256i a2 = _mm256_setzero_si256();
-      __m256i a3 = _mm256_setzero_si256();
+      const int8_t *p[R];
+      for (int i = 0; i < R; ++i) {
+        p[i] = q8[i * q8_stride + b].qs;
+        a[i] = _mm256_setzero_si256();
+      }
       for (int j = 0; j < 2; ++j) {
         const __m256i q4bits1 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(ql));
         const __m256i q4bits2 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(ql + 32));
@@ -958,7 +949,6 @@ void dot_4rows_q8k(int type_id, const quant::Q8KBlock *q8, int64_t q8_stride,
         const __m256i q4_3 = _mm256_or_si256(
             _mm256_and_si256(_mm256_srli_epi16(q4bits2, 4), m4), q4h_3);
 
-        /* The four 16-weight scales of this half, one per run. */
         const int is = 4 * j;
         const __m256i sc_0 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle_k6(is)));
         const __m256i sc_1 =
@@ -968,7 +958,7 @@ void dot_4rows_q8k(int type_id, const quant::Q8KBlock *q8, int64_t q8_stride,
         const __m256i sc_3 =
             _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle_k6(is + 3)));
 
-#define POCKETLLM_ROW_ACC6(SUMI, PTR)                                                   \
+#define POCKETLLM_TILE_ACC6(SUMI, PTR)                                                  \
   {                                                                                     \
     __m256i p0v = _mm256_maddubs_epi16(q4_0, _mm256_loadu_si256(                        \
         reinterpret_cast<const __m256i *>((PTR) + 0)));                                 \
@@ -985,48 +975,30 @@ void dot_4rows_q8k(int type_id, const quant::Q8KBlock *q8, int64_t q8_stride,
     SUMI = _mm256_add_epi32(SUMI, _mm256_add_epi32(p0v, p1v));                          \
     SUMI = _mm256_add_epi32(SUMI, _mm256_add_epi32(p2v, p3v));                          \
   }
-        POCKETLLM_ROW_ACC6(a0, p0)
-        POCKETLLM_ROW_ACC6(a1, p1)
-        POCKETLLM_ROW_ACC6(a2, p2)
-        POCKETLLM_ROW_ACC6(a3, p3)
-#undef POCKETLLM_ROW_ACC6
-        p0 += 128;
-        p1 += 128;
-        p2 += 128;
-        p3 += 128;
+        for (int i = 0; i < R; ++i) {
+          POCKETLLM_TILE_ACC6(a[i], p[i])
+          p[i] += 128;
+        }
+#undef POCKETLLM_TILE_ACC6
         ql += 64;
         qh += 32;
       }
-      /* The offset subtraction and the block scale, in `dot_row_q8k`'s order:
-       * `sumi - q8sclsub` first, then the float multiply -- and the multiply is
-       * `y.d * wd` per row, the activation's scale folded in exactly as the
-       * one-row kernel's `d` folds it.  Dropping `y.d` here is a factor of the
-       * block scale and reads as a plausible wrong answer, not a crash. */
-      acc0 = _mm256_fmadd_ps(_mm256_set1_ps(y0.d * wd),
-                             _mm256_cvtepi32_ps(_mm256_sub_epi32(a0, off0)), acc0);
-      acc1 = _mm256_fmadd_ps(_mm256_set1_ps(y1.d * wd),
-                             _mm256_cvtepi32_ps(_mm256_sub_epi32(a1, off1)), acc1);
-      acc2 = _mm256_fmadd_ps(_mm256_set1_ps(y2.d * wd),
-                             _mm256_cvtepi32_ps(_mm256_sub_epi32(a2, off2)), acc2);
-      acc3 = _mm256_fmadd_ps(_mm256_set1_ps(y3.d * wd),
-                             _mm256_cvtepi32_ps(_mm256_sub_epi32(a3, off3)), acc3);
+      for (int i = 0; i < R; ++i) {
+        const quant::Q8KBlock &y = q8[i * q8_stride + b];
+        acc[i] = _mm256_fmadd_ps(_mm256_set1_ps(y.d * wd),
+                                 _mm256_cvtepi32_ps(_mm256_sub_epi32(a[i], off[i])), acc[i]);
+      }
     }
   }
 
-  /* One horizontal reduce per row, the expression `dot_row_q8k` ends with: the
-   * q4_k minimum term folds its four lanes down first, and the q6_k path has no
-   * float term of its own -- its offset was already subtracted in int32 -- so it
-   * reduces to zero.  Both are spelled out here rather than shared through a
-   * `__m128` array because the two types keep their terms in different types. */
-  const __m256 accs[4] = {acc0, acc1, acc2, acc3};
-  const __m128 mins[4] = {mn0, mn1, mn2, mn3};
-  for (int i = 0; i < 4; ++i) {
+  /* One horizontal reduce per row, the expression `dot_row_q8k` ends with. */
+  for (int i = 0; i < R; ++i) {
     alignas(32) float lanes[8];
-    _mm256_store_ps(lanes, accs[i]);
+    _mm256_store_ps(lanes, acc[i]);
     const float total = ((lanes[0] + lanes[4]) + (lanes[1] + lanes[5])) +
                         ((lanes[2] + lanes[6]) + (lanes[3] + lanes[7]));
     if (type_id == quant::kGgmlQ4K) {
-      __m128 am = mins[i];
+      __m128 am = mn[i];
       am = _mm_add_ps(am, _mm_movehl_ps(am, am));
       am = _mm_add_ss(am, _mm_movehdup_ps(am));
       out[i] = total + _mm_cvtss_f32(am);
@@ -1035,8 +1007,6 @@ void dot_4rows_q8k(int type_id, const quant::Q8KBlock *q8, int64_t q8_stride,
     }
   }
 }
-
-#endif /* POCKETLLM_Q8K_HAVE_INT */
 
 #endif /* POCKETLLM_HAVE_AVX2 */
 
@@ -1280,21 +1250,26 @@ void gemm_quant(const float *x, const uint8_t *blocks, const float *bias, float 
      * and every row takes the one-row path, which is why the batched kernel
      * costs a decode nothing; at prefill `m % 4` is usually zero and the whole
      * GEMM walks its weights `m / 4` times instead of `m`. */
-    const int64_t groups = m / 4;
-    const int64_t tail = m - groups * 4;
+    const int64_t rpw = gemm_rows_per_walk();
+    const int64_t groups = m / rpw;
+    const int64_t tail = m - groups * rpw;
     parallel_for(groups * n + tail * n, /*min_per_task=*/32, [&](int64_t lo, int64_t hi, int64_t) {
       for (int64_t index = lo; index < hi; ++index) {
         const int64_t g = index / n;
         const int64_t j = index - g * n;
         const uint8_t *row_blocks_ptr = blocks + j * row_bytes;
         if (g < groups) {
-          const int64_t r = g * 4;
-          /* The four rows' whole dot in one call -- see `dot_4rows_q8k` for why
-           * it is one call and why its arithmetic is the one-row kernel's, not
-           * a reassociation of it. */
-          float totals[4];
-          dot_4rows_q8k(type_id, q8 + r * row_blocks, row_blocks, row_blocks_ptr, k, totals);
-          for (int64_t i = 0; i < 4; ++i) {
+          const int64_t r = g * rpw;
+          /* The rows' whole dot in one call -- see `dot_Rrows_q8k` for why it is
+           * one call and why its arithmetic is the one-row kernel's, not a
+           * reassociation of it. */
+          float totals[8];
+          if (rpw == 8) {
+            dot_Rrows_q8k<8>(type_id, q8 + r * row_blocks, row_blocks, row_blocks_ptr, k, totals);
+          } else {
+            dot_Rrows_q8k<4>(type_id, q8 + r * row_blocks, row_blocks, row_blocks_ptr, k, totals);
+          }
+          for (int64_t i = 0; i < rpw; ++i) {
             float value = totals[i];
             if (bias != nullptr) {
               value += bias[j];
@@ -1303,7 +1278,7 @@ void gemm_quant(const float *x, const uint8_t *blocks, const float *bias, float 
             out[o] = accumulate ? out[o] + value : value;
           }
         } else {
-          const int64_t r = groups * 4 + (g - groups);
+          const int64_t r = groups * rpw + (g - groups);
           const float total =
               dot_row_q8k(type_id, reinterpret_cast<const uint8_t *>(q8 + r * row_blocks),
                           row_blocks_ptr, k);

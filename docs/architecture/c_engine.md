@@ -253,6 +253,19 @@ the result does not depend on the count; `=1` reproduces a single-threaded numbe
 host it is the polite setting. `build/pocketllm-bench` prints the count it resolved, so a table row
 is never ambiguous about how many cores produced it.
 
+**Ask for more threads than you have pinned cores and the pool collapses, which is a benchmark trap
+rather than a kernel property.** The pool is sized from `hardware_concurrency()` — the machine, not
+the affinity mask — so `taskset -c 0-21` with the default thread count builds 88 workers on 22 cores.
+Every worker spins on the generation counter while idle, so 66 threads that cannot run are fighting
+the 22 that can, and the run does not degrade gracefully: **`pp512` reads 26 t/s against 500 for the
+same binary at `-t 22`**, a 20× loss with no error and no wrong answer. Two rules follow for anyone
+measuring this engine:
+
+- **Set `$POCKETLLM_CPU_THREADS` to match the mask** (`taskset -c 0-21` wants `=22`), or do not pin
+  at all and let the default take the whole machine.
+- **The thread count and the core count are two different numbers, and the interesting comparison is
+  at matched core counts.** The table in "What it measures" is laid out that way for this reason.
+
 ### The vectorized packed GEMM
 
 `gemm_quant` is where the FLOPs are — more than 99% of them, at both prefill and decode — so it is
@@ -319,13 +332,13 @@ that included `kernel/parallel.h` would drag the thread pool into an install tha
 The serial `quantize_row_q8_k` is still there for callers with no pool to hand — it is the definition
 the parallel schedule is checked against.
 
-### Four rows per weight walk
+### Rows per weight walk: four, and now eight
 
 With the quantizer parallelized, the GEMM is a walk over weight blocks, and the pairing is still
 one activation row to one weight row: `dot_row_q8k` reads each weight block once per output row, so
-a 512-token prefill reads the same 590 KB weight panel 512 times. `dot_4rows_q8k` walks the weight
-block once and applies its decoded nibbles to four activation rows at a time, keeping four
-independent integer accumulators and four float accumulators live across the same walk.
+a 512-token prefill reads the same 590 KB weight panel 512 times. `dot_Rrows_q8k` walks the weight
+block once and applies its decoded nibbles to `R` activation rows at a time, keeping `R` independent
+integer accumulators and `R` float accumulators live across the same walk.
 
 **Measured at 1.58× to 1.80× on the kernel, and bit-exact.** The `/tmp` probe (`rows4.cpp`: copies
 of both kernels, a synthetic panel, one core, both measured back to back in one process) puts
@@ -341,13 +354,36 @@ integer accumulation is over the same values in the same order, its float multip
 (`y.d * wd`, the activation's scale folded in exactly where the one-row kernel folds it), and its
 horizontal reduce is the same expression. The first draft of the q6_k branch multiplied by the
 weight's `d` alone and left out the activation's `y.d`; the test written with the kernel reported it
-as a 537-thousand error on its first run. `tests/native/test_cpu_parallel.py` now pins the
-equivalence directly: a six-row `gemm_quant` against six one-row calls, rows 0–3 through the batched
-walk and rows 4–5 through the one-row kernel, compared byte for byte. The conformance tolerance
-would have passed a reassociated sum; this would not.
+as a 537-thousand error on its first run. `tests/native/test_cpu_parallel.py` pins the equivalence
+directly: a six-row `gemm_quant` against six one-row calls, rows 0–3 through the batched walk and
+rows 4–5 through the one-row kernel, compared byte for byte. The conformance tolerance would have
+passed a reassociated sum; this would not.
 
-The dispatch lives in `gemm_quant` and is shape-driven: `m / 4` groups take the batched path and the
-`m % 4` tail takes `dot_row_q8k`. At decode `m` is 1, so every call takes the one-row path and the
+**The row count is now eight, and getting there took two wrong measurements before the right one.**
+The kernel is a template on `R` after the eight-row form, and `$POCKETLLM_CPU_GEMM_RPW=4` selects the
+old count, because the two are bit-identical (a new test holds them to the same bytes at `m=16` and
+`m=18`, so both the full tiles and the ragged tail are covered) and differ only in speed.
+
+The first probe of the pair, on one core, put R=8 only 5–8% ahead of R=4 — a small margin for
+something that halves the panel traffic. The second put both kernels behind the engine's own
+`parallel_for` and reported R=8 *behind* R=4 at 22 threads, which looked like a refutation. **It was
+not: that probe's traversal ran 6× slower than the engine's own GEMM**, so it was measuring its own
+memory behaviour rather than the kernel's. The number that decides it is the engine's, on a quiet
+host, at the thread count that matters — `pp512`, `q4_k_m`, all 88 hardware threads, interleaved,
+median of six:
+
+| row count | t/s |
+|---:|---:|
+| 4 (the previous default) | 905 |
+| 8 | **978** |
+
+R=8 wins by 8% with the machine full, which is the *opposite* of what register pressure predicts (the
+tile wants roughly 29 of the 32 AVX2 registers at R=8 against 17 at R=4) and is why this has to be
+measured rather than reasoned about. **Check the host load first**: the same comparison run under a
+loaded host read 26 t/s at 44 threads against 500 at 22, all of it contention.
+
+The dispatch lives in `gemm_quant` and is shape-driven: `m / R` groups take the batched path and the
+`m % R` tail takes `dot_row_q8k`. At decode `m` is 1, so every call takes the one-row path and the
 batched kernel costs a decode nothing — which is why the change is a prefill change and the decode
 column of the A/B is flat.
 
@@ -718,16 +754,38 @@ before, 98.7 after, 96.2 for llama.cpp, against a ±4 run-to-run spread), and th
 `m` is 1, so the dispatcher routes every decode GEMM to the one-row kernel. The batched path exists
 for prefill and costs decode a branch.
 
-**Prefill is now 0.61 of llama.cpp's at its best thread count**, up from 0.52 — the four-query tiling
-above is what closed the last third of that and attention's share of the wall with it, and the two
-sections are adjacent for that reason. The remaining term is the GEMM: at 22 threads `gemm_quant` is
-625 ms of the prefill and llama.cpp's repacked 8×8 form is still 1.3× the kernel ours is. That is the
-next lever the pairing argument above points at: a four-row walk still spends its time in the weight
-*decode*, and an 8×8 form (which is what llama.cpp's repack is) amortizes the decode over eight rows
-rather than four. **It is an argument and not a measurement** — unlike the attention tiling above,
-where the probe's R=8 column is the measurement of what eight rows per walk would buy, nothing has
-built the 8×8 GEMM and the comparison is between our two adjacent stages, not between our kernel and
-llama.cpp's.
+**And then the eight-row walk, which is what closed it.** The argument in the paragraph above — that
+the four-row walk still spends its time in the weight decode and an eight-row form amortizes it over
+eight rows rather than four — turned out to be right, but only the engine could show it: the
+single-core probe understated the win and the `parallel_for` probe actively inverted it. `pp512`,
+`q4_k_m`, interleaved, median of six, at matched core counts and with `-fa 0` so neither engine is
+using flash attention:
+
+| threads | PocketLLM | llama.cpp | ratio |
+|---:|---:|---:|---:|
+| 22 (node 0) | 526 | 677 | 0.78 |
+| 44 | 933 | 815 | **1.14** |
+| 88 (both engines' default) | **976** | 823 | **1.19** |
+
+**PocketLLM's prefill is now ahead of llama.cpp's on this host** — 976 against 823 t/s at the
+configuration both engines default to, a 1.19×. It still loses at 22 threads (0.78), and the honest
+reading of that column is the one the earlier tables kept pointing at: llama.cpp scales better on a
+single socket, and ours needs both to get ahead. Earlier in this document's history that was a loss
+of 0.35 at `pp512`; the score tiling, the weighted-sum tiling and the eight-row walk took it to 0.78
+at 22, 1.14 at 44 and 1.19 at 88.
+
+Two things the win does **not** cover. It is a `-fa 0` comparison — llama.cpp with flash attention
+measures **1222 t/s**, which this engine does not implement, so a reader who runs `llama-bench` with
+its defaults on a newer build may see a different ordering. And it is one host, one checkpoint and
+one prompt length; `pp32` and longer prompts were not re-measured against this build.
+
+**The measurement that would have said "no" is worth keeping.** Before the engine A/B, a probe put
+both row counts behind the engine's own `parallel_for` and reported R=8 *slower* than R=4 at 22
+threads — which would have ended the idea. The probe's traversal ran 6× slower than the engine's own
+GEMM, so it was measuring its own memory behaviour. A kernel ratio is only transferable if the probe
+and the engine are doing the same thing at the same speed; when they are not, the engine is the
+instrument. The same lesson is why the thread-count trap above is called out separately: two of the
+three "measurements" that framed this stage were artefacts of the harness.
 
 ## Building
 
