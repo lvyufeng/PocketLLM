@@ -1110,6 +1110,23 @@ So the current honest position is: **decode ahead on the like-for-like basis, pr
 it, and both behind llama.cpp's shipped default.** The last two rows are the ones a reader running
 `llama-bench` with no flags sees, and they are the number that matters to the goal.
 
+### The attention blocks are dealt from both ends
+
+Attention was the worst-scaling op in the tree and the reason was load balance, not the kernel. It is
+causal, so block `b` walks `q_offset + b * kAttentionRows` shared keys and its cost grows with the
+block index; the unit index was `b * groups + g`, and `parallel_for` splits that contiguously and
+**caps its chunk count at the thread count**, so there is no over-decomposition for a work-stealing
+pool to even out. The first worker got the cheapest block and the last one got the whole expensive
+tail. Measured at `pp512`, `attention` reached **8.6× on 22 cores where the GEMM reached 13.6× —
+39% of the ideal against the GEMM's 62%** — which made a 39%-efficient op 24% of prefill.
+
+Dealing the blocks `0, blocks-1, 1, blocks-2, …` makes the cumulative cost linear in the unit index:
+the first half of the sequence pairs a cheap block with an expensive one, so any contiguous range
+carries about its share. **It is a permutation of which worker runs which unit, not a reassociation**
+— each unit's arithmetic, its private scratch and the set of outputs it writes are untouched — so the
+result is bit-identical and the thread-count test holds unchanged. Paired A/B at `pp512`:
+**1.10–1.16× at 22 threads**, more at 44. A decode is one block, so nothing moves there.
+
 ### `kv_append` was the one op that did not use the pool
 
 The f32 cache path is a single `memcpy`; the **f16 path — the shipped one — was a serial double loop
