@@ -257,16 +257,35 @@ identifies it as a partition and not an arithmetic change. The `attention` comme
 constraint on the same number: the unit is the whole of a task's work and cannot be sliced finer,
 because its three passes are chained through `max_score` and `total`.
 
-The thread count is `$POCKETLLM_CPU_THREADS`, falling back to every hardware thread, clamped to
-`[1, 256]`. The default is all cores because the requirement is speed with nothing to configure and
-the result does not depend on the count; `=1` reproduces a single-threaded number, and on a shared
-host it is the polite setting. `build/pocketllm-bench` prints the count it resolved, so a table row
-is never ambiguous about how many cores produced it.
+The thread count is `$POCKETLLM_CPU_THREADS`, falling back to the **physical core count**, clamped to
+`[1, 256]`. `=1` reproduces a single-threaded number, and on a shared host it is the polite setting.
+`build/pocketllm-bench` prints the count it resolved, so a table row is never ambiguous about how
+many cores produced it.
+
+**The default is cores, not hardware threads, and the difference is 1.3× on decode.** The first
+version of this used `hardware_concurrency()`, which on this host is 88 — 44 physical cores × 2
+hyperthreads — and it is the wrong number for a pool whose workers *spin*: two hyperthread siblings
+that are both spinning are fighting over one core's issue ports and one core's share of the memory
+pipeline, and the arithmetic they are supposed to be doing pays for it. Reading the topology from
+`sysfs` (`physical_core_count`, one distinct `thread_siblings_list` per core) gives 44, and at that
+count both halves of the benchmark are faster than at 88 — prefill because nothing is contending,
+decode because decode is memory-bound and the extra threads only add coherence traffic:
+
+| threads | `pp512` | `tg64` |
+|---:|---:|---:|
+| 22 (one socket's cores) | 521 | 74.2 |
+| **44 (both sockets' cores — the default)** | **939** | **72.4** |
+| 88 (every hardware thread — the old default) | 862 | 54.5 |
+
+The `taskset` trap below is the same effect seen from the other side: a run pinned to 22 cores that
+still builds 88 workers collapses the same way. `physical_core_count` reads the machine's topology
+and so does not see an affinity mask either; the advice to set `$POCKETLLM_CPU_THREADS` by hand when
+pinning stands.
 
 **Ask for more threads than you have pinned cores and the pool collapses, which is a benchmark trap
-rather than a kernel property.** The pool is sized from `hardware_concurrency()` — the machine, not
-the affinity mask — so `taskset -c 0-21` with the default thread count builds 88 workers on 22 cores.
-Every worker spins on the generation counter while idle, so 66 threads that cannot run are fighting
+rather than a kernel property.** The pool is sized from the machine's topology — the machine, not
+the affinity mask — so `taskset -c 0-21` with the default thread count builds 44 workers on 22 cores.
+Every worker spins on the generation counter while idle, so 22 threads that cannot run are fighting
 the 22 that can, and the run does not degrade gracefully: **`pp512` reads 26 t/s against 500 for the
 same binary at `-t 22`**, a 20× loss with no error and no wrong answer. Two rules follow for anyone
 measuring this engine:
