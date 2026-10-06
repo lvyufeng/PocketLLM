@@ -31,6 +31,8 @@
 
 #include <cstdint>
 
+#include "kernel/backend.h"
+
 namespace pocketllm {
 namespace kernel {
 
@@ -158,9 +160,27 @@ void rope_neox(float *x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t s
  * not drift is `kAttentionScoreRowsPerTask` matching what `attention` indexes:
  * the backend's `attention_scratch` and any caller that sizes the buffer are
  * derived from the same two constants the kernel is. */
-void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_cache,
-               const float *v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
-               int64_t q_offset, float scale, float *out, float *scores);
+/* One cache row's worth of f16 elements, widened to `d` floats or narrowed from
+ * them.  `row` is the cache's own layout -- `n_head_kv * d` f16 elements with
+ * this head's `d` starting at `kv_head * d` -- so `dst`/`src` is a single head's
+ * slice of it.
+ *
+ * These are the f16 cache's whole interface, and it is one function pair rather
+ * than a second family of dot kernels on purpose: see `kv_row_to_float` in
+ * `kernels.cpp` for why, and for why widening a `d`-element row costs nothing
+ * the kernels were not already paying for an f32 one.  `kv_row_to_float` is
+ * exact -- every f16 is an f32 -- and `float_to_kv_row` rounds to nearest, which
+ * is the loss the cache accepts. */
+void kv_row_to_float(const void *row, int64_t d, float *dst);
+void float_to_kv_row(const float *src, int64_t d, void *row);
+
+/* `k_cache`/`v_cache` are `KVDtype` elements wide -- f32 or f16 -- while `q`,
+ * `out` and `scores` are always f32. See `Backend::attention` for why the cache
+ * is the one operand whose width is worth trading. */
+void attention(const float *q, int64_t q_len, int64_t n_heads, const void *k_cache,
+               const void *v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
+               int64_t q_offset, float scale, float *out, float *scores,
+               KVDtype kv_dtype = KVDtype::kF32);
 
 /* How many *query rows of one head* one attention task scores in a single walk
  * over the key vector.

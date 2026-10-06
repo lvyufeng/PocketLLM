@@ -18,6 +18,17 @@
 #define POCKETLLM_HAVE_AVX2 0
 #endif
 
+/* The f16 conversion the cache needs.  AVX2 implies F16C on every part that has
+ * both, but the two are separate CPUID bits and the guard is written for what
+ * is actually used rather than what usually comes with it -- an AVX2 build
+ * without F16C would otherwise compile `_mm_cvtph_ps` into an illegal
+ * instruction, which is a SIGILL at the first token rather than a build error. */
+#if defined(__F16C__) && (defined(__x86_64__) || defined(__i386__))
+#define POCKETLLM_HAVE_F16C 1
+#else
+#define POCKETLLM_HAVE_F16C 0
+#endif
+
 #include "kernel/parallel.h"
 #include "quant/blocks.h"
 #include "quant/q8k.h"
@@ -90,6 +101,42 @@ int64_t gemm_rows_per_walk() {
  * The rule is the same one `kAttentionRows` follows in the header -- shared with
  * the device-agnostic kernel, not with one instruction set. */
 constexpr int64_t kAttentionSumMaxDim = 256;
+
+/* An f16 bit pattern as a float.
+ *
+ * Exact for every input, including subnormals, infinities and NaN, which is why
+ * it is bit arithmetic rather than a lookup: an f16 is an f32 whose exponent is
+ * biased by 112 instead of 127, so widening is a shift and, for the subnormal
+ * case, a rescale. `_mm_cvtph_ps` does this in hardware where F16C is available,
+ * and this is the scalar path beside it and the reference for the tail. */
+inline float half_to_float(uint16_t bits) {
+  const uint32_t sign = static_cast<uint32_t>(bits & 0x8000U) << 16;
+  const uint32_t exp = (bits >> 10) & 0x1FU;
+  const uint32_t man = bits & 0x3FFU;
+  uint32_t out;
+  if (exp == 0) {
+    if (man == 0) {
+      out = sign; /* +-0 */
+    } else {
+      /* Subnormal: normalize by shifting the mantissa up until its top bit is
+       * set, the exponent following it. */
+      uint32_t m = man;
+      uint32_t e = 113U;
+      while ((m & 0x400U) == 0) {
+        m <<= 1;
+        --e;
+      }
+      out = sign | (e << 23) | ((m & 0x3FFU) << 13);
+    }
+  } else if (exp == 0x1FU) {
+    out = sign | 0x7F800000U | (man << 13); /* inf / NaN */
+  } else {
+    out = sign | ((exp + 112U) << 23) | (man << 13);
+  }
+  float f;
+  std::memcpy(&f, &out, sizeof(f));
+  return f;
+}
 
 /* ``sum_k a[k] * b[k]`` for `k` values.
  *
@@ -266,6 +313,7 @@ __attribute__((optimize("fp-contract=off"))) inline void dot_pair(const float *q
     out[r] = ((src[r][0] + src[r][1]) + (src[r][2] + src[r][3])) + tail;
   }
 }
+
 #else
 inline void dot_pair(const float *qa, const float *qb, const float *key, int64_t k, float out[2]) {
   out[0] = dot(qa, key, k);
@@ -1484,17 +1532,36 @@ void rope_neox(float *x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t s
   });
 }
 
-void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_cache,
-               const float *v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
-               int64_t q_offset, float scale, float *out, float *scores) {
+void attention(const float *q, int64_t q_len, int64_t n_heads, const void *k_cache,
+               const void *v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
+               int64_t q_offset, float scale, float *out, float *scores, KVDtype kv_dtype) {
   const int64_t group = n_heads / n_head_kv;
-  const int64_t cache_row = n_head_kv * d;
   /* The score row for a query at position `q_offset + q_len - 1` is the widest
    * any row can be, and it is what spaces the rows within a per-task scratch
    * region apart.  `attention_scratch` and the callers that size the buffer use
    * the same quantity. */
   const int64_t max_span = q_offset + q_len - first_key;
   const int64_t blocks = (q_len + kAttentionRows - 1) / kAttentionRows;
+
+  /* One cache row, widened out of the f16 cache and then read from L1 by every
+   * kernel in the unit.  `f16` is false on an f32 cache, where this is the
+   * cache pointer itself -- the f32 path keeps exactly the address arithmetic
+   * it always had and pays one predicted branch per row, not per element.
+   *
+   * The scratch is declared *inside* the parallel body below, and that is not
+   * a style choice: a buffer in this frame would be one buffer written by every
+   * pool thread at once, which is a race whose symptom is a finite, plausible,
+   * wrong score row -- and it measured as a real slowdown as well, because the
+   * false sharing on one 512-byte line serialized the eight attention units.
+   * Per task is per thread here: a task runs to completion on one thread.
+   *
+   * See `kv_row_to_float` for why widening is the design. */
+  const bool f16 = kv_dtype == KVDtype::kF16;
+  const int64_t kv_stride = n_head_kv * d;
+  if (f16 && d > kAttentionSumMaxDim) {
+    throw Error("attention: an f16 cache needs d <= " + std::to_string(kAttentionSumMaxDim) +
+                ", got " + std::to_string(d));
+  }
 
   /* Over `(block of kAttentionRows tokens, head)`.  Each unit owns one output
    * row per token it covers and one score row per token too, so the scratch is
@@ -1533,6 +1600,21 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_ca
   parallel_for(blocks * groups, kAttentionGrain,
                [&](int64_t lo, int64_t hi, int64_t chunk) {
                  float *const task_scores = scores + chunk * kAttentionScoreRowsPerTask * max_span;
+                 /* This task's own widened row -- see the note on `widen`.  A
+                  * second row's worth exists so that a pass that ever needs two
+                  * live rows at once does not have to grow this; today each pass
+                  * widens, consumes and drops a single row. */
+                 alignas(32) float row_buf[2 * kAttentionSumMaxDim];
+                 auto widen = [&](const void *base, int64_t index, int64_t kv_head, int slot) {
+                   if (f16) {
+                     float *const dst = row_buf + slot * d;
+                     kv_row_to_float(
+                         static_cast<const uint16_t *>(base) + index * kv_stride + kv_head * d, d,
+                         dst);
+                     return static_cast<const float *>(dst);
+                   }
+                   return static_cast<const float *>(base) + index * kv_stride + kv_head * d;
+                 };
                  for (int64_t unit = lo; unit < hi; ++unit) {
                    const int64_t b = unit / groups;
                    const int64_t g = unit - b * groups;
@@ -1583,7 +1665,7 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_ca
                    const int64_t shared_end = q_offset + t0;
                    if (rows == kAttentionRows) {
                      for (; s <= shared_end; ++s) {
-                       const float *kvec = k_cache + s * cache_row + kv_head * d;
+                       const float *kvec = widen(k_cache, s, kv_head, 0);
                        for (int64_t p = 0; p < hb; ++p) {
                          float sc[kAttentionRows];
                          dot_tile(qvec[p], kvec, d, sc);
@@ -1603,7 +1685,7 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_ca
                       * spans here, so each takes one dot per row over the keys
                       * it shares with the rest, the batched heads together. */
                      for (; s <= shared_end; ++s) {
-                       const float *kvec = k_cache + s * cache_row + kv_head * d;
+                       const float *kvec = widen(k_cache, s, kv_head, 0);
                        for (int64_t j = 0; j < rows; ++j) {
                          float sc[kAttentionHeadBatch];
                          score_row(j, kvec, sc);
@@ -1622,7 +1704,7 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_ca
                     * t0 + j`, which is `j` keys. */
                    for (int64_t k = 1; k < rows; ++k) {
                      const int64_t abs = q_offset + t0 + k;
-                     const float *kvec = k_cache + abs * cache_row + kv_head * d;
+                     const float *kvec = widen(k_cache, abs, kv_head, 0);
                      for (int64_t j = k; j < rows; ++j) {
                        float sc[kAttentionHeadBatch];
                        score_row(j, kvec, sc);
@@ -1670,8 +1752,7 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_ca
                          const int64_t span = q_offset + t0 + j - first_key + 1;
                          for (int64_t i = 0; i < span; ++i) {
                            const float weight = wrow[i];
-                           const float *vvec =
-                               v_cache + (first_key + i) * cache_row + kv_head * d;
+                           const float *vvec = widen(v_cache, first_key + i, kv_head, 0);
                            for (int64_t x = 0; x < d; ++x) {
                              dst[x] += weight * vvec[x];
                            }
@@ -1729,8 +1810,7 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_ca
                        }
                        const int64_t span0 = q_offset + t0 + j0 - first_key + 1;
                        for (int64_t i = 0; i < span0; ++i) {
-                         const float *vvec =
-                             v_cache + (first_key + i) * cache_row + kv_head * d;
+                         const float *vvec = widen(v_cache, first_key + i, kv_head, 0);
                          for (int64_t j = 0; j < jn; ++j) {
                            const float weight = row_scores[p][j0 + j][i];
                            for (int64_t x = 0; x < d; ++x) {
@@ -1743,8 +1823,7 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_ca
                          const float *wrow = row_scores[p][j0 + j];
                          for (int64_t i = span0; i < span; ++i) {
                            const float weight = wrow[i];
-                           const float *vvec =
-                               v_cache + (first_key + i) * cache_row + kv_head * d;
+                           const float *vvec = widen(v_cache, first_key + i, kv_head, 0);
                            for (int64_t x = 0; x < d; ++x) {
                              acc[j][x] += weight * vvec[x];
                            }
@@ -1877,6 +1956,79 @@ void topk_sample(const float *logits, int64_t vocab, float uniform, int64_t top_
     }
   }
   *out = order[chosen];
+}
+
+/* Widen one f16 cache row into `dst` as floats.
+ *
+ * **This is how the f16 cache is read, and the decision to materialize rather
+ * than to write a second family of dot kernels is the design.**  Every score
+ * kernel in this file -- `dot`, `dot4`, `dot_pair`, `dot_tile` -- is the result
+ * of a measured correctness argument about lane structure, and the score dot is
+ * the one place a last-bit change flips tokens (see `dot4`).  A parallel
+ * `_f16` family would double that surface and put two kernels under one
+ * argument.  Widening first means a cache row is read by exactly the kernels an
+ * f32 cache is, so the *only* new claim in the whole f16 path is "this
+ * expansion equals each element's width", which is one line of hardware.
+ *
+ * It is also where the bytes go.  A head row is `d` = 128 halves = 256 bytes,
+ * and the widened row is 512 bytes -- which is L1-resident five times over, so
+ * the row is streamed from the cache once and then read and re-read out of L1
+ * by whatever tiling the kernel uses.  `dot_pair` reads a key row twice (once
+ * per query head) and `dot_tile` reads it once for four rows; both were
+ * reading the same 512-byte row in the f32 case already, so this is the access
+ * pattern the kernels were written against, not a new one.
+ *
+ * The tail below `AVX2` is `half_to_float` per element, which is where that
+ * function is exercised: the vector branch is only compiled where `_mm_cvtph_ps`
+ * exists, and the two agree bit for bit. */
+void kv_row_to_float(const void *row, int64_t d, float *dst) {
+#if POCKETLLM_HAVE_F16C
+  const uint16_t *src = static_cast<const uint16_t *>(row);
+  int64_t i = 0;
+  for (; i + 8 <= d; i += 8) {
+    const __m128i lo_bits = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(src + i));
+    const __m128i hi_bits = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(src + i + 4));
+    _mm_storeu_ps(dst + i, _mm_cvtph_ps(lo_bits));
+    _mm_storeu_ps(dst + i + 4, _mm_cvtph_ps(hi_bits));
+  }
+  for (; i < d; ++i) {
+    dst[i] = half_to_float(src[i]);
+  }
+#else
+  const uint16_t *src = static_cast<const uint16_t *>(row);
+  for (int64_t i = 0; i < d; ++i) {
+    dst[i] = half_to_float(src[i]);
+  }
+#endif
+}
+
+/* Narrow one f32 row into an f16 cache row.  The round trip is what makes the
+ * cache a *lossy* copy of the f32 K/V the layer computes, and that is the same
+ * loss the oracle's default basis takes -- see `Backend::attention`. */
+void float_to_kv_row(const float *src, int64_t d, void *row) {
+#if POCKETLLM_HAVE_F16C
+  uint16_t *dst = static_cast<uint16_t *>(row);
+  int64_t i = 0;
+  for (; i + 8 <= d; i += 8) {
+    const __m128i lo = _mm_cvtps_ph(_mm_loadu_ps(src + i), _MM_FROUND_TO_NEAREST_INT);
+    const __m128i hi = _mm_cvtps_ph(_mm_loadu_ps(src + i + 4), _MM_FROUND_TO_NEAREST_INT);
+    _mm_storel_epi64(reinterpret_cast<__m128i *>(dst + i), lo);
+    _mm_storel_epi64(reinterpret_cast<__m128i *>(dst + i + 4), hi);
+  }
+  for (; i < d; ++i) {
+    /* One at a time through a lane rather than a masked store: `d` is 128 for
+     * every model this runs, so the tail is dead code here and the cost of it
+     * being slow is zero.  It exists so a width that is not a multiple of eight
+     * is wrong in no way. */
+    const __m128i one = _mm_cvtps_ph(_mm_set_ss(src[i]), _MM_FROUND_TO_NEAREST_INT);
+    dst[i] = static_cast<uint16_t>(_mm_cvtsi128_si32(one) & 0xFFFF);
+  }
+#else
+  (void)src;
+  (void)d;
+  (void)row;
+  throw Error("float_to_kv_row: this build has no f16 conversion (needs F16C)");
+#endif
 }
 
 }  // namespace kernel

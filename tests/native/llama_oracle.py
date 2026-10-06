@@ -38,6 +38,39 @@ attention is a block-reduced shift, which lands on the same token as llama.cpp's
 flash mode, and `test_quantized_forward.py` names per backend which convention
 it compares against.  The default here is the CPU convention, because that is
 the backend every test can run.
+
+## The K/V cache width is pinned too -- and it is pinned to f32, not llama's f16
+
+The engine chooses its cache width per backend -- `Backend::preferred_kv_dtype`,
+f16 on the CPU path and f32 on the card -- and llama.cpp has the same knob one
+level down in `llama_context_params.type_k`/`type_v`, whose *library* default is
+f16.
+
+f16 would be the obvious like-for-like choice, and it is the one this oracle
+first made.  It does not work, for a reason that has nothing to do with this
+tree: **llama.cpp's f16 cache is not self-consistent between its batched prefill
+and its one-token decode.**  On the suite's prompt the two paths quantize the
+same K/V entry differently and pick different tokens at the second generated
+step -- a batched six-token decode says `11`, a five-token prefill followed by a
+one-token decode says `13` -- while the *f32* cache says `11` on both.  There is
+therefore no single "llama.cpp on f16" to match: whichever path the oracle
+drives, the other disagrees, and a token-exact test against it fails on
+llama.cpp's own inconsistency rather than on the engine's.
+
+The f32 cache is the self-consistent one, so it is the one the token-exact
+comparisons use.  The near-tie is real either way -- tokens `11` and `13` are
+the top two at that step under every cache width on both engines, separated by
+0.06-0.5% of the logit spread -- but f32 resolves it the same way on the prefill
+and the decode path, which is the property an oracle needs.
+
+Comparing the engine's f16 against llama.cpp's f32 is not a mismatch: llama.cpp's
+own f16 differs from its own f32 by 1.12 in the logits, *more* than the engine's
+f16 differs from llama.cpp's f32 (0.89).  The engine sits inside llama.cpp's own
+cache-width spread, and over sixteen greedy tokens its decode path reproduces
+llama.cpp's f32 sequence exactly.
+
+:func:`run` takes `kv_type` for the same reason it takes `flash_attn`, and
+:data:`KV_TYPE` names the default.
 """
 
 from __future__ import annotations
@@ -55,6 +88,15 @@ LLAMA_BUILD = LLAMA_CPP / "build" / "bin"
 #: `"on"` agrees with the CUDA kernel, and `"auto"` is llama.cpp's shipped
 #: default.  See the module docstring.
 FLASH_ATTN = "off"
+
+#: What the oracle asks llama.cpp for unless the caller says otherwise.  `"f32"`
+#: rather than llama.cpp's f16 library default because the f16 cache gives
+#: different answers from llama.cpp's batched prefill and its one-token decode,
+#: so there is no single "llama.cpp on f16" to compare against; the f32 cache is
+#: the self-consistent one.  The engine's own cache width is f16 on the CPU and
+#: f32 on the card, and comparing the two is not a mismatch -- see the module
+#: docstring for the measured spread.  See the module docstring.
+KV_TYPE = "f32"
 
 
 def repository_root() -> pathlib.Path:
@@ -99,7 +141,13 @@ def compile_tool() -> None:
     )
 
 
-def run(model_path: str, tokens: list[int], steps: int = 0, flash_attn: str | None = None) -> dict:
+def run(
+    model_path: str,
+    tokens: list[int],
+    steps: int = 0,
+    flash_attn: str | None = None,
+    kv_type: str | None = None,
+) -> dict:
     """One call to the tool, parsed.
 
     `steps` of 0 asks for the logits of the last token of `tokens`; a positive
@@ -107,12 +155,15 @@ def run(model_path: str, tokens: list[int], steps: int = 0, flash_attn: str | No
     ``"generated"``.
 
     `flash_attn` overrides :data:`FLASH_ATTN` with ``"on"``, ``"off"`` or
-    ``"auto"``.  It exists so a caller that wants to see llama.cpp's *shipped*
-    behaviour -- AUTO, which enables flash attention -- can ask for it by name
-    instead of the module silently changing what every test compares against.
+    ``"auto"``, and `kv_type` overrides :data:`KV_TYPE` with ``"f16"`` or
+    ``"f32"``.  Both exist so a caller that wants to see llama.cpp's *shipped*
+    behaviour can ask for it by name instead of the module silently changing
+    what every test compares against, and so that each backend's comparison
+    names the convention it is on.
     """
     command = [str(tool_path()), model_path] + [str(t) for t in tokens]
     command += ["--flash-attn", FLASH_ATTN if flash_attn is None else flash_attn]
+    command += ["--kv-type", KV_TYPE if kv_type is None else kv_type]
     if steps:
         command += ["--steps", str(steps)]
     result = subprocess.run(command, capture_output=True, text=True)
@@ -121,11 +172,20 @@ def run(model_path: str, tokens: list[int], steps: int = 0, flash_attn: str | No
     return json.loads(result.stdout)
 
 
-def logits(model_path: str, tokens: list[int], flash_attn: str | None = None) -> list[float]:
-    return run(model_path, tokens, flash_attn=flash_attn)["logits"]
+def logits(
+    model_path: str,
+    tokens: list[int],
+    flash_attn: str | None = None,
+    kv_type: str | None = None,
+) -> list[float]:
+    return run(model_path, tokens, flash_attn=flash_attn, kv_type=kv_type)["logits"]
 
 
 def generated(
-    model_path: str, tokens: list[int], steps: int, flash_attn: str | None = None
+    model_path: str,
+    tokens: list[int],
+    steps: int,
+    flash_attn: str | None = None,
+    kv_type: str | None = None,
 ) -> list[int]:
-    return run(model_path, tokens, steps, flash_attn=flash_attn)["generated"]
+    return run(model_path, tokens, steps, flash_attn=flash_attn, kv_type=kv_type)["generated"]

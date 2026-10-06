@@ -240,6 +240,13 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
 
   std::unique_ptr<Qwen3Model> model(new Qwen3Model(backend));
 
+  /* The cache width is the backend's decision and it is taken here, before the
+   * first allocation, because every slab offset in `forward` is derived from
+   * it.  f16 is the interface's default and the CPU backend's; the card
+   * overrides it.  A backend that cannot consume an f16 cache overrides the
+   * same call, which is what keeps this line from deciding for it. */
+  model->kv_dtype_ = backend.preferred_kv_dtype();
+
   /* The keys are namespaced by architecture, and the prefix comes from the file
    * rather than from a literal so that a checkpoint declaring `qwen3` cannot be
    * read with `qwen2`'s hyperparameters. */
@@ -470,13 +477,15 @@ kernel::DeviceBuffer Qwen3Model::forward(const int32_t *tokens, int64_t n, int64
       backend_->release(k_cache_);
       backend_->release(v_cache_);
     }
-    k_cache_ = backend_->allocate(static_cast<int64_t>(per_layer) * n_layer_ * 4);
-    v_cache_ = backend_->allocate(static_cast<int64_t>(per_layer) * n_layer_ * 4);
+    const int64_t elem = kernel::kv_dtype_size(kv_dtype_);
+    k_cache_ = backend_->allocate(static_cast<int64_t>(per_layer) * n_layer_ * elem);
+    v_cache_ = backend_->allocate(static_cast<int64_t>(per_layer) * n_layer_ * elem);
     cache_capacity_ = grown;
   }
   grow_rope_table(needed);
 
   const int64_t kv_width = n_head_kv_ * head_dim_;
+  const int64_t kv_elem = kernel::kv_dtype_size(kv_dtype_);
 
   /* The prompt is uploaded once and gathered on the device; only the ids cross
    * the bus, not the embedding rows they select. */
@@ -512,28 +521,45 @@ kernel::DeviceBuffer Qwen3Model::forward(const int32_t *tokens, int64_t n, int64
      * the next call read them. */
     const int64_t layer_offset = cache_capacity_ * kv_width * il;
     kernel::DeviceBuffer layer_k{k_cache_.handle +
-                                     static_cast<uintptr_t>(layer_offset * 4),
-                                 kv_width * cache_capacity_ * 4};
+                                     static_cast<uintptr_t>(layer_offset * kv_elem),
+                                 kv_width * cache_capacity_ * kv_elem};
     kernel::DeviceBuffer layer_v{v_cache_.handle +
-                                     static_cast<uintptr_t>(layer_offset * 4),
-                                 kv_width * cache_capacity_ * 4};
+                                     static_cast<uintptr_t>(layer_offset * kv_elem),
+                                 kv_width * cache_capacity_ * kv_elem};
     /* Both directions are device memory, so this is `copy_device_to_device` and
      * not `copy_to_device`: the source is a device address, and a backend that
      * dereferenced it as a host pointer would read the CPU's memory on a card.
      * The CPU backend cannot tell the difference, which is exactly why the
-     * interface carries the distinction. */
-    backend_->copy_device_to_device(
-        kernel::DeviceBuffer{layer_k.handle + static_cast<uintptr_t>(start_pos * kv_width * 4),
-                             n * kv_width * 4},
-        k_, n * kv_width * 4);
-    backend_->copy_device_to_device(
-        kernel::DeviceBuffer{layer_v.handle + static_cast<uintptr_t>(start_pos * kv_width * 4),
-                             n * kv_width * 4},
-        v_, n * kv_width * 4);
+     * interface carries the distinction.
+     *
+     * When the cache is wider than the activations -- an f32 cache, which is
+     * every backend but the CPU one -- this is a plain copy of the rows.  The
+     * f16 cache is a *lossy* copy and has to be written by a kernel that
+     * converts, one row at a time, because the source rows are `head_dim`
+     * apart and the destination rows are `n_head_kv * head_dim` apart: a flat
+     * convert over the batch would interleave the heads into each other's
+     * slots. */
+    if (kv_elem == 4) {
+      backend_->copy_device_to_device(
+          kernel::DeviceBuffer{layer_k.handle + static_cast<uintptr_t>(start_pos * kv_width * 4),
+                               n * kv_width * 4},
+          k_, n * kv_width * 4);
+      backend_->copy_device_to_device(
+          kernel::DeviceBuffer{layer_v.handle + static_cast<uintptr_t>(start_pos * kv_width * 4),
+                               n * kv_width * 4},
+          v_, n * kv_width * 4);
+    } else {
+      const uintptr_t at = static_cast<uintptr_t>(start_pos * kv_width * kv_elem);
+      const int64_t bytes = n * kv_width * kv_elem;
+      backend_->kv_append(kernel::DeviceBuffer{layer_k.handle + at, bytes}, k_, n, n_head_kv_,
+                          head_dim_, kv_elem);
+      backend_->kv_append(kernel::DeviceBuffer{layer_v.handle + at, bytes}, v_, n, n_head_kv_,
+                          head_dim_, kv_elem);
+    }
 
     const float scale = 1.0F / std::sqrt(static_cast<float>(head_dim_));
     backend_->attention(q_, n, n_head_, layer_k, layer_v, n_head_kv_, head_dim_,
-                        /*first_key=*/0, start_pos, scale, attn_, scores_);
+                        /*first_key=*/0, start_pos, scale, attn_, scores_, kv_dtype_);
 
     matmul(layer.wo, attn_, x_, n, /*accumulate=*/true);
 

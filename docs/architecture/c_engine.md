@@ -180,6 +180,16 @@ longer the difference. Two others are, and they are named rather than absorbed i
 - **The activation quantization's error.** It is absolute, so a logit near zero carries a large
   relative error while staying a percent of the range — which is why the quantized comparison is a
   bound on the error relative to the logit spread and not elementwise.
+- **The K/V cache width, and llama.cpp's own inconsistency across it.** llama.cpp's f16 cache does
+  not answer the same question on its two paths: on this prompt's second generated token — a real
+  near-tie, tokens `11` and `13` separated by 0.06–0.5% of the logit spread — a batched prefill says
+  `11` where a one-token decode says `13`, so there is no single f16 sequence to match. Its **f32**
+  cache says `11` on both. The oracle therefore pins f32
+  (`tests/native/llama_oracle.py::KV_TYPE`) even though the CPU engine keeps f16, and that is not a
+  mismatch: llama.cpp's own f16 differs from its own f32 by **1.12** in the logits, more than the
+  engine's f16 differs from llama.cpp's f32 (**0.89**). Over sixteen greedy tokens the engine's
+  decode path reproduces llama.cpp's f32 sequence exactly. The near-tie is present on every cache
+  width on both engines; the width only picks a side.
 
 So the two quantized results are compared on their argmax, their logits at that global bound, and
 their greedy sequence. Both sequences match their own convention exactly, and both differ from the
@@ -668,6 +678,66 @@ would have passed.
 The same rounding appears in the CPU backend's `attention_scratch`, which sizes the per-task score
 region from the partition the kernel takes and now derives both the unit count and the rows-per-unit
 from `kAttentionHeadBatch` rather than assuming one head per task.
+
+### The K/V cache is f16, and the widening is where the win is
+
+The cache is the one operand in the graph whose *size* grows with the sequence, and it is the only
+thing the attention pass streams. At 464 rows of context a decode step reads 28 layers × 8 KV heads ×
+464 rows × 128 values — **4.2 MB per token** in f32 against **2.1 MB** in f16 — and the pass is bound
+by that read, not by its arithmetic: the score dot is 82% of the call and the walk is memory-bound
+(the probe in the section above measures the same key row being re-read at a four-kilobyte stride).
+
+There is a second reason, and it is the one that settled it: **`-ctk f16 -ctv f16` is llama.cpp's
+default.** A f32 cache is not "more correct" than the oracle, it is a different basis — twice the
+bytes to read for precision the comparison does not credit. Reading the same number of bytes is what
+makes the rest of the comparison a comparison of the walk.
+
+**The f16 cache is read by widening a row to f32 and running the f32 kernels, not by a second family
+of f16 dot kernels.** Every score kernel here — `dot`, `dot4`, `dot_pair`, `dot_tile` — is the product
+of a measured argument about lane structure, and the score dot is the one place a last-bit change
+flips tokens (the FMA experiment above moved a 32/32 token match to 1/32). A parallel `_f16` family
+would double that surface with a second kernel under a weaker argument. Widening leaves exactly one
+new claim — "this expansion equals each element's width", which is `vcvtph2ps` — and every score
+kernel then reads a cache row it has already been verified against.
+
+It is also where the bytes go. A head row is 128 halves = 256 bytes, and the widened row is 512
+bytes: L1-resident five times over. `dot_pair` reads a key row twice (once per query head) and
+`dot_tile` reads it once for four rows; both were already reading a 512-byte row in the f32 case, so
+this is the access pattern the kernels were written against. A single-core probe that widens a row and
+then runs the real score loop measures **393 us against 410 us at span 512** — the conversion costs 4%
+and saves half the bytes, and the trade only improves as the cache grows.
+
+**End to end**, `pocketllm-bench` on `qwen3-0.6b-q4_k_m.gguf`, both binaries from the same tree, run
+interleaved at 8 threads (`tg64` follows a full `pp1024`, so the decode column is measured against a
+1024-row cache):
+
+| test | f32 (before) | f16 (after) | after/before |
+|---|---:|---:|---:|
+| `tg64` after a 1024-token prefill | 32.1 | **38.7** | **1.19** |
+| `pp1024` | 175.4 | **189.2** | **1.08** |
+| `tg16` at a 256-row context | 60.2 | 56.1 | 0.93 |
+
+The shape of that table is the design. The win is **1.19× on decode and 1.08× on prefill at a
+1024-row context**, because that is where the cache is large enough for halving it to matter. At a
+256-row context the cache is a quarter the size and the conversion is not yet paid back — the third
+row is a loss, and it is on the page rather than in a footnote because a lever that only pays at long
+context is exactly what this one is.
+
+**The bug the change shipped and the profile caught.** The first version put the widened row in a
+buffer on the *attention function's* frame. Every pool thread writes that buffer, so eight attention
+units raced on one 512-byte line — a data race whose output is not a crash but a plausible, finite,
+wrong score row, and whose measured effect was a 2.2× *slowdown* from the false sharing, not the 1.19×
+speedup. Moving the buffer inside the per-task lambda (a task is a thread here) fixed both, and the
+number above is what it measured once it did. Nothing about the timing said "race"; it looked like a
+slow conversion until the buffer was traced.
+
+**The f16 cache is what the engine ships.** `Backend::preferred_kv_dtype` returns `kF16` by default;
+the CPU backend takes it and the CUDA one overrides it to `kF32`, because a card at this model size is
+nowhere near bandwidth-bound and the trade buys nothing there. The graph asks rather than assuming —
+nothing in `qwen3.cpp` names a width — which is what keeps a backend that cannot consume an f16 cache
+from silently storing the wrong layout. `opcheck` defaults to f32 (its job is checking an op against
+an f32 reference) and takes `kv_dtype 1` to exercise the f16 path; the shipped path is covered end to
+end by the token tests instead.
 
 ### The activation scratch is the shape's size, not a fixed one
 

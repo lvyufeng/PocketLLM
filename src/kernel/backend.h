@@ -30,6 +30,16 @@
 namespace pocketllm {
 namespace kernel {
 
+/* The element type of the K/V cache. Only the two widths the attention kernel
+ * reads are named -- a cache is never f32 *and* f16 within one call, and a
+ * third value would be a type the kernels do not implement. */
+enum class KVDtype : int32_t {
+  kF32 = 0,
+  kF16 = 1,
+};
+
+inline int64_t kv_dtype_size(KVDtype dtype) { return dtype == KVDtype::kF16 ? 2 : 4; }
+
 /* A number that identifies a device buffer. An opaque handle rather than a
  * pointer because on the CPU it is an address and on a device it may not be one
  * -- and because a caller that treats it as a pointer is a caller that has
@@ -127,11 +137,56 @@ class Backend {
 
   /* Causal grouped-query attention over a cache laid out ``[position][head][d]``,
    * with the query chunk at `q_offset`. `scores` holds what `attention_scratch`
-   * asked for. */
+   * asked for.
+   *
+   * `kv_dtype` is the element type of `k_cache`/`v_cache`, and only those two:
+   * the query, the output and the score scratch stay f32 on every backend. The
+   * cache is the one operand whose *size* grows with the sequence, so it is the
+   * one whose width is worth trading precision for -- at 512 rows a f32 cache is
+   * twice the bytes of an f16 one on the decode path's only streaming read, and
+   * the probe in `docs/architecture/c_engine.md` measures the attention call
+   * halving when it does. A backend that cannot consume an f16 cache is expected
+   * to widen it rather than refuse: the graph picks the cache width from
+   * `preferred_kv_dtype`, so a backend that cannot must override that too. */
   virtual void attention(DeviceBuffer q, int64_t q_len, int64_t n_heads, DeviceBuffer k_cache,
                          DeviceBuffer v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
                          int64_t q_offset, float scale, DeviceBuffer out,
-                         DeviceBuffer scores) = 0;
+                         DeviceBuffer scores, KVDtype kv_dtype) = 0;
+
+  /* Append `n` rows of the chunk just computed to a K/V cache slab that is
+   * `elem` bytes per element wide.
+   *
+   * `dst` and `src` are both device memory: `src` holds `n * n_head_kv * d`
+   * floats laid out ``[token][head][d]``, `dst` begins at the chunk's own slot
+   * in a slab whose row stride is `n_head_kv * d` elements and whose rows are
+   * `capacity` wide, and this writes the same ``[token][head][d]`` shape into
+   * it.  `elem` is 4 for an f32 slab -- where this is exactly the copy
+   * `copy_device_to_device` would do -- and 2 for an f16 one, where the rows are
+   * not contiguous in the destination and the conversion is per head.
+   *
+   * It exists as its own method rather than as a loop in the graph for the same
+   * reason `copy_device_to_device` does: a caller that walked the pointers
+   * itself would be dereferencing device addresses as host ones, which happens
+   * to work on the CPU and is a crash on a card.  `src` rows are `d` apart and
+   * `dst` rows are `n_head_kv * d` apart, so a flat elementwise conversion over
+   * the chunk would write every head into the next head's slot -- finite,
+   * plausible, wrong. */
+  virtual void kv_append(DeviceBuffer dst, DeviceBuffer src, int64_t n, int64_t n_head_kv,
+                         int64_t d, int64_t elem) = 0;
+
+  /* What width this backend wants its K/V cache in.
+   *
+   * f16 by default: it is llama.cpp's *library* default (`-ctk f16 -ctv f16`),
+   * so the two engines read the same number of bytes off the cache and a
+   * comparison between them is a comparison of the walk rather than of the
+   * storage -- and at 512 rows it is half the bytes on the decode path's only
+   * streaming read (`docs/architecture/c_engine.md` measures the attention call
+   * halving when it does).  A backend with no f16 path -- or one whose native
+   * precision makes the cast pointless, like the card -- overrides this to
+   * `kF32`.  The oracle is pinned to llama.cpp's f32 cache for a separate
+   * reason that is llama.cpp's rather than this tree's; see
+   * `tests/native/llama_oracle.py`. */
+  virtual KVDtype preferred_kv_dtype() const { return KVDtype::kF16; }
 
   /* The index of the largest of `n` values, written to device memory. Returns a
    * device address rather than an integer so the caller transfers four bytes

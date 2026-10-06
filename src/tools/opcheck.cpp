@@ -59,6 +59,7 @@ namespace {
 
 using pocketllm::kernel::Backend;
 using pocketllm::kernel::DeviceBuffer;
+using pocketllm::kernel::KVDtype;
 
 /* Deliberately not a value any of these kernels can produce: an odd exponent far
  * outside the range the graph occupies.  A true positive is still possible in
@@ -528,15 +529,48 @@ void run_attention(std::ostream &out, Backend &backend, const Request &request) 
   const float scale = request.float_param("scale", 1.0F / std::sqrt(static_cast<float>(d)));
 
   DeviceBuffer dq = upload(backend, q.floats);
-  DeviceBuffer dk = upload(backend, k_cache.floats);
-  DeviceBuffer dv = upload(backend, v_cache.floats);
+  /* The cache's width is chosen here rather than read from the backend.
+   *
+   * f32 is the default because this tool's contract is to check an *op* against
+   * a reference, and the reference is computed in f32: defaulting to the
+   * backend's preference would make every existing attention comparison a
+   * comparison of a rounded cache, and the tolerances those tests use would
+   * have to be widened to hide it.  The `kv_dtype` field is how a test asks for
+   * the lossy width explicitly, and doing so is the only way both widths come
+   * out of one backend -- which is what makes the f16 path's reference the f32
+   * result beside it.
+   *
+   * The *graph* does read the preference (see `Qwen3Model::load`), so the f16
+   * cache a shipped run uses is covered end to end by the token tests rather
+   * than by this tool. */
+  const KVDtype kv_dtype =
+      request.int_param("kv_dtype", 0) == 1 ? KVDtype::kF16 : KVDtype::kF32;
+  const int64_t kv_elem = pocketllm::kernel::kv_dtype_size(kv_dtype);
+  const int64_t kv_width = n_head_kv * d;
+  const int64_t cache_bytes = k_cache.shape[0] * kv_width * kv_elem;
+  DeviceBuffer dk = backend.allocate(cache_bytes);
+  DeviceBuffer dv = backend.allocate(cache_bytes);
+  {
+    /* Built through the same `kv_append` the graph uses, one cache row at a
+     * time: an f16 cache whose rows were written by a flat elementwise cast
+     * would be the head-interleaving bug `kv_append` exists to prevent, and a
+     * test that built its own fixture that way would be testing the bug. */
+    DeviceBuffer host_k = upload(backend, k_cache.floats);
+    DeviceBuffer host_v = upload(backend, v_cache.floats);
+    backend.kv_append(DeviceBuffer{dk.handle, cache_bytes}, host_k, k_cache.shape[0],
+                      n_head_kv, d, kv_elem);
+    backend.kv_append(DeviceBuffer{dv.handle, cache_bytes}, host_v, v_cache.shape[0],
+                      n_head_kv, d, kv_elem);
+    backend.release(host_k);
+    backend.release(host_v);
+  }
   /* The scratch is the backend's to size -- see `attention_scratch` -- and this
    * is the one place a caller outside the graph has to ask for it. */
   const int64_t span = q_offset + q_len - first_key;
   DeviceBuffer scores = backend.allocate(backend.attention_scratch(q_len, n_heads, span));
   run_and_report(out, backend, request, {q_len, n_heads, d}, [&](DeviceBuffer result) {
     backend.attention(dq, q_len, n_heads, dk, dv, n_head_kv, d, first_key, q_offset, scale, result,
-                      scores);
+                      scores, kv_dtype);
   });
   backend.release(dq);
   backend.release(dk);

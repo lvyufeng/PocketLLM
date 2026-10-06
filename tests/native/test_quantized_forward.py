@@ -101,6 +101,20 @@ QUANTIZED_RTOL = 5e-2
 #: this names the card's explicitly.
 ORACLE_FA = {"cpu": "off", "cuda": "on"}
 
+#: The KV cache width the oracle is asked for.  Both backends take llama.cpp's
+#: f32 cache, and the engine's own width (:data:`Backend::preferred_kv_dtype`,
+#: f16 on the CPU and f32 on the card) is deliberately *not* mirrored here.
+#:
+#: The reason is llama.cpp's inconsistency, not the engine's: its f16 cache
+#: answers the second generated token of :data:`PROMPT` differently from a
+#: batched prefill and from a one-token decode, so there is no single f16
+#: sequence to match, while its f32 cache answers the same way on both paths.
+#: The near-tie that exposes this is real on every cache width on both engines --
+#: tokens `11` and `13`, 0.06-0.5% of the logit spread apart -- and the engine's
+#: f16 sits *inside* llama.cpp's own f16-vs-f32 spread (0.89 against 1.12), so
+#: comparing the two is not a mismatch.  See :mod:`llama_oracle`'s docstring.
+ORACLE_KV = {"cpu": "f32", "cuda": "f32"}
+
 #: `"The capital of France is"`, as ids -- the same prompt `test_forward.py`
 #: uses, for the same reason: a tokenizer regression must not read as a
 #: forward-pass one.
@@ -199,7 +213,9 @@ def test_the_logits_track_llama_cpp(device: str, tokens: list[int]) -> None:
     side, the card on the flash side -- which is the statement this test can
     make and the module docstring says why it is the right one.
     """
-    expected = oracle_logits(str(CHECKPOINT), tokens, flash_attn=ORACLE_FA[device])
+    expected = oracle_logits(
+        str(CHECKPOINT), tokens, flash_attn=ORACLE_FA[device], kv_type=ORACLE_KV[device]
+    )
     with native.Engine.open(str(CHECKPOINT), device) as engine:
         got = engine.forward(tokens)
 
@@ -229,7 +245,9 @@ def test_the_greedy_sequence_matches_llama_cpp(device: str) -> None:
     coincidence rather than a check.
     """
     steps = 16
-    expected = generated(str(CHECKPOINT), PROMPT, steps, flash_attn=ORACLE_FA[device])
+    expected = generated(
+        str(CHECKPOINT), PROMPT, steps, flash_attn=ORACLE_FA[device], kv_type=ORACLE_KV[device]
+    )
 
     with native.Engine.open(str(CHECKPOINT), device) as engine:
         ours = []
@@ -355,8 +373,12 @@ def test_the_quantized_answer_is_what_llama_cpp_gets_from_the_same_file(
 
     quantized = ours(CHECKPOINT)
     dense = ours(DENSE_CHECKPOINT)
-    their_quantized = generated(str(CHECKPOINT), PROMPT, steps, flash_attn=ORACLE_FA[device])
-    their_dense = generated(str(DENSE_CHECKPOINT), PROMPT, steps, flash_attn=ORACLE_FA[device])
+    their_quantized = generated(
+        str(CHECKPOINT), PROMPT, steps, flash_attn=ORACLE_FA[device], kv_type=ORACLE_KV[device]
+    )
+    their_dense = generated(
+        str(DENSE_CHECKPOINT), PROMPT, steps, flash_attn=ORACLE_FA[device], kv_type=ORACLE_KV[device]
+    )
 
     assert quantized == their_quantized, (
         f"ours {quantized} vs llama.cpp {their_quantized} on the same q4_k_m file"
