@@ -940,17 +940,34 @@ using flash attention:
 | 44 | 933 | 815 | **1.14** |
 | 88 (both engines' default) | **976** | 823 | **1.19** |
 
-**PocketLLM's prefill is now ahead of llama.cpp's on this host** — 976 against 823 t/s at the
-configuration both engines default to, a 1.19×. It still loses at 22 threads (0.78), and the honest
-reading of that column is the one the earlier tables kept pointing at: llama.cpp scales better on a
-single socket, and ours needs both to get ahead. Earlier in this document's history that was a loss
-of 0.35 at `pp512`; the score tiling, the weighted-sum tiling and the eight-row walk took it to 0.78
-at 22, 1.14 at 44 and 1.19 at 88.
+**That table is at 88 threads and is history, not the current default.** Re-measured at each
+engine's *current* default — both now pick the physical core count, and llama.cpp's `llama-bench`
+prints `44` — on a loaded host, best-of-four interleaved, `pp512`/`tg64`:
 
-Two things the win does **not** cover. It is a `-fa 0` comparison — llama.cpp with flash attention
-measures **1222 t/s**, which this engine does not implement, so a reader who runs `llama-bench` with
-its defaults on a newer build may see a different ordering. And it is one host, one checkpoint and
-one prompt length; `pp32` and longer prompts were not re-measured against this build.
+| | PocketLLM | llama.cpp | ratio |
+|---|---:|---:|---:|
+| `pp512`, `-fa 0` on both | 680 | 883 | 0.77 |
+| `tg64`, `-fa 0` on both | **64.8** | 50.1 | **1.29** |
+| `pp512`, pure defaults | 684 | **1295** | 0.53 |
+| `tg64`, pure defaults | 66.3 | **80.7** | 0.82 |
+
+So the current honest position is: **decode ahead on the like-for-like basis, prefill behind on
+it, and both behind llama.cpp's shipped default.** The last two rows are the ones a reader running
+`llama-bench` with no flags sees, and they are the number that matters to the goal.
+
+**Where the prefill gap is, and where it is not.** The per-op profile of our own `pp512` at 44
+threads (817 ms total): `gemm_quant` 521 ms (64%), `attention` 220 ms (27%), `kv_append` 51 ms (6%),
+the rest under 3%. Subtract attention and our GEMM half is 597 ms against llama.cpp's whole 580 ms —
+so **the GEMM already matches llama.cpp; the entire prefill gap is attention.** llama.cpp's default
+is flash attention (`flash_attn_type = AUTO`, which resolves to *on* on the CPU path), and a flash
+kernel fuses the score, softmax and weighted-sum passes with an online rescaling instead of writing
+the score row out, reading it back for the max, reading it again for the exponentials and a third
+time for the weighted sum. Per the `-fa auto` vs `-fa 0` columns above that fusion is worth 1.47× on
+prefill and 1.61× on decode to llama.cpp. This engine does not implement it, and that is the
+decisive remaining gap.
+
+One thing the earlier win **does not** cover: it is one host, one checkpoint and one prompt length;
+`pp32` and longer prompts were not re-measured against this build.
 
 **The measurement that would have said "no" is worth keeping.** Before the engine A/B, a probe put
 both row counts behind the engine's own `parallel_for` and reported R=8 *slower* than R=4 at 22
