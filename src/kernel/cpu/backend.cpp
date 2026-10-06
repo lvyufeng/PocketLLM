@@ -172,12 +172,29 @@ class CpuBackend final : public Backend {
     }
     uint16_t *const to = reinterpret_cast<uint16_t *>(w(dst));
     const int64_t kv_width = n_head_kv * d;
-    for (int64_t row = 0; row < n; ++row) {
-      for (int64_t h = 0; h < n_head_kv; ++h) {
+    /* Over `(row, head)`, and this used to be a serial double loop.
+     *
+     * The f32 path above is one `memcpy` and needed nothing; the f16 path is
+     * `n * n_head_kv` independent `d`-wide conversions, and leaving them on the
+     * caller's thread made `kv_append` the one prefill op that got *slower* with
+     * more threads -- measured at `pp512` as 31.6 ms on one thread against 43.2
+     * ms on 44, because a serial walk is exposed to the pool's spin contention
+     * while contributing no work to it.  It is 5% of prefill, which is the
+     * difference between the 0.8x and the 0.9x against llama.cpp on that half.
+     *
+     * Each `(row, head)` writes its own slice of `to` from its own slice of
+     * `from`, and the conversion is elementwise, so the output is byte-identical
+     * at any thread count -- the same claim the thread-count test checks for
+     * every other op.  `min_per_task` is one row-head's `d` floats; a decode
+     * (`n == 1`) is `n_head_kv` of them and stays on the caller's thread. */
+    parallel_for(n * n_head_kv, /*min_per_task=*/8, [&](int64_t lo, int64_t hi, int64_t) {
+      for (int64_t i = lo; i < hi; ++i) {
+        const int64_t row = i / n_head_kv;
+        const int64_t h = i - row * n_head_kv;
         kernel::float_to_kv_row(from + row * kv_width + h * d, d,
                                 to + row * kv_width + h * d);
       }
-    }
+    });
   }
 
   void argmax(DeviceBuffer values, int64_t n, DeviceBuffer out) override {

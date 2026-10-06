@@ -1110,6 +1110,17 @@ So the current honest position is: **decode ahead on the like-for-like basis, pr
 it, and both behind llama.cpp's shipped default.** The last two rows are the ones a reader running
 `llama-bench` with no flags sees, and they are the number that matters to the goal.
 
+### `kv_append` was the one op that did not use the pool
+
+The f32 cache path is a single `memcpy`; the **f16 path — the shipped one — was a serial double loop
+over `(row, head)`**, and it was the only prefill op that got *slower* with more threads: measured
+across `pp512`, 31.6 ms on one thread against **43.2 ms on 44**, because a serial walk is exposed to
+the pool's spin contention while contributing no work to it and so loses the race for the core the
+caller is on. It is now `parallel_for` over `(row, head)` at a grain of 8; each slice writes its own
+`to` range from its own `from` range and the conversion is elementwise, so the output is
+**byte-identical at every thread count** — the same claim the thread-count test checks for every
+other op. Paired A/B, four rounds each: **1.02× prefill at 22 threads and 1.07× at 44**, at `pp512`.
+
 **Where the prefill gap is, and where it is not.** The per-op profile of our own `pp512` at 44
 threads (817 ms total): `gemm_quant` 521 ms (64%), `attention` 220 ms (27%), `kv_append` 51 ms (6%),
 the rest under 3%. Subtract attention and our GEMM half is 597 ms against llama.cpp's whole 580 ms —
