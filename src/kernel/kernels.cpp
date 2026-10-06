@@ -1169,12 +1169,25 @@ void dot_Rrows_q8k(int type_id, const quant::Q8KBlock *q8, int64_t q8_stride,
     }
   }
 
-  /* One horizontal reduce per row, the expression `dot_row_q8k` ends with. */
+  /* One horizontal reduce per row, the expression `dot_row_q8k` ends with.
+   *
+   * The association is exactly `((l0 + l4) + (l1 + l5)) + ((l2 + l6) + (l3 +
+   * l7))`, the tree the row kernel has always built, and it is what makes this
+   * bit-identical to R calls to `dot_row_q8k`.  The pairing is *across* the two
+   * 128-bit halves, so the halves are added first (`lo + hi` gives
+   * `[l0+l4, l1+l5, l2+l6, l3+l7]`) and only then reduced horizontally --
+   * `_mm_hadd_ps` on the raw 256-bit value would pair lanes *within* each half
+   * and build `((l0+l1)+(l2+l3)) + ((l4+l5)+(l6+l7))` instead, which is a
+   * different sum.  Writing the scalar form out lane by lane costs the compiler
+   * a stack round trip plus eight `vaddss`; the three instructions below are the
+   * same tree.  `tests/native/test_cpu_parallel.py` holds the two forms
+   * together, and the point of stating the association here is that a future
+   * change to either one has to keep it. */
   for (int i = 0; i < R; ++i) {
-    alignas(32) float lanes[8];
-    _mm256_store_ps(lanes, acc[i]);
-    const float total = ((lanes[0] + lanes[4]) + (lanes[1] + lanes[5])) +
-                        ((lanes[2] + lanes[6]) + (lanes[3] + lanes[7]));
+    const __m128 halves =
+        _mm_add_ps(_mm256_castps256_ps128(acc[i]), _mm256_extractf128_ps(acc[i], 1));
+    const __m128 s = _mm_hadd_ps(halves, halves);
+    const float total = _mm_cvtss_f32(_mm_hadd_ps(s, s));
     if (type_id == quant::kGgmlQ4K) {
       __m128 am = mn[i];
       am = _mm_add_ps(am, _mm_movehl_ps(am, am));

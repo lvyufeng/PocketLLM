@@ -446,6 +446,28 @@ The dispatch lives in `gemm_quant` and is shape-driven: `m / R` groups take the 
 batched kernel costs a decode nothing — which is why the change is a prefill change and the decode
 column of the A/B is flat.
 
+### The horizontal reduce, and why the lane pairing is load-bearing
+
+`dot_Rrows_q8k` ends each row with one horizontal reduce, and the tree it builds has to be the one
+`dot_row_q8k` builds or the two kernels stop agreeing. That tree pairs *across* the two 128-bit
+halves — `((l0 + l4) + (l1 + l5)) + ((l2 + l6) + (l3 + l7))` — so the halves are added first
+(`lo + hi` is `[l0+l4, l1+l5, l2+l6, l3+l7]`) and only then reduced, two `_mm_hadd_ps` down to lane
+zero. Posted as a store of the eight lanes plus eight scalar `vaddss`, the whole thing cost a stack
+round trip the compiler could not see through; the three instructions are the same tree.
+
+**`_mm_hadd_ps` on the raw 256-bit value is not that tree.** It pairs lanes *within* each half —
+`((l0+l1)+(l2+l3)) + ((l4+l5)+(l6+l7))` — which is a different sum. The first form of this change
+posted exactly that and reassociated the output; `test_a_large_activation_row_keeps_the_integer_path`
+failed on four prefill shapes because the integer path's error against the exact path grew past
+`QUANTIZED_RTOL`. The one-row-versus-batched test would have caught it just as directly, and the two
+together are why the association is stated in the kernel's comment.
+
+Bit-identical, and measured: 1.012× on the isolated kernel at one thread and 1.015× at 22 (six
+interleaved rounds); `pp512` on `q4_k_m` at 636.9 against 629.1 t/s at 22 threads (+1.2%) and 1162.9
+against 1132.2 t/s at 44 (+2.7%), five interleaved rounds each with the change ahead in every one.
+Decode is unmoved, as the section above says it must be: `m` is 1 there and the edited kernel is
+never entered.
+
 ### The attention score dot, four lanes wide and bit-exact
 
 Decode's cost is not the GEMM once the context is long. At a 512-token context one decode step runs
