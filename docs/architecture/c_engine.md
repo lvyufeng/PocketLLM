@@ -490,6 +490,65 @@ not re-instrumented. What is left at 22 threads is `gemm_quant` at 625 ms and at
 projected, so the score pass is no longer the larger half and the four-row GEMM — 1.3× behind
 llama.cpp's repacked 8×8 form — is.
 
+### Four query rows per walk over a V row
+
+The score pass got its four-row tiling and the **weighted sum was left alone**, which made it the
+second term of the call: at `q_len = 512`, 22 threads, the three passes split score ~6.6 ms, softmax
+~0.8 ms, weighted sum ~7.2 ms — the last one streaming the whole `V` slab for every query row and
+running `dst[x] += weight * vvec[x]`, two memory operations per one FMA whose multiplicand is a
+broadcast register. After the score tiling it was the larger of the two halves of attention.
+
+The tiling is the same idea at the other end of the call: hold `kAttentionRows` accumulators and
+walk a V row once for all of them. The split is what the correctness argument turns on, and the
+first draft of the probe got it backwards. Row `j` owns keys `[0, span0 + j)`, where
+`span0 = q_offset + t0 - first_key + 1` is the part every row of the tile shares, so the walk is two
+regions: the **shared prefix** `[0, span0)`, run with the V row outer and the rows inner — the only
+shape in which the load is shared at all — and the **triangular remainder** `[span0, span0 + j)`,
+run per row because no other row sees those keys. A version that looped `j` outside `i` gave every
+row only its own private slice and produced fluent output **0.8 of its own scale off at a 1.58×
+"win"** — which is why this is checked by comparison and not by its speed.
+
+**It came out bit-exact**, which it did not have to. Row `r` still adds its own terms in key order,
+one `+=` per key, with the same weight; the tiling changes *which row* is being accumulated between
+two loads of the same V vector, never the order within a row's own sum. The probe
+(`/tmp/prof/attnwsum.cpp`: the shipped `attention` against a copy whose only difference is the last
+pass, `Rv = 1` verified byte-identical to the shipped kernel first) reports `relerr 0.00e+00` at
+every chunk from 1 to 512, and `test_the_tiled_attention_weighted_sum_is_the_row_at_a_time_one`
+holds the end-to-end call to `array_equal` rather than to a tolerance.
+
+The probe's whole-call timings, one core, `q_len = d`-length caches, best of three:
+
+| chunk | shipped | tiled (`Rv = 4`) | whole-call speedup |
+|---:|---:|---:|---:|
+| 1 | 1.6 us | 1.7 us | 0.93× |
+| 8 | 26.6 us | 28.7 us | 0.93× |
+| 32 | 336.0 us | 340.8 us | 0.99× |
+| 512 | 102342 us | 88575 us | **1.16×** |
+
+The sub-512 rows are below 1.0× because a decode or a short prompt has one block per head — 16 units
+against 22 threads — and the tile's extra bookkeeping buys no V reuse there. At the prefill shape
+the call is 1.16×, and since attention was ~368 ms of a ~1080 ms `pp512`, that projects to about
+0.34 × (1 − 1/1.16) = **4.7% off the total** — which is the 5% the A/B below measures on its own.
+
+**End to end, interleaved A/B, `73cbf8f` against the change**, both pinned to NUMA node 0,
+three runs each, `--reps 3`:
+
+| threads | before | after | after/before |
+|---:|---:|---:|---:|
+| 1 | 38.87 | 40.67 | 1.05 |
+| 8 | 200.48 | 212.03 | 1.06 |
+| 22 | 479.11 | 501.54 | 1.05 |
+
+`tg64` at 22 threads is the control and it is flat to slightly up (96.7 → 99.6, ±4 run to run),
+which is what the construction predicts: a decode step is `q_len = 1`, one block per head, and the
+tile is a single row.
+
+Against llama.cpp in the same session the same way (`-t 22` pinned to node 0, `-fa 0` so neither
+engine is using flash attention, median of two): **681.0 t/s against our 501.5, or 0.74×**, up from
+0.70× when the score tiling landed. With `-fa 1` llama.cpp measures 796.0. Prefill is still the gap
+and the remaining term is `gemm_quant`, whose `n = 1024, k = 1024` shape is 305 ms of the ~1070 ms
+call on 22 threads — the four-row GEMM behind llama.cpp's eight-row repacked form.
+
 ### The activation scratch is the shape's size, not a fixed one
 
 The integer path needs somewhere to put the quantized activations, and that buffer used to be a

@@ -28,6 +28,47 @@ namespace kernel {
 
 namespace {
 
+/* Must `attention`'s weighted sum walk one row at a time?
+ *
+ * The same kind of switch `$POCKETLLM_CPU_SCALAR_DOT` and
+ * `$POCKETLLM_CPU_EXACT_GEMM` are, and for the same reason: "the tiling gives
+ * the same number" is a claim that gets *checked* rather than asserted.  Unlike
+ * the score dot's four lanes this one was not *required* to be bit-exact -- the
+ * weighted sum is the last accumulation of the attention output, and the
+ * tolerance tests plus the llama.cpp token match are what it has to hold -- and
+ * it turned out to be bit-exact anyway, because the tiling moves *which row* is
+ * being accumulated between two loads of the same V vector and not the order
+ * within any row's own sum.  This switch is what keeps that measured rather
+ * than incidental.
+ *
+ * `tests/native/test_cpu_parallel.py` runs one attention call each way and
+ * compares the output bytes.  A function-local static so the running process
+ * cannot change it and the hot loop pays a predicted branch rather than a
+ * `getenv` per call. */
+bool scalar_weighted_sum_forced() {
+  static const bool forced = [] {
+    const char *from_env = std::getenv("POCKETLLM_CPU_SCALAR_VSUM");
+    return from_env != nullptr && from_env[0] != '\0' && from_env[0] != '0';
+  }();
+  return forced;
+}
+
+/* The widest head dimension the tiled weighted sum holds on the stack.
+ *
+ * `attention`'s last pass keeps one accumulator row per tile row while it walks
+ * the V rows, so the buffer is ``kAttentionRows * d`` floats.  It is a fixed
+ * bound rather than a `std::vector` because this is the token path and the
+ * allocation would be per call; a `d` past it takes the untiled loop, which is
+ * the shipped code and gives the same answer more slowly.  Qwen3's head
+ * dimension is 128, so this is two of them.
+ *
+ * It is deliberately *outside* the `POCKETLLM_HAVE_AVX2` block the integer
+ * kernels live in: `attention` has a scalar path too, and a constant only an
+ * AVX2 build can see would make a non-AVX2 build reference an undeclared name.
+ * The rule is the same one `kAttentionRows` follows in the header -- shared with
+ * the device-agnostic kernel, not with one instruction set. */
+constexpr int64_t kAttentionSumMaxDim = 256;
+
 /* ``sum_k a[k] * b[k]`` for `k` values.
  *
  * The four-way accumulator is not premature: a 1024-wide row over twenty-eight
@@ -714,6 +755,7 @@ inline bool exact_gemm_forced() {
   const char *from_env = std::getenv("POCKETLLM_CPU_EXACT_GEMM");
   return from_env != nullptr && from_env[0] != '\0' && from_env[0] != '0';
 }
+
 
 /* Four activation rows against one weight row, in one walk over the weights.
  *
@@ -1517,23 +1559,112 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const float *k_ca
                      const int64_t span = q_offset + t0 + j - first_key + 1;
                      /* Shifted by the max, as the reference `softmax` is: the
                       * exponentials of a 1000-scale score row would otherwise all
-                      * be zero and the row would normalize to 0/0. */
+                      * be zero and the row would normalize to 0/0.  The
+                      * normalization is folded into the stored weights here
+                      * rather than applied at the use site, so the weighted sum
+                      * below reads one value per (row, key) either way. */
                      float total = 0.0F;
                      for (int64_t i = 0; i < span; ++i) {
                        const float w = std::exp(row_scores[j][i] - max_score[j]);
                        row_scores[j][i] = w;
                        total += w;
                      }
-
-                     float *dst = out + ((t0 + j) * n_heads + h) * d;
-                     std::fill(dst, dst + d, 0.0F);
                      const float inv_total = 1.0F / total;
                      for (int64_t i = 0; i < span; ++i) {
-                       const float weight = row_scores[j][i] * inv_total;
-                       const float *vvec = v_cache + (first_key + i) * cache_row + kv_head * d;
-                       for (int64_t x = 0; x < d; ++x) {
-                         dst[x] += weight * vvec[x];
+                       row_scores[j][i] *= inv_total;
+                     }
+                   }
+
+                   /* The untiled form is the fallback for two callers: the test
+                    * that asks for it, and a head dimension wider than the
+                    * tile's stack bound. */
+                   if (scalar_weighted_sum_forced() || d > kAttentionSumMaxDim) {
+                     for (int64_t j = 0; j < rows; ++j) {
+                       float *dst = out + ((t0 + j) * n_heads + h) * d;
+                       std::fill(dst, dst + d, 0.0F);
+                       const float *wrow = row_scores[j];
+                       const int64_t span = q_offset + t0 + j - first_key + 1;
+                       for (int64_t i = 0; i < span; ++i) {
+                         const float weight = wrow[i];
+                         const float *vvec = v_cache + (first_key + i) * cache_row + kv_head * d;
+                         for (int64_t x = 0; x < d; ++x) {
+                           dst[x] += weight * vvec[x];
+                         }
                        }
+                     }
+                     continue;
+                   }
+
+                   /* The weighted sum, `kAttentionRows` output rows per walk
+                    * over a V row.
+                    *
+                    * This pass had no work done to it when the score pass got
+                    * its tiling, and it is the *second* largest term of the
+                    * attention call: for every query row it streamed the whole
+                    * V slab and did `dst[x] += weight * vvec[x]`, two memory
+                    * operations per one FMA whose constants are a broadcast
+                    * register.  The tiling is the same idea the score pass
+                    * already uses, applied to the other end of the call.
+                    *
+                    * **The split between the two regions is the whole
+                    * correctness argument and the first draft of the probe got
+                    * it backwards.**  Row `j` owns keys `[0, span0 + j)`, where
+                    * `span0 = q_offset + t0 - first_key + 1` is what every row
+                    * of the tile shares.  So the *shared prefix* `[0, span0)` is
+                    * walked with the V row outer and the rows inner -- the only
+                    * shape in which the V load is shared at all -- and the
+                    * *triangular remainder* `[span0, span0 + j)` is walked per
+                    * row, because no other row sees those keys.  A version that
+                    * looped `j` outside `i` gave every row only its own region
+                    * and produced fluent output that was wrong by 0.8 of its own
+                    * scale.
+                    *
+                    * The store to `out` is deferred to the end of the tile
+                    * rather than done in row order, so the tile's results are
+                    * copied once per row instead of once per key.  Both
+                    * differences are silent -- no race, no NaN, just a different
+                    * number -- which is why the two tests in
+                    * `tests/native/test_cpu_parallel.py` compare the untiled
+                    * path's token sequence and its bytes.
+                    *
+                    * `kAttentionRows * d` floats of scratch is what this costs:
+                    * 2 KiB at the shipped constant, on the task's own stack. */
+                   for (int64_t j0 = 0; j0 < rows; j0 += kAttentionRows) {
+                     const int64_t jn = std::min<int64_t>(kAttentionRows, rows - j0);
+                     /* `kAttentionSumMaxDim` and not `d`: the rows of this array
+                      * are not `d` apart, so a single `fill` over `jn * d` floats
+                      * from `&acc[0][0]` would zero only the first two rows of a
+                      * four-row tile and leave the rest holding whatever the
+                      * stack had.  That is a NaN-shaped bug, not a slow one. */
+                     alignas(32) float acc[kAttentionRows][kAttentionSumMaxDim];
+                     for (int64_t j = 0; j < jn; ++j) {
+                       std::fill(acc[j], acc[j] + d, 0.0F);
+                     }
+                     const int64_t span0 = q_offset + t0 + j0 - first_key + 1;
+                     for (int64_t i = 0; i < span0; ++i) {
+                       const float *vvec = v_cache + (first_key + i) * cache_row + kv_head * d;
+                       for (int64_t j = 0; j < jn; ++j) {
+                         const float weight = row_scores[j0 + j][i];
+                         for (int64_t x = 0; x < d; ++x) {
+                           acc[j][x] += weight * vvec[x];
+                         }
+                       }
+                     }
+                     for (int64_t j = 1; j < jn; ++j) {
+                       const int64_t span = span0 + j;
+                       const float *wrow = row_scores[j0 + j];
+                       for (int64_t i = span0; i < span; ++i) {
+                         const float weight = wrow[i];
+                         const float *vvec =
+                             v_cache + (first_key + i) * cache_row + kv_head * d;
+                         for (int64_t x = 0; x < d; ++x) {
+                           acc[j][x] += weight * vvec[x];
+                         }
+                       }
+                     }
+                     for (int64_t j = 0; j < jn; ++j) {
+                       std::memcpy(out + ((t0 + j0 + j) * n_heads + h) * d, acc[j],
+                                   static_cast<std::size_t>(d) * 4);
                      }
                    }
                  }
