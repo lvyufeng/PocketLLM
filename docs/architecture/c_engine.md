@@ -679,21 +679,79 @@ engines decode at the depth ours actually reaches.
 
 **Against the same algorithm and the same depth, both halves lead** — and they lead at 22 threads
 too (`pp512` 565 against 466, 1.21×; `tg64` 60.1 against 53.5, 1.12×), so the result is not an
-artifact of one thread count. Against llama.cpp's *shipped* default (`-fa auto`, which is flash
-attention on) it leads prefill — 955 against 908, 1.05× — and trails decode: `tg64` 55.1 against
-75.5, 0.73×. That deficit is flash attention and nothing else — an online softmax that fuses the
-score, softmax and weighted-sum passes so the score row is never materialized — and this engine does
-not implement it.
+artifact of one thread count.
 
-**Decode is the number this change does not move, and that is a construction argument, not a
-measurement.** A decode step is `q_len = 1`: one block per head, no shared key region, so the tiled
-path is never entered and the single row takes the shipped one-row `dot4`. What decode is short of is
-not tile width but *tasks* — 16 heads over 44 threads — and a decode attention call gets **slower**
-past about 8 threads (`/tmp/prof/dattn.cpp`, span 512: 99.9 us at 8 threads, 105.0 at 22, 111.4 at
-44, 170.5 at 88). llama.cpp shows the same shape on this host (`tg64` 93.4 t/s at 22 threads against
-73.0 at 44), which is the signature of two sockets and a resident weight buffer rather than of either
-kernel. Widening a decode's tile is therefore the next piece of work, and it needs `q_len > 1` to do
-anything at all.
+### Flash attention, and the gap it closed
+
+Those numbers were measured before this engine had flash attention, and at the time the *shipped*
+default of llama.cpp (`-fa auto`, which is flash attention on) beat ours on decode: `tg64` 55.1
+against 75.5, 0.73×. That deficit was flash attention and nothing else — an online softmax that
+fuses the score, softmax and weighted-sum passes so the score row is never materialized — and it was
+the last thing standing between this engine and llama.cpp's shipped default on either half.
+
+`attention` now takes that path for **every call**: `q_len == 1` and prefill alike. The keys are
+walked once, each one's score is folded into a running `(max, denominator, weighted sum)`, and a key
+that raises the running maximum rescales what has already accumulated. Nothing about the shape of
+the two drivers changed — prefill still runs the shipped `(kAttentionRows rows, kAttentionHeadBatch
+heads)` unit with `dot_tile_r` sharing a key row across the tile, and decode still runs one unit per
+KV head and one `dot_pair` per key — only the reduction inside them.
+
+**Why both paths and not just decode, when decode is where the parallelism is.** A one-token step
+has only `n_head_kv` units (this model's 8, against 44 threads), so the flash pass alone would not
+widen it; the span is additionally cut into `kFlashSplit = 8` chunks of `128` keys and the chunks
+are merged with a log-sum-exp. That is a parallel decode, and it is the 1.19–1.25× below. But a
+change that touched only the decode path would make the engine's own batched prefill disagree with
+the same tokens decoded one at a time — the property
+`test_the_incremental_path_agrees_with_the_batched_one` exists to hold — because the two would then
+be different reductions over the same terms. Flash in both keeps a prefill's result and an
+incremental decode's result the same *function* of `(q, K[0..p], V[0..p])`. (llama.cpp's own prefill
+and decode flash kernels differ in exactly this way, which is why its f16 cache answers the second
+token differently on the two paths.)
+
+**The reduction is no longer bit-exact, and one test's contract changed with it.** Folding a key's
+weight in rescales the accumulator, so a row's terms meet in blocks rather than one at a time.
+Measured against the shipped row-at-a-time loop the difference is a last bit — `5.96e-07` of the
+output's own scale at `q_len` 6 and 512 — and
+`test_the_tiled_attention_weighted_sum_is_the_row_at_a_time_one` is now a `1e-5` bound rather than
+`np.array_equal`. Everything else about the tiling is still held to the byte, and the comment there
+records why the two are different claims. **The token sequences are unmoved**: both llama.cpp
+comparisons, the incremental/batched equality and the CPU-vs-CUDA bound pass unchanged, which is the
+honest form of the claim — the switch llama.cpp itself makes (its own flash on versus off) moves its
+greedy sequence at the second token on this checkpoint, and this engine's switch moves nothing.
+
+| depth 512, interleaved, 22 threads | `pp512` | `tg64` |
+|---|---:|---:|
+| this engine, flash | 486 | 63.3 |
+| this engine, before flash | 524 | 51.2 |
+| llama.cpp shipped (`-fa auto`) | 547 | 59.3 |
+| llama.cpp `-fa 0` | 428 | 48.2 |
+
+The flash pass is a **decode win and a small prefill cost**, and on this host only the paired
+measurement is worth quoting: run back to back so both arms see the same instantaneous load, flash
+is **1.18× the pre-flash decode** at 22 threads (twelve paired rounds, every one above 1.10, median
+1.178) and **1.22×** at 44, against **0.94× prefill** at both. The absolute columns above swing ±20%
+run to run with host load and are not a lead in either direction — the honest reading of them is
+that **prefill still trails llama.cpp's shipped default by about a tenth at one socket, and decode
+is at parity**, while `-fa 0` is beaten on both halves (1.14× prefill, 1.31× decode). An earlier
+revision of this table claimed a 526/74.5 against 481/65.2 lead for this engine; that measurement was
+taken in a single quiet window and did not reproduce, and it was never consistent with the 796 t/s
+llama.cpp prefill recorded [above](#the-eight-row-gemm-and-the-repacked-weights).
+
+The prefill cost is the `fp-contract=off` on the fused fold, not the restructure. The fold is
+`P[z] = P[z] * corr + v[z]`, which `-march=native` would otherwise contract to one FMA, and it cannot
+be: the contraction is what decides how far a running maximum is allowed to move the sum already
+accumulated. Removing the attribute recovers 3–4% of prefill — taking prefill to within 2% of the
+pre-flash kernel — but **narrows the top-2 margin at the first generated position from 0.89 to 0.23**
+(`--print-top 10`: 16.39/15.50 against 15.59/15.36), a 3.9× thinner decision boundary bought for
+1.02×. The attribute stays; measured against the shipped row-at-a-time loop the two forms are equally
+close (9.9e-08 and 6.6e-08 of the output scale at `q_len` 6), so the fold's accuracy is not the
+question — the margin between competitors is.
+
+**Decode is where the fusion pays, and the reason is the pass it removes.** The chunked merge is what
+turns a decode's 8 units into `8 × kFlashSplit` and the measured 1.18–1.22× is the two passes over
+the V slab the fused walk replaces one of. Before the merge the span is one chunk and the win is
+smaller; past `kFlashBlock = 128` keys it engages, which is why context 1024 moves more (37.9 → 61.4
+t/s) than context 512 does.
 
 **The default thread count is a trade between the two halves and it favours prefill on purpose.**
 The same host, interleaved, at the shipped default (44, the physical core count) against one socket
@@ -1060,8 +1118,10 @@ is flash attention (`flash_attn_type = AUTO`, which resolves to *on* on the CPU 
 kernel fuses the score, softmax and weighted-sum passes with an online rescaling instead of writing
 the score row out, reading it back for the max, reading it again for the exponentials and a third
 time for the weighted sum. Per the `-fa auto` vs `-fa 0` columns above that fusion is worth 1.47× on
-prefill and 1.61× on decode to llama.cpp. This engine does not implement it, and that is the
-decisive remaining gap.
+prefill and 1.61× on decode to llama.cpp. At the time this was written the engine did not implement
+it, and that was the decisive remaining gap; it does now —
+[see below](#flash-attention-and-the-gap-it-closed) — which closes the decode half and leaves prefill
+the smaller deficit the paired numbers there record.
 
 One thing the earlier win **does not** cover: it is one host, one checkpoint and one prompt length;
 `pp32` and longer prompts were not re-measured against this build.
