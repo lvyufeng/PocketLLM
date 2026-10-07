@@ -446,6 +446,65 @@ The dispatch lives in `gemm_quant` and is shape-driven: `m / R` groups take the 
 batched kernel costs a decode nothing — which is why the change is a prefill change and the decode
 column of the A/B is flat.
 
+### The repacked q4_K panel GEMM, and the one place it is not bit-exact
+
+`dot_Rrows_q8k` walks **one** weight column against `R` activation rows and decodes each weight block
+once per walk, so a prefill GEMM still re-reads the whole weight matrix `m / R` times. The panel path
+is llama.cpp's answer to the same problem, ported deliberately rather than re-derived: pre-tile the
+weights into eight-column panels (`Q4Kx8`) and the activations into four-row groups (`Q8Kx4`), so one
+kernel pass produces an 8×8 tile of the output with every operand block decoded once. **A repacked
+panel is the same byte count as the eight `q4_K` blocks it replaces** (`1152 == 8 × 144`), which is
+what lets the loader repack a weight through a scratch buffer and copy it back into the same slot.
+
+**This is the one kernel in the tree that is not bit-identical to the row kernel, and that is stated
+rather than discovered.** The panel kernel's four `maddubs` products of a 32-weight sub-block
+accumulate in **int16** and take one `madd_epi16` scale multiply, where our own layout needs four
+`madd_epi16` because our four `j` iterations carry different scales. The int16 association is legal
+only for q4_K: 4-bit weights (0–15) against int8 activations (±127) give at most 1905 per `maddubs`
+lane, so four sum to 7620 < 32767. q6_K's 6-bit values would overflow, which is why **only q4_K has a
+panel path** — everything else stays on the row kernel, and qwen3-0.6B's `output.weight` is q6_k, so
+the head is never repacked.
+
+It is a **selected whole GEMM, never mixed with the row kernel**: when the panel path is on it computes
+the entire sub-batch and `dot_row_q8k` is not called for that weight at all. That is what leaves the
+mutual-consistency invariant untouched — `gemm_quant`'s own schedule is unchanged, and
+`test_the_four_row_weight_walk_is_the_one_row_walk_four_times` still describes it exactly.
+
+The decode half of the layout is `gemv_q4k_8x8`: one activation row against the same panels, reading
+the row kernel's own `quant::Q8KBlock` array, because a repacked weight has to be readable at **every**
+`m` and not only at multiples of eight. Without it a repacked checkpoint would decode from misread
+bytes — and it would not fail, it would answer fluently. Both kernels are **split across output-column
+panels**, the split that wins: splitting output *rows* makes every thread stream the whole weight
+matrix and measures ~1.7× *slower* than the row kernel at 22 threads.
+
+The activation pack calls `quant::quantize_q8_block` — the row kernel's own quantizer — rather than a
+second transcription of it, so the two engines quantize an activation identically and the
+token-for-token match against llama.cpp is structural rather than a thing to re-check.
+
+**Measured** (`q4_k_m`, interleaved A/B, `pp512` and `tg64`, five rounds each):
+
+| | row kernel | panel path | ratio |
+|---|---:|---:|---:|
+| `pp512` @ t22 (one socket's cores) | 637 | 723 | 1.135 |
+| `tg64` @ t22 | 82.6 | 95.2 | 1.152 |
+| `pp512` @ t44 (both sockets' cores — the default) | 736 | 809 | 1.098 |
+| `tg64` @ t44 | 76.6 | 83.7 | 1.093 |
+
+The decode column moves at all only because the panel GEMV replaces `dot_row_q8k` there too; a first
+version of it was not parallel and measured **3.4× slower** at t22 (86.6 → 25.5 t/s), which is the
+shape of a kernel that forgot `parallel_for` rather than one that is intrinsically slow.
+
+**The contract the extra speed buys is a different last bit, and the tests say so.** `POCKETLLM_CPU_REPACK`
+is off by default in this stage. With it on, `tests/native/` is 286 passed against the q4_K oracle
+except where a long greedy sequence is involved: the per-op difference from the row kernel is at most
+**1.6 × 10⁻⁶ relative** over 504 checked GEMMs and 336 GEMVs on a 32-token prefill (zero outputs
+outside a 1e-3 absolute band), but that is enough to move a near-tie after the first few dozen
+generated tokens. On a 32-token prompt the two paths share their first 30 generated tokens and split
+at the 31st. **f16 is the control and is never repacked** — `repack_enabled()` gates on
+`type_id == kTypeQ4K`, and the f16 checkpoint is byte-identical with the flag on and off at every
+length tested. Thread invariance is unaffected either way: the output is bit-identical at 1, 4, 22 and
+44 threads, with the reduce never split.
+
 ### The horizontal reduce, and why the lane pairing is load-bearing
 
 `dot_Rrows_q8k` ends each row with one horizontal reduce, and the tree it builds has to be the one
@@ -666,7 +725,10 @@ Against llama.cpp in the same session the same way (`-t 22` pinned to node 0, `-
 engine is using flash attention, median of two): **681.0 t/s against our 501.5, or 0.74×**, up from
 0.70× when the score tiling landed. With `-fa 1` llama.cpp measures 796.0. Prefill is still the gap
 and the remaining term is `gemm_quant`, whose `n = 1024, k = 1024` shape is 305 ms of the ~1070 ms
-call on 22 threads — the four-row GEMM behind llama.cpp's eight-row repacked form.
+call on 22 threads — the four-row GEMM behind llama.cpp's eight-row repacked form. That form has since
+been ported, behind `POCKETLLM_CPU_REPACK`; see [the repacked q4_K panel
+GEMM](#the-repacked-q4_k-panel-gemm-and-the-one-place-it-is-not-bit-exact) for what it is worth and
+why it does not close the gap on its own.
 
 ### Eight query rows per key walk
 
@@ -773,7 +835,7 @@ that **prefill still trails llama.cpp's shipped default by about a tenth at one 
 is at parity**, while `-fa 0` is beaten on both halves (1.14× prefill, 1.31× decode). An earlier
 revision of this table claimed a 526/74.5 against 481/65.2 lead for this engine; that measurement was
 taken in a single quiet window and did not reproduce, and it was never consistent with the 796 t/s
-llama.cpp prefill recorded [above](#the-eight-row-gemm-and-the-repacked-weights).
+llama.cpp prefill recorded [above](#four-query-rows-per-walk-over-a-v-row).
 
 The prefill cost was the `fp-contract=off` on the fused fold, not the restructure, and **the attribute
 has since come off the fold** (keeping it on the score dots, where the last bit is the argmax). The
