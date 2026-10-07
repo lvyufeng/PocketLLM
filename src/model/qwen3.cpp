@@ -7,6 +7,9 @@
 #include <vector>
 
 #include "abi/spec.h"
+#include "kernel/parallel.h"
+#include "kernel/repack_q4k.h"
+#include "quant/q8k.h"
 #include "quant/blocks.h"
 #include "quant/half.h"
 #include "runtime/status.h"
@@ -62,8 +65,8 @@ Qwen3Model::~Qwen3Model() {
     return;
   }
   for (kernel::DeviceBuffer buffer : {x_, x_norm_, q_, k_, v_, attn_, gate_, up_, ffn_, last_,
-                                      logits_, scores_, tokens_, rope_cos_, rope_sin_, k_cache_,
-                                      v_cache_, output_norm_}) {
+                                      logits_, scores_, tokens_, rope_cos_, rope_sin_, act_packed_,
+                                      panel_tile_, k_cache_, v_cache_, output_norm_}) {
     if (buffer.handle != 0) {
       backend_->release(buffer);
     }
@@ -199,7 +202,51 @@ Weight Qwen3Model::bind_matrix(const GgufReader &checkpoint, const std::string &
   }
   weight.quantized = true;
   weight.blocks = bind_packed(checkpoint, name).blocks;
+  /* A GEMM weight is the one place the panel layout is wanted, and only when it
+   * is a q4_K whose shape tiles exactly.  The token embedding is deliberately
+   * *not* repacked: it feeds `embedding_quant`'s gather as well as the tied head
+   * GEMM, and the gather reads the file layout -- qwen3-0.6B carries a separate
+   * `output.weight`, so the tie costs nothing here and the table stays readable
+   * by the one kernel that already understands it. */
+  if (panel_gemm_ && weight.type_id == kTypeQ4K) {
+    repack_weight(weight);
+  }
   return weight;
+}
+
+/* Panels are eight columns and four activation rows, so both axes have to
+ * divide.  `cols` is already a multiple of 256 by the caller's check; the 8 is
+ * the one that can be violated, and a matrix that did would have to fall back --
+ * which is the "half a repack" state the flag exists to make impossible.  The
+ * rest of the shape (a 256-multiple contraction axis, the exact byte count) is
+ * the caller's, already checked above. */
+void Qwen3Model::repack_weight(Weight &weight) const {
+  if (weight.rows % 8 != 0 || weight.cols % 8 != 0) {
+    throw Error("tensor of shape " + std::to_string(weight.rows) + "x" +
+                std::to_string(weight.cols) +
+                " cannot be repacked into eight-column panels; POCKETLLM_CPU_REPACK needs both "
+                "axes to be multiples of 8");
+  }
+  if (weight.nbytes != weight.rows * (weight.cols / 256) * quant::kQ4KBlockBytes) {
+    throw Error("tensor of shape " + std::to_string(weight.rows) + "x" +
+                std::to_string(weight.cols) + " holds " + std::to_string(weight.nbytes) +
+                " bytes, which is not a whole number of q4_K blocks; it cannot be repacked");
+  }
+  /* **Out of line, and not for tidiness.**  The repack is a *permutation* of the
+   * matrix's own bytes: block `b` of column-panel `p` reads rows `p*8 .. p*8+7`
+   * at one stride and writes a contiguous 1152-byte run at another, so a panel's
+   * output lands on top of some *later* panel's input.  Written in place it reads
+   * bytes it has already overwritten -- and the result is not obviously wrong:
+   * the numbers are still in the right range, so it surfaces as fluent nonsense
+   * from layer nine rather than as a crash -- and a prototype that repacked
+   * through two independent arrays, which is the obvious way to write the
+   * packer and the way it was first measured, cannot show the bug at all. */
+  kernel::DeviceBuffer scratch = backend_->allocate(weight.nbytes);
+  kernel::repack_weights_q4k(reinterpret_cast<const uint8_t *>(weight.blocks.handle), weight.rows,
+                             weight.cols, reinterpret_cast<kernel::Q4Kx8 *>(scratch.handle));
+  backend_->copy_device_to_device(weight.blocks, scratch, weight.nbytes);
+  backend_->release(scratch);
+  weight.panel = true;
 }
 
 Weight Qwen3Model::bind_table(const GgufReader &checkpoint, const std::string &name) {
@@ -239,6 +286,12 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
   }
 
   std::unique_ptr<Qwen3Model> model(new Qwen3Model(backend));
+  /* The repacked panel GEMM is opt-in, CPU-only and AVX2-only.  Deciding it here,
+   * once, keeps `matmul` from asking three questions per weight per layer, and
+   * keeps the answer the same for every weight in the session -- which is what
+   * makes the path a *selected whole GEMM* rather than a per-tensor choice. */
+  model->panel_gemm_ = kernel::repack_enabled() && kernel::repack_available() &&
+                       std::string(backend.name()) == "cpu";
 
   /* The cache width is the backend's decision and it is taken here, before the
    * first allocation, because every slab offset in `forward` is derived from
@@ -398,6 +451,8 @@ void Qwen3Model::ensure_capacity(int64_t n, int64_t end_pos) {
   backend_->release(logits_);
   backend_->release(scores_);
   backend_->release(tokens_);
+  backend_->release(act_packed_);
+  backend_->release(panel_tile_);
 
   x_ = backend_->allocate(n * n_embd_ * 4);
   x_norm_ = backend_->allocate(n * n_embd_ * 4);
@@ -424,12 +479,105 @@ void Qwen3Model::ensure_capacity(int64_t n, int64_t end_pos) {
    * and a backend whose indices live on the host would have to fetch the whole
    * table back. */
   tokens_ = backend_->allocate(n * 4 + 64);
+  /* The packed activations a panel kernel reads.  **The widest contraction axis
+   * is `n_ff`, not `n_embd`**: `w_down` contracts over the FFN's hidden width,
+   * which is four times the model's.  Sizing this to `n_embd` overflowed on that
+   * one weight -- and overflowed *silently*, because a heap buffer has no
+   * bounds, so the entries it trampled were the next weight's or the KV cache's
+   * and the model answered `0! 0! 0!` nine layers later.  The `n / 4 + 4` is the
+   * panel GEMM's own slop (`nr / 4` groups plus four for the tail pass). */
+  int64_t act_bytes = 0;
+  if (panel_gemm_) {
+    const int64_t widest = n_embd_ > n_ff_ ? n_embd_ : n_ff_;
+    act_bytes = (n / 4 + 4) * (widest / 256) * static_cast<int64_t>(sizeof(kernel::Q8Kx4));
+  }
+  act_packed_ = backend_->allocate(act_bytes > 0 ? act_bytes : 4);
+  /* The accumulating tile is `n` rows by an output axis, and only two weights
+   * ever write through it: `wo` and `w_down`, whose outputs are both `n_embd`
+   * wide.  It is sized to the model's *widest* axis anyway (`n_ff`, four times
+   * `n_embd` here) rather than to the 1024 the two of them actually need, so
+   * that a future accumulating weight with a wider output cannot overflow it by
+   * accident -- the failure the comment above records.  Nothing reads it before
+   * the call that writes it, so it needs no initialization. */
+  panel_tile_ = backend_->allocate(panel_gemm_ ? n * n_ff_ * 4 : 4);
 }
 
 void Qwen3Model::matmul(const Weight &w, kernel::DeviceBuffer x, kernel::DeviceBuffer out, int64_t m,
                         bool accumulate) const {
   kernel::DeviceBuffer no_bias;
   if (w.quantized) {
+    /* A repacked weight is readable at every `m`, which is why the panel path is
+     * selected for the whole session rather than per shape: the decode GEMM has
+     * to come from the same bytes the prefill GEMM does.  When `w.panel` is set
+     * the row kernel is never called for it -- not even for the rows a batched
+     * call would leave over -- because `dot_row_q8k` reads the file's per-row
+     * blocks and these are panels.  It would not fail; it would answer fluently.
+     *
+     * Two kernels, one weight layout:
+     *   `m % 8 == 0` -> `gemm_q4k_8x8`, the panel GEMM, whose whole win is that
+     *                   a prefill no longer re-decodes the matrix `m / 8` times;
+     *   otherwise    -> `gemv_q4k_8x8`, one activation row at a time, which is
+     *                   the decode path.
+     * Neither is bit-identical to `dot_row_q8k`; `kernel/repack_q4k.h` says why,
+     * and `gemm_quant`'s own schedule -- the thing the mutual-consistency
+     * invariant pins -- is untouched because neither of these is it. */
+    if (w.panel && m % 8 == 0) {
+      const float *src = reinterpret_cast<const float *>(x.handle);
+      /* An accumulating call builds its tile out of line and adds it to `out` at
+       * the end, because `out` and `x` are different buffers: `out` is the
+       * residual being accumulated into and `x` is the operand the GEMM is
+       * consuming, and for `wo`/`w_down` the kernel would otherwise overwrite
+       * the row it is still reading. */
+      float *dst = reinterpret_cast<float *>(out.handle);
+      if (accumulate) {
+        dst = reinterpret_cast<float *>(panel_tile_.handle);
+      }
+      kernel::Q8Kx4 *acts = reinterpret_cast<kernel::Q8Kx4 *>(act_packed_.handle);
+      kernel::repack_activations(src, m, w.cols, acts);
+      kernel::gemm_q4k_8x8(static_cast<int>(w.cols), dst, static_cast<size_t>(w.rows),
+                           reinterpret_cast<const kernel::Q4Kx8 *>(w.blocks.handle), acts,
+                           static_cast<int>(m), static_cast<int>(w.rows));
+      if (accumulate) {
+        /* The residual is `out`, not `x`.  Both accumulating calls in the graph
+         * pass `x_` as the destination and the projection's own input as `x`, so
+         * `out` already holds the residual the new term is added to.  Adding `x`
+         * instead is a plausible-looking line that silently replaces the residual
+         * with the projection -- and because the graph's last two matmuls are
+         * both accumulating, it corrupts every block from layer 0 on. */
+        float *out_f = reinterpret_cast<float *>(out.handle);
+        const int64_t total = m * w.rows;
+        for (int64_t i = 0; i < total; ++i) {
+          out_f[i] = out_f[i] + dst[i];
+        }
+      }
+      return;
+    }
+    if (w.panel) {
+      /* The panel GEMV writes its whole output row, so an accumulating call
+       * needs the same out-of-line tile the GEMM does. */
+      const int64_t row_blocks = w.cols / quant::kBlockWeights;
+      const float *src = reinterpret_cast<const float *>(x.handle);
+      quant::Q8KBlock *acts = reinterpret_cast<quant::Q8KBlock *>(act_packed_.handle);
+      kernel::parallel_for(m, 1, [&](int64_t lo, int64_t hi, int64_t) {
+        for (int64_t r = lo; r < hi; ++r) {
+          quant::quantize_row_q8_k(src + r * w.cols, acts + r * row_blocks, w.cols);
+        }
+      });
+      float *dst = accumulate ? reinterpret_cast<float *>(panel_tile_.handle)
+                              : reinterpret_cast<float *>(out.handle);
+      kernel::gemv_q4k_8x8(static_cast<int>(w.cols), dst, static_cast<size_t>(w.rows),
+                           reinterpret_cast<const kernel::Q4Kx8 *>(w.blocks.handle), acts,
+                           static_cast<int>(m), static_cast<int>(w.rows));
+      if (accumulate) {
+        /* `out` is the residual; see the panel GEMM above. */
+        float *out_f = reinterpret_cast<float *>(out.handle);
+        const int64_t total = m * w.rows;
+        for (int64_t i = 0; i < total; ++i) {
+          out_f[i] = out_f[i] + dst[i];
+        }
+      }
+      return;
+    }
     backend_->gemm_quant(x, w.blocks, no_bias, out, m, w.rows, w.cols, w.type_id, accumulate);
     return;
   }

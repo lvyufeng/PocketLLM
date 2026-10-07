@@ -68,6 +68,13 @@ struct Weight {
   int type_id = 0;
   int64_t nbytes = 0;
   bool quantized = false;
+  /* The bytes in `blocks` are eight-column panels (`Q4Kx8`), not the file's
+   * per-row `q4_K` blocks.  The two are the same byte count, so this flag is the
+   * only thing that says which the buffer holds -- and it is set in exactly one
+   * place, so a reader of `matmul` does not have to re-derive the decision from
+   * the shape.  False for everything else, including the embedding table, whose
+   * gather reads the file layout. */
+  bool panel = false;
 };
 
 class Qwen3Model {
@@ -134,6 +141,13 @@ class Qwen3Model {
    * once, here, and every other function reads `Weight::quantized`. */
   Weight bind_matrix(const GgufReader &checkpoint, const std::string &name);
 
+  /* Repack a bound q4_K weight's blocks from the file's per-row 4-bit blocks into
+   * eight-column panels, in place -- the two are the same byte count, so this
+   * reinterprets the one buffer rather than allocating a second.  Called only
+   * when the session selected the panel path and the shape divides; throws if it
+   * does not, rather than leaving a matrix half in each layout. */
+  void repack_weight(Weight &weight) const;
+
   /* Copy a tensor's stored bytes to the device untouched and describe them as
    * a `Weight`. Nothing is decoded at load: the type id travels with the
    * handle and the kernel is what reads the layout. */
@@ -169,6 +183,26 @@ class Qwen3Model {
   kernel::DeviceBuffer scores_;
   kernel::DeviceBuffer tokens_;
   kernel::DeviceBuffer rope_cos_, rope_sin_;
+  /* The packed activations the repacked q4_K panel GEMM reads, `nr / 4 * n / 256`
+   * `Q8Kx4` groups. Nothing else uses it: the panel path is a *selected whole
+   * GEMM*, so this is filled and consumed inside one `matmul` call and may be
+   * released immediately. It is a member rather than a local because
+   * reallocating it per weight per layer would be 200 allocations a token, and
+   * because the only size that can change with the batch is the batch. */
+  kernel::DeviceBuffer act_packed_;
+  /* Where an *accumulating* panel GEMM builds its tile.  The two accumulating
+   * calls in the graph (`wo`, `w_down`) write into a buffer the residual is
+   * already in -- `out` and `x` are the same handle -- so the tile cannot be
+   * written there, and `x` is still being read row by row.  A third buffer is
+   * the honest answer; the panel kernel takes a destination pointer, so this is
+   * one more argument rather than a second kernel.  Only allocated when the
+   * panel path is on. */
+  kernel::DeviceBuffer panel_tile_;
+  /* Is the repacked panel path on for this run? Decided once at load -- from
+   * `repack_enabled()` and the backend's name -- rather than per `matmul`,
+   * because it is a property of the session and a per-call string comparison
+   * would be a per-op decision that cannot change. */
+  bool panel_gemm_ = false;
 
   /* The KV cache, `[layer][position][kv_head][head_dim]`.
    *

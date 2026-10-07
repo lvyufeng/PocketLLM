@@ -98,6 +98,7 @@ add_library(pocketllm SHARED
   tokenizer/pretokenize.cpp
   tokenizer/bpe.cpp
   kernel/kernels.cpp
+  kernel/repack_q4k.cpp
   kernel/cpu/backend.cpp
   kernel/registry.cpp
   model/qwen3.cpp
@@ -164,6 +165,7 @@ add_executable(pocketllm-run
   tokenizer/pretokenize.cpp
   tokenizer/bpe.cpp
   kernel/kernels.cpp
+  kernel/repack_q4k.cpp
   kernel/cpu/backend.cpp
   kernel/registry.cpp
   model/qwen3.cpp
@@ -185,6 +187,7 @@ add_executable(pocketllm-opcheck
   tools/opcheck.cpp
   runtime/status.cpp
   kernel/kernels.cpp
+  kernel/repack_q4k.cpp
   kernel/cpu/backend.cpp
   kernel/registry.cpp
   ${POCKETLLM_CUDA_SOURCES}
@@ -208,6 +211,7 @@ add_executable(pocketllm-bench
   tokenizer/pretokenize.cpp
   tokenizer/bpe.cpp
   kernel/kernels.cpp
+  kernel/repack_q4k.cpp
   kernel/cpu/backend.cpp
   kernel/registry.cpp
   model/qwen3.cpp
