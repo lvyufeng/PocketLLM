@@ -1323,10 +1323,16 @@ void gemv_q4k_8x8(int n, float *s, size_t bs, const Q4Kx8 *panels,
 namespace pocketllm {
 namespace kernel {
 
+/* **The sense is inverted from every other selector in this tree, on purpose.**
+ * `$POCKETLLM_CPU_KV_F32`, `$POCKETLLM_CPU_SCALAR_DOT` and the rest are opt-in:
+ * unset means the shipped default and setting them adds a behaviour.  Here the
+ * shipped default *is* the panel path, because it is what brings a `q4_k_m`
+ * prefill to llama.cpp parity, and unset has to select it for a caller who never
+ * read this file.  `=0` is the escape hatch back to the row kernel. */
 bool repack_enabled() {
   static const bool on = [] {
     const char *v = std::getenv("POCKETLLM_CPU_REPACK");
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
+    return !(v != nullptr && v[0] == '0');
   }();
   return on;
 }

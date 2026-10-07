@@ -1,4 +1,5 @@
-/* The repacked q4_K panel GEMM -- opt-in, `$POCKETLLM_CPU_REPACK`.
+/* The repacked q4_K panel GEMM -- on by default, `$POCKETLLM_CPU_REPACK=0` for the
+ * row kernel.
  *
  * `dot_Rrows_q8k<8>` walks **one** weight column against eight activation rows
  * and decodes each weight block once per walk.  A prefill GEMM re-walks the whole
@@ -28,7 +29,13 @@
  * `test_the_four_row_weight_walk_is_the_one_row_walk_four_times` still describes
  * `gemm_quant`'s own schedule exactly.
  *
- * Default off while it is proven: set `POCKETLLM_CPU_REPACK=1` to select it. */
+ * **On by default, and that is the stage's whole point**: the panel path is what
+ * takes a `q4_k_m` prefill from 0.86x of llama.cpp to parity at the default 22
+ * threads, and a default that leaves the engine 14% behind is not a default.
+ * `POCKETLLM_CPU_REPACK=0` selects the row kernel, which is *not* the opt-in
+ * convention the other selectors in this tree use -- those add a behaviour that
+ * was not there, this one withholds one, and inverting the sense is what makes
+ * the shipped binary the fast one. */
 #ifndef POCKETLLM_KERNEL_REPACK_Q4K_H
 #define POCKETLLM_KERNEL_REPACK_Q4K_H
 
@@ -62,8 +69,9 @@ struct Q8Kx4 {
 };
 static_assert(sizeof(Q8Kx4) == 1168, "block_q8_Kx4 size");
 
-/* Is the repacked path selected?  Reads `POCKETLLM_CPU_REPACK` once, the way the
- * other CPU selectors are read. */
+/* Is the repacked path selected?  Reads `$POCKETLLM_CPU_REPACK` once, the way the
+ * other CPU selectors are read -- but with the opposite sense: unset selects the
+ * panel path, `=0` withholds it.  See the file comment for why. */
 bool repack_enabled();
 
 /* Can this build run the panel kernel at all?  True only when the translation
