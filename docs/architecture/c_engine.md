@@ -814,6 +814,46 @@ engines decode at the depth ours actually reaches.
 too (`pp512` 565 against 466, 1.21×; `tg64` 60.1 against 53.5, 1.12×), so the result is not an
 artifact of one thread count.
 
+### The query rows are interleaved once per tile, not once per key
+
+`dot_tile_r` builds its pair register — `vinsertf128(low, high)` — *inside* the key loop. That is a
+rebuild of a value that does not change while the key walks the span: `q` is the same `R × d` for
+key `first_key` and for key `q_offset + t0`. Against a 512-key span an eight-row tile rebuilds the
+same 32 registers 512 times over, and at `pp2048`, 22 threads, the four `vmovups`→`vinsertf128` pairs
+under `dot_tile_r` are **23% of the whole profile** — the score dot's 15% self time, itself the
+largest attention term after the GEMM.
+
+Hoisting the interleave out of the key loop is not a reassociation. Every lane it moves comes from
+where `dot4` would have loaded it, and the `_mm_mul_ps` → `_mm_add_ps` that consume it are the same
+instructions on the same operands in the same order — so the result is **bit-identical**, confirmed
+three ways: the `dot_tile_pre_r` microbench reports max abs diff `0` against the shipped kernel; the
+row-walk and panel-walk binaries produce byte-identical text on the 40-token prompt above on **both**
+checkpoints at **1, 4 and 22 threads**; and the model's greedy sequence against llama.cpp is
+unchanged. A standalone probe (`qinter.cpp`: the shipped dot and the pre-interleaved dot over the
+real shape `d = 128`, `R = 8`) measures **1.34–1.43×** on the kernel.
+
+It is a second entry point rather than an interior change to `dot_tile_r` because the hoist needs a
+fact `dot_tile_r` does not have. Its call sites hand it `q` as `const float *const [R]` and nothing
+promises the rows stay put from one call to the next; only a caller that *walked* the span can
+interleave ahead of it, and the batched prefill walk is that caller. `interleave_query` fills a
+`rows/2 × (k/4)` panel buffer before the key loop, and `dot_tile_pre_r<8>` reads it. A short tile
+(`rows != kAttentionRows`) and a head width that is not a multiple of four keep the row kernel; both
+are correctness-neutral, since the two dots are the same arithmetic, so the split is a schedule
+choice and not a slow path with its own semantics.
+
+**End to end, interleaved, `--reps 3 --warmup 1`, 22 threads, frozen binaries, `q4_k_m`:**
+
+| | base | pre-interleaved | ratio |
+|---|---:|---:|---:|
+| `pp512` | 701–744 | 749–773 | **1.02–1.08×** |
+| `pp2048` | 446–470 | 495–513 | **1.08–1.15×** |
+
+Against llama.cpp at the **same** 22 threads, six interleaved rounds, llama.cpp `-p` and ours aligned
+(`-n 0`, same prompt): `pp512` **1.02×** (ours ahead), `pp2048` **0.99×** (parity, up from 0.91×
+before this change), decode `tg64` at depth 512 **1.04×**. Prefill is now at parity to slightly ahead
+at the default thread count and decode stays ahead — see the status table in the repository README
+for the headline.
+
 ### Flash attention, and the gap it closed
 
 Those numbers were measured before this engine had flash attention, and at the time the *shipped*

@@ -478,6 +478,119 @@ inline void dot_tile_r(const float *const *q, const float *key, int64_t k, float
 
 #endif
 
+/* The batched prefill walk's score dot, with the query rows' two four-lane
+ * groups interleaved *once per tile* instead of once per key.
+ *
+ * **The arithmetic is `dot_tile_r`'s, instruction for instruction, and that is
+ * the whole point of doing it this way.**  `dot_tile_r` builds its pair register
+ * with an `vinsertf128(low, high)` *inside* the key loop, where the key count
+ * multiplies it: eight rows against a 512-key span rebuild the same 32 registers
+ * 512 times over.  On the pp2048 profile those four `vmovups`+`vinsertf128`
+ * pairs sit under `dot_tile_r`'s 15% self time, and that self time is 15% of a
+ * prefill -- the single largest attention term after the GEMM.  But `q` does not
+ * move while `s` walks the span, so the interleave is loop-invariant there and
+ * can be hoisted.  Nothing is reassociated: the multiply and add that follow see
+ * the same lanes from the same operands in the same order, which is why this is
+ * bit-identical to the row path -- `qinter.cpp` reports max abs diff 0 and the
+ * model's greedy token sequence is unchanged.
+ *
+ * It is a second entry point and not an interior change to `dot_tile_r` because
+ * the hoist needs a fact `dot_tile_r` does not have: its callers pass `q` as
+ * `const float *const [R]` and nothing promises the rows stay put from one call
+ * to the next, so only a caller that walked the span itself can interleave ahead
+ * of it.  The batched prefill walk is that caller.
+ *
+ * `qi` is `rows/2` panels of `k/4` eight-float groups; group `i` of panel `p` is
+ * row `2p`'s floats `4i..4i+3` in the low half and row `2p+1`'s in the high,
+ * exactly the register `dot_tile_r` builds.  `k` must be a multiple of four (the
+ * head width is 128 and the caller tiles by four), so the tail `dot_tile_r`
+ * carries for a width that is not is absent here by construction. */
+
+/* The forced-scalar route and the portable fallback.
+ *
+ * **It mirrors `dot` term for term, and that is the whole point of it.**  `dot`
+ * is not a single ascending accumulator: it keeps four strided chains `s0..s3`
+ * and reduces `(s0 + s1) + (s2 + s3)`, and a naive one-accumulator loop here
+ * would be a *different summation order* -- still correct, but not the same
+ * bytes, which is the property the forced-scalar route exists to let a test
+ * check.  So the four chains are reproduced exactly, over the interleaved row's
+ * four-float group at the same offsets `dot` reads them. */
+template <int64_t R>
+inline void dot_tile_pre_scalar(const float *qi, const float *key, int64_t k, float out[R]) {
+  static_assert(R % 2 == 0, "dot_tile_pre_r holds two query rows per panel");
+  const int64_t n4 = k / 4;
+  for (int64_t p = 0; p < R; ++p) {
+    const float *const row = qi + (p / 2) * n4 * 8 + (p % 2) * 4;
+    float s0 = 0.0F, s1 = 0.0F, s2 = 0.0F, s3 = 0.0F;
+    for (int64_t i = 0; i < n4; ++i) {
+      s0 += row[i * 8 + 0] * key[i * 4 + 0];
+      s1 += row[i * 8 + 1] * key[i * 4 + 1];
+      s2 += row[i * 8 + 2] * key[i * 4 + 2];
+      s3 += row[i * 8 + 3] * key[i * 4 + 3];
+    }
+    out[p] = (s0 + s1) + (s2 + s3);
+  }
+}
+
+/* Fill `qi` for `rows` query rows in the panel layout above.  Two four-float
+ * copies rather than an intrinsic: it compiles to the same `vinsertf128` on
+ * AVX2, and it keeps the buffer a plain `float *` the caller can `alignas(32)`
+ * without the intrinsic's type leaking into the signature. */
+inline void interleave_query(const float *const *q, int64_t rows, int64_t k, float *qi) {
+  const int64_t n4 = k / 4;
+  for (int64_t p = 0; p < rows / 2; ++p) {
+    float *const out = qi + p * n4 * 8;
+    for (int64_t i = 0; i < n4; ++i) {
+      std::memcpy(out + 8 * i, q[2 * p] + 4 * i, 4 * sizeof(float));
+      std::memcpy(out + 8 * i + 4, q[2 * p + 1] + 4 * i, 4 * sizeof(float));
+    }
+  }
+}
+
+#if POCKETLLM_HAVE_AVX2
+
+template <int64_t R>
+__attribute__((optimize("fp-contract=off"))) inline void dot_tile_pre_r(const float *qi,
+                                                                        const float *key, int64_t k,
+                                                                        float out[R]) {
+  static_assert(R % 2 == 0, "dot_tile_pre_r holds two query rows per __m256");
+  if (scalar_dot_forced()) {
+    dot_tile_pre_scalar<R>(qi, key, k, out);
+    return;
+  }
+  const int64_t n4 = k / 4;
+  __m256 acc[R / 2];
+  for (int64_t p = 0; p < R / 2; ++p) {
+    acc[p] = _mm256_setzero_ps();
+  }
+  for (int64_t i = 0; i < n4; ++i) {
+    const __m128 kk = _mm_loadu_ps(key + 4 * i);
+    const __m256 kv = _mm256_insertf128_ps(_mm256_castps128_ps256(kk), kk, 1);
+    for (int64_t p = 0; p < R / 2; ++p) {
+      /* The same `add(mul(x, kv), acc)` `dot_tile_r` issues, on the panel the
+       * tile was interleaved into rather than one rebuilt this key. */
+      acc[p] = _mm256_add_ps(_mm256_mul_ps(_mm256_load_ps(qi + p * n4 * 8 + 8 * i), kv), acc[p]);
+    }
+  }
+  alignas(32) float lanes[R / 2][8];
+  for (int64_t p = 0; p < R / 2; ++p) {
+    _mm256_store_ps(lanes[p], acc[p]);
+  }
+  for (int64_t p = 0; p < R; ++p) {
+    const float *l = lanes[p / 2] + (p % 2) * 4;
+    out[p] = (l[0] + l[1]) + (l[2] + l[3]);
+  }
+}
+
+#else
+
+template <int64_t R>
+inline void dot_tile_pre_r(const float *qi, const float *key, int64_t k, float out[R]) {
+  dot_tile_pre_scalar<R>(qi, key, k, out);
+}
+
+#endif
+
 /* ``sum_i row[i] * dequant_q4_k(block, i)`` for one Q4_K super-block.
  *
  * The arithmetic is `dequant_q4_k`'s, term for term and in the same order, so
@@ -1933,13 +2046,32 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const void *k_cac
         }
         int64_t s = first_key;
         const int64_t shared_end = q_offset + t0;
+        /* The full tile's score dot interleaves the query rows once here, before
+         * the key walk, instead of `dot_tile_r` rebuilding the same registers on
+         * every key.  A short tile has too few rows to fill a panel and keeps
+         * the row kernel, and so does a head width the panel layout cannot
+         * express; both are correctness-neutral -- the two dots are the same
+         * arithmetic -- so the split is a schedule choice and not a slow path
+         * with its own semantics. */
+        const bool pre = rows == kAttentionRows && d % 4 == 0;
+        alignas(32) float qinter[kAttentionHeadBatch]
+                               [kAttentionRows / 2 * (kAttentionSumMaxDim / 4) * 8];
+        if (pre) {
+          for (int64_t p = 0; p < hb; ++p) {
+            interleave_query(qvec[p], kAttentionRows, d, qinter[p]);
+          }
+        }
         if (rows == kAttentionRows) {
           for (; s <= shared_end; ++s) {
             const float *const kvec = widen2(row_buf, k_cache, s, kv_head, 0);
             const float *const vvec = widen2(row_buf, v_cache, s, kv_head, 1);
             for (int64_t p = 0; p < hb; ++p) {
               float sc[kAttentionRows];
-              dot_tile_r<kAttentionRows>(qvec[p], kvec, d, sc);
+              if (pre) {
+                dot_tile_pre_r<kAttentionRows>(qinter[p], kvec, d, sc);
+              } else {
+                dot_tile_r<kAttentionRows>(qvec[p], kvec, d, sc);
+              }
               for (int64_t j = 0; j < rows; ++j) {
                 flash_fold(part[j][p], sc[j] * scale, vvec, d);
               }
