@@ -775,15 +775,23 @@ revision of this table claimed a 526/74.5 against 481/65.2 lead for this engine;
 taken in a single quiet window and did not reproduce, and it was never consistent with the 796 t/s
 llama.cpp prefill recorded [above](#the-eight-row-gemm-and-the-repacked-weights).
 
-The prefill cost is the `fp-contract=off` on the fused fold, not the restructure. The fold is
-`P[z] = P[z] * corr + v[z]`, which `-march=native` would otherwise contract to one FMA, and it cannot
-be: the contraction is what decides how far a running maximum is allowed to move the sum already
-accumulated. Removing the attribute recovers 3–4% of prefill — taking prefill to within 2% of the
-pre-flash kernel — but **narrows the top-2 margin at the first generated position from 0.89 to 0.23**
-(`--print-top 10`: 16.39/15.50 against 15.59/15.36), a 3.9× thinner decision boundary bought for
-1.02×. The attribute stays; measured against the shipped row-at-a-time loop the two forms are equally
-close (9.9e-08 and 6.6e-08 of the output scale at `q_len` 6), so the fold's accuracy is not the
-question — the margin between competitors is.
+The prefill cost was the `fp-contract=off` on the fused fold, not the restructure, and **the attribute
+has since come off the fold** (keeping it on the score dots, where the last bit is the argmax). The
+fold is `P[z] = P[z] * corr + v[z]`; the earlier note argued the contraction "decides how far a running
+maximum is allowed to move the sum already accumulated" and had to be forbidden, citing a top-2 margin
+that narrowed from 0.89 to 0.23 when it was removed. **That measurement does not reproduce on the
+current code and is superseded**: the `part` layout changed since it was taken (from `{m, acc[n], l}`
+with the scale first to `{max, denominator, sum…}` with the compare off `P[0]`), and on that layout
+contracting the fold is bit-identical to not — the full 151936-wide logit vector is equal byte for
+byte on **both** checkpoints, at the first generated position and across eight decode steps, and the
+greedy sequence is unmoved (32/32 against llama.cpp's oracle on the recorded prompt for f16 and for
+`q4_k_m`, the other prompts identical between the two builds). What the attribute was buying, on this
+layout, is nothing measurable — and what it cost is 3–4% of prefill. Contracting the fold is worth
+**+3.0% of `pp512` at t22** (6/6 paired rounds against a frozen prior build), **+7.6% at `pp2048`**
+(consistent with more keys folded per row), and ~+1% of decode; the win grows with context exactly as
+the FMA count in the fold's `O(keys)` loop predicts. Measured against the shipped row-at-a-time loop
+the two forms were always equally close (9.9e-08 and 6.6e-08 of the output scale at `q_len` 6), so the
+fold's accuracy was never the question — and it turns out the contraction does not move it.
 
 **Decode is where the fusion pays, and the reason is the pass it removes.** The chunked merge is what
 turns a decode's 8 units into `8 × kFlashSplit` and the measured 1.18–1.22× is the two passes over
