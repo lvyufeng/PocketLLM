@@ -1094,6 +1094,19 @@ from silently storing the wrong layout. `opcheck` defaults to f32 (its job is ch
 an f32 reference) and takes `kv_dtype 1` to exercise the f16 path; the shipped path is covered end to
 end by the token tests instead.
 
+**The widening and narrowing are 256-bit now, and it is the widening that pays.** Both helpers
+converted eight halves with *two* 128-bit `vcvtph2ps`/`vcvtps2ph` calls and two 8-byte moves; each is
+now one 256-bit `vcvtph2ps`/`vcvtps2ph` and one 16-byte move. Widening is exact — every f16 is an f32,
+so the result is bit-identical — and narrowing uses the same round-to-nearest-even, so the narrowed
+bytes are identical too; the row-vs-row token diff on both checkpoints at 1/4/22 threads is the check
+that it stayed that way. A standalone probe (`kvbench.cpp`, 4096 rows of `d = 128` per pass, 200
+passes, three reps) measures **1.72–2.57× on the widen and 1.13–1.15× on the narrow**, and the pp2048
+profile moves the way that predicts: `kv_row_to_float` self drops from **5.7% to 3.9%**. End to end,
+interleaved at 22 threads, `tg128` after a `pp512` is **~1.02× (4/5 rounds)** — small, because the
+conversion was only ever a few percent of a decode token, but consistently the right sign and real at
+the kernel. Prefill is inside the noise at this size, as the section above already says the conversion
+is: this is a decode-side win on the path that reads the cache most.
+
 ### The activation scratch is the shape's size, not a fixed one
 
 The integer path needs somewhere to put the quantized activations, and that buffer used to be a
