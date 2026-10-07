@@ -281,8 +281,27 @@ inline float dot4(const float *a, const float *b, int64_t k) { return dot(a, b, 
  * and `dot_tile_r`, so the equivalence stays checkable through the public API. */
 #if POCKETLLM_HAVE_AVX2
 
-__attribute__((optimize("fp-contract=off"))) inline void flash_fold(float *P, float x,
-                                                                   const float *vvec, int64_t d) {
+/* **This fold contracts and the score dots above do not, and the split is
+ * deliberate.**  `dot4`, `dot_pair` and `dot_tile_r` all produce the *score*,
+ * and a score's last bit is exactly what the softmax turns into an argmax --
+ * the 32/32-to-1/32 measurement on `dot4` is why they carry `fp-contract=off`
+ * and keep it.  `flash_fold` runs *after* the score: it updates the running
+ * `(max, denominator, weighted sum)` for one key.  Its expensive step is a
+ * `d`-element weighted average accumulated over hundreds of keys, where one
+ * contracted `a*b+c` is one more rounding in a sum that is already a long
+ * chain -- and the `part` layout is `{max, denominator, sum...}`, so the
+ * compare-and-rescale that decides the max is a load/branch off `P[0]` and not
+ * something an FMA can fold into.
+ *
+ * Measured by dropping the attribute here alone: `pp512` at t22 **+3.0%** (6/6
+ * paired rounds against a frozen prior build), decode +1.1%, and the greedy
+ * sequence unchanged -- 16/16 then 32/32 on the recorded prompt against
+ * llama.cpp's oracle, and an identical 75/144 on two further prompts to the old
+ * build (those prompts differ from the oracle's f32/flash-off convention under
+ * *both* builds, so the change is neutral there rather than responsible).  The
+ * attribute was originally put on both the score and the fold together; the
+ * score needed it, the fold was never shown to. */
+inline void flash_fold(float *P, float x, const float *vvec, int64_t d) {
 #if POCKETLLM_HAVE_AVX2
   if (x > P[0]) {
     const float corr = std::exp(P[0] - x);
