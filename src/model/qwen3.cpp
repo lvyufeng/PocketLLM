@@ -207,8 +207,17 @@ Weight Qwen3Model::bind_matrix(const GgufReader &checkpoint, const std::string &
    * *not* repacked: it feeds `embedding_quant`'s gather as well as the tied head
    * GEMM, and the gather reads the file layout -- qwen3-0.6B carries a separate
    * `output.weight`, so the tie costs nothing here and the table stays readable
-   * by the one kernel that already understands it. */
-  if (panel_gemm_ && weight.type_id == kTypeQ4K) {
+   * by the one kernel that already understands it.
+   *
+   * **The shape guard skips rather than throws, and that is not a fallback.**
+   * The panel path is on by default now, so a checkpoint with a q4_K weight that
+   * does not tile would otherwise be *rejected at load* -- an engine that used to
+   * read a file suddenly refusing it, for a reason that is about a tuning
+   * decision and not about the file.  A weight that does not tile keeps the row
+   * kernel: `Weight::panel` stays false, and `matmul` reads exactly that flag.
+   * The two layouts never meet inside one weight, so this is a per-matrix
+   * decision, not the half-a-repack state `repack_weight` refuses. */
+  if (panel_gemm_ && weight.type_id == kTypeQ4K && weight.rows % 8 == 0 && weight.cols % 8 == 0) {
     repack_weight(weight);
   }
   return weight;

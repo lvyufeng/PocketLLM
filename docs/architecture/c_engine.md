@@ -481,29 +481,62 @@ The activation pack calls `quant::quantize_q8_block` — the row kernel's own qu
 second transcription of it, so the two engines quantize an activation identically and the
 token-for-token match against llama.cpp is structural rather than a thing to re-check.
 
-**Measured** (`q4_k_m`, interleaved A/B, `pp512` and `tg64`, five rounds each):
+**Measured** (`q4_k_m`, interleaved A/B against the row kernel, `pp512` and `tg64`):
 
 | | row kernel | panel path | ratio |
 |---|---:|---:|---:|
 | `pp512` @ t22 (one socket's cores) | 637 | 723 | 1.135 |
 | `tg64` @ t22 | 82.6 | 95.2 | 1.152 |
-| `pp512` @ t44 (both sockets' cores — the default) | 736 | 809 | 1.098 |
+| `pp512` @ t44 (both sockets' cores) | 736 | 809 | 1.098 |
 | `tg64` @ t44 | 76.6 | 83.7 | 1.093 |
 
 The decode column moves at all only because the panel GEMV replaces `dot_row_q8k` there too; a first
 version of it was not parallel and measured **3.4× slower** at t22 (86.6 → 25.5 t/s), which is the
 shape of a kernel that forgot `parallel_for` rather than one that is intrinsically slow.
 
-**The contract the extra speed buys is a different last bit, and the tests say so.** `POCKETLLM_CPU_REPACK`
-is off by default in this stage. With it on, `tests/native/` is 286 passed against the q4_K oracle
-except where a long greedy sequence is involved: the per-op difference from the row kernel is at most
-**1.6 × 10⁻⁶ relative** over 504 checked GEMMs and 336 GEMVs on a 32-token prefill (zero outputs
-outside a 1e-3 absolute band), but that is enough to move a near-tie after the first few dozen
-generated tokens. On a 32-token prompt the two paths share their first 30 generated tokens and split
-at the 31st. **f16 is the control and is never repacked** — `repack_enabled()` gates on
-`type_id == kTypeQ4K`, and the f16 checkpoint is byte-identical with the flag on and off at every
-length tested. Thread invariance is unaffected either way: the output is bit-identical at 1, 4, 22 and
-44 threads, with the reduce never split.
+**It is on by default, and the env var inverts the usual sense.** Every other selector in this tree
+is opt-in — unset is the shipped default and setting the variable adds a behaviour. Here the shipped
+default *is* the panel path, because it is what carries `pp512` from about 0.86× of llama.cpp to
+parity, and a caller who never read this file should get the fast one: `POCKETLLM_CPU_REPACK=0`
+withholds it and restores the row kernel.
+
+At the default 22 threads on `q4_k_m`, interleaved against llama.cpp on the same host:
+
+| | row kernel | panel path (shipped default) | llama.cpp |
+|---|---:|---:|---:|
+| `pp512` | ~637 | 675–744 (median **~700**) | 728–739 |
+| `tg128` @ depth 512 | ~83 | 83–85 | 68.8 |
+
+so prefill is **at parity and not ahead**: llama's runs sit inside ±1% where ours span ±5%, and the
+two medians land within a percent of each other in either direction. **Decode is 1.21–1.23× ahead**
+and is not in question. `t44` is where both engines' numbers break down on this host and is not a
+comparison to quote; the t22 column is.
+
+**The contract the extra speed buys is a different last bit, and the tests say so.** The per-op
+difference from the row kernel is at most **1.6 × 10⁻⁶ relative** over 504 checked GEMMs and 336
+GEMVs on a 32-token prefill (zero outputs outside a 1e-3 absolute band). What that buys is real but
+bounded: with the flag on, `tests/native/` is **286 passed** and, on the full suite, **1001 passed /
+70 skipped** — the same totals as with it off — including the exact greedy-token match against
+llama.cpp, the batched-versus-incremental equality and the logits check. Where it does move is a
+*long* greedy sequence on a near-tie: on a 32-token prompt the two paths share their first 30
+generated tokens and split at the 31st, which is the chaos amplification of a 1.6 × 10⁻⁶ per-op
+difference and the regime `tests/native/llama_oracle.py` already documents. **f16 is the control and
+is never repacked** — `repack_enabled()` gates on `type_id == kTypeQ4K`, and the f16 checkpoint is
+byte-identical with the flag on and off at every length tested. Thread invariance is unaffected
+either way: the output is bit-identical at 1, 4, 22 and 44 threads, with the reduce never split.
+
+**Where the remaining prefill time is** (`perf record`, `pp512`, t22, inclusive shares): the panel
+GEMM 41%, attention's score and fold passes 14%, the q6_K head 7.5%, and the pool's **barrier spin
+7.2%** — 14% at t44. The GEMM's share now matches llama.cpp's own 47% for `ggml_gemm_q4_K_8x8_q8_K`,
+so the GEMM is no longer the differentiator it was: single-threaded, both engines are near 60% of
+AVX2 peak. What is left is single-core issue efficiency (0.82× at one thread, 0.87× at eight,
+1.00× at twenty-two — the gap closes with cores, so it is not arithmetic), where the panel kernel's
+32 live `__m256` accumulators overflow sixteen architectural registers and put about a fifth of the
+hot loop's instructions on the stack, and attention, where recomputing `exp` in the folded layout
+costs one `__expf` per (row, key) pair against llama.cpp's `exp_ps` over a whole score row.
+
+**`POCKETLLM_CPU_REPACK=1` is still accepted and is the same thing as unset**, so a script written
+before this default does not silently switch engines.
 
 ### The horizontal reduce, and why the lane pairing is load-bearing
 
