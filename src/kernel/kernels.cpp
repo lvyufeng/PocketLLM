@@ -2514,12 +2514,22 @@ void kv_row_to_float(const void *row, int64_t d, float *dst) {
 #if POCKETLLM_HAVE_F16C
   const uint16_t *src = static_cast<const uint16_t *>(row);
   int64_t i = 0;
+#if POCKETLLM_HAVE_AVX2
+  /* One 256-bit `vcvtph2ps` per eight halves, where the 128-bit form needs two
+   * 128-bit converts and two stores.  Widening is exact -- every f16 is an f32,
+   * so the result is bit-identical and there is nothing to round. */
+  for (; i + 8 <= d; i += 8) {
+    const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + i));
+    _mm256_storeu_ps(dst + i, _mm256_cvtph_ps(bits));
+  }
+#else
   for (; i + 8 <= d; i += 8) {
     const __m128i lo_bits = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(src + i));
     const __m128i hi_bits = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(src + i + 4));
     _mm_storeu_ps(dst + i, _mm_cvtph_ps(lo_bits));
     _mm_storeu_ps(dst + i + 4, _mm_cvtph_ps(hi_bits));
   }
+#endif
   for (; i < d; ++i) {
     dst[i] = half_to_float(src[i]);
   }
@@ -2538,12 +2548,22 @@ void float_to_kv_row(const float *src, int64_t d, void *row) {
 #if POCKETLLM_HAVE_F16C
   uint16_t *dst = static_cast<uint16_t *>(row);
   int64_t i = 0;
+#if POCKETLLM_HAVE_AVX2
+  /* One 256-bit `vcvtps2ph` per eight, same round-to-nearest-even as the
+   * 128-bit pair it replaces, so the narrowed bytes are identical. */
+  for (; i + 8 <= d; i += 8) {
+    const __m128i packed =
+        _mm256_cvtps_ph(_mm256_loadu_ps(src + i), _MM_FROUND_TO_NEAREST_INT);
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(dst + i), packed);
+  }
+#else
   for (; i + 8 <= d; i += 8) {
     const __m128i lo = _mm_cvtps_ph(_mm_loadu_ps(src + i), _MM_FROUND_TO_NEAREST_INT);
     const __m128i hi = _mm_cvtps_ph(_mm_loadu_ps(src + i + 4), _MM_FROUND_TO_NEAREST_INT);
     _mm_storel_epi64(reinterpret_cast<__m128i *>(dst + i), lo);
     _mm_storel_epi64(reinterpret_cast<__m128i *>(dst + i + 4), hi);
   }
+#endif
   for (; i < d; ++i) {
     /* One at a time through a lane rather than a masked store: `d` is 128 for
      * every model this runs, so the tail is dead code here and the cost of it
