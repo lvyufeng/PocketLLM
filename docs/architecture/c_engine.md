@@ -848,11 +848,23 @@ choice and not a slow path with its own semantics.
 | `pp512` | 701–744 | 749–773 | **1.02–1.08×** |
 | `pp2048` | 446–470 | 495–513 | **1.08–1.15×** |
 
-Against llama.cpp at the **same** 22 threads, six interleaved rounds, llama.cpp `-p` and ours aligned
-(`-n 0`, same prompt): `pp512` **1.02×** (ours ahead), `pp2048` **0.99×** (parity, up from 0.91×
-before this change), decode `tg64` at depth 512 **1.04×**. Prefill is now at parity to slightly ahead
-at the default thread count and decode stays ahead — see the status table in the repository README
-for the headline.
+Against llama.cpp at the **same** 22 threads, llama.cpp `-p` and ours aligned (`-n 0`, same prompt),
+frozen binaries and interleaved rounds: `pp512` **1.037×** and `pp2048` **1.034×**, each **6/8 rounds
+ahead** (median paired ratio), decode `tg64` at a matched depth **1.37×**. At 44 threads `pp2048` is
+**1.014× (7/8 ahead)**; `pp512` is **0.977× (2/8)** and is the one size that still reads behind there,
+which is the expected shape — its runs are the shortest, so a co-tenant on this shared host lands in
+a larger fraction of them (its least-loaded round measured 1.005×).
+
+**Two readings in this page's earlier history were contention artifacts and are corrected here.**
+`pp2048` was recorded at "~0.99×, parity" and 44 threads at "0.68×, loses badly". Re-run on the same
+host: the 0.68 round was one of eight at load 27 while the other seven measured 1.004–1.130 and the
+median was 1.014; the 0.99 reading likewise came from a window with another process on the box. A
+co-tenant on one core is enough to move our prefill by 5–10% — measured directly, a `pp2048` sweep
+whose first four rounds ran against a competing job scored 0.86–0.96 by our engine while llama.cpp
+held 489–517 t/s throughout, and whose last four rounds, as that job exited, scored 1.00–1.03. This
+engine is more contention-sensitive than llama.cpp; the engine's own numbers are only meaningful at
+low load, and every row above was taken at `load1m < 3` where it could be. Prefill is ahead at the
+default thread count and at least at parity at 44; decode is decisively ahead.
 
 ### Flash attention, and the gap it closed
 
