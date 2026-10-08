@@ -220,7 +220,37 @@ Weight Qwen3Model::bind_matrix(const GgufReader &checkpoint, const std::string &
   if (panel_gemm_ && weight.type_id == kTypeQ4K && weight.rows % 8 == 0 && weight.cols % 8 == 0) {
     repack_weight(weight);
   }
+  /* q6_K gets the byte-expanded repack, but only on a backend that reads it --
+   * the layout is CUDA-only, and the flag is what `matmul` and the backend both
+   * key off. Any shape works (the repack has no tiling requirement), so unlike
+   * the q4_K panels there is nothing to guard but the type and the backend. */
+  if (q6k_repack_enabled_ && weight.type_id == kTypeQ6K) {
+    repack_weight_q6k(checkpoint, name, weight);
+  }
   return weight;
+}
+
+void Qwen3Model::repack_weight_q6k(const GgufReader &checkpoint, const std::string &name,
+                                   Weight &weight) const {
+  /* The transform runs on *host* bytes and its result is uploaded.  The q4_K
+   * panel repack reads and writes a device buffer in place because on the CPU
+   * backend a handle is an address; this one runs on the card, where
+   * `blocks.handle` is a device pointer the host cannot dereference -- taking
+   * the same shape here segfaults at load.  Re-reading the file's bytes for the
+   * repack costs one extra pass over a q6_K tensor at load and nothing per
+   * token. */
+  uint64_t nbytes = 0;
+  const uint8_t *src = checkpoint.tensor_data(name, &nbytes);
+  const int64_t blocks = weight.rows * (weight.cols / 256);
+  const int64_t expanded = blocks * quant::kQ6KRepackedBytes;
+  std::vector<uint8_t> host(static_cast<std::size_t>(expanded));
+  kernel::repack_weights_q6k(src, weight.rows, weight.cols, host.data());
+  kernel::DeviceBuffer repacked = backend_->allocate(expanded);
+  backend_->copy_to_device(repacked, host.data(), expanded);
+  backend_->release(weight.blocks);
+  weight.blocks = repacked;
+  weight.nbytes = expanded;
+  weight.q6k_repacked = true;
 }
 
 /* Panels are eight columns and four activation rows, so both axes have to
@@ -301,6 +331,12 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
    * makes the path a *selected whole GEMM* rather than a per-tensor choice. */
   model->panel_gemm_ = kernel::repack_enabled() && kernel::repack_available() &&
                        std::string(backend.name()) == "cpu";
+  /* The byte-expanded q6_K layout is selected by the backend, not a build flag:
+   * only the CUDA decoder reads it, so it is on exactly when the session's
+   * backend is `cuda`. Deciding it here, once, is the same shape as the panels
+   * above -- one answer for every weight, so the layout never varies within a
+   * tensor. */
+  model->q6k_repack_enabled_ = std::string(backend.name()) == "cuda";
 
   /* The cache width is the backend's decision and it is taken here, before the
    * first allocation, because every slab offset in `forward` is derived from
@@ -587,7 +623,8 @@ void Qwen3Model::matmul(const Weight &w, kernel::DeviceBuffer x, kernel::DeviceB
       }
       return;
     }
-    backend_->gemm_quant(x, w.blocks, no_bias, out, m, w.rows, w.cols, w.type_id, accumulate);
+    backend_->gemm_quant(x, w.blocks, no_bias, out, m, w.rows, w.cols, w.type_id, accumulate,
+                         w.q6k_repacked);
     return;
   }
   backend_->gemm(x, w.data, no_bias, out, m, w.rows, w.cols, accumulate);

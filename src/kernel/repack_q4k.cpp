@@ -1079,6 +1079,39 @@ void gemm_q4k_8x8_avx2(int n, float *s, size_t bs, const void *vx, const void *v
 }
 
 }  // namespace
+/* The q6_K repack is a plain byte transform with no AVX2.  It walks every
+ * column and super-block of the tensor, decodes each weight to the `q - 32`
+ * byte the kernel will read, and copies the sixteen scales and the half `d`
+ * through unchanged.  The decode is the file decoder's own
+ * `quant::dequant_q6_k`, read back as the integer it started from: rather than
+ * re-derive the bit layout here (a second transcription, and the one the file
+ * header warns against), it recovers `q` the same way the kernel does and
+ * stores `q - 32`, which is exactly the range an `int8` holds.  The float `d`
+ * and `scale` are *not* folded in -- they are carried to the kernel so the
+ * per-weight product keeps the association `dequant_q6_k` used. */
+void repack_weights_q6k(const uint8_t *blocks, int64_t n, int64_t k, uint8_t *out) {
+  const int64_t nb = k / 256;
+  const size_t row_bytes = static_cast<size_t>(nb * quant::kQ6KBlockBytes);
+  const size_t out_row_bytes = static_cast<size_t>(nb) * quant::kQ6KRepackedBytes;
+  parallel_for(n, 1, [&](int64_t r_lo, int64_t r_hi, int64_t) {
+    for (int64_t r = r_lo; r < r_hi; ++r) {
+      for (int64_t b = 0; b < nb; ++b) {
+        const uint8_t *in = blocks + r * row_bytes + b * quant::kQ6KBlockBytes;
+        uint8_t *o = out + r * out_row_bytes + b * quant::kQ6KRepackedBytes;
+        int8_t *qs = reinterpret_cast<int8_t *>(o);
+        for (int i = 0; i < 256; ++i) {
+          qs[i] = static_cast<int8_t>(quant::q6_k_raw_value(in, i) - 32);
+        }
+        for (int s = 0; s < 16; ++s) {
+          o[256 + s] = in[192 + s];
+        }
+        o[272] = in[208];
+        o[273] = in[209];
+      }
+    }
+  });
+}
+
 }  // namespace kernel
 }  // namespace pocketllm
 

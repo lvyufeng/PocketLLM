@@ -504,7 +504,11 @@ class AscendBackend final : public Backend {
   }
 
   void gemm_quant(DeviceBuffer x, DeviceBuffer blocks, DeviceBuffer bias, DeviceBuffer out,
-                  int64_t m, int64_t n, int64_t k, int type_id, bool accumulate) override {
+                  int64_t m, int64_t n, int64_t k, int type_id, bool accumulate,
+                  bool q6k_repacked = false) override {
+    /* The byte-expanded q6_K layout is a CUDA-only path; the ascend backend
+     * decodes the GGUF blocks itself and never sets this. */
+    (void)q6k_repacked;
     if (bias.handle != 0) {
       throw Error("ascend: gemm_quant bias is not implemented yet");
     }
