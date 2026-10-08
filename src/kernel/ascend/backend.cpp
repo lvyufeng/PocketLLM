@@ -492,6 +492,19 @@ class AscendBackend final : public Backend {
                   " exceeds RmsNormNdCustom's " + std::to_string(kRmsMaxD) +
                   "; a wider row needs a tiled reduction this backend does not have");
     }
+    /* The AscendC vector pipe is 32 bytes = 16 fp16 lanes wide, and a row
+     * narrower than one repeat is not processed: `RmsNormNdCustom` returns the
+     * output buffer untouched for d < 16 (measured: d = 1, 8, 15 all come back
+     * as zeros, d = 16 onwards is right).  Its own host op runs the model at
+     * d = 4096 and d = 128, both aligned, so the op's authors never met this.
+     * This backend refuses rather than returning zeros: no shape the graph runs
+     * reaches it, and a phone-side build that one day did would want the error
+     * far more than it would want a silent row of zeros. */
+    if (d % 16 != 0) {
+      throw Error("ascend: rms_norm row width " + std::to_string(d) +
+                  " is not a multiple of 16, below which RmsNormNdCustom does not write its "
+                  "output");
+    }
     /* The op is fp16-native and the graph's operands are f32 -- `bind_dense`
      * widens every dense tensor, the norm gammas included, so both x and the
      * weight arrive f32.  Narrow both, drive the op, widen the result back. */
@@ -633,22 +646,32 @@ class AscendBackend final : public Backend {
     if (kv_dtype != KVDtype::kF32 && kv_dtype != KVDtype::kF16) {
       throw Error("ascend: attention has no path for this cache dtype");
     }
-    if (q_offset <= 0) {
-      return;  /* nothing visible yet */
-    }
-    if (q_offset > kMaxContext) {
-      throw Error("ascend: attention context " + std::to_string(q_offset) + " exceeds the op's " +
-                  std::to_string(kMaxContext));
+    if (q_offset < 0) {
+      throw Error("ascend: attention got a negative q_offset " + std::to_string(q_offset));
     }
     if (d % 16 != 0) {
       throw Error("ascend: attention head_dim " + std::to_string(d) +
                   " must be a multiple of 16 for the fused step kernel");
     }
-    /* The graph's cache is ``[position][head][d]`` with the visible rows packed
+    /* `q_offset` is the chunk's first position, so a one-token decode at
+     * `q_offset` must attend to keys `0..q_offset` inclusive -- its own key has
+     * already been appended to the cache by the time attention runs (this model
+     * scores against the current key; see `Qwen3Model::forward`).  That makes
+     * the visible count `q_offset + 1`, the same `end_pos` `attention_scratch`
+     * is sized to.  Attending to `q_offset` keys instead -- which this backend
+     * did until the conformance run caught it at an 85% error on a one-key span
+     * -- drops the token's own key and is simply a wrong answer.
+     *
+     * The graph's cache is ``[position][head][d]`` with the visible rows packed
      * contiguously from position 0, and the op's `kCache` is
-     * ``[n_head_kv, max_seq, d]`` -- so `max_seq == context` is the layout the
-     * graph actually produces.  The op's window is `[0, context)` either way. */
-    run_attention(q, n_heads, n_head_kv, d, q_offset, scale, k_cache, v_cache, kv_dtype, out);
+     * ``[n_head_kv, max_seq, d]``, so `max_seq == context` is the layout the
+     * graph actually produces and the op's window is `[0, context)` either way. */
+    const int64_t context = q_offset + 1;
+    if (context > kMaxContext) {
+      throw Error("ascend: attention context " + std::to_string(context) + " exceeds the op's " +
+                  std::to_string(kMaxContext));
+    }
+    run_attention(q, n_heads, n_head_kv, d, context, scale, k_cache, v_cache, kv_dtype, out);
   }
 
   void kv_append(DeviceBuffer dst, DeviceBuffer src, int64_t n, int64_t n_head_kv, int64_t d,
