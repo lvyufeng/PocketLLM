@@ -1,10 +1,12 @@
-"""Which adapter ``pocketllm serve`` builds, checkable on any host.
+"""Which runtime ``pocketllm serve`` and ``pocketllm run`` pick, checkable on any host.
 
 ``serve`` used to build :class:`~pocketllm.server.native_backend.NativeBackend`
 unconditionally, so the S600 delegate adapter existed but no command could reach
-it.  The selection that fixes that is pure host logic -- a device kind maps to an
-adapter module -- and this checks it without a board, a ``.hbm`` or ``libxlm.so``:
-the property under test is *which* adapter is named, never that it loads.
+it.  The selection that fixes that is pure host logic -- a device kind maps to a
+runtime -- and this checks it without a board, a ``.hbm`` or ``libxlm.so``:
+the property under test is *which* runtime is named, never that it loads.  The
+same seam now serves ``run`` (see tests/native/test_run_horizon_dispatch.py),
+which is why the mapping is checked here once rather than per command.
 
 The two failure modes worth guarding are both silent if wrong.  A kind with no
 adapter that fell through to the C engine would serve a checkpoint on the wrong
@@ -21,10 +23,16 @@ import importlib
 import pytest
 
 from pocketllm.api import ConfigurationError, EngineArgs
-from pocketllm.cli import _cmd_serve, _require_delegate_env, _serve_adapter, build_parser
+from pocketllm.cli import (
+    _cmd_serve,
+    _require_delegate_env,
+    _run_runtime,
+    _serve_runtime,
+    build_parser,
+)
 
-_NATIVE = "pocketllm.server.native_backend"
-_DELEGATE = "pocketllm.server.xlm_backend"
+_NATIVE = "native"
+_DELEGATE = "delegate"
 
 
 def _args(device: str) -> EngineArgs:
@@ -42,7 +50,7 @@ def test_the_c_engines_kinds_select_the_native_adapter(device: str) -> None:
     resolves it to ``cpu`` for the same reason: it is the choice that cannot fail
     on a host where CUDA was never built in.
     """
-    assert _serve_adapter(_args(device)) == _NATIVE
+    assert _serve_runtime(_args(device)) == _NATIVE
 
 
 def test_the_delegate_is_selected_by_the_horizon_kind() -> None:
@@ -53,7 +61,7 @@ def test_the_delegate_is_selected_by_the_horizon_kind() -> None:
     from ``pocketllm devices`` and reuses, rather than a second vocabulary for the
     same silicon.
     """
-    assert _serve_adapter(_args("horizon")) == _DELEGATE
+    assert _serve_runtime(_args("horizon")) == _DELEGATE
 
 
 @pytest.mark.parametrize("device", ["qnn", "mps", "ascend"])
@@ -65,7 +73,7 @@ def test_a_kind_with_no_adapter_is_refused_by_name(device: str) -> None:
     ``--device qnn`` and run the model on the CPU, which the client cannot tell.
     """
     with pytest.raises(ConfigurationError) as raised:
-        _serve_adapter(_args(device))
+        _serve_runtime(_args(device))
     message = str(raised.value)
     assert device in message
     assert "horizon" in message  # the remedy names the adapters that do exist
@@ -73,13 +81,17 @@ def test_a_kind_with_no_adapter_is_refused_by_name(device: str) -> None:
 
 
 def test_the_selected_modules_export_the_adapter_they_are_named_for() -> None:
-    """The table's value is a real module with the class ``_cmd_serve`` builds.
+    """Each runtime has a real module exporting what ``serve`` builds for it.
 
-    A free check that keeps the two halves of the mapping honest: renaming the
-    adapter module without updating the table would otherwise only surface on a
-    board, at the point a session is about to load a 1 GiB ``.hbm``.
+    A free check that keeps the two halves honest: ``serve`` maps the runtime name
+    to a module at its call site, so renaming that module without updating the
+    branch would otherwise only surface on a board, at the point a session is
+    about to load a 1 GiB ``.hbm``.
     """
-    for module_name, attribute in ((_NATIVE, "NativeBackend"), (_DELEGATE, "XlmBackend")):
+    for module_name, attribute in (
+        ("pocketllm.server.native_backend", "NativeBackend"),
+        ("pocketllm.server.xlm_backend", "XlmBackend"),
+    ):
         module = importlib.import_module(module_name)
         assert hasattr(module, attribute)
 
@@ -142,9 +154,31 @@ def test_the_device_flag_flows_from_the_parser_to_the_selection() -> None:
     namespace = build_parser().parse_args(
         ["serve", "--model", "checkpoint", "--device", "horizon"]
     )
-    assert _serve_adapter(EngineArgs(model=namespace.model, device=namespace.device)) == _DELEGATE
+    assert _serve_runtime(EngineArgs(model=namespace.model, device=namespace.device)) == _DELEGATE
 
 
 def test_the_serve_command_is_still_wired() -> None:
     """``serve`` stays a dispatched command; the selection did not replace it."""
     assert _cmd_serve is not None
+
+
+# -- the same seam, one command over ----------------------------------------
+
+
+def test_run_shares_the_selection_seam_with_serve() -> None:
+    """``run`` and ``serve`` agree for every kind the table knows.
+
+    ``run`` had the gap ``serve`` did, one command over: it imported ``.native``
+    and drove the C engine unconditionally.  The two now call the *same* helper,
+    and this is the assertion that keeps it that way -- a kind that means the
+    delegate for one command and the C engine for the other is the exact
+    divergence the shared table exists to prevent.
+    """
+    for device in ("auto", "cpu", "cuda", "horizon"):
+        args = _args(device)
+        assert _run_runtime(args) == _serve_runtime(args)
+
+
+def test_run_picks_the_delegate_for_horizon() -> None:
+    """``run --device horizon`` is the S600 delegate, the property the fix is for."""
+    assert _run_runtime(_args("horizon")) == _DELEGATE
