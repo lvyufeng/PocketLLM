@@ -5,6 +5,7 @@ Task-oriented documentation: how to develop in this tree, how to check a change,
 | Guide | What it covers |
 |---|---|
 | [Cutting a release](pypi_release.md) | The single source of truth for publishing `pocketllm` to PyPI, including the Test PyPI dry run |
+| [The board fleet](fleet_workflow.md) | The three resident board sessions, the one rule that keeps them from forking the tree, and how a change travels home as a git bundle |
 | [Getting started](../getting-started.md) | Install, the four read-only commands, and running the test suite |
 | [The kernel ABI](../architecture/kernel_abi_v1.md) | What a backend must implement before it can be selected |
 | [Adding a backend](../architecture/devices.md#adding-a-backend) | The entry-point group, and the two obligations the harness holds a backend to |
