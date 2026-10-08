@@ -37,6 +37,17 @@ matter for `gemm_quant`: a quantized kernel has no numpy *oracle* in the sense
 llama.cpp is one -- the reference decoder is the definition -- so what it can be
 checked against is the CPU kernel, which this file is what establishes is
 trustworthy.
+
+`ascend` joins them where it can.  It is a native backend reached through the
+same tool, so a case that runs on it is compared to the same reference -- and
+because it is fp16-hardware it is compared at :data:`AS_F16_RTOL`, a second bound
+with its own justification and not a widened :data:`BACKEND_RTOL`.  Where a case
+cannot run -- an op the backend has not implemented, or a shape its op refuses --
+it is named in :data:`DEVICE_EXCLUDED_CASES` with the reason rather than skipped
+in the body, so the set of what is *not* covered is as legible as the set of what
+is.  There is no cross-backend comparison for `ascend` yet: the CPU-versus-card
+check is meaningful because both contract in f32, and against an fp16 kernel it
+would be measuring the two widths against each other.
 """
 
 from __future__ import annotations
@@ -66,6 +77,37 @@ QUANTIZED_RTOL = 5e-2
 #: :data:`DENSE_RTOL` by an order: no third-party kernel choices are in between,
 #: only two association orders for the same sum.
 BACKEND_RTOL = 2e-4
+
+#: How far an `ascend` kernel may drift from the reference *for the operations
+#: the 310B executes in fp16*.  This is not slack and it is not a loosening of
+#: :data:`BACKEND_RTOL` -- it is a second, wider bound with a different
+#: justification, applied only to the four op families in
+#: :data:`ASCEND_F16_OPS` and only on `ascend`.
+#:
+#: The fact behind it: every custom op in the package this backend drives
+#: (`RmsNormNdCustom`, `SiluMulCustom`, `MatmulCubeCustom`,
+#: `AttentionStepCustom`, `MatmulW4a16Custom`) has an fp16 kernel -- there is no
+#: f32 variant -- so the backend narrows every f32 operand to fp16 on the way in
+#: and widens the fp16 result on the way out.  Every other backend here, the
+#: reference included, contracts in f32.  An fp16 relative epsilon is 2^-11
+#: (4.9e-4), and a K- or context-long reduction that rounds each partial to fp16
+#: accumulates several of those, so a ~1e-3 bound is the width of the format and
+#: not headroom over it.  Measured across these very cases on the board, the worst
+#: relative error per op is 6.0e-4 (silu_mul), 5.7e-4 (rms_norm, from the fp16
+#: gamma alone), 5.2e-4 (gemm) and 5.3e-4 (attention); a bound set at
+#: :data:`BACKEND_RTOL` (2e-4) would fail every one of them while the kernels are
+#: bit-honest, which is what makes this a width bound rather than a fudge.
+#:
+#: What it still catches is the thing the case is for: a mis-transposed GEMM,
+#: an attention head group read wrong, a norm that divided by the wrong `d` --
+#: all of which move a value by a large fraction of its range, orders past 1e-3.
+AS_F16_RTOL = 1.5e-3
+
+#: The op families the 310B executes in fp16, and so the ones :data:`AS_F16_RTOL`
+#: applies to.  Named as op families rather than case names because it is the
+#: *kernel* that has the width, not the individual case -- a new rms_norm case is
+#: fp16 on this backend for the same reason the existing one is.
+ASCEND_F16_OPS = frozenset({"rms_norm", "silu_mul", "gemm", "attention"})
 
 #: How far `softmax` may drift from the reference, as an *absolute* bound.
 #:
@@ -239,19 +281,154 @@ def _cuda_reason() -> str | None:
     return None
 
 
+def _ascend_reason() -> str | None:
+    """Why `ascend` is unusable here, or None if it works.
+
+    The same shape as :func:`_cuda_reason` -- a one-element request through the
+    tool -- but its answer is read differently, and the difference is worth
+    stating because the two obvious short cuts are both wrong here.
+
+    "Converts to `--device ascent`" is the same *question*: the tool resolves the
+    backend before it reads a tensor, so the answer comes back without a kernel
+    running.  But the *text* cannot be inverted the way the CUDA check inverts
+    "cuda", because this backend's unimplemented ops throw "ascend: <op> not
+    implemented yet" -- so seeing the word "ascend" proves only that the backend
+    was reached, which is the useful case and not the excluded one.
+
+    What separates a build that has this backend from one that does not is
+    `registry.cpp`'s refusal, "is not in this build".  What separates a host that
+    can *load* it from one that cannot is the dynamic loader's own message: the
+    backend links the CANN runtime, and a run without the toolkit's `set_env.sh`
+    sourced dies before `main` with "error while loading shared libraries".  And
+    a host whose CANN is present but has no NPU to bind fails inside the
+    backend's constructor, named by the call that failed (`aclInit`,
+    `aclrtSetDevice`, `aclrtCreateStream`).  All three are "no ascend here"; a
+    kernel-level error is not.
+    """
+    if not opcheck_path().is_file():
+        return "build/pocketllm-opcheck is not built"
+    probe = write_request("argmax", {"values": np.arange(3, dtype=np.float32)})
+    try:
+        run(probe, "ascend")
+    except AssertionError as exc:
+        message = str(exc)
+        if "error while loading shared libraries" in message:
+            return (
+                "the ascend backend needs the CANN runtime on LD_LIBRARY_PATH; "
+                "source <toolkit>/set_env.sh and the custom-op set_env.bash first"
+            )
+        if "is not in this build" in message:
+            return message.splitlines()[0]
+        for call in ("aclInit", "aclrtSetDevice", "aclrtCreateStream", "aclrtGetSocName"):
+            if call in message:
+                return f"ascend is built but this host cannot bind a device ({call} failed)"
+        return None
+    return None
+
+
 BACKENDS = ["cpu"]
 _cuda_reason = _cuda_reason()
 if _cuda_reason is None:
     BACKENDS.append("cuda")
+_ascend_reason = _ascend_reason()
+if _ascend_reason is None:
+    BACKENDS.append("ascend")
+
+
+DEVICE_REASONS = {"cuda": _cuda_reason, "ascend": _ascend_reason}
 
 
 def _device_param(name: str) -> pytest.ParameterSet:
     if name in BACKENDS:
         return pytest.param(name, id=name)
-    return pytest.param(name, marks=pytest.mark.skipif(True, reason=_cuda_reason or ""), id=name)
+    return pytest.param(
+        name, marks=pytest.mark.skipif(True, reason=DEVICE_REASONS[name] or ""), id=name
+    )
 
 
-DEVICES = [_device_param(name) for name in ("cpu", "cuda")]
+DEVICES = [_device_param(name) for name in ("cpu", "cuda", "ascend")]
+
+#: Cases a device cannot drive, keyed by the case's op, each with the reason.
+#:
+#: Not a loosened tolerance and not a deleted case: these are ops the 310B
+#: backend does not implement, so a request that reaches one is refused *by
+#: name* rather than answered with a wrong number, and there is no expected value
+#: to compare against.  Recording them here rather than skipping inline keeps the
+#: divergence in one place a reader can audit, and keeps the cases alive on `cpu`
+#: and `cuda` where they are the point.
+#:
+#: Two kinds of reason live here and they are worth telling apart:
+#:
+#:   * The op is absent from the backend ("not implemented yet").  These are the
+#:     ops the backend's file header says it still throws for -- the gather and
+#:     the sampler families, `rope_neox`, and the shape limits on the packed and
+#:     dense GEMMs.  Removing an entry here is how a newly implemented op gets
+#:     its conformance coverage, so the list is a to-do and not a "these do not
+#:     matter".
+#:   * The op exists but its interface is narrower than the harness's case, and
+#:     refuses the case by name: `attention` on this backend is a one-token
+#:     decode step (`q_len == 1`, `first_key == 0`), which is the shape the
+#:     graph's decode uses, so the chunked and sliding-window cases cannot run.
+DEVICE_EXCLUDED_CASES: dict[str, dict[str, str]] = {
+    "ascend": {
+        # --- ops the backend still throws by name for ---
+        "rope_start_zero": "ascend: rope_neox not implemented yet",
+        "rope_start_pos_offsets": "ascend: rope_neox not implemented yet",
+        "rope_small_head_dim": "ascend: rope_neox not implemented yet",
+        "embedding": "ascend: embedding not implemented yet",
+        "embedding_quant_q4_k": "ascend: embedding_quant not implemented yet",
+        "embedding_quant_q6_k": "ascend: embedding_quant not implemented yet",
+        "argmax": "ascend: argmax not implemented yet",
+        "argmax_ties": "ascend: argmax not implemented yet",
+        "softmax": "ascend: softmax not implemented yet",
+        "softmax_wide_row": "ascend: softmax not implemented yet",
+        "logits_temperature": "ascend: logits_temperature not implemented yet",
+        "topk_sample": "ascend: topk_sample not implemented yet",
+        "topk_sample_uniform_on_a_boundary": "ascend: topk_sample not implemented yet",
+        "topk_sample_min_p": "ascend: topk_sample not implemented yet",
+        "topk_sample_top_p": "ascend: topk_sample not implemented yet",
+        "topk_sample_all_tied": "ascend: topk_sample not implemented yet",
+        # --- ops that exist but take a narrower shape ---
+        #
+        # `gemm_quant` here is q4_k only, M=1 only, and needs n and k multiples
+        # of 128 for the W4A16 packing; these two cases are f32 (M=3/4) and
+        # q6_k, so the op refuses them by name rather than running them wrong.
+        "gemm_quant_q4_k": "ascend: gemm_quant is M=1 and n,k % 128 == 0 only",
+        "gemm_quant_q6_k": "ascend: gemm_quant decodes q4_k only",
+        "gemm_bias": "ascend: gemm bias not implemented yet (MatmulCubeCustom has no bias input)",
+        # `AttentionStepCustom` is a one-token decode step; `q_len > 1` throws
+        # "not implemented for prefill" and `first_key != 0` a sliding window the
+        # op does not implement.
+        "attention_chunk": "ascend: attention is decode-only (q_len == 1)",
+        "attention_grouped": "ascend: attention is decode-only (q_len == 1)",
+        "attention_first_key": "ascend: attention has no sliding window (first_key != 0)",
+        # --- cases that do not apply to an fp16/32B-lane kernel ---
+        #
+        # `rms_norm_single_row` is `d = 1`, which is below the 16-lane vector
+        # repeat the AscendC kernel works in: `RmsNormNdCustom` writes nothing for
+        # `d < 16` (measured -- `d = 1, 8, 15` come back zeroed, `d = 16` onwards
+        # is right), and this backend refuses that width by name rather than
+        # returning the zeros.  The case pins a division-by-`d` bug the reference
+        # and the CPU/CUDA kernels can have; on a kernel that cannot run the
+        # shape, there is nothing to compare.
+        "rms_norm_single_row": "ascend: rms_norm needs d a multiple of 16 (RmsNormNdCustom's "
+        "vector repeat)",
+        # `silu_mul_large_negative` is a gate of -50, whose correct output is
+        # -9.6e-21 -- about 1e13 below the smallest positive fp16 subnormal
+        # (6e-8).  An fp16 kernel has no way to represent it and returns signed
+        # zero, so the two answers differ by 100% of a quantity that is zero in
+        # the format doing the computing.  Not a divergence to widen a bound for:
+        # the case is about f32 overflow in `exp(50)`, and the 310B kernel never
+        # evaluates it in f32 to begin with.
+        "silu_mul_large_negative": "ascend: result 9.6e-21 is below fp16's smallest subnormal "
+        "(6e-8), so an fp16 kernel returns signed zero",
+    }
+}
+
+
+def _device_case_skip_reason(device: str, case: str) -> str | None:
+    """The recorded reason this (device, case) is not run, or None."""
+    return DEVICE_EXCLUDED_CASES.get(device, {}).get(case)
 
 
 # --------------------------------------------------------------------------
@@ -816,7 +993,20 @@ QUANTIZED_CASES = frozenset(
 )
 
 
-def _compare(case: str, result: dict, want: np.ndarray) -> None:
+def _bound(device: str, case: str) -> float:
+    """The relative bound this (device, case) is compared at.
+
+    One place, so the reason a bound differs is next to the bound.  `ascend` gets
+    :data:`AS_F16_RTOL` for the ops it executes in fp16 and :data:`BACKEND_RTOL`
+    for everything else it runs -- but every other op it runs is excluded, so in
+    practice the wider bound is what its dense cases use.
+    """
+    if device == "ascend" and OP_OF_CASE[case] in ASCEND_F16_OPS:
+        return AS_F16_RTOL
+    return QUANTIZED_RTOL if case in QUANTIZED_CASES else BACKEND_RTOL
+
+
+def _compare(case: str, result: dict, want: np.ndarray, device: str = "cpu") -> None:
     """The request's answer against the reference's, at the case's tolerance."""
     if case in INDEX_CASES:
         got = int(result["ints"]["out"])
@@ -834,8 +1024,8 @@ def _compare(case: str, result: dict, want: np.ndarray) -> None:
         # changes a weight by a large fraction of its range.
         error = float(np.max(np.abs(got - want.astype(np.float64))))
         scale = float(np.max(np.abs(want))) or 1.0
-        assert error <= QUANTIZED_RTOL * scale, (
-            f"{case}: max |c - reference| = {error} over a scale of {scale}"
+        assert error <= _bound(device, case) * scale, (
+            f"{case} on {device}: max |c - reference| = {error} over a scale of {scale}"
         )
         return
     if case == "softmax" or case == "softmax_wide_row":
@@ -844,8 +1034,8 @@ def _compare(case: str, result: dict, want: np.ndarray) -> None:
         return
     spread = float(np.max(np.abs(want))) or 1.0
     worst = float(np.max(np.abs(got - want.astype(np.float64))))
-    assert worst <= BACKEND_RTOL * spread, (
-        f"{case}: max |c - reference| = {worst} over a scale of {spread}"
+    assert worst <= _bound(device, case) * spread, (
+        f"{case} on {device}: max |c - reference| = {worst} over a scale of {spread}"
     )
 
 
@@ -853,10 +1043,13 @@ def _compare(case: str, result: dict, want: np.ndarray) -> None:
 @pytest.mark.parametrize("case", list(CASES))
 def test_the_kernel_matches_the_reference(device: str, case: str) -> None:
     """One op, one shape, against `backends/reference`."""
+    reason = _device_case_skip_reason(device, case)
+    if reason is not None:
+        pytest.skip(reason)
     rng = np.random.default_rng(SEED)
     tensors, params, expected = CASES[case](rng)
     request = write_request(OP_OF_CASE[case], tensors, params)
-    _compare(case, run(request, device), expected)
+    _compare(case, run(request, device), expected, device)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -877,6 +1070,9 @@ def test_the_kernel_writes_every_element(device: str, case: str) -> None:
     it rather than the tool refusing.  A real collision would report as a
     nonzero count on a passing kernel, and would be obvious from the value.
     """
+    reason = _device_case_skip_reason(device, case)
+    if reason is not None:
+        pytest.skip(reason)
     rng = np.random.default_rng(SEED)
     tensors, params, _ = CASES[case](rng)
     request = write_request(OP_OF_CASE[case], tensors, params, poison=True)
@@ -975,6 +1171,11 @@ def test_an_out_of_range_token_id_zeroes_the_row(device: str) -> None:
     to define the error handling around it -- and this test is where that
     distinction is written down rather than assumed.
     """
+    # `ascend` has no `embedding` yet, so it is named in the exclusion set and
+    # skipped rather than driven.  The divergence this pins is in `kernels.cpp`,
+    # which this backend will share the moment its gather lands.
+    if _device_case_skip_reason(device, "embedding") is not None:
+        pytest.skip(_device_case_skip_reason(device, "embedding"))
     table = np.arange(12, dtype=np.float32).reshape(4, 3)
     tokens = np.array([-1, 1, 99], dtype=np.int32)
     request = write_request("embedding", {"tokens": tokens, "table": table})
@@ -1037,6 +1238,13 @@ def test_a_flat_tail_samples_where_an_exact_reference_would(device: str) -> None
     rounding error, and the next person to read `softmax_row`'s comment about
     two accumulators deserves to find out why.
     """
+    # This drives `topk_sample`, which `ascend` does not implement yet, so it is
+    # recorded in the exclusion set rather than run into a refusal.  The op it
+    # pins is `kernels.cpp`'s, which this backend will share when its sampler
+    # lands -- at which point the entry comes out and this runs on it too.
+    reason = _device_case_skip_reason(device, "topk_sample")
+    if reason is not None:
+        pytest.skip(reason)
     rng = np.random.default_rng(SEED)
     logits = rng.standard_normal(151936, dtype=np.float32)
     uniform = np.array([0.999], dtype=np.float32)
