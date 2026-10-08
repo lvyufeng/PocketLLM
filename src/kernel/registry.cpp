@@ -21,10 +21,14 @@
 namespace pocketllm {
 namespace kernel {
 
-/* Defined in `cpu/backend.cpp`, and in `cuda/backend.cpp` when it is built. */
+/* Defined in `cpu/backend.cpp`, and in `cuda/backend.cpp` / `ascend/backend.cpp`
+ * when the corresponding backend is built. */
 std::unique_ptr<Backend> make_cpu_backend();
 #ifdef POCKETLLM_WITH_CUDA
 std::unique_ptr<Backend> make_cuda_backend();
+#endif
+#ifdef POCKETLLM_WITH_ASCEND
+std::unique_ptr<Backend> make_ascend_backend();
 #endif
 
 namespace {
@@ -35,6 +39,11 @@ bool known(const std::string &name) {
   }
 #ifdef POCKETLLM_WITH_CUDA
   if (name == "cuda") {
+    return true;
+  }
+#endif
+#ifdef POCKETLLM_WITH_ASCEND
+  if (name == "ascend") {
     return true;
   }
 #endif
@@ -57,6 +66,9 @@ void require_backend(const std::string &name) {
 #ifdef POCKETLLM_WITH_CUDA
   message += " and 'cuda'";
 #endif
+#ifdef POCKETLLM_WITH_ASCEND
+  message += " and 'ascend'";
+#endif
   throw Error(message);
 }
 
@@ -69,6 +81,12 @@ std::unique_ptr<Backend> make_backend(const std::string &name) {
   if (name == "cpu") {
     return make_cpu_backend();
   }
+#ifdef POCKETLLM_WITH_ASCEND
+  if (name == "ascend") {
+    /* Reached only for "ascend": `require_backend` threw for every other name. */
+    return make_ascend_backend();
+  }
+#endif
 #ifdef POCKETLLM_WITH_CUDA
   /* Reached only for "cuda": `require_backend` threw for every other name. */
   return make_cuda_backend();
