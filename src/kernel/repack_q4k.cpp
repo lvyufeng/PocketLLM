@@ -1487,5 +1487,15 @@ void gemm_q4k_8x8(int n, float *s, size_t bs, const Q4Kx8 *panels, const Q8Kx4 *
 void gemm_q4k_8x8(int, float *, size_t, const Q4Kx8 *, const Q8Kx4 *, int, int) {}
 #endif
 
+#if !defined(__AVX2__)
+/* The decode half of the panel layout, empty for the same reason `gemm_q4k_8x8`
+ * is: there is no scalar port of it, and `repack_available()` is false here, so
+ * the caller takes the row kernel instead.  It still has to *exist*, because
+ * `qwen3.cpp` calls it unconditionally and the symbol is resolved at link time
+ * whether or not the path is taken -- without this, every non-AVX2 build of
+ * `libpocketllm.so` fails to link. */
+void gemv_q4k_8x8(int, float *, size_t, const Q4Kx8 *, const quant::Q8KBlock *, int, int) {}
+#endif
+
 }  // namespace kernel
 }  // namespace pocketllm
