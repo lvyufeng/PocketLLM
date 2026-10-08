@@ -94,6 +94,13 @@ _ALLOWED: dict[str, set[str] | None] = {
     # the server) calls *it* rather than `ctypes`, so there is exactly one place
     # that knows a shared library exists.
     "pocketllm.native": {"pocketllm.native"},
+    # The ctypes bridge to the S600 `libxlm.so` delegate.  The second seam, and
+    # like the first it imports nothing from `pocketllm`: it is the only place
+    # that knows the delegate exists, and a serving adapter above it calls it
+    # rather than `ctypes` directly.  Stdlib only -- `ctypes`, `glob`, `os` --
+    # so a host without the S600 SDK imports it and gets an `XlmUnavailable`
+    # from `load()` rather than an import error.
+    "pocketllm.xlm": {"pocketllm.xlm"},
 }
 
 #: Runtimes that a base install does not have, so only a backend may import one.
