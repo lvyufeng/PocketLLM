@@ -23,7 +23,7 @@ import pathlib
 import pytest
 
 from pocketllm.api import EngineArgs
-from pocketllm.cli import _run_delegate, _run_runtime, build_parser
+from pocketllm.cli import _cmd_run, _run_runtime, build_parser
 
 _DELEGATE = "delegate"
 
@@ -83,12 +83,12 @@ def test_a_greedy_flag_is_not_refused(overrides: dict) -> None:
     asserted separately.  The point here is that the flag check itself is silent.
     """
     namespace = _run_delegate_args(**overrides)
-    args = EngineArgs(model=namespace.model, device=namespace.device)
-    # The flag policy lives inside `_run_delegate`; calling it on a host without
-    # the delegate must not raise for a *flag* reason.  A flag refusal is a
-    # `SystemExit` naming the flag, so we assert the absence of that specifically.
+    # The whole command, not `_run_delegate` alone: a refusal is converted to
+    # `SystemExit` at the `_cmd_run` boundary, so the boundary is where the
+    # message can be read.  Calling the branch directly would see the raw
+    # `ConfigurationError` that `_cmd_run` is responsible for converting.
     with pytest.raises(SystemExit) as raised:
-        _run_delegate(namespace, args)
+        _cmd_run(namespace)
     message = str(raised.value)
     for field in ("temperature", "top_p", "top_k"):
         assert f"--{field.replace('_', '-')}" not in message, (
@@ -114,9 +114,8 @@ def test_a_non_greedy_flag_is_refused_naming_the_flag(overrides: dict) -> None:
     ``--temperature 0.7`` and got the file's behaviour cannot tell from the text.
     """
     namespace = _run_delegate_args(**overrides)
-    args = EngineArgs(model=namespace.model, device=namespace.device)
     with pytest.raises(SystemExit) as raised:
-        _run_delegate(namespace, args)
+        _cmd_run(namespace)
     message = str(raised.value)
     flag = f"--{next(iter(overrides)).replace('_', '-')}"
     assert flag in message
@@ -132,9 +131,9 @@ def test_a_pathless_model_is_refused_before_the_delegate_opens() -> None:
     one -- at the same point: before a 1 GiB ``.hbm`` is mapped.
     """
     namespace = _run_delegate_args()
-    args = EngineArgs(model=str(pathlib.Path("/tmp/definitely-absent.hbm")), device="horizon")
+    namespace.model = str(pathlib.Path("/tmp/definitely-absent.hbm"))
     with pytest.raises(SystemExit) as raised:
-        _run_delegate(namespace, args)
+        _cmd_run(namespace)
     assert "cannot start" in str(raised.value)
 
 
