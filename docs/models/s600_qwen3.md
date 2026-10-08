@@ -169,31 +169,77 @@ file the caller edits, which is why `--seed` is refused rather than honoured —
 
 The project's accuracy target is agreement with the 2080ti C-engine oracle. This path is **text-in /
 text-out and takes no token-id input**, so the comparison is made by feeding the oracle the exact ids
-the delegate's chat template produced and diffing the greedy continuations. The method and the raw
-ids are in `~/scratch/ref/parity/s600_parity.json` on the board (prompt ids, per-size text and ids,
-and the tokenizer directory).
+the delegate's chat template produced and diffing the greedy continuations.
 
-The 1.7B case is the clean one — the board's `.hbm` is **w4** and the oracle was driven on
-`Qwen3-1.7B-Q4_K_M`, the same 4-bit width, on `cpu`, greedy:
+**A single prompt flattered this path; a batch does not.** The first measurement used one prompt
+("The capital of France is") and read as "identical for 14 tokens, then a near-tie". Widening it to
+ten diverse prompts × both sizes tells a more honest story — **0/10 fully identical at either size**,
+and the agreement is a **prefix**, not the whole answer:
 
-| Index range | Result |
-|---|---|
-| 0–13 | **identical** — including the whole answer, `… The capital of France is Paris.` |
-| 14 | first divergence |
+| Size | Fully identical | Shared exact prefix (tokens) | Median |
+|---|---|---|---|
+| 0.6B (w8 vs oracle `q4_k_m`) | **0 / 10** | 8 … 59 | ~26 |
+| 1.7B (w4 vs oracle `Qwen3-1.7B-Q4_K_M`) | **0 / 10** | 4 … 52 | ~12 |
 
-At index 14 the oracle chose `358` (`It`) at logit 38.69 and the S600 chose `6771` (`France`) at
-37.65 — the top **two** candidates, **1.04 apart**, with third place at 29.81. So this is a
-quantization coin-flip between two coherent phrasings of the same fact, not a kernel error: both
-continuations open the same reasoning block and the same answer, and differ only in the phrasing that
-follows. The 0.6B behaves the same way (**identical for all 122 shared tokens** in the earlier
-measurement; on a longer run it splits at index 16 on one function word, `France is` vs `France, the`).
-The 0.6B comparison is the weaker of the two: the board's `.hbm` is **w8** while the only 0.6B GGUF on
-the oracle is `q4_k_m`, so that pair differs in quantization *width* as well as engine.
+The batch (10 prompts, their prompt ids, greedy continuation ids and text, both sizes, plus the
+tokenizer and the greedy `generation_config.json`) is `~/scratch/ref/s600_parity_batch.tgz` on the
+board; the single-prompt artifacts are `~/scratch/ref/parity/s600_parity.json`.
 
-The honest statement is therefore: **on the answer the two agree, and where they diverge it is at a
-logit near-tie between two top candidates, which is what a 4-bit weight difference produces.** This
-path cannot be compared to 1e-3 at the logit level — the delegate exposes no logits — so the token
-agreement above is the whole of the evidence, and the page says so rather than implying more.
+**Most divergences are near-ties — but not all.** Row 01 (1.7B) splits on a **1.33**-logit gap, the
+"two coherent phrasings of the same fact" case the single prompt showed. **Row 05 (1.7B) does not**:
+the two engines diverge at the same 12-token context with the oracle scoring its own choice
+**57.33** against the S600's choice **43.26** — a **14.06** gap. A gap that large is not 4-bit
+rounding noise against the *same* weights; the S600's `.hbm` is therefore **not the oracle's
+`q4_k_m` numerically**, whatever the bucket's `w4` label says.
+
+### What quantization the `.hbm` actually is
+
+The `w4`/`w8` in the filename is the **`leap_llm` weight-bit count**, and the scheme is in the
+toolchain we hold (the `oellm_build` wheels shipped in the SDK — see
+[the native compile chain](../architecture/s600_native_chain.md)):
+
+- **1.7B = `w4` → symmetric, per-output-channel, weight-only affine int4.** `FakeQuantLinear`'s
+  4-bit path (`leap_llm/nn/modules/linear.py:66-78`) is `q_weight = clip(round(w / scales), -7, 7)`
+  with **one fp scale per output channel**, `zeros = 0` — i.e. GPTQ-**style** per-channel
+  symmetric int4, but with *no* GPTQ error compensation and *no* AWQ search (neither appears in the
+  shipped `llm_compression` tree).
+- **0.6B = `w8` → symmetric per-channel int8** via the `const_fake_quant(..., axis=0)` path.
+
+**This is a different scheme from `q4_k_m`, on both axes that matter.** `q4_k_m` is asymmetric
+6-bit sub-scales over 256-weight *super-blocks* (a mixed `q4_K`/`q6_K` file, so `attn_v`/`ffn_down`
+are 6-bit); the `.hbm` is one scale per output *row*, uniformly 4-bit (or 8-bit). There is no
+`q4_k`/`q6_k`/super-block code path anywhere in `leap_llm` or `hbdk4` — the scheme is not reachable
+from `leap_llm` at all. So the board `.hbm` and the oracle's GGUF are **two different quantizers**
+that happen to both be "4-bit", and a 14-logit disagreement is the expected consequence, not a bug
+in either engine.
+
+**The honest statement is therefore:** the output is **coherent and on-topic** (all ten prompts
+produced correct, well-formed answers — see the table below), but it is **token-identical to the
+oracle only for a prefix** (median ~12 tokens at 1.7B, ~26 at 0.6B), and at least one divergence
+(Row 05) is a large-margin disagreement that reflects the two sides being **different
+quantizations**, not a near-tie. This path cannot be compared to 1e-3 at the logit level — the
+delegate exposes no logits — so the token agreement above is the whole of the evidence, and the page
+says so rather than implying more.
+
+### The per-prompt batch (S600 side)
+
+| Prompt | 0.6B ids | 1.7B ids | Note |
+|---|---|---|---|
+| factual short-answer (largest planet) | 126 | 125 | both correct |
+| multi-step arithmetic (train distance) | 919 | 651 | both correct |
+| code snippet (iterative factorial) | 782 | 1330 | both correct |
+| list three primes > 20 | 429 | 509 | both correct |
+| two-part (boiling + freezing point) | 325 | 229 | **1.7B = Row 05, the 14.06 divergence** |
+| translate EN→FR | 225 | 271 | both correct |
+| summarize a paragraph | 232 | 442 | both correct |
+| yes/no with reasoning (is 0 even) | 251 | 401 | both correct |
+| long division (100th digit of 1/7) | 789 | **4055** | 1.7B loops in ` thinking`, never closes it |
+| long prefill (~225-token passage) | 120 | 122 | both correct |
+
+Every answer is correct to a human read, including the intended-to-be-hard 1/7 prompt (the 0.6B
+computes `100 mod 6 = 4` → the 4th digit of `142857` = **8**, right). The one quality defect is
+1.7B's repetition loop on that prompt — a model artifact, kept in the record rather than dropped,
+and a strong oracle test precisely because a degenerate loop is hard to reproduce by accident.
 
 ## Sampling and caps the CLI enforces
 
