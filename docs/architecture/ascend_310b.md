@@ -117,14 +117,64 @@ weight tile stays fp16-sized — `Axpy` with an fp32 destination and an fp16 sou
 dav_m310 mixed-width path, which converts and multiplies in fp32. Converting the weight buffer
 itself to fp32 would need 224 KB at the widest tile.
 
-## The cube path
+## The cube path is the backend's default
 
-`MatmulCubeCustom` is the other candidate and is the numerically correct one on paper: it is
-`MatmulImpl<half,half,half>`, so the cube's L0C accumulator is fp32, and it costs 1.4× *less* than
-the fp16 vector loop — a different order of magnitude from either W4A16 variant. It takes
-dequantized fp16 weights (`a[M,K] · b[K,N] → out[M,N]`), so a backend would need a host-side or
-fused int4→fp16 dequantize first, which adds `K·N·2` bytes of GM per layer.
+`MatmulCubeCustom` is `MatmulImpl<half,half,half>`, so the cube's L0C accumulator is fp32, and it
+costs 1.4× *less* than the fp16 vector loop — a different order of magnitude from either W4A16
+variant. It takes dequantized fp16 weights (`a[M,K] · b[K,N] → out[M,N]`), so the backend decodes a
+packed checkpoint tensor to a persistent f32 buffer once per weight and drives the cube as
+`a[M,K] · b[K,N]` with `b` the transposed weight plane.
 
-It is the likely long-term answer, but it is **not yet independently verified**: the standalone
-cube probe currently fails phase 1 with the same `161001` as above, and until that runs there is no
-trustworthy cube number to compare against the table. The W4A16 row is the measured one.
+**The backend uses it, and it is the measured correct path** — `gemm` and `gemm_quant` both route
+here, and the whole Qwen3 forward runs on it. Measured against the CPU kernel at real model shapes
+(1×1024×1024, 1 or 16 × 1024×3072) it is **~2.7e-4 relative**, the same order as the fp32-accumulate
+W4A16 row above and for the same underlying reason (fp32 accumulate, fp16 operands). The table's
+fp16-*vector*-loop row is not what the backend runs; it is the sibling work's measurement of a
+different kernel.
+
+**The standalone cube probe still fails phase 1 with `161001`**, and that discrepancy is
+unexplained: the same op the backend drives successfully will not come up through the probe's
+`aclnnMm`-style path. Until someone reconciles it, treat "the probe fails" as a fact about the
+probe, not about the op — the backend's result is the one to trust, because it is the one a
+token-for-token forward pass exercises end to end.
+
+### The cube is not correct at every N
+
+`MatmulCubeCustom` returns a right-shaped tensor of *wrong* numbers above an N this backend had to
+find the hard way. The tied output projection is `gemm_quant` q6_K at **n = 151936**, and measured
+against the CPU kernel the op came back **131% off** there, while n = 32768 and below matched to
+5e-4. Bisected on the board, the unchunked op crosses from ~5e-4 to 100%+ between **n = 49152 and
+n = 65536** (q4_k and q6_k alike — the failure is in the shared cube drive above the decode, not in
+either format). It is a silent failure: right shape, plausible magnitude, wrong values.
+
+The backend therefore walks N in 8192-column blocks, each a shape the op answers correctly, and
+places the columns into the caller's row-major output by hand (`run_cube`, `kCubeChunkN`). The bound
+is an order of magnitude under the failing edge so a tiling change on another board is far more
+likely to land inside the safe range than outside it. This is pinned by
+`case_gemm_quant_large_n_{q4_k,q6_k}` at n = 65600, which is over the edge and ends on a partial
+final chunk — the only conformance cases whose N reaches the failing region.
+
+## End to end: a full Qwen3 forward runs
+
+The backend runs a complete Qwen3-0.6B forward — prefill and decode — and produces text **identical
+to the CPU backend**:
+
+```
+pocketllm-run <Qwen3-0.6B q4_k_m> --device ascend --prompt "The capital of France is" --steps 8
+  -> [12095 Paris 13. 576 The 6722 capital 315 of 9625 France 374 is 1083 also]   # == --device cpu
+```
+
+Every op on the greedy path is implemented: `rms_norm`, `gemm`, `gemm_quant` (q4_k and q6_k),
+`embedding`/`embedding_quant`, `silu_mul`, `rope_neox`, `attention` (decode and prefill), and the KV
+append. `softmax`, `argmax`, `topk_sample` and `logits_temperature` are host-side in `run.cpp`, not
+graph ops, so the sampler tail is not a backend gap.
+
+Wrong answers are still possible where the trilogy of numeric width, tuned kernel, and API surface
+disagree — this is the page that documented the W4A16 fp16-accumulate floor and the cube's
+large-N edge — but the *coverage* gap is closed: there is no op the graph calls that the backend
+refuses. The paths the whole forward still lacks are the ones the graph never calls: `gemm` bias,
+attention with a sliding window (`first_key != 0`), and `topk_sample`/`logits_temperature`.
+
+The cost is real. Decoding a packed checkpoint to f32 weights is ~2 GB resident on the NPU for a
+0.6B q4_k_m file (~0.4 GB packed), and the prefill of a five-token prompt takes minutes against the
+CPU's milliseconds. This is a correctness path, not a fast one.
