@@ -1880,6 +1880,10 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const void *k_cac
                const void *v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
                int64_t q_offset, float scale, float *out, float *scores, KVDtype kv_dtype) {
   const int64_t group = n_heads / n_head_kv;
+  if (group > kAttentionMaxGroup) {
+    throw Error("attention: GQA group " + std::to_string(group) + " exceeds kAttentionMaxGroup (" +
+                std::to_string(kAttentionMaxGroup) + "); raise it and rebuild");
+  }
   /* The score row for a query at position `q_offset + q_len - 1` is the widest
    * any row can be, and it is what spaces the rows within a per-task scratch
    * region apart.  `attention_scratch` and the callers that size the buffer use
@@ -2058,11 +2062,13 @@ void attention(const float *q, int64_t q_len, int64_t n_heads, const void *k_cac
             const int64_t khi = std::min<int64_t>(q_offset, klo + kFlashBlock - 1);
             for (int64_t s = klo; s <= khi; ++s) {
               const float *const kvec = widen2(row_buf, k_cache, s, u, 0);
-              float sc[kAttentionHeadBatch];
+              float sc[kAttentionMaxGroup];
               if (group == 2) {
                 dot_pair(qh, qh + d, kvec, d, sc);
               } else {
-                sc[0] = dot4(qh, kvec, d);
+                for (int64_t p = 0; p < group; ++p) {
+                  sc[p] = dot4(qh + p * d, kvec, d);
+                }
               }
               const float *const vvec = widen2(row_buf, v_cache, s, u, 1);
               for (int64_t p = 0; p < group; ++p) {
