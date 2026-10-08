@@ -640,9 +640,10 @@ class CudaBackend final : public Backend {
      * computes exactly one output column with the same single serial
      * accumulation chain, so the output is bit-identical and no token moves.
      *
-     * 32 is the value that measured best; the win comes from having enough
-     * blocks, and it is flat from 32 to 128 (16.5 vs 13.8 t/s at 64/128 on an
-     * earlier run) with a floor at 256. */
+     * 32 is the value that measured best. The win comes from having enough
+     * blocks, and it falls off as the block widens again -- an earlier run gave
+     * tg128 16.5 t/s at 64 and 13.8 at 128, against 24.2 at 32 -- so 256 is not
+     * the only bad value, just the worst one measured. */
     const unsigned threads = 32;
     const dim3 grid(static_cast<unsigned>((n + threads - 1) / threads), static_cast<unsigned>(m));
     gemm_quant_kernel<<<grid, threads>>>(f(x), reinterpret_cast<const uint8_t *>(blocks.handle),
