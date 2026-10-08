@@ -101,6 +101,17 @@ _ALLOWED: dict[str, set[str] | None] = {
     # so a host without the S600 SDK imports it and gets an `XlmUnavailable`
     # from `load()` rather than an import error.
     "pocketllm.xlm": {"pocketllm.xlm"},
+    # The serving adapter over the S600 delegate: the second `server/` module that drives a device,
+    # and it is alongside `native_backend` for the same reason -- `backends/` is the kernel ABI,
+    # this is the serving contract.  It reaches `xlm` for the delegate and the protocol layer for
+    # the field audit and the reasoning split, both of which are text-level and device-free.
+    "pocketllm.server.xlm_backend": {
+        "pocketllm.api",
+        "pocketllm.choices",
+        "pocketllm.protocol",
+        "pocketllm.server",
+        "pocketllm.xlm",
+    },
 }
 
 #: Runtimes that a base install does not have, so only a backend may import one.

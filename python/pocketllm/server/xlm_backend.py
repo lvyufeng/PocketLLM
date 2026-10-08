@@ -1,0 +1,617 @@
+"""The ``EngineBackend`` adapter over the S600 `libxlm.so` delegate.
+
+:class:`~pocketllm.server.native_backend.NativeBackend` drives this tree's own C
+engine, which is a *token* engine: the host tokenizes, forwards, reads logits,
+and draws.  This one drives Horizon's delegate, which is not that.  The delegate
+takes a **string**, decodes on the BPU, and hands text back through a callback;
+there is no logits surface and no token-id surface to build on.  So the adapter
+has the same *serving* contract and a quite different *engineering* one, and the
+differences are what this module is mostly about.
+
+**Three of them are worth naming up front, because each is a capability the
+adapter declines rather than a bug it works around.**
+
+*Sampling is the delegate's, and it is fixed at open.*  ``xlm_init`` takes the
+temperature and top-k in its parameter block, so they are set once per process;
+a per-request ``temperature`` cannot be honoured.  Refusing it is the honest
+answer -- a 200 whose text was generated greedily when the client asked for
+``temperature: 1.0`` is a response the client cannot tell from the one it wanted.
+:meth:`XlmBackend.audit_request` refuses exactly that, and accepts a client that
+spells out the delegate's own behaviour (an absent temperature, ``temperature:
+0``, ``top_p: 1``), which is the same "a value that names what this server does
+anyway is not punished" rule :func:`pocketllm.protocol.contract.audit` follows.
+
+*There are no token counts.*  ``TokenEvent.token_id`` is left ``None`` and
+:class:`~pocketllm.api.GenerationResult.token_ids` is left empty, because the
+delegate never reveals them.  The HTTP layer keys TTFT and the token counter off
+``token_id is not None``, so those metrics are simply absent on this path rather
+than filled with an invented count.  ``Usage`` is the same story and worth
+stating plainly: the delegate's performance block carries **throughput** — the
+``prefill_tps``/``decode_tps`` that travel in the result metadata — but this
+build of the SDK leaves ``prefill_token_num``/``decode_token_num`` at zero, so
+the token counts on this path are unavailable and are reported as zero rather
+than estimated from the wall time and the throughput.
+
+*One request at a time, and the lock is load-bearing.*  The delegate holds one
+conversation state and one KV cache, exactly as a C ``Session`` does, so two
+threads sharing it do not fail -- they interleave one prompt's tokens into
+another's answer and return a 200 with the wrong text.  The lock is the same
+serialization the native adapter applies, for the same reason.
+
+**The reasoning block is the model's, not this adapter's.**  A Qwen3 checkpoint
+with thinking enabled opens its answer with `` thinking``; the delegate returns
+that verbatim.  Splitting it is the protocol layer's job
+(``pocketllm.protocol.templating.split_reasoning``) and is applied here exactly as
+the native adapter applies it, so the two paths agree about where the answer
+starts.
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+import queue
+import threading
+import time
+from collections.abc import Iterator, Mapping, Sequence
+from typing import Any
+
+from pocketllm.api import (
+    BackendCapabilities,
+    BackendUnavailableError,
+    ConfigurationError,
+    EngineArgs,
+    GenerationRequest,
+    GenerationResult,
+    HealthStatus,
+    SamplingParams,
+    TimingMetrics,
+    TokenEvent,
+    Usage,
+)
+from pocketllm.choices import RequestState
+from pocketllm.protocol.contract import CHAT, FieldRefusal, ServedFields, audit
+from pocketllm.protocol.templating import split_reasoning
+from pocketllm.xlm import XlmEngine, XlmModelType, XlmUnavailable, is_available
+
+__all__ = ["XlmBackend"]
+
+#: The fields this runtime applies, as :func:`audit` reads them.
+#:
+#: ``stop`` is served by the *host*: the delegate returns text, and a stop
+#: sequence is matched against it, so the engine has no part in it.  ``min_p``
+#: is **not** served -- the delegate's own ``min_p`` is fixed at open like the
+#: rest of its sampling, so a per-request one is refused.  ``logprobs``,
+#: ``response_format``, the penalties, ``echo``, ``suffix``, ``best_of`` and
+#: ``parallel_tool_calls`` are absent for the same reason the native adapter
+#: leaves them out: the delegate exposes no way to apply them.
+_SERVES = ServedFields(
+    choices=True,  # honoured by the host fan-out, one delegate call per choice
+    stop=True,
+    min_p=False,
+)
+
+
+class XlmBackend:
+    """One delegate session behind the serving contract, serialized by a lock.
+
+    Construction opens the delegate, which loads the whole `.hbm` (1.1 GB for
+    Qwen3-0.6B) into BPU memory, so the cost of getting this wrong is a slow
+    failure on the first request rather than a fast one at startup -- which is
+    why the open happens here and a bad path raises with the delegate's own
+    message before the port is advertised as ready.
+    """
+
+    def __init__(self, args: EngineArgs, *, lib: Any = None) -> None:
+        self._args = args
+        self._model = _resolve_model(args)
+        self._state = RequestState()
+        self._lock = threading.Lock()
+        self._queue_lock = threading.Lock()
+        self._queued = 0
+        self._closed = False
+
+        if not is_available() and lib is None:
+            raise BackendUnavailableError(
+                "the S600 `libxlm.so` is not installed on this host, so there is nothing to "
+                "serve. Install the D-Robotics LLM SDK under ~/llm_sdk/, or point "
+                "POCKETLLM_XLM_LIB at an existing libxlm.so."
+            )
+        try:
+            self._engine = XlmEngine.open(
+                model_path=str(self._model.hbm),
+                tokenizer_dir=str(self._model.tokenizer_dir),
+                config_path=str(self._model.config),
+                model_type=self._model.model_type,
+                lib=lib,
+            )
+        except (XlmUnavailable, OSError) as exc:
+            raise BackendUnavailableError(
+                f"the delegate refused {self._model.hbm!r}: {exc}"
+            ) from exc
+
+        self._context_length = _context_length(self._model.config)
+
+    # -- lifecycle ----------------------------------------------------------
+
+    @property
+    def capabilities(self) -> BackendCapabilities:
+        """What this path actually has.  Four of these are ``False`` on purpose.
+
+        ``supports_streaming`` is true and is the delegate's own strength: it
+        hands text back chunk by chunk as it decodes, so a stream is native here
+        rather than reconstructed.  ``supports_batch`` is false because one
+        delegate holds one cache.  ``supports_logprobs`` and
+        ``supports_structured_outputs`` are false because there is no logits
+        surface to rank and no constrained-decoding path to hold a schema with.
+        ``supports_cancellation`` is false because ``xlm_infer`` runs to
+        completion and nothing in the SDK observes a flag mid-call.
+        """
+        return BackendCapabilities(
+            name="horizon",
+            models=(os.path.basename(str(self._model.hbm)),),
+            model_formats=("hbm",),
+            devices=("horizon",),
+            supports_batch=False,
+            supports_streaming=True,
+            supports_cancellation=False,
+            supports_logprobs=False,
+            supports_structured_outputs=False,
+            supports_prefix_caching=False,
+            details={
+                "context_length": self._context_length,
+                "model_type": self._model.model_type,
+                "sampling": "delegate (fixed at open; per-request sampling is refused)",
+            },
+        )
+
+    def prepare(self) -> None:
+        """Nothing left to do eagerly -- the delegate was opened in ``__init__``."""
+        return None
+
+    def health(self) -> HealthStatus:
+        if self._closed:
+            return HealthStatus(status="stopped", backend="horizon", ready=False)
+        return HealthStatus(
+            status="ready",
+            backend="horizon",
+            ready=True,
+            message=f"{os.path.basename(str(self._model.hbm))} on the BPU",
+            details={"context_length": self._context_length},
+        )
+
+    def metrics(self) -> Mapping[str, float]:
+        """Only the queue depth, which is the engine's own and no request's."""
+        with self._queue_lock:
+            return {"pocketllm_waiting_requests": float(self._queued)}
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._state.close()
+            self._engine.close()
+
+    def cancel(self, request_id: str) -> bool:
+        """Answer honestly: ``xlm_infer`` cannot be stopped once it has started."""
+        del request_id
+        return False
+
+    # -- the field audit ----------------------------------------------------
+
+    def audit_request(self, body: Mapping[str, Any], *, endpoint: str = CHAT) -> FieldRefusal | None:
+        """The first field this runtime will not apply, or ``None``.
+
+        Two checks, in this order.  The first is the shared one, which settles
+        every field in :class:`ServedFields` and the shapes of the rest.  The
+        second is this runtime's own and is **local to this module on purpose**:
+        the sampling fields are not in that table, because every other runtime in
+        this tree samples from logits the host owns and so has nothing to refuse.
+        The delegate is the first backend whose sampling is not the host's, and
+        widening the shared table for one runtime is a change that should be
+        reviewed as such rather than folded in here.
+
+        The rule the second check follows is the table's own: refuse a value that
+        would have changed the answer, accept one that names what this server
+        does anyway.  The delegate samples greedily, so an absent temperature,
+        ``temperature: 0``, ``top_p: 1``, an absent or non-positive ``top_k`` and
+        ``min_p: 0`` are all accepted; anything else is refused by name.
+        """
+        refusal = audit(body, endpoint=endpoint, serves=_SERVES)
+        if refusal is not None:
+            return refusal
+        return _refuse_unsupported_sampling(body, self._engine_sampling_note())
+
+    def _engine_sampling_note(self) -> str:
+        """How to say, in a refusal, what the delegate is doing instead."""
+        return (
+            "the S600 delegate samples greedily, and its sampling is fixed when the model is "
+            "loaded rather than per request, so this value cannot be applied."
+        )
+
+    # -- generation ---------------------------------------------------------
+
+    def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
+        """One delegate call per request, in order, each holding the lock for its life."""
+        return [self._run(request) for request in requests]
+
+    def stream(self, request: GenerationRequest) -> Iterator[TokenEvent]:
+        """Yield the delegate's own chunks as it decodes them.
+
+        **The delegate is synchronous and the callback is not.**  ``xlm_infer``
+        does not return until the answer is whole, so a generator that called it
+        directly could not yield anything until the last token -- which is a
+        collected answer wearing a stream's clothes.  The call runs on a worker
+        thread and the callback pushes each chunk into a queue this generator
+        drains, so a chunk reaches the client when the delegate produces it.
+
+        The lock is held across the whole generator, not per chunk: the delegate
+        carries one conversation state, and releasing it between chunks would let
+        a second request's prompt be appended to this one's turn.
+        """
+        self._state.begin(request.request_id)
+        self._enter_queue()
+        self._lock.acquire()
+        chunks: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+        def sink(piece: str, _status: int) -> None:
+            chunks.put(("chunk", piece))
+
+        def worker() -> None:
+            try:
+                tokens = self._prompt(request)
+                chunks.put(("done", self._engine.infer(tokens, on_chunk=sink)))
+            except Exception as exc:  # noqa: BLE001 - re-raised in the consumer
+                chunks.put(("error", exc))
+
+        try:
+            if self._state.is_cancelled(request.request_id):
+                raise ConfigurationError(f"request {request.request_id} was cancelled")
+            started = time.perf_counter()
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
+
+            emitted = ""
+            first_at: float | None = None
+            splitter = _ReasoningSplitter(_thinking_mode(request))
+            finish_reason = "length"
+            performance: Any = None
+
+            while True:
+                kind, payload = chunks.get()
+                if kind == "error":
+                    raise payload
+                if kind == "done":
+                    performance = self._engine.last_performance
+                    break
+                emitted += payload
+                reasoning, content = splitter.feed(emitted)
+                if first_at is None:
+                    first_at = time.perf_counter()
+                if reasoning or content:
+                    yield TokenEvent(
+                        request_id=request.request_id,
+                        text=content,
+                        metadata={"reasoning_content": reasoning} if reasoning else {},
+                    )
+                stop_at = _stop_match(emitted, request.sampling_params.stop)
+                if stop_at is not None:
+                    finish_reason = "stop"
+                    break
+
+            ended = time.perf_counter()
+            yield TokenEvent(
+                request_id=request.request_id,
+                finish_reason=finish_reason,
+                usage=_usage(performance),
+                metadata={
+                    "timings": TimingMetrics(
+                        prefill_seconds=(first_at or started) - started,
+                        decode_seconds=ended - (first_at or started),
+                        total_seconds=ended - started,
+                        ttft_seconds=(first_at or started) - started,
+                    ).as_dict(),
+                    **_performance_metadata(performance),
+                },
+            )
+        finally:
+            self._lock.release()
+            self._leave_queue()
+            self._state.clear(request.request_id)
+
+    def _run(self, request: GenerationRequest) -> GenerationResult:
+        """The whole generation, collected."""
+        self._state.begin(request.request_id)
+        self._enter_queue()
+        self._lock.acquire()
+        try:
+            if self._state.is_cancelled(request.request_id):
+                raise ConfigurationError(f"request {request.request_id} was cancelled")
+            prompt = self._prompt(request)
+            started = time.perf_counter()
+            text = self._engine.infer(prompt)
+            completed = time.perf_counter()
+            performance = self._engine.last_performance
+
+            finish_reason = "length"
+            trimmed = text
+            stop_at = _stop_match(text, request.sampling_params.stop)
+            if stop_at is not None:
+                trimmed = text[:stop_at]
+                finish_reason = "stop"
+
+            reasoning, content = split_reasoning(trimmed, _thinking_mode(request))
+            metadata: dict[str, Any] = _performance_metadata(performance)
+            if reasoning:
+                metadata["reasoning_content"] = reasoning
+            return GenerationResult(
+                request_id=request.request_id,
+                # The delegate reveals no token ids, so this is empty rather than
+                # a count dressed up as one.
+                token_ids=[],
+                text=content,
+                finish_reason=finish_reason,
+                usage=_usage(performance),
+                timings=TimingMetrics(
+                    prefill_seconds=completed - started,
+                    decode_seconds=completed - started,
+                    total_seconds=completed - started,
+                ),
+                metadata=metadata,
+            )
+        finally:
+            self._lock.release()
+            self._leave_queue()
+            self._state.clear(request.request_id)
+
+    # -- helpers ------------------------------------------------------------
+
+    def _prompt(self, request: GenerationRequest) -> str:
+        """The prompt text.  Token ids are refused, not silently dropped.
+
+        The delegate is text-in only -- ``XLM_INPUT_TOKEN`` is annotated "not
+        support yet" in its header -- so a caller that supplied ids is asking for
+        something this path cannot do.  Falling back to the ``prompt`` field when
+        one is also present would be a guess about which the caller meant;
+        there is no tokenizer here to turn ids back into text either.
+        """
+        if request.prompt_tokens:
+            raise ConfigurationError(
+                "the S600 delegate is text-in only and accepts no token ids, so 'prompt_tokens' "
+                "cannot be served. Send the prompt as text instead."
+            )
+        text = self._render(request)
+        if not text:
+            raise ConfigurationError("the prompt is empty")
+        return text
+
+    def _render(self, request: GenerationRequest) -> str:
+        """The prompt text, using the checkpoint's chat template when one is supplied.
+
+        The delegate applies its own template from the tokenizer directory, so a
+        chat request that carries ``messages`` is rendered by the *host* here only
+        in the fallback case the protocol layer already produces -- the
+        ``role: content`` lines.  The model's own template is preferred when the
+        request carries the messages a renderer can use.
+        """
+        renderer = self._renderer(request)
+        messages = request.metadata.get("messages")
+        if renderer is not None and messages:
+            return renderer(
+                messages,
+                request.metadata.get("tools"),
+                bool(request.metadata.get("add_generation_prompt", True)),
+                _thinking_mode(request) == "thinking",
+            )
+        return request.prompt or ""
+
+    def _renderer(self, request: GenerationRequest):
+        """A Jinja renderer for the checkpoint's template, or ``None``.
+
+        Built lazily from the GGUF... which this checkpoint does not have: an
+        S600 deliverable is a `.hbm`, not a `.gguf`, and the chat template lives
+        in the tokenizer directory the delegate reads.  There is no in-tree
+        reader for that directory's template format, so this returns ``None`` and
+        the protocol layer's plain rendering is used.  The delegate still frames
+        the conversation itself when the prompt is bare text, which is the case
+        this path is built for.
+        """
+        del request
+        return None
+
+    def _enter_queue(self) -> None:
+        with self._queue_lock:
+            self._queued += 1
+
+    def _leave_queue(self) -> None:
+        with self._queue_lock:
+            self._queued = max(0, self._queued - 1)
+
+
+# -- module helpers ----------------------------------------------------------
+
+
+class _ModelPaths:
+    """Where the delegate's three inputs are, resolved from :class:`EngineArgs`."""
+
+    __slots__ = ("hbm", "tokenizer_dir", "config", "model_type")
+
+    def __init__(self, hbm: pathlib.Path, tokenizer_dir: pathlib.Path,
+                 config: pathlib.Path, model_type: int) -> None:
+        self.hbm = hbm
+        self.tokenizer_dir = tokenizer_dir
+        self.config = config
+        self.model_type = model_type
+
+
+def _resolve_model(args: EngineArgs) -> _ModelPaths:
+    """The `.hbm`, tokenizer directory and config a session needs.
+
+    ``EngineArgs`` is the host's vocabulary and does not have a field for each of
+    these, so they are carried the way the vocabulary does have: ``model`` is the
+    `.hbm` — or a demo-style JSON config, which names the other two — and
+    ``tokenizer_path``/``config_path`` override what that config says.  A JSON
+    config is accepted as the model because that is the one path the SDK's own
+    demo takes, and a caller who has one should not have to open it by hand.
+    """
+    import json
+
+    model = pathlib.Path(args.model or "")
+    spec: dict[str, Any] = {}
+    if model.suffix == ".json":
+        if not model.is_file():
+            raise ConfigurationError(f"{str(model)!r} is not a readable config file")
+        spec = json.loads(model.read_text(encoding="utf-8"))
+        base = model.parent
+        hbm = (base / spec["hbm_path"]).resolve()
+        tokenizer = (base / spec.get("tokenizer_dir", "")).resolve()
+    else:
+        hbm = model
+        tokenizer = pathlib.Path(args.tokenizer_path or "")
+
+    if args.tokenizer_path:
+        tokenizer = pathlib.Path(args.tokenizer_path)
+    if args.config_path:
+        config = pathlib.Path(args.config_path)
+    elif model.suffix == ".json":
+        config = model
+    else:
+        raise ConfigurationError(
+            "the S600 delegate needs the JSON config the SDK's demo passes -- it carries the "
+            "BPU core list and context size the .hbm was compiled for. Pass --config-path, or "
+            "give --model a demo config JSON."
+        )
+
+    if not hbm.is_file():
+        raise ConfigurationError(f"no .hbm at {str(hbm)!r}")
+    if not tokenizer.is_dir():
+        raise ConfigurationError(f"no tokenizer directory at {str(tokenizer)!r}")
+    if not config.is_file():
+        raise ConfigurationError(f"no config file at {str(config)!r}")
+
+    model_type = int(spec.get("model_type", XlmModelType.QWEN3))
+    return _ModelPaths(hbm, tokenizer, config, model_type)
+
+
+def _context_length(config: pathlib.Path) -> int:
+    """The context the config asks for, or the delegate's own default of 0."""
+    import json
+
+    try:
+        spec = json.loads(pathlib.Path(config).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - a config we cannot read is one open() already accepted
+        return 0
+    for key in ("context_size", "max_context", "context_length", "cache_size"):
+        if isinstance(spec.get(key), int):
+            return int(spec[key])
+    return 0
+
+
+def _refuse_unsupported_sampling(body: Mapping[str, Any], note: str) -> FieldRefusal | None:
+    """Refuse a per-request sampling value the fixed delegate cannot apply.
+
+    See :meth:`XlmBackend.audit_request` for why this lives here rather than in
+    the shared :class:`ServedFields` table.
+    """
+    temperature = body.get("temperature")
+    if temperature is not None and _is_number(temperature) and float(temperature) > 1.0e-5:
+        return FieldRefusal.build(
+            "temperature", temperature,
+            note,
+            "Omit \"temperature\", or set it to 0 for the greedy behaviour this path has.",
+        )
+
+    top_p = body.get("top_p")
+    if top_p is not None and _is_number(top_p) and float(top_p) < 1.0:
+        return FieldRefusal.build(
+            "top_p", top_p,
+            note,
+            'Omit "top_p", or set it to 1.0 (the value that disables it).',
+        )
+
+    top_k = body.get("top_k")
+    if top_k is not None and _is_number(top_k) and float(top_k) > 0:
+        return FieldRefusal.build(
+            "top_k", top_k,
+            note,
+            'Omit "top_k", or set it to 0 (the value that disables it).',
+        )
+    return None
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _usage(performance: Any) -> Usage:
+    """The delegate's own token counts, which this SDK build does not fill in.
+
+    Read rather than hard-coded to zero, so an SDK version that starts populating
+    ``prefill_token_num``/``decode_token_num`` is picked up without a change here.
+    The counts are **not** derived from the timings and the throughput: that
+    arithmetic would produce a number that looks like a measurement and is not
+    one, and a caller reading ``usage`` on this path is better served by an
+    honest zero than by an estimate it cannot distinguish from the real thing.
+    """
+    if performance is None:
+        return Usage()
+    return Usage(
+        prompt_tokens=int(getattr(performance, "prefill_token_num", 0) or 0),
+        completion_tokens=int(getattr(performance, "decode_token_num", 0) or 0),
+    )
+
+
+def _performance_metadata(performance: Any) -> dict[str, Any]:
+    """The three numbers the SDK's demo prints, when the delegate gave them."""
+    if performance is None:
+        return {}
+    return {
+        "prefill_tps": float(getattr(performance, "prefill_tps", 0.0) or 0.0),
+        "decode_tps": float(getattr(performance, "decode_tps", 0.0) or 0.0),
+        "ttft_ms": float(getattr(performance, "ttft", 0.0) or 0.0),
+    }
+
+
+def _thinking_mode(request: GenerationRequest) -> str:
+    """The request's reasoning mode, defaulting to the protocol layer's ``"chat"``."""
+    mode = request.metadata.get("thinking_mode")
+    return mode if isinstance(mode, str) and mode else "chat"
+
+
+class _ReasoningSplitter:
+    """Splits a growing decode into a reasoning delta and a content delta.
+
+    The split itself is :func:`split_reasoning`, so the streaming and collected
+    answers cannot disagree about where the thinking block ends.  What is added
+    is the diffing: a chunk stream has already sent everything it has seen, so
+    each step reports only what is new.
+
+    The one case that cannot be recovered is a ``</think>`` marker straddling a
+    chunk boundary, which is the cost ``split_reasoning`` documents, paid here
+    rather than at a retraction the wire format has no room for.
+    """
+
+    def __init__(self, thinking_mode: str) -> None:
+        self._mode = thinking_mode
+        self._reasoning = ""
+        self._content = ""
+
+    def feed(self, text: str) -> tuple[str, str]:
+        reasoning, content = split_reasoning(text, self._mode)
+        delta_reasoning = (
+            reasoning[len(self._reasoning):] if reasoning.startswith(self._reasoning) else ""
+        )
+        delta_content = (
+            content[len(self._content):] if content.startswith(self._content) else content
+        )
+        self._reasoning, self._content = reasoning, content
+        return delta_reasoning, delta_content
+
+
+def _stop_match(text: str, stop: Sequence[str]) -> int | None:
+    """The index a stop sequence first appears at, or ``None``."""
+    for sequence in stop:
+        if sequence and sequence in text:
+            return text.index(sequence)
+    return None

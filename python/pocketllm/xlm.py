@@ -498,6 +498,7 @@ class XlmEngine:
         state["sink"] = on_chunk
         state["chunks"] = []
         state["error"] = False
+        state["performance"] = None
 
         request = LmRequest()
         ctypes.memset(ctypes.byref(request), 0, ctypes.sizeof(request))
@@ -524,6 +525,18 @@ class XlmEngine:
             raise XlmUnavailable(f"xlm_infer refused the request (status {status})")
         chunks: list[str] = state.get("chunks", [])  # type: ignore[assignment]
         return "".join(chunks)
+
+    @property
+    def last_performance(self) -> Any:
+        """The `xlm_model_performance_t` the delegate reported at the last ``STATE_END``.
+
+        A copy, or ``None`` before the first completed request.  It is the one
+        place the delegate's own token counts and throughput are available --
+        there is no token-id surface to count tokens any other way -- so a
+        serving layer reads its ``prefill_token_num``/``decode_token_num`` here
+        rather than inventing a count.
+        """
+        return self._state.get("performance")  # type: ignore[attr-defined]
 
     def close(self) -> None:
         if self._closed:
