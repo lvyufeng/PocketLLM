@@ -67,12 +67,14 @@ earlier hand-written probe of this API did.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import ctypes.util
 import glob
 import os
 import pathlib
-from typing import TYPE_CHECKING, Callable
+import sys
+from typing import TYPE_CHECKING, Callable, Iterator
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ctypes import CDLL
@@ -96,7 +98,62 @@ __all__ = [
     "is_available",
     "library_path",
     "load",
+    "quiet_delegate_stdout",
 ]
+
+
+@contextlib.contextmanager
+def quiet_delegate_stdout(target: int | None = None) -> Iterator[None]:
+    """Send the delegate's own **fd 1** chatter to ``target`` while the body runs.
+
+    ``libxlm.so`` and the HBRT stack under it write their banner to file
+    descriptor **1**, not 2: ``[UCP]: …``, ``[DNN]: …``, and a
+    ``[BPU][[BPU_MONITOR]][<address>]…`` line whose address is *per process*, so
+    the noise is not even stable run to run.  A host command whose contract is
+    "echo the prompt, then the completion" must not leak a third party's monitor
+    output into its stdout — a caller doing ``pocketllm run … > out.txt`` gets a
+    file with eight lines of SDK banner before the answer.
+
+    **The redirection is on the file descriptor, not on ``sys.stdout``.**  The
+    library is C and writes to fd 1 directly, so ``contextlib.redirect_stdout``
+    cannot see it; what does is ``os.dup2``, which replaces what fd 1 *is* for
+    the whole process for the duration.  ``target`` defaults to a fresh handle on
+    fd 2, so the delegate's banner lands on **stderr** beside its own ``[E]``
+    error lines and a caller who wants it can still ``2>`` it — the honest choice
+    over dropping it, because the lines are the library's diagnostics, not ours,
+    and stderr is where diagnostics belong.
+
+    ``sys.stdout`` is flushed before the swap and after restoring it, so a caller
+    that has buffered text does not have it follow the fd to the wrong place.
+
+    The delegate returns its answer through the result struct and its callback,
+    never through fd 1 (verified on the board: the struct text equals the text
+    that appears, and fd 1 carries only the banner), so nothing this module needs
+    travels on the descriptor being moved.
+    """
+    if target is None:
+        # A private dup of stderr: reopening the path each call would leak a
+        # descriptor if a caller's stderr were closed, and `dup` of fd 2 is the
+        # same file by construction.
+        target = os.dup(2)
+        owned = True
+    else:
+        owned = False
+
+    sys.stdout.flush()
+    saved = os.dup(1)
+    try:
+        os.dup2(target, 1)
+        yield
+    finally:
+        # Restore before flushing anything of ours, so our own writes go to the
+        # real stdout, and flush the (now swappable) fd 1 first so nothing the
+        # library left buffered lands after the swap.
+        os.dup2(saved, 1)
+        os.close(saved)
+        if owned:
+            os.close(target)
+        sys.stdout.flush()
 
 #: The failure :func:`load` raises when the delegate is not on this host.
 class XlmUnavailable(RuntimeError):
@@ -483,21 +540,26 @@ class XlmEngine:
         :class:`Sampling` block, and a knob that does nothing is worse than no
         knob.  Requires ``LD_LIBRARY_PATH=<sdk>/lib`` and
         ``HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6`` (see the module docstring).
+
+        The library's fd-1 banner is moved to stderr for the duration -- see
+        :func:`quiet_delegate_stdout`, which is what keeps ``load``/``xlm_init``
+        from decorating the caller's stdout.
         """
-        loaded = lib if lib is not None else load()
-        param = loaded.xlm_create_default_param()
-        param.model_path = _encode(model_path)
-        param.token_config_path = _encode(tokenizer_dir)
-        param.config_path = _encode(config_path)
-        param.model_type = int(model_type)
-        if context_size:
-            param.context_size = int(context_size)
+        with quiet_delegate_stdout():
+            loaded = lib if lib is not None else load()
+            param = loaded.xlm_create_default_param()
+            param.model_path = _encode(model_path)
+            param.token_config_path = _encode(tokenizer_dir)
+            param.config_path = _encode(config_path)
+            param.model_type = int(model_type)
+            if context_size:
+                param.context_size = int(context_size)
 
-        state: dict[str, object] = {"sink": callback}
-        ffi = _trampoline(state)
+            state: dict[str, object] = {"sink": callback}
+            ffi = _trampoline(state)
 
-        handle = ctypes.c_void_p()
-        status = loaded.xlm_init(ctypes.byref(param), ffi, ctypes.byref(handle))
+            handle = ctypes.c_void_p()
+            status = loaded.xlm_init(ctypes.byref(param), ffi, ctypes.byref(handle))
         if status != 0 or not handle.value:
             raise XlmUnavailable(f"xlm_init refused the checkpoint (status {status})")
         engine = cls(loaded, handle, param)
@@ -564,7 +626,11 @@ class XlmEngine:
 
         requests = (LmRequest * 1)(request)
         batch = Input(request_num=1, requests=requests)
-        status = self._lib.xlm_infer(self._handle, ctypes.byref(batch), None)
+        # The decode walks the BPU and the runtime logs as it goes; the answer
+        # itself arrives through the callback, not on fd 1, so the banner is
+        # moved to stderr here too (see `quiet_delegate_stdout`).
+        with quiet_delegate_stdout():
+            status = self._lib.xlm_infer(self._handle, ctypes.byref(batch), None)
         # `keep_alive` and `requests` are read through the call; the call is
         # synchronous, so nothing past this line may touch them.  Binding them
         # to `_` keeps the references alive until here without a bare `del`.
