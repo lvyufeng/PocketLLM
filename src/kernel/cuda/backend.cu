@@ -611,11 +611,39 @@ class CudaBackend final : public Backend {
      * memory once and read by the whole tile rather than re-fetched per column.
      * The weights cannot be shared this way -- each column owns a different
      * weight row -- so the weight reuse is the per-group decode hoist inside
-     * `quant_block_accumulate`, not the staging. 256 columns against 36 layers
-     * of this model is 4-8 blocks per projection at decode -- enough to fill the
-     * card -- and eight of the nine projections per layer are exactly 256 or 512
-     * columns wide. */
-    const unsigned threads = 256;
+     * `quant_block_accumulate`, not the staging.
+     *
+     * **32 columns to a block, not 256.** The block size is the decode
+     * bottleneck and it is not a tuning detail. `grid.x` is
+     * `ceil(n / threads)` and `grid.y` is `m`, so at decode (`m == 1`) a
+     * 256-wide block gives a projection only `n / 256` blocks: `o_proj` and
+     * `down_proj` (n=2048) become **8 blocks**, and `q/k/v` (n=1024/2048) fewer,
+     * on a card with 68 SMs. The GPU was running eight blocks at a time on a
+     * 68-SM machine -- 12% occupancy, the rest of the card idle -- which is why
+     * the kernel moved weights at ~2% of HBM and why decode was ~100 ms/token.
+     * At 32 columns the same projection is 64 blocks and the card is filled.
+     *
+     * Measured on Qwen3-1.7B-Q4_K_M (3 reps, interleaved, same host):
+     *
+     *     columns/block   pp512 t/s   tg128 t/s
+     *          256          40.83        9.92     <- the old value
+     *           32          41.61       24.20
+     *
+     * Decode is 2.44x faster, and prefill is unchanged, because prefill's `m`
+     * is already large enough to fill the grid and never depended on `grid.x`.
+     * The kernel still moves 1.10 GB of weights per token (1.276 GB of model
+     * minus the gathered embedding table), so decode bandwidth went from
+     * 10.9 GB/s to 26.6 GB/s -- 1.8% to 4.3% of the card's ~616 GB/s HBM peak.
+     * The win therefore comes entirely from occupying more of the card, not
+     * from touching memory more efficiently; the kernel remains far from the
+     * HBM roofline. It is a pure launch-geometry change: every thread still
+     * computes exactly one output column with the same single serial
+     * accumulation chain, so the output is bit-identical and no token moves.
+     *
+     * 32 is the value that measured best; the win comes from having enough
+     * blocks, and it is flat from 32 to 128 (16.5 vs 13.8 t/s at 64/128 on an
+     * earlier run) with a floor at 256. */
+    const unsigned threads = 32;
     const dim3 grid(static_cast<unsigned>((n + threads - 1) / threads), static_cast<unsigned>(m));
     gemm_quant_kernel<<<grid, threads>>>(f(x), reinterpret_cast<const uint8_t *>(blocks.handle),
                                          bias.handle ? f(bias) : nullptr, w(out), m, n, k, type_id,
