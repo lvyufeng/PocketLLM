@@ -214,8 +214,18 @@ __device__ void quant_block_accumulate(int type_id, const uint8_t *block, const 
        * the same `run`/`high` split `dequant_q4_k` makes, hoisted to the group. */
       const uint8_t *packed = block + 16 + (g / 2) * 32;
       const bool high = (g % 2) != 0;
+      /* The run is 32 packed nibble-bytes, and it sits at `block + 16 + n*32`:
+       * a Q4_K block is 144 bytes (`= 9 * 16`), so every run starts on a 16-byte
+       * boundary and the run is two aligned `uint4` loads. Reading the bytes
+       * back out of their eight little-endian words reproduces `as_byte`
+       * exactly, so the nibbles and the sum are unchanged -- this trades 32
+       * uncoalesced scalar byte loads, whose warp footprint at decode is one
+       * used byte per 32-byte sector, for two full-sector vector loads. */
+      const uint4 lo = *reinterpret_cast<const uint4 *>(packed);
+      const uint4 hi = *reinterpret_cast<const uint4 *>(packed + 16);
+      const unsigned word[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
       for (int i = 0; i < 32; ++i, ++col) {
-        const int q = quant::as_byte(packed, i);
+        const int q = static_cast<int>((word[i >> 2] >> ((i & 3) * 8)) & 0xFFu);
         const int nibble = high ? (q >> 4) : (q & 0x0F);
         total += xs[col] * (sd * static_cast<float>(nibble) - md);
       }
