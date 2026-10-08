@@ -25,7 +25,7 @@ A status is a claim about evidence, so each one names the evidence it stands on.
 
 One checkpoint **does** run today through an entry point in this tree, and it is not an architecture:
 [**Qwen3 on the RDK S600**](s600_qwen3.md) runs on the Horizon Nash BPU through the `xlm`/`.hbm`
-delegate (0.6B and 1.7B; the board's 384 MiB BPU region refuses 4B and 8B). It is documented
+delegate (0.6B and 1.7B; the board's 2 GiB `ion_carveout` pool refuses 4B and 8B). It is documented
 separately because it is a *delegate over a prebuilt artifact*, not a graph this tree builds — so it
 is not a row above, for the same reason the C engine's Qwen3 is not. What it would take to get a
 smaller 4B graph onto that board is scoped in

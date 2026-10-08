@@ -182,7 +182,10 @@ These are the reasons the verdict below is "half", not "yes":
   on this board by a memory ceiling that is the vendor's packaging choice. But it is **not** a hard
   vendor gate: the toolchain to produce a smaller graph is in our hands. The honest framing is:
   **1.7B is the ceiling for what the vendor ships and this board can load; 4B becomes reachable only
-  if we compile our own smaller graph, and that build has not been attempted.**
+  if we compile our own smaller graph, and that build has not been attempted.** (The one other path —
+  enlarging the 2 GiB `ion_carveout` pool the `.hbm` is loaded through, from the device tree — is
+  examined and left untested on [the model page](../models/s600_qwen3.md#is-it-resizable-in-principle-yes-not-by-us-safely),
+  because it needs a reboot the board cannot safely undo.)
 
 **No build was attempted for this page, and none of the numbers above are a build result.** They are
 the SDK's stated tool versions, the vendor's published artifacts, and this board's measured refusal.
