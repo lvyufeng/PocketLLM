@@ -526,6 +526,52 @@ def case_gemm_quant_q6_k(rng):
     )
 
 
+def case_gemm_quant_large_n_q6_k(rng):
+    """The packed product wide enough to cross the cube op's column-chunk bound.
+
+    `MatmulCubeCustom` returns a right-shaped tensor of *wrong* numbers above an
+    N this backend had to find the hard way: the tied output projection is
+    `gemm_quant` q6_K at n = 151936, and measured against the CPU kernel the op
+    came back 131% off there while n = 32768 and below matched to 5e-4. The
+    backend now walks N in 8192-column blocks (`run_cube`), each a shape the op
+    answers correctly. This case is the one that would go red if that walk were
+    dropped: it is the only case whose N reaches the failing region.
+
+    `n = 65600` is chosen on two counts. It is *over* the op's failure edge --
+    measured, the unchunked op crosses from ~5e-4 to 100%+ between n = 49152 and
+    n = 65536, so any N below 65536 would pass with or without the fix and prove
+    nothing (the reviewer's suggested 12288/16384 sits in exactly that dead
+    zone). And `65600 % 8192 == 64`, so the block walk ends on a 64-column
+    partial chunk rather than a full one -- a dropped or mis-sized final chunk
+    would show up here and not at a boundary-multiple of 8192.
+
+    A `q4_k` twin (`case_gemm_quant_large_n_q4_k`) carries the other format:
+    the two share nothing but the 256-wide block and the failure is in the shared
+    cube drive above them, not in either decode, so one case would report a
+    format bug under this name. `k = 512` keeps both cheap -- the width that
+    matters is N, and every byte of the 65600x512 weight is still a real decoded
+    value.
+    """
+    x = rng.standard_normal((1, 512), dtype=np.float32)
+    blocks = packed_row(rng, rows=65600, cols=512, fmt="q6_k")
+    return (
+        {"x": x, "w_blocks": blocks},
+        {"type_id": 14},
+        ref.gemm_quant(x, blocks, w_blocks_fmt="q6_k"),
+    )
+
+
+def case_gemm_quant_large_n_q4_k(rng):
+    """The same wide product in the format most of a `q4_k_m` file's bytes are in."""
+    x = rng.standard_normal((1, 512), dtype=np.float32)
+    blocks = packed_row(rng, rows=65600, cols=512, fmt="q4_k")
+    return (
+        {"x": x, "w_blocks": blocks},
+        {"type_id": 12},
+        ref.gemm_quant(x, blocks, w_blocks_fmt="q4_k"),
+    )
+
+
 def case_embedding(rng):
     table = rng.standard_normal((32, 48), dtype=np.float32)
     tokens = np.array([0, 31, 7, 7, 0], dtype=np.int32)
@@ -714,6 +760,28 @@ def case_attention_chunk(rng):
     return _attention_case(rng, 4, 16, 8, 128, 0, 4, capacity=8)
 
 
+def case_attention_prefill_q_offset(rng):
+    """A prefill chunk whose first query is *not* at position 0.
+
+    `case_attention_chunk` starts at offset 4, so it does exercise `q_offset > 0`
+    -- but the backend's prefill is a loop of `q_len` decode steps, and the one
+    thing that loop has to get right per query is that query `t` attends to
+    exactly `q_offset + t + 1` keys (its own included). A loop that passed the
+    whole chunk's span to every query, or that used `q_offset + 1` for all of
+    them, would still look right where the chunk starts at 0 and the window is
+    the whole cache. Here the chunk starts at offset 6 against a cache of 12, so
+    the four queries attend to spans of 7, 8, 9 and 10 -- four different windows,
+    *every* one a strict subset of the cache (the chunk does not end at the
+    cache's end, where the last query would again see everything). A single-span
+    loop would let the early queries see keys past their own, i.e. the future,
+    and fail on the early columns.
+
+    Heads and width are the shipped GQA group and head width (16 over 8, d=128)
+    so this is also the one prefill case at the geometry the graph actually runs.
+    """
+    return _attention_case(rng, 4, 16, 8, 128, first_key=0, q_offset=6, capacity=12)
+
+
 def case_attention_first_key(rng):
     """A nonzero `first_key` with a single query -- the sliding-window hook.
 
@@ -888,6 +956,8 @@ CASES = {
     "gemm_accumulate": case_gemm_accumulate,
     "gemm_quant_q4_k": case_gemm_quant_q4_k,
     "gemm_quant_q6_k": case_gemm_quant_q6_k,
+    "gemm_quant_large_n_q4_k": case_gemm_quant_large_n_q4_k,
+    "gemm_quant_large_n_q6_k": case_gemm_quant_large_n_q6_k,
     "embedding": case_embedding,
     "embedding_quant_q4_k": case_embedding_quant_q4_k,
     "embedding_quant_q6_k": case_embedding_quant_q6_k,
@@ -898,6 +968,7 @@ CASES = {
     "rope_small_head_dim": case_rope_small_head_dim,
     "attention_single_query": case_attention_single_query,
     "attention_chunk": case_attention_chunk,
+    "attention_prefill_q_offset": case_attention_prefill_q_offset,
     "attention_first_key": case_attention_first_key,
     "attention_grouped": case_attention_grouped,
     "attention_decode_group2": case_attention_decode_group2,
@@ -926,6 +997,8 @@ OP_OF_CASE = {
     "gemm_accumulate": "gemm",
     "gemm_quant_q4_k": "gemm_quant",
     "gemm_quant_q6_k": "gemm_quant",
+    "gemm_quant_large_n_q4_k": "gemm_quant",
+    "gemm_quant_large_n_q6_k": "gemm_quant",
     "embedding": "embedding",
     "embedding_quant_q4_k": "embedding_quant",
     "embedding_quant_q6_k": "embedding_quant",
@@ -936,6 +1009,7 @@ OP_OF_CASE = {
     "rope_small_head_dim": "rope",
     "attention_single_query": "attention",
     "attention_chunk": "attention",
+    "attention_prefill_q_offset": "attention",
     "attention_first_key": "attention",
     "attention_grouped": "attention",
     "attention_decode_group2": "attention",
@@ -993,6 +1067,8 @@ QUANTIZED_CASES = frozenset(
     {
         "gemm_quant_q4_k",
         "gemm_quant_q6_k",
+        "gemm_quant_large_n_q4_k",
+        "gemm_quant_large_n_q6_k",
         "embedding_quant_q4_k",
         "embedding_quant_q6_k",
     }
