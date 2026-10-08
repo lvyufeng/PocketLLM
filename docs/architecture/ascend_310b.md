@@ -10,14 +10,23 @@ aarch64, CANN **8.3.RC2**, npu-smi 23.0.0) on 2026-10-09. Whether a number trans
 310B board is a claim to re-check in place, not an assumption — the CANN version in particular is
 part of the result.
 
-## The built-in matmul has no 310B kernel
+## The built-in *matmul* has no 310B kernel
 
-`aclnnMm` and the other aclnn *built-in* ops on this CANN ship no `ascend310b` kernel binary, so
-the built-in matmul path fails on the board. The 310B is a small-CANN board and the ops the
-910B takes for granted were simply not compiled for it.
+`aclnnMm` and the other built-in **matmul** ops on this CANN ship no `ascend310b` kernel binary, so
+the built-in matmul path fails on the board. The 310B is a small-CANN board and the matmul the
+910B takes for granted was simply not compiled for it.
 
-The workaround is a set of **AscendC custom ops** with their own 310B kernel binaries. They are
-not in this repository — they live in the adjacent
+**This is a fact about the matmul, not about every built-in, and the difference was measured.** The
+tempting generalisation — "the built-ins have no 310B kernel" — is false: `aclnnEmbedding`,
+`aclnnSoftmax` and `aclnnArgMax` all run on the board (phase-1 and phase-2 status 0, correct
+values), and the backend drives them. What is true is that a header's *existence* proves nothing
+and each built-in has to be run to learn whether a 310B binary is behind it — which is exactly why
+the built-in matmul looked usable and was not. (The kernel binaries do not even live under the
+expected name: the op `aclnnArgMax` runs from an `arg_max_v2` directory, `aclnnSoftmax` from
+`softmax_v2`. The `ascend310b` factory listing is a bad index of what can run.)
+
+The workaround for matmul is a set of **AscendC custom ops** with their own 310B kernel binaries.
+They are not in this repository — they live in the adjacent
 [minicpm-o-4.5-orangepi](https://github.com/lvyufeng/minicpm-o-4.5-orangepi) tree, under
 `src/csrc/custom_ops/`, and the relevant ones are:
 
@@ -26,9 +35,19 @@ not in this repository — they live in the adjacent
 | `MatmulW4a16Custom` | GPTQ int4 weight, fp16 activation matmul (M=1 fast path) |
 | `MatmulW8a8I32Custom` | int8 × int8 → int32 matmul |
 | `MatmulCubeCustom` | the cube-unit fp16 matmul (`MatmulImpl<half,half,half>`) |
-| `RmsNorm1024Custom` | RMSNorm |
+| `RmsNorm1024Custom` | RMSNorm (bakes `HIDDEN_SIZE = 1024`, so only that width) |
+| `RmsNormNdCustom` | RMSNorm with the row width from the shape (≤ 4096) |
 | `SiluMulCustom` | SiLU-gated multiply |
 | `AttentionStepCustom` | one decode attention step |
+| `RopeCustom` | split-half rotary embedding, cos/sin table indexed by an INT32 row |
+
+Three of them are `half`-only kernels (`RmsNormNdCustom`, `RopeCustom`, and the matmuls), which is
+why the backend narrows f32 operands to fp16 for those ops and widens the result — the fp16-wide
+tolerance those cases use is the format's width, not slack. Two of them (`RmsNormNdCustom`,
+`RopeCustom`) move their operands in the AscendC vector pipe's 32-byte (16-half-word) repeat, so a
+width that is not a whole number of repeats is refused by name: `rms_norm` needs `d % 16 == 0` and
+`rope_neox` needs `d % 32 == 0`. Head dim 128 and hidden 1024 satisfy both; the suite's `d = 1`
+norm and `d = 4` rope cases do not, and they are the two shape exclusions.
 
 ## Installation, and the env the two-phase call requires
 

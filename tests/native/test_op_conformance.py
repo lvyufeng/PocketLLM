@@ -107,7 +107,14 @@ AS_F16_RTOL = 1.5e-3
 #: applies to.  Named as op families rather than case names because it is the
 #: *kernel* that has the width, not the individual case -- a new rms_norm case is
 #: fp16 on this backend for the same reason the existing one is.
-ASCEND_F16_OPS = frozenset({"rms_norm", "silu_mul", "gemm", "attention"})
+#:
+#: `rope` is the fifth: `aclnnRopeCustom` is another fp16-only custom-op kernel
+#: (its internal arithmetic is fp32 but it reads and writes half), measured at
+#: 5.1e-4 relative on the two `d = 128` cases -- the same shape of error as the
+#: other four, and over :data:`BACKEND_RTOL` for the same reason.  `embedding`,
+#: `argmax` and `softmax` are deliberately *not* here: they run through f32
+#: built-ins on this board, so they are compared at the f32 bounds.
+ASCEND_F16_OPS = frozenset({"rms_norm", "silu_mul", "gemm", "attention", "rope"})
 
 #: How far `softmax` may drift from the reference, as an *absolute* bound.
 #:
@@ -360,28 +367,20 @@ DEVICES = [_device_param(name) for name in ("cpu", "cuda", "ascend")]
 #: Two kinds of reason live here and they are worth telling apart:
 #:
 #:   * The op is absent from the backend ("not implemented yet").  These are the
-#:     ops the backend's file header says it still throws for -- the gather and
-#:     the sampler families, `rope_neox`, and the shape limits on the packed and
-#:     dense GEMMs.  Removing an entry here is how a newly implemented op gets
-#:     its conformance coverage, so the list is a to-do and not a "these do not
-#:     matter".
+#:     ops the backend's file header says it still throws for -- the sampler
+#:     family (`logits_temperature`, `topk_sample`) and the shape limits on the
+#:     packed and dense GEMMs.  Removing an entry here is how a newly implemented
+#:     op gets its conformance coverage, so the list is a to-do and not a "these
+#:     do not matter".
 #:   * The op exists but its interface is narrower than the harness's case, and
 #:     refuses the case by name: `attention` on this backend is a one-token
 #:     decode step (`q_len == 1`, `first_key == 0`), which is the shape the
-#:     graph's decode uses, so the chunked and sliding-window cases cannot run.
+#:     graph's decode uses, so the chunked and sliding-window cases cannot run;
+#:     `rms_norm` and `rope_neox` need a width that is a whole number of fp16
+#:     vector lanes (see their entries).
 DEVICE_EXCLUDED_CASES: dict[str, dict[str, str]] = {
     "ascend": {
         # --- ops the backend still throws by name for ---
-        "rope_start_zero": "ascend: rope_neox not implemented yet",
-        "rope_start_pos_offsets": "ascend: rope_neox not implemented yet",
-        "rope_small_head_dim": "ascend: rope_neox not implemented yet",
-        "embedding": "ascend: embedding not implemented yet",
-        "embedding_quant_q4_k": "ascend: embedding_quant not implemented yet",
-        "embedding_quant_q6_k": "ascend: embedding_quant not implemented yet",
-        "argmax": "ascend: argmax not implemented yet",
-        "argmax_ties": "ascend: argmax not implemented yet",
-        "softmax": "ascend: softmax not implemented yet",
-        "softmax_wide_row": "ascend: softmax not implemented yet",
         "logits_temperature": "ascend: logits_temperature not implemented yet",
         "topk_sample": "ascend: topk_sample not implemented yet",
         "topk_sample_uniform_on_a_boundary": "ascend: topk_sample not implemented yet",
@@ -413,6 +412,14 @@ DEVICE_EXCLUDED_CASES: dict[str, dict[str, str]] = {
         # shape, there is nothing to compare.
         "rms_norm_single_row": "ascend: rms_norm needs d a multiple of 16 (RmsNormNdCustom's "
         "vector repeat)",
+        # `d = 4`, whose split half is two half-words -- a quarter of the 16-lane
+        # vector repeat `aclnnRopeCustom` moves its halves in, so the `DataCopy`
+        # over-reads into the next row (measured: 100% error, and the same at
+        # d = 16).  The width the graph actually uses is 128, which is a whole
+        # number of repeats; the backend refuses `d % 32 != 0` by name rather
+        # than returning the garbage.
+        "rope_small_head_dim": "ascend: rope_neox needs d a multiple of 32 (RopeCustom's "
+        "16-lane repeat over one split half)",
         # `silu_mul_large_negative` is a gate of -50, whose correct output is
         # -9.6e-21 -- about 1e13 below the smallest positive fp16 subnormal
         # (6e-8).  An fp16 kernel has no way to represent it and returns signed
@@ -1171,9 +1178,13 @@ def test_an_out_of_range_token_id_zeroes_the_row(device: str) -> None:
     to define the error handling around it -- and this test is where that
     distinction is written down rather than assumed.
     """
-    # `ascend` has no `embedding` yet, so it is named in the exclusion set and
-    # skipped rather than driven.  The divergence this pins is in `kernels.cpp`,
-    # which this backend will share the moment its gather lands.
+    # A device that does not implement `embedding` is named in the exclusion set
+    # and skipped rather than driven.  `ascend` now does implement it -- its
+    # gather is the built-in `aclnnEmbedding`, and the zeroing is done over the
+    # out-of-range rows on the host, because the built-in itself returns garbage
+    # for an id it cannot reject (measured: `19023.8` for `-1`).  The divergence
+    # this pins is the one in `kernels.cpp`, and this is where the 310B is held
+    # to it too.
     if _device_case_skip_reason(device, "embedding") is not None:
         pytest.skip(_device_case_skip_reason(device, "embedding"))
     table = np.arange(12, dtype=np.float32).reshape(4, 3)
