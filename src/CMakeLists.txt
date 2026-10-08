@@ -86,6 +86,95 @@ if(POCKETLLM_CUDA)
   endif()
 endif()
 
+# The Ascend backend, opt-in and default OFF.
+#
+# Unlike CUDA -- which is on by *availability*, because a machine with a toolkit
+# should get the backend -- this one is a flag. Two reasons. It needs CANN *and*
+# a per-user custom-op package that is not part of CANN, so "the toolkit is
+# present" is not the same as "this can build"; and it is 310B-only, so an
+# x86 host with a stray CANN install must not pick it up. A flag is honest about
+# both. It is additionally guarded on aarch64: the backend file includes acl/acl.h
+# and links aarch64 CANN libraries, and the x86 host this tree is developed on
+# must not be broken by the option existing.
+option(POCKETLLM_ASCEND "Build the Ascend 310B backend (aarch64 + CANN only)" OFF)
+set(POCKETLLM_ASCEND_HOME "" CACHE STRING
+    "CANN toolkit root; defaults to \$ASCEND_HOME_PATH, \$ASCEND_TOOLKIT_HOME, then /usr/local/Ascend/ascend-toolkit/latest")
+set(POCKETLLM_CUSTOM_OPP_DIR "" CACHE STRING
+    "Custom-op vendor dir (the one holding op_api/); defaults to \$ASCEND_CUSTOM_OPP_PATH, then \$HOME/Ascend/custom_opp/vendors/customize")
+
+set(POCKETLLM_ASCEND_SOURCES)
+if(POCKETLLM_ASCEND)
+  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    message(FATAL_ERROR
+      "pocketllm: POCKETLLM_ASCEND=ON needs an aarch64 host (this is ${CMAKE_SYSTEM_PROCESSOR})")
+  endif()
+
+  if(POCKETLLM_ASCEND_HOME)
+    set(_ascend_home "${POCKETLLM_ASCEND_HOME}")
+  elseif(DEFINED ENV{ASCEND_HOME_PATH})
+    set(_ascend_home "$ENV{ASCEND_HOME_PATH}")
+  elseif(DEFINED ENV{ASCEND_TOOLKIT_HOME})
+    set(_ascend_home "$ENV{ASCEND_TOOLKIT_HOME}")
+  else()
+    set(_ascend_home "/usr/local/Ascend/ascend-toolkit/latest")
+  endif()
+  if(NOT EXISTS "${_ascend_home}/include/acl/acl.h")
+    message(FATAL_ERROR
+      "pocketllm: CANN headers not found under ${_ascend_home}; set POCKETLLM_ASCEND_HOME")
+  endif()
+
+  if(POCKETLLM_CUSTOM_OPP_DIR)
+    set(_custom_opp "${POCKETLLM_CUSTOM_OPP_DIR}")
+  elseif(DEFINED ENV{ASCEND_CUSTOM_OPP_PATH})
+    set(_custom_opp "$ENV{ASCEND_CUSTOM_OPP_PATH}")
+  else()
+    set(_custom_opp "$ENV{HOME}/Ascend/custom_opp/vendors/customize")
+  endif()
+  # `ASCEND_CUSTOM_OPP_PATH` is a colon-separated list, and the installer's
+  # generated `set_env.bash` appends its own value to an (often empty) inherited
+  # one -- so what arrives is ".../vendors/customize:". Take the first component.
+  string(REGEX REPLACE ":.*$" "" _custom_opp "${_custom_opp}")
+  if(NOT EXISTS "${_custom_opp}/op_api/include/aclnn_matmul_w4a16_custom.h")
+    message(FATAL_ERROR
+      "pocketllm: custom ops not found under ${_custom_opp}; install the custom_opp "
+      "package and set POCKETLLM_CUSTOM_OPP_DIR (see docs/architecture/ascend_310b.md)")
+  endif()
+
+  find_library(POCKETLLM_ASCENDCL_LIB ascendcl HINTS "${_ascend_home}/lib64" REQUIRED)
+  find_library(POCKETLLM_NNOPBASE_LIB nnopbase HINTS "${_ascend_home}/lib64" REQUIRED)
+  find_library(POCKETLLM_OPAPI_LIB opapi HINTS "${_ascend_home}/lib64" REQUIRED)
+  find_library(POCKETLLM_CUST_OPAPI_LIB cust_opapi HINTS "${_custom_opp}/op_api/lib" REQUIRED)
+
+  set(POCKETLLM_ASCEND_SOURCES kernel/ascend/backend.cpp)
+  message(STATUS "pocketllm: Ascend backend enabled (CANN ${_ascend_home}, custom ops ${_custom_opp})")
+
+  # The include roots, the four libraries, and the `POCKETLLM_WITH_ASCEND` define,
+  # carried as one INTERFACE target so an option added here reaches every kernel
+  # target rather than being copied into each -- the same reason
+  # `pocketllm-kernel-options` exists.
+  add_library(pocketllm-ascend-options INTERFACE)
+  target_include_directories(pocketllm-ascend-options INTERFACE
+    "${_ascend_home}/include"
+    "${_custom_opp}/op_api/include")
+  target_link_directories(pocketllm-ascend-options INTERFACE
+    "${_ascend_home}/lib64"
+    "${_custom_opp}/op_api/lib")
+  target_link_libraries(pocketllm-ascend-options INTERFACE
+    ${POCKETLLM_ASCENDCL_LIB}
+    ${POCKETLLM_NNOPBASE_LIB}
+    ${POCKETLLM_OPAPI_LIB}
+    ${POCKETLLM_CUST_OPAPI_LIB})
+  target_compile_definitions(pocketllm-ascend-options INTERFACE POCKETLLM_WITH_ASCEND=1)
+
+  # Add the backend to a kernel target: its source, the includes, the libraries
+  # and the define. A function rather than five copies of the same three lines,
+  # which is how a flag gets added to four of the five.
+  function(pocketllm_add_ascend target)
+    target_sources(${target} PRIVATE ${POCKETLLM_ASCEND_SOURCES})
+    target_link_libraries(${target} PRIVATE pocketllm-ascend-options)
+  endfunction()
+endif()
+
 # Warning-as-errors and the kernel options, stated once.
 #
 # The three targets that link `kernel/` -- the library, `pocketllm-run` and
@@ -136,6 +225,9 @@ add_library(pocketllm SHARED
 if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)
   target_compile_definitions(pocketllm PRIVATE POCKETLLM_WITH_CUDA=1)
   set_target_properties(pocketllm PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+endif()
+if(POCKETLLM_ASCEND_SOURCES)
+  pocketllm_add_ascend(pocketllm)
 endif()
 
 target_include_directories(pocketllm
@@ -204,6 +296,9 @@ if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)
   set_target_properties(pocketllm-run PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 endif()
 target_link_libraries(pocketllm-run PRIVATE pocketllm-kernel-options)
+if(POCKETLLM_ASCEND_SOURCES)
+  pocketllm_add_ascend(pocketllm-run)
+endif()
 
 # Run one kernel over inputs a caller supplies, for checking it against the
 # Python reference.  It links the kernel objects and both backends, and no model:
@@ -225,6 +320,9 @@ if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)
   set_target_properties(pocketllm-opcheck PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 endif()
 target_link_libraries(pocketllm-opcheck PRIVATE pocketllm-kernel-options)
+if(POCKETLLM_ASCEND_SOURCES)
+  pocketllm_add_ascend(pocketllm-opcheck)
+endif()
 
 # Measure the engine's own throughput, as `llama-bench` measures llama.cpp's.
 # Same object list as `pocketllm-run` -- it needs the model and both backends --
@@ -250,6 +348,9 @@ if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)
   set_target_properties(pocketllm-bench PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 endif()
 target_link_libraries(pocketllm-bench PRIVATE pocketllm-kernel-options)
+if(POCKETLLM_ASCEND_SOURCES)
+  pocketllm_add_ascend(pocketllm-bench)
+endif()
 
 # `POCKETLLM_ABI_VERSION_MAJOR` is a C preprocessor macro in the header, not a
 # CMake variable, so the soname major is stated here too.  It is the one number
