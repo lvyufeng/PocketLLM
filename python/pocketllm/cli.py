@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pathlib
 import random
 import sys
 
@@ -249,51 +250,78 @@ def _run_device(engine_args: EngineArgs) -> str:
     return device.split(":")[0]
 
 
-def _serve_adapter(engine_args: EngineArgs) -> str:
-    """Which serving adapter ``serve`` builds: the C engine, or the S600 delegate.
-
-    ``--device`` is the same *kind* a user already reads from ``pocketllm
-    devices``, so it is what picks the adapter too -- there is no second flag to
-    learn.  Two kinds map to an adapter and the rest are refused:
-
-    * ``horizon`` -- the S600 delegate (:class:`~pocketllm.server.xlm_backend.XlmBackend`),
-      which drives ``libxlm.so`` over a prebuilt ``.hbm``.
-    * ``cpu``/``cuda`` (and ``auto``, which resolves to ``cpu`` for the same
-      reason :func:`_run_device` says) -- this tree's own C engine
-      (:class:`~pocketllm.server.native_backend.NativeBackend`).
-
-    *Honest about the rest.*  ``qnn``, ``mps``, ``ascend`` and every other kind
-    the registry knows are Python-ABI backends with no ``EngineBackend`` adapter
-    at all -- ``serve`` cannot run them, and saying so by name is the point.  A
-    silent fall-through to the C engine would be a server that accepts ``--device
-    qnn`` and then runs the checkpoint on the CPU, which is worse than a refusal
-    because the client cannot tell.  The extension seam is
-    :data:`_SERVE_ADAPTERS`: a new adapter names the kinds it serves and the
-    dispatch follows, rather than another ``if`` here.
-    """
-    device = engine_args.device.split(":")[0]
-    if device == "auto":
-        device = "cpu"
-    if device not in _SERVE_ADAPTERS:
-        raise ConfigurationError(
-            f"`serve` has no adapter for --device {device!r}; it serves "
-            f"{', '.join(sorted(_SERVE_ADAPTERS))} (and `auto`, which is cpu)"
-        )
-    return _SERVE_ADAPTERS[device]
-
-
-#: The serving adapters, keyed by the device kind each one runs on.  The value is
-#: the module that owns the adapter, imported only when it is selected -- the
-#: same laziness :func:`_cmd_serve` already relies on so ``pocketllm devices``
-#: does not pay for ``http.server``.
-_SERVE_ADAPTERS: dict[str, str] = {
-    "cpu": "pocketllm.server.native_backend",
-    "cuda": "pocketllm.server.native_backend",
-    _DELEGATE_DEVICE: "pocketllm.server.xlm_backend",
+#: The two runtimes a host entry point can drive, by the device kind each runs on.
+#:
+#: ``--device`` is the same *kind* a user already reads from ``pocketllm devices``,
+#: so it is what picks the runtime too -- there is no second flag to learn.  It
+#: maps to a *runtime*, not to a class, because ``run`` and ``serve`` drive the
+#: same two runtimes through different seams: the C engine through ``native.py``
+#: for ``run`` and through ``NativeBackend`` for ``serve``, the delegate through
+#: ``XlmEngine`` for ``run`` and ``XlmBackend`` for ``serve``.  Keeping the mapping
+#: to the runtime in one place is what stops the two commands from drifting into
+#: two spellings of the same decision -- the gap this table closes.
+#:
+#: The *sampling* differences between the two are real and stay in each command;
+#: only "which silicon does this name mean" is shared here.
+_RUNTIMES: dict[str, str] = {
+    "cpu": "native",
+    "cuda": "native",
+    _DELEGATE_DEVICE: "delegate",
 }
 
 
-def _require_delegate_env() -> None:
+def _dispatch_device(engine_args: EngineArgs, command: str) -> str:
+    """The runtime ``command`` drives for these engine args: ``native`` or ``delegate``.
+
+    *Honest about the rest.*  ``qnn``, ``mps``, ``ascend`` and every other kind
+    the registry knows are Python-ABI backends with no runtime a host entry point
+    can drive at all -- ``run`` and ``serve`` cannot use them, and saying so by
+    name is the point.  A silent fall-through to the C engine would accept
+    ``--device qnn`` and run the checkpoint on the CPU (or refuse it for reasons
+    about the wrong runtime), which is worse than a refusal because the caller
+    cannot tell.  The extension seam is :data:`_RUNTIMES`: a new runtime names the
+    kinds it serves and both commands follow.
+
+    ``command`` is the word the refusal uses -- ``run`` or ``serve`` -- so the
+    message names the command the user actually typed rather than a fixed one.
+    """
+    device = engine_args.device.split(":")[0]
+    if device == "auto":
+        # ``auto`` resolves to ``cpu`` for the reason :func:`_run_device` gives:
+        # it is the choice that cannot fail on a host where CUDA was never built in.
+        device = "cpu"
+    if device not in _RUNTIMES:
+        raise ConfigurationError(
+            f"`{command}` has no runtime for --device {device!r}; it runs "
+            f"{', '.join(sorted(_RUNTIMES))} (and `auto`, which is cpu)"
+        )
+    return _RUNTIMES[device]
+
+
+def _serve_runtime(engine_args: EngineArgs) -> str:
+    """Which runtime ``serve`` drives: the C engine, or the S600 delegate.
+
+    A named wrapper rather than a bare call so the ``serve`` half of the dispatch
+    reads as one thing at its call site, exactly as :func:`_run_runtime` does.
+    """
+    return _dispatch_device(engine_args, "serve")
+
+
+def _run_runtime(engine_args: EngineArgs) -> str:
+    """Which runtime ``run`` drives: the C engine, or the S600 delegate.
+
+    ``run`` had the same gap ``serve`` did, one command over: it imported
+    ``.native`` and drove the C engine unconditionally, so on the S600 -- where
+    the delegate over a ``.hbm`` is what exists and the C engine is not built --
+    ``run --device horizon`` refused a checkpoint it could have run.  The runtime
+    is decided here and each branch below is the honest shape for that runtime:
+    the C engine is a *token* loop this file owns, the delegate is a text-in/
+    text-out call that owns its own decode.
+    """
+    return _dispatch_device(engine_args, "run")
+
+
+def _require_delegate_env(command: str = "serve") -> None:
     """Refuse to start the delegate without the two variables it cannot run without.
 
     Neither can be set usefully from here.  ``LD_LIBRARY_PATH`` is read by
@@ -323,17 +351,44 @@ def _require_delegate_env() -> None:
     if not problems:
         return
     raise ConfigurationError(
-        "the S600 delegate cannot start without, set before `pocketllm serve`: "
+        f"the S600 delegate cannot start without, set before `pocketllm {command}`: "
         + "; ".join(problems)
         + ". `source` the SDK's run_llm.sh, or export both and retry."
     )
 
 
 def _cmd_run(namespace: argparse.Namespace) -> int:
-    """Load a checkpoint and generate through the C core.
+    """Load a checkpoint and run one prompt through the runtime ``--device`` names.
 
-    The engine does the whole chain -- GGUF read, tokenize, graph walk, sample --
-    and this function is the host half the ABI's header describes: it opens a
+    Two runtimes, and they are different shapes, not two implements of one
+    interface: the C engine is a *token* loop this file owns (host tokenizes,
+    forwards, draws), and the S600 delegate is a *text-in/text-out* call that
+    owns its own decode on the BPU.  :func:`_run_runtime` picks between them by
+    the device kind, the same table ``serve`` uses, so the two commands cannot
+    drift into two spellings of "what does ``--device horizon`` mean".
+
+    The *sampling* flags are the one place the two genuinely differ, and each
+    branch states its own rule: the C engine applies them (see
+    :func:`_run_native`), the delegate does not and refuses a non-greedy one
+    (see :func:`_run_delegate`).  Keeping the difference inside the branch is
+    what lets the shared dispatch stay a plain "which silicon" question.
+    """
+    engine_args = _args(namespace)
+    # Selection is inside the try so a device with no runtime is a one-line
+    # refusal, exactly as ``serve`` does, not a traceback.
+    try:
+        runtime = _run_runtime(engine_args)
+    except ConfigurationError as exc:
+        raise SystemExit(f"`pocketllm run` cannot start: {exc}") from exc
+    if runtime == "delegate":
+        return _run_delegate(namespace, engine_args)
+    return _run_native(namespace, engine_args)
+
+
+def _run_native(namespace: argparse.Namespace, engine_args: EngineArgs) -> int:
+    """The C engine's token loop: GGUF read, tokenize, graph walk, sample, print.
+
+    This function is the host half the ABI's header describes: it opens a
     session, drives the loop, and prints.  Nothing here knows what Qwen3 is.
 
     Greedy is the default and its output is bit-identical to what it was before
@@ -346,7 +401,6 @@ def _cmd_run(namespace: argparse.Namespace) -> int:
     from . import native
     from .native import Engine, EngineUnavailable
 
-    engine_args = _args(namespace)
     device = _run_device(engine_args)
     checkpoint = engine_args.checkpoint_dir
 
@@ -422,6 +476,154 @@ def _cmd_run(namespace: argparse.Namespace) -> int:
         raise SystemExit(f"`pocketllm run` failed: {exc}") from exc
 
 
+def _run_delegate(namespace: argparse.Namespace, engine_args: EngineArgs) -> int:
+    """Run one prompt through the S600 delegate over a prebuilt ``.hbm``.
+
+    The delegate is text-in/text-out: it tokenizes, decodes on the BPU, applies
+    its own chat template, and hands text back.  There is no logits surface, so
+    there is nothing here to sample from, and ``max_tokens`` is the *model's*
+    budget rather than this function's -- the delegate's sampler reads its own
+    stop conditions from ``generation_config.json`` beside the tokenizer, and
+    nothing in the ``xlm.h`` request struct carries a token cap.  The cap is
+    therefore reported, not applied -- see below.
+
+    **The sampling flags do not exist on this path, so a non-greedy one is
+    refused by name.**  This is the same rule ``server/xlm_backend.py`` applies
+    per request, and for the same reason: the delegate's sampler is fixed at open
+    by the tokenizer directory's file, so honouring ``--temperature 0.7`` is not
+    something this path can do, and silently generating with the file's sampler
+    would answer a question the caller did not ask.  A value that names what the
+    delegate does anyway (temperature 0, ``top_k 0``, ``top_p 1``) is accepted --
+    spelling out the default is not a contradiction.  The check is the *shared*
+    one (``_refuse_unsupported_sampling``), so ``run`` and ``serve`` cannot
+    disagree about which values are refused.
+    """
+    from .server.xlm_backend import (
+        _refuse_unsupported_sampling,
+        _resolve_model,
+    )
+    from .xlm import XlmEngine, XlmModelType, XlmUnavailable
+
+    # The flag policy is settled **before** anything touches the disk: a bad flag
+    # is a caller's mistake about the request, not about the checkpoint, and
+    # reporting it first is what keeps the two failures from being confused.  The
+    # note is built without the tokenizer directory here (it is not resolved yet),
+    # which only drops the "is this session deterministic" clause from the message.
+    body: dict[str, object] = {
+        "temperature": namespace.temperature,
+        "top_p": namespace.top_p,
+        "top_k": namespace.top_k,
+    }
+    # `min_p` is not a delegate field and `_refuse_unsupported_sampling` does not
+    # read it; a non-default one is refused separately, naming the same reason.
+    if namespace.min_p not in (None, 0.0):
+        raise SystemExit(
+            f"`pocketllm run` cannot apply --min-p {namespace.min_p} on --device horizon: the "
+            "delegate's sampler is fixed when the .hbm is loaded, so it cannot be set per call. "
+            "Omit --min-p, or use a device kind whose engine samples on the host (cpu, cuda)."
+        )
+    if namespace.seed is not None:
+        raise SystemExit(
+            f"`pocketllm run` cannot apply --seed {namespace.seed} on --device horizon: the "
+            "delegate has no RNG of its own to seed, and its reproducibility comes from the "
+            "tokenizer directory's generation_config.json, not from a flag. Omit --seed, or make "
+            "that file greedy (temperature 0, do_sample false) for a deterministic run."
+        )
+    refusal = _refuse_unsupported_sampling(body, _delegate_sampling_note(None))
+    if refusal is not None:
+        # The refusal names the *field* (``top_k``); a CLI caller typed a *flag*
+        # (``--top-k``), and it is the flag the remedy has to name for the
+        # message to be actionable without translating one spelling into the other.
+        flag = "--" + refusal.field.replace("_", "-")
+        raise SystemExit(
+            f"`pocketllm run` cannot apply {flag} {refusal.requested}: {refusal.message} "
+            f"Omit {flag}, or use a device kind whose engine samples on the host (cpu, cuda)."
+        )
+
+    # The same resolution `serve` uses: `--model` may be a `.hbm` or the SDK's
+    # demo-style JSON config, and `--tokenizer-path`/`--config-path` override
+    # what it says.  Reusing `_resolve_model` rather than re-deriving the three
+    # paths is what makes `run` and `serve` accept the same `--model` spelling.
+    try:
+        model = _resolve_model(engine_args)
+    except ConfigurationError as exc:
+        raise SystemExit(f"`pocketllm run` cannot start: {exc}") from exc
+
+    # Same gate ``serve`` applies, for the same reason: the two variables are read
+    # by dlopen / libhbrt4 before this process started, so they must be *required*
+    # here, ahead of the .hbm load, not set.
+    _require_delegate_env("run")
+
+    try:
+        engine = XlmEngine.open(
+            model_path=str(model.hbm),
+            tokenizer_dir=str(model.tokenizer_dir),
+            config_path=str(model.config),
+            model_type=model.model_type,
+        )
+    except (XlmUnavailable, OSError) as exc:
+        raise SystemExit(f"`pocketllm run` failed: {exc}") from exc
+
+    try:
+        text = engine.infer(namespace.prompt)
+    finally:
+        engine.close()
+
+    # `--max-tokens` is the model's budget on this path and the delegate does not
+    # take one: the request struct in `xlm.h` carries no token cap, and the
+    # delegate stops on the `generation_config.json`'s own conditions.  Saying so
+    # is the honest option -- truncating the text *after* the delegate produced it
+    # would be this CLI inventing a cap the model never saw, and a caller who set
+    # `--max-tokens 16` and got 200 tokens should hear why.  The line is a warning
+    # on stderr, so it does not contaminate the answer on stdout.
+    if namespace.max_tokens != 16:
+        print(
+            f"`pocketllm run` on --device horizon does not cap generation: --max-tokens "
+            f"{namespace.max_tokens} was not applied, and the delegate decodes until its own "
+            "stop condition. The text below is the whole answer.",
+            file=sys.stderr,
+        )
+
+    # Mirror the native path's contract: echo the prompt, then the completion.
+    print(namespace.prompt, end="", flush=True)
+    print(text)
+    return 0
+
+
+def _delegate_sampling_note(tokenizer_dir: os.PathLike[str] | str | None) -> str:
+    """How to say, in a ``run`` refusal, what the delegate is doing instead of the flag.
+
+    The ``serve`` adapter builds a note like this from its own model paths
+    (:meth:`~pocketllm.server.xlm_backend.XlmBackend._engine_sampling_note`); this
+    is the ``run`` side of the same sentence, kept here because ``run`` refuses a
+    bad flag *before* it resolves the tokenizer directory.  ``None`` is that
+    honest case -- the note then says what the delegate does without claiming to
+    know whether *this* session is deterministic, rather than guessing.
+    """
+    if tokenizer_dir is None:
+        behaviour = "whether this session is deterministic is decided by that file"
+        return (
+            "the S600 delegate builds its sampler from generation_config.json in the tokenizer "
+            "directory, and that sampler is fixed when the model is loaded rather than per call: "
+            f"{behaviour}. A value that would change the decode cannot be applied."
+        )
+    from .server.xlm_backend import _tokenizer_dir_is_deterministic
+
+    deterministic = _tokenizer_dir_is_deterministic(pathlib.Path(tokenizer_dir))
+    behaviour = (
+        "the tokenizer directory's generation_config.json is deterministic, so this session "
+        "decodes greedily"
+        if deterministic
+        else "this session samples from the tokenizer directory's generation_config.json, "
+        "which is not deterministic"
+    )
+    return (
+        "the S600 delegate builds its sampler from generation_config.json in the tokenizer "
+        f"directory, and that sampler is fixed when the model is loaded rather than per call: "
+        f"{behaviour}. A value that would change the decode cannot be applied."
+    )
+
+
 def _cmd_serve(namespace: argparse.Namespace) -> int:
     """Load a checkpoint and serve it over the OpenAI-compatible HTTP surface.
 
@@ -434,13 +636,11 @@ def _cmd_serve(namespace: argparse.Namespace) -> int:
     reads it from the body.  A server-wide default would be a second place the same number
     lives.
 
-    Which adapter is built follows ``--device`` (:func:`_serve_adapter`): the S600 delegate for
+    Which runtime is built follows ``--device`` (:func:`_serve_runtime`): the S600 delegate for
     ``horizon``, this tree's C engine for everything else it serves.  The delegate needs two
     environment variables that must be set *before this process started* -- see
     :func:`_require_delegate_env` -- so they are checked here, ahead of the ``.hbm`` load.
     """
-    import importlib
-
     from .server.openai import serve
 
     engine_args = _args(namespace)
@@ -449,16 +649,18 @@ def _cmd_serve(namespace: argparse.Namespace) -> int:
 
     # Construction is where the checkpoint is opened and the template read, so a bad path or an
     # unbuilt library fails here -- with the engine's own message -- rather than on the first
-    # request, after the port has been advertised as ready.  Adapter selection is inside the block
-    # for the same reason: a device with no adapter must be a one-line refusal, not a traceback.
+    # request, after the port has been advertised as ready.  Runtime selection is inside the block
+    # for the same reason: a device with no runtime must be a one-line refusal, not a traceback.
     try:
-        adapter = _serve_adapter(engine_args)
-        module = importlib.import_module(adapter)
-        if adapter == "pocketllm.server.xlm_backend":
+        if _serve_runtime(engine_args) == "delegate":
             _require_delegate_env()
-            backend = module.XlmBackend(engine_args)
+            from .server.xlm_backend import XlmBackend
+
+            backend = XlmBackend(engine_args)
         else:
-            backend = module.NativeBackend(engine_args, device)
+            from .server.native_backend import NativeBackend
+
+            backend = NativeBackend(engine_args, device)
     except (BackendUnavailableError, ConfigurationError) as exc:
         raise SystemExit(f"`pocketllm serve` cannot start: {exc}") from exc
 
