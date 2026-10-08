@@ -37,6 +37,18 @@ from .backends import registry
 __all__ = ["build_parser", "main"]
 
 
+#: The device kind served by the S600 delegate, ``libxlm.so``.
+#:
+#: The delegate is the one serving path this tree drives that is *not* its own C
+#: engine, so it is named here rather than folded into the C engine's dispatch.
+#: ``pocketllm.backends.horizon`` already claims this kind (its
+#: ``device_kind`` is ``"horizon"`` and its probe finds ``libhbrt4.so`` on a
+#: board), so ``--device horizon`` is a name a user already has from
+#: ``pocketllm devices`` -- the selection below reuses it rather than inventing a
+#: second vocabulary for the same silicon.
+_DELEGATE_DEVICE = "horizon"
+
+
 def _device_kinds() -> tuple[str, ...]:
     return device_kinds()
 
@@ -237,6 +249,86 @@ def _run_device(engine_args: EngineArgs) -> str:
     return device.split(":")[0]
 
 
+def _serve_adapter(engine_args: EngineArgs) -> str:
+    """Which serving adapter ``serve`` builds: the C engine, or the S600 delegate.
+
+    ``--device`` is the same *kind* a user already reads from ``pocketllm
+    devices``, so it is what picks the adapter too -- there is no second flag to
+    learn.  Two kinds map to an adapter and the rest are refused:
+
+    * ``horizon`` -- the S600 delegate (:class:`~pocketllm.server.xlm_backend.XlmBackend`),
+      which drives ``libxlm.so`` over a prebuilt ``.hbm``.
+    * ``cpu``/``cuda`` (and ``auto``, which resolves to ``cpu`` for the same
+      reason :func:`_run_device` says) -- this tree's own C engine
+      (:class:`~pocketllm.server.native_backend.NativeBackend`).
+
+    *Honest about the rest.*  ``qnn``, ``mps``, ``ascend`` and every other kind
+    the registry knows are Python-ABI backends with no ``EngineBackend`` adapter
+    at all -- ``serve`` cannot run them, and saying so by name is the point.  A
+    silent fall-through to the C engine would be a server that accepts ``--device
+    qnn`` and then runs the checkpoint on the CPU, which is worse than a refusal
+    because the client cannot tell.  The extension seam is
+    :data:`_SERVE_ADAPTERS`: a new adapter names the kinds it serves and the
+    dispatch follows, rather than another ``if`` here.
+    """
+    device = engine_args.device.split(":")[0]
+    if device == "auto":
+        device = "cpu"
+    if device not in _SERVE_ADAPTERS:
+        raise ConfigurationError(
+            f"`serve` has no adapter for --device {device!r}; it serves "
+            f"{', '.join(sorted(_SERVE_ADAPTERS))} (and `auto`, which is cpu)"
+        )
+    return _SERVE_ADAPTERS[device]
+
+
+#: The serving adapters, keyed by the device kind each one runs on.  The value is
+#: the module that owns the adapter, imported only when it is selected -- the
+#: same laziness :func:`_cmd_serve` already relies on so ``pocketllm devices``
+#: does not pay for ``http.server``.
+_SERVE_ADAPTERS: dict[str, str] = {
+    "cpu": "pocketllm.server.native_backend",
+    "cuda": "pocketllm.server.native_backend",
+    _DELEGATE_DEVICE: "pocketllm.server.xlm_backend",
+}
+
+
+def _require_delegate_env() -> None:
+    """Refuse to start the delegate without the two variables it cannot run without.
+
+    Neither can be set usefully from here.  ``LD_LIBRARY_PATH`` is read by
+    ``dlopen`` **once, before this process ran**, so writing it into
+    ``os.environ`` now is a no-op -- measured: ``libxlm.so`` still fails to load
+    its ``libopencv_world.so.409`` dependency when the variable is set in-process.
+    ``HB_DNN_USER_DEFINED_L2M_SIZES`` may fare no better once ``libhbrt4`` has
+    initialised.  So the honest thing is to require them **before** the adapter
+    opens the ``.hbm`` and say where they come from, not to set them and pretend.
+
+    The values are the SDK demo's own (``oellm_runtime/examples/llm_demo/
+    run_llm.sh``): ``LD_LIBRARY_PATH`` must contain the SDK ``lib/`` directory,
+    and the four-core Qwen3 ``.hbm``s need ``6:6:6:6``.
+    """
+    sdk_lib = "the SDK's lib/ directory"
+    problems: list[str] = []
+    if not os.environ.get("LD_LIBRARY_PATH"):
+        problems.append(
+            f"LD_LIBRARY_PATH must contain {sdk_lib} "
+            "(the `libxlm.so` the delegate loads needs it)"
+        )
+    if not os.environ.get("HB_DNN_USER_DEFINED_L2M_SIZES"):
+        problems.append(
+            "HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6 "
+            "(the L2m split the four-core Qwen3 `.hbm`s were built for)"
+        )
+    if not problems:
+        return
+    raise ConfigurationError(
+        "the S600 delegate cannot start without, set before `pocketllm serve`: "
+        + "; ".join(problems)
+        + ". `source` the SDK's run_llm.sh, or export both and retry."
+    )
+
+
 def _cmd_run(namespace: argparse.Namespace) -> int:
     """Load a checkpoint and generate through the C core.
 
@@ -341,8 +433,14 @@ def _cmd_serve(namespace: argparse.Namespace) -> int:
     Sampling is not a CLI flag on this path: the client names it per request, and the adapter
     reads it from the body.  A server-wide default would be a second place the same number
     lives.
+
+    Which adapter is built follows ``--device`` (:func:`_serve_adapter`): the S600 delegate for
+    ``horizon``, this tree's C engine for everything else it serves.  The delegate needs two
+    environment variables that must be set *before this process started* -- see
+    :func:`_require_delegate_env` -- so they are checked here, ahead of the ``.hbm`` load.
     """
-    from .server.native_backend import NativeBackend
+    import importlib
+
     from .server.openai import serve
 
     engine_args = _args(namespace)
@@ -351,9 +449,16 @@ def _cmd_serve(namespace: argparse.Namespace) -> int:
 
     # Construction is where the checkpoint is opened and the template read, so a bad path or an
     # unbuilt library fails here -- with the engine's own message -- rather than on the first
-    # request, after the port has been advertised as ready.
+    # request, after the port has been advertised as ready.  Adapter selection is inside the block
+    # for the same reason: a device with no adapter must be a one-line refusal, not a traceback.
     try:
-        backend = NativeBackend(engine_args, device)
+        adapter = _serve_adapter(engine_args)
+        module = importlib.import_module(adapter)
+        if adapter == "pocketllm.server.xlm_backend":
+            _require_delegate_env()
+            backend = module.XlmBackend(engine_args)
+        else:
+            backend = module.NativeBackend(engine_args, device)
     except (BackendUnavailableError, ConfigurationError) as exc:
         raise SystemExit(f"`pocketllm serve` cannot start: {exc}") from exc
 
