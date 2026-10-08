@@ -90,6 +90,7 @@ nav:
   - Models:
       - Overview: models/README.md
       - Reference architectures: models/architectures.md
+      - Qwen3 on the RDK S600: models/s600_qwen3.md
   - Guides:
       - Overview: guides/index.md
       - Cutting a release: guides/pypi_release.md
