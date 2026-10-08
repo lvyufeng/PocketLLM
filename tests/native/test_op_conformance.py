@@ -389,18 +389,17 @@ DEVICE_EXCLUDED_CASES: dict[str, dict[str, str]] = {
         "topk_sample_all_tied": "ascend: topk_sample not implemented yet",
         # --- ops that exist but take a narrower shape ---
         #
-        # `gemm_quant` here is q4_k only, M=1 only, and needs n and k multiples
-        # of 128 for the W4A16 packing; these two cases are f32 (M=3/4) and
-        # q6_k, so the op refuses them by name rather than running them wrong.
-        "gemm_quant_q4_k": "ascend: gemm_quant is M=1 and n,k % 128 == 0 only",
-        "gemm_quant_q6_k": "ascend: gemm_quant decodes q4_k only",
+        # `gemm_quant` now decodes q4_k and q6_k faithfully through the dense
+        # cube at any m and any n (chunked along n), so both cases below run --
+        # see `ascend-310b-backend-build`.  Bias is still the one gap.
         "gemm_bias": "ascend: gemm bias not implemented yet (MatmulCubeCustom has no bias input)",
-        # `AttentionStepCustom` is a one-token decode step; `q_len > 1` throws
-        # "not implemented for prefill" and `first_key != 0` a sliding window the
-        # op does not implement.
-        "attention_chunk": "ascend: attention is decode-only (q_len == 1)",
-        "attention_grouped": "ascend: attention is decode-only (q_len == 1)",
+        # Prefill (`q_len > 1`) now runs as a loop of the decode step; the
+        # sliding window (`first_key != 0`) is the remaining attention gap.
         "attention_first_key": "ascend: attention has no sliding window (first_key != 0)",
+        # `attention_grouped` is `d = 8`, below the 16-lane fp16 repeat the
+        # AscendC kernel moves, so the backend refuses it by name (same edge as
+        # `rms_norm_single_row` and `rope_small_head_dim`), not a prefill gap.
+        "attention_grouped": "ascend: attention head_dim d=8 is below the 16-lane fp16 repeat",
         # --- cases that do not apply to an fp16/32B-lane kernel ---
         #
         # `rms_norm_single_row` is `d = 1`, which is below the 16-lane vector
