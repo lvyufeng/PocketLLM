@@ -99,6 +99,45 @@ def test_refusals_do_not_mistake_a_bool_for_a_number() -> None:
     assert _refuse_unsupported_sampling({"top_k": False}, _NOTE) is None
 
 
+# -- whether a session can be deterministic, checkable on any host -----------
+
+
+@pytest.mark.parametrize(
+    ("config", "deterministic"),
+    [
+        ({"temperature": 0.0, "do_sample": False, "top_k": 1, "top_p": 1.0}, True),
+        ({"do_sample": False}, True),
+        ({"temperature": 0}, True),
+        # The SDK's own shipped file: sampling, and not reproducible run to run.
+        ({"temperature": 0.6, "do_sample": True, "top_k": 20, "top_p": 0.95}, False),
+        ({"temperature": 0.6}, False),
+        # A bool is not a temperature, and a missing file is not a promise.
+        ({"temperature": False}, False),
+        ({}, False),
+    ],
+)
+def test_the_determinism_flag_reads_the_generation_config(
+    tmp_path: pathlib.Path, config: dict, deterministic: bool
+) -> None:
+    """The sampler is built from `generation_config.json`, so that file decides.
+
+    The delegate ignores the request's `Sampling` block, so the only lever on
+    reproducibility is the file beside the tokenizer.  Reading it here is what
+    tells the refusal message (and a diagnostic) whether this session can
+    promise the same text twice; a spine that guessed "greedy" would be lying
+    on the SDK's own default file.
+    """
+    (tmp_path / "generation_config.json").write_text(json.dumps(config))
+    assert xlm_backend._tokenizer_dir_is_deterministic(tmp_path) is deterministic
+
+
+def test_a_directory_without_a_generation_config_is_not_called_deterministic(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An absent file is the delegate's own default, which samples."""
+    assert xlm_backend._tokenizer_dir_is_deterministic(tmp_path) is False
+
+
 # -- where the delegate's inputs come from, checkable on any host -----------
 
 

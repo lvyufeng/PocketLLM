@@ -15,6 +15,7 @@ The skip is the same shape `tests/native/` already uses for the C engine:
 from __future__ import annotations
 
 import ctypes
+import json
 import pathlib
 
 import pytest
@@ -33,6 +34,42 @@ needs_delegate = pytest.mark.skipif(
 needs_checkpoint = pytest.mark.skipif(
     not _HBM.is_file(), reason=f"no .hbm at {_HBM}"
 )
+
+#: A greedy ``generation_config.json``.  The delegate builds its sampler from
+#: this file rather than from the request's ``Sampling`` block, so making a
+#: session deterministic means pointing ``tokenizer_dir`` at a directory that
+#: carries one of these.  Only the four sampling keys matter to the delegate;
+#: the token ids are kept so the file still reads as the checkpoint's own.
+_GREEDY_GENERATION_CONFIG = {
+    "bos_token_id": 151643,
+    "do_sample": False,
+    "eos_token_id": [151645, 151643],
+    "pad_token_id": 151643,
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "transformers_version": "4.51.0",
+}
+
+
+def _greedy_tokenizer_dir(tmp_path: pathlib.Path) -> pathlib.Path:
+    """A tokenizer directory whose ``generation_config.json`` forces greedy decode.
+
+    The SDK ships the tokenizer and the config in the *same* directory and the
+    delegate reads both from ``tokenizer_dir``, so the tokenizer files are linked
+    in rather than copied and the one file that decides sampling is written
+    fresh.  ``symlink`` needs no elevated privilege on the board and keeps the
+    11 MB ``tokenizer.json`` out of the test's temporary tree.
+    """
+    directory = tmp_path / "tokenizer"
+    directory.mkdir()
+    for source in _TOKENIZER.iterdir():
+        if source.is_file() and source.name != "generation_config.json":
+            (directory / source.name).symlink_to(source)
+    (directory / "generation_config.json").write_text(
+        json.dumps(_GREEDY_GENERATION_CONFIG), encoding="utf-8"
+    )
+    return directory
 
 
 # -- the transcription, checkable on any host -------------------------------
@@ -102,6 +139,37 @@ def test_model_type_qwen3_is_nine() -> None:
 
 
 # -- the behaviour, needs the board -----------------------------------------
+
+
+@needs_delegate
+@needs_checkpoint
+def test_a_deterministic_generation_config_decodes_identically(tmp_path: pathlib.Path) -> None:
+    """The same prompt twice returns byte-identical text, when the config is greedy.
+
+    Determinism on this path is the **tokenizer directory's**, not the bridge's:
+    the delegate ignores the :class:`~pocketllm.xlm.Sampling` block and builds
+    its sampler from ``generation_config.json`` beside the tokenizer.  The SDK
+    ships a file that samples (``temperature: 0.6, top_k: 20``), so this test
+    supplies its own greedy file and then asserts the two answers are equal
+    character for character -- which is the property the fleet's text-identity
+    parity rests on.  If this fails, the file, not the engine, is what moved.
+    """
+    engine = xlm.XlmEngine.open(
+        model_path=str(_HBM),
+        tokenizer_dir=str(_greedy_tokenizer_dir(tmp_path)),
+        config_path=str(_CONFIG),
+    )
+    try:
+        first = engine.infer("The capital of France is")
+        second = engine.infer("The capital of France is")
+    finally:
+        engine.close()
+
+    assert first.strip(), "the delegate returned nothing on the prompt"
+    assert first == second, (
+        "the deterministic generation_config.json did not pin the decode: two inferences of "
+        "the same prompt differ, so this session is sampling"
+    )
 
 
 @needs_delegate
