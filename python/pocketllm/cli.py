@@ -334,7 +334,20 @@ def _require_delegate_env(command: str = "serve") -> None:
 
     The values are the SDK demo's own (``oellm_runtime/examples/llm_demo/
     run_llm.sh``): ``LD_LIBRARY_PATH`` must contain the SDK ``lib/`` directory,
-    and the four-core Qwen3 ``.hbm``s need ``6:6:6:6``.
+    and the demo sets ``HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6`` for the
+    four-core Qwen3 ``.hbm``s.
+
+    **This checks that each variable is set, not that it has a particular value**,
+    and the message says exactly that.  The split is the one value the delegate
+    might be sensitive to, and it was measured not to be: on this board
+    ``6:6:6:6``, ``0:0:0:0``, ``2:2:2:2``, ``1:1:1:1`` and ``12:12:12:12`` all
+    initialise the model identically (the phase-2 ``ion_alloc`` refusal for 4B is
+    at ``hbDNNInitializeFromFiles``, before the split is consulted).  Refusing
+    anything but ``6:6:6:6`` would therefore assert a constraint nobody has shown
+    -- the SDK's own documentation sets ``6:6:6:6`` for every model regardless of
+    size, so it is a convention, not a per-checkpoint requirement.  The variable
+    is still *required* rather than defaulted here because the delegate reads it
+    at init and this process cannot set it in time.
     """
     sdk_lib = "the SDK's lib/ directory"
     problems: list[str] = []
@@ -345,8 +358,8 @@ def _require_delegate_env(command: str = "serve") -> None:
         )
     if not os.environ.get("HB_DNN_USER_DEFINED_L2M_SIZES"):
         problems.append(
-            "HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6 "
-            "(the L2m split the four-core Qwen3 `.hbm`s were built for)"
+            "HB_DNN_USER_DEFINED_L2M_SIZES must be set to the L2m split the `.hbm` was "
+            "built for (the SDK demo's run_llm.sh uses 6:6:6:6 for the four-core Qwen3 graphs)"
         )
     if not problems:
         return
@@ -374,15 +387,27 @@ def _cmd_run(namespace: argparse.Namespace) -> int:
     what lets the shared dispatch stay a plain "which silicon" question.
     """
     engine_args = _args(namespace)
-    # Selection is inside the try so a device with no runtime is a one-line
-    # refusal, exactly as ``serve`` does, not a traceback.
+    # **The whole body, not just the dispatch, is inside one try.**  A
+    # `ConfigurationError` is this command's own refusal -- a device with no
+    # runtime, a flag the delegate cannot apply, an out-of-range flag, an env var
+    # the delegate needs -- and every one of them is a caller's mistake that
+    # belongs in a one-line `SystemExit`, not a traceback.  Wrapping it here
+    # rather than at each raise is what keeps a *new* refusal from being added
+    # later without the conversion: the branch functions raise, and this is the
+    # one frame that has to catch.  `serve` does the same over its own whole
+    # construction block (see :func:`_cmd_serve`), which is why the two commands
+    # now fail the same way.
+    #
+    # Only `ConfigurationError` is caught: an `EngineUnavailable`, an `OSError`
+    # and a bug are all left to propagate, so the conversion cannot hide a real
+    # failure as a tidy refusal.
     try:
         runtime = _run_runtime(engine_args)
+        if runtime == "delegate":
+            return _run_delegate(namespace, engine_args)
+        return _run_native(namespace, engine_args)
     except ConfigurationError as exc:
         raise SystemExit(f"`pocketllm run` cannot start: {exc}") from exc
-    if runtime == "delegate":
-        return _run_delegate(namespace, engine_args)
-    return _run_native(namespace, engine_args)
 
 
 def _run_native(namespace: argparse.Namespace, engine_args: EngineArgs) -> int:
@@ -544,10 +569,13 @@ def _run_delegate(namespace: argparse.Namespace, engine_args: EngineArgs) -> int
     # demo-style JSON config, and `--tokenizer-path`/`--config-path` override
     # what it says.  Reusing `_resolve_model` rather than re-deriving the three
     # paths is what makes `run` and `serve` accept the same `--model` spelling.
-    try:
-        model = _resolve_model(engine_args)
-    except ConfigurationError as exc:
-        raise SystemExit(f"`pocketllm run` cannot start: {exc}") from exc
+    #
+    # Its `ConfigurationError` is raised uncaught on purpose: `_cmd_run` wraps
+    # every branch call in one handler, so the conversion to `SystemExit` happens
+    # for this refusal and for the ones below it in a single place rather than
+    # three.  Catching here too would be the scattered shape this consolidation
+    # removed.
+    model = _resolve_model(engine_args)
 
     # Same gate ``serve`` applies, for the same reason: the two variables are read
     # by dlopen / libhbrt4 before this process started, so they must be *required*
