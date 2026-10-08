@@ -169,39 +169,149 @@ __global__ void gemm_kernel(const float *x, const float *w, const float *bias, f
   *dst = accumulate ? *dst + value : value;
 }
 
-/* The packed product: one thread per output element, walking the weight row's
- * blocks and decoding each weight as the sum consumes it.
+/* One 256-weight super-block added into a running sum, with the block's own
+ * scale/min decode hoisted out of the weight loop.
  *
- * The decode is `quant/blocks.h`, the same header the CPU kernel includes, so
- * the bit layout is stated once. What is *not* shared is the accumulation: the
- * CPU walks a row block by block with a single running sum, and so does this,
- * which is what keeps the two comparable at the tolerance the test uses. A
- * shared-memory reduction over the row would be the faster shape and would
- * differ from the CPU by the association order rather than by the arithmetic.
+ * This is the packed GEMM's inner kernel and the reason the decode lives here
+ * rather than in a per-weight call: `dequant_block` recomputes a Q4_K block's
+ * `d`, `dmin` and all eight packed `(scale, min)` pairs -- a branchy
+ * `get_scale_min_k4` each -- for *every one* of the 256 weights, so the obvious
+ * "one weight at a time" loop does 256 decodes per block where 8 will do. The
+ * CPU kernel hoists exactly this (`dot_q4_k_block_scalar`, `kernels.cpp`), and
+ * so does this.
  *
- * The block boundary is computed per column -- `col / 256` and `col % 256` --
- * rather than walked by an outer loop over blocks. Every row is block-aligned
- * here, because the caller refuses a `k` that is not a whole number of blocks,
- * so the two spellings index the same bytes; the division costs one modulus per
- * weight and says on the line what the layout is, which an outer loop would
- * leave to the reader to reconstruct. */
+ * What is deliberately *not* changed is the arithmetic or its order. The
+ * expression per weight is `xs[col] * (sd * q - md)` for Q4_K, where
+ * `sd = d * scale` and `md = dmin * minimum` are formed once per group, and
+ * `xs[col] * (ds * (q - 32))` for Q6_K. `quant::dequant_q4_k` writes
+ * `d * scale * q - dmin * minimum`, which associates left to
+ * `(d * scale) * q - (dmin * minimum)` -- the same two products in the same
+ * order -- and `dequant_q6_k` writes `(d * scale) * (q - 32)` with the same
+ * hoist, so each weight is the float the per-weight decoder produced, bit for
+ * bit. The sum is still a single serial `total += ...` in column order, so the
+ * accumulation is not reassociated either: this kernel's output is *identical*
+ * to the per-weight loop it replaces, which is what lets a performance change
+ * land without moving a token.
+ *
+ * The scale index for Q6_K is `i / 16 + 2 * sub` -- indexed by run as well as by
+ * position -- which is the piece a decoder indexing by position alone gets right
+ * for one run in four; it is written the way `dequant_q6_k` writes it. */
+__device__ void quant_block_accumulate(int type_id, const uint8_t *block, const float *xs,
+                                       float &total) {
+  if (type_id == quant::kGgmlQ4K) {
+    const float d = quant::as_half(block, 0);
+    const float dmin = quant::as_half(block, 2);
+    const uint8_t *scales = block + 4;
+    int col = 0;
+    for (int g = 0; g < 8; ++g) {
+      int scale = 0;
+      int minimum = 0;
+      quant::get_scale_min_k4(scales, g, &scale, &minimum);
+      const float sd = d * static_cast<float>(scale);
+      const float md = dmin * static_cast<float>(minimum);
+      /* The eight 32-weight groups map onto four 32-byte runs of packed
+       * nibbles, low nibble for the earlier group and high for the later one --
+       * the same `run`/`high` split `dequant_q4_k` makes, hoisted to the group. */
+      const uint8_t *packed = block + 16 + (g / 2) * 32;
+      const bool high = (g % 2) != 0;
+      for (int i = 0; i < 32; ++i, ++col) {
+        const int q = quant::as_byte(packed, i);
+        const int nibble = high ? (q >> 4) : (q & 0x0F);
+        total += xs[col] * (sd * static_cast<float>(nibble) - md);
+      }
+    }
+    return;
+  }
+  /* Q6_K: two 128-weight halves, four 32-weight runs each, sixteen signed byte
+   * scales. The per-weight work is the `ql`/`qh` bit assembly, which stays in
+   * the loop; `d * scale` is formed once per 16-weight span. */
+  const float d = quant::as_half(block, 208);
+  int col = 0;
+  for (int half = 0; half < 2; ++half) {
+    const uint8_t *ql = block + half * 64;
+    const uint8_t *qh = block + 128 + half * 32;
+    for (int sub = 0; sub < 4; ++sub) {
+      const uint8_t *ql_run = ql + (sub % 2) * 32;
+      for (int i = 0; i < 32; ++i, ++col) {
+        const int ql_byte = quant::as_byte(ql_run, i);
+        const int qh_byte = quant::as_byte(qh, i);
+        const int high = ((qh_byte >> (2 * sub)) & 3) << 4;
+        const int low = sub < 2 ? (ql_byte & 0x0F) : (ql_byte >> 4);
+        const int q = low | high;
+        const int scale = quant::as_int8(block, 192 + half * 8 + i / 16 + 2 * sub);
+        const float ds = d * static_cast<float>(scale);
+        total += xs[col] * (ds * static_cast<float>(q - 32));
+      }
+    }
+  }
+}
+
+/* The packed product over a tile of output columns, walking the weight row one
+ * super-block at a time.
+ *
+ * `blockIdx.x` tiles the output columns -- `blockDim.x` of them per block, one
+ * thread each -- and `blockIdx.y` is the output row.
+ *
+ * What a column tile can share is the *activation*, and only the activation:
+ * every column of the tile multiplies the same `x` row, so the 256 activation
+ * values of a super-block are staged in shared memory once and read by all
+ * `blockDim.x` threads, instead of each thread pulling the same 256 floats from
+ * L2. The weights are *not* staged, and cannot be: each column owns a different
+ * weight row (`blocks + j * row_bytes`), so there is no single weight block to
+ * share across the tile. The weight reuse in this kernel is within a thread
+ * across `k`, which is what `quant_block_accumulate`'s hoist provides.
+ *
+ * Staging uses all `blockDim.x` lanes because `blockDim.x == kBlockWeights`; the
+ * loop is written to tolerate any `blockDim.x` anyway, for the reason below.
+ *
+ * The two `__syncthreads` are unconditional. A thread whose column is past `n`
+ * (the last, ragged tile) still reaches every barrier and simply skips the
+ * accumulate -- a barrier some threads skip is a hang, not a wrong number, and an
+ * earlier draft of this kernel that let an inactive lane *write zeros into the
+ * staged block* corrupted the real columns sharing that buffer. Only lanes that
+ * are loading a valid address write to shared here. */
 __global__ void gemm_quant_kernel(const float *x, const uint8_t *blocks, const float *bias,
                                   float *out, int64_t m, int64_t n, int64_t k, int type_id,
                                   int block_bytes, int accumulate) {
   const int64_t r = blockIdx.y;
   const int64_t j = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (r >= m || j >= n) {
-    return;
-  }
-  const int64_t row_bytes = (k / quant::kBlockWeights) * block_bytes;
-  const uint8_t *row_blocks = blocks + j * row_bytes;
+  const int lane = threadIdx.x;
+  const bool active = (r < m) && (j < n);
+
+  const int64_t n_blk = k / quant::kBlockWeights;
+  const int64_t row_bytes = n_blk * block_bytes;
   const float *row = x + r * k;
+  /* Guarded so the pointer arithmetic is not formed for an out-of-range column:
+   * an inactive thread must not read `blocks` past the end even though it never
+   * dereferences the result. */
+  const uint8_t *col_blocks = active ? blocks + j * row_bytes : blocks;
+
+  __shared__ float xs[quant::kBlockWeights];
 
   float total = 0.0F;
-  for (int64_t col = 0; col < k; ++col) {
-    const int64_t block = col / quant::kBlockWeights;
-    const int within = static_cast<int>(col % quant::kBlockWeights);
-    total += row[col] * quant::dequant_block(type_id, row_blocks + block * block_bytes, within);
+  for (int64_t b = 0; b < n_blk; ++b) {
+    /* Cooperative stage of this row's activation super-block. Only the lanes
+     * that own a real element write, so a `blockDim.x` smaller than the block
+     * width cannot have a non-loading lane clobber another's value with a
+     * default. */
+    for (int i = lane; i < quant::kBlockWeights; i += blockDim.x) {
+      xs[i] = row[b * quant::kBlockWeights + i];
+    }
+    __syncthreads();
+    if (active) {
+      /* The running sum is passed *into* the block walk rather than returned
+       * from it: the sum stays one serial chain across the whole row of `k`
+       * weights, exactly as the loop it replaces kept it, so no block boundary
+       * reassociates the accumulation. This thread's own weight block -- the
+       * column `j` it owns -- is read from global (L2-resident after the first
+       * block touches it) and decoded with the hoisted scale/min unpack. */
+      quant_block_accumulate(type_id, col_blocks + b * block_bytes, xs, total);
+    }
+    __syncthreads();
+  }
+
+  if (!active) {
+    return;
   }
   if (bias != nullptr) {
     total += bias[j];
@@ -496,6 +606,15 @@ class CudaBackend final : public Backend {
        * formats this particular build compiles. */
       throw Error("backend 'cuda': no packed kernel for GGML type id " + std::to_string(type_id));
     }
+    /* A block covers a *tile* of output columns, one thread per column, so that
+     * the activation super-block every column multiplies is staged into shared
+     * memory once and read by the whole tile rather than re-fetched per column.
+     * The weights cannot be shared this way -- each column owns a different
+     * weight row -- so the weight reuse is the per-group decode hoist inside
+     * `quant_block_accumulate`, not the staging. 256 columns against 36 layers
+     * of this model is 4-8 blocks per projection at decode -- enough to fill the
+     * card -- and eight of the nine projections per layer are exactly 256 or 512
+     * columns wide. */
     const unsigned threads = 256;
     const dim3 grid(static_cast<unsigned>((n + threads - 1) / threads), static_cast<unsigned>(m));
     gemm_quant_kernel<<<grid, threads>>>(f(x), reinterpret_cast<const uint8_t *>(blocks.handle),
