@@ -74,6 +74,7 @@ bool scalar_weighted_sum_forced() {
  * is re-measured on a different host without an edit.  Read once, on first use:
  * the answer cannot change under a running process, and the per-call `getenv`
  * would be a lock on the token path. */
+#if POCKETLLM_HAVE_AVX2
 int64_t gemm_rows_per_walk() {
   static const int64_t rpw = [] {
     const char *from_env = std::getenv("POCKETLLM_CPU_GEMM_RPW");
@@ -85,6 +86,7 @@ int64_t gemm_rows_per_walk() {
   }();
   return rpw;
 }
+#endif
 
 /* The widest head dimension the tiled weighted sum holds on the stack.
  *
@@ -136,6 +138,81 @@ inline float half_to_float(uint16_t bits) {
   float f;
   std::memcpy(&f, &out, sizeof(f));
   return f;
+}
+
+/* The inverse of `half_to_float`: an f32 narrowed to an f16 bit pattern,
+ * round-to-nearest-ties-to-even.
+ *
+ * It exists because the f16 KV cache has to be written on hosts that have no
+ * F16C, which is every aarch64 board this tree targets.  The alternative --
+ * refusing to narrow -- would take the cache away from exactly the devices that
+ * need it most, and the narrow direction is routine integer arithmetic rather
+ * than the optional instruction the vector path uses.  The one thing it owes to
+ * `_mm_cvtps_ph(..., _MM_FROUND_TO_NEAREST_INT)` is that the bytes agree: a row
+ * written on one host and read on another has to be the same row, so the tie
+ * rule and the overflow behaviour are the same, not merely similar.
+ *
+ * Overflow saturates to infinity, as the hardware convert does. Out-of-range
+ * exponents cannot walk into the NaN encoding because the magnitude bands are
+ * checked first and narrowed in order. */
+inline uint16_t float_to_half(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const uint32_t sign = (bits >> 16) & 0x8000U;
+  const uint32_t mag = bits & 0x7FFFFFFFU;
+
+  if (mag >= 0x7F800000U) {
+    /* inf, and NaN.  A NaN keeps a payload so it stays a NaN, and the quiet bit
+     * is forced because the f32 quiet bit is not at the f16 quiet bit's
+     * position: a signaling f32 would otherwise narrow to a signaling f16.
+     * Masked to ten bits -- `mag` still has the exponent in it, and shifting
+     * without the mask walks into the sign. */
+    const uint32_t payload = mag > 0x7F800000U ? (((mag >> 13) & 0x3FFU) | 0x200U) : 0U;
+    return static_cast<uint16_t>(sign | 0x7C00U | payload);
+  }
+
+  const uint32_t exp = mag >> 23;
+  const uint32_t man = mag & 0x7FFFFFU;
+
+  if (exp <= 112U) {
+    /* Subnormal, or small enough to round to zero.  An f16 subnormal is an
+     * integer count of 2^-24, so widening the significand to 24 bits and
+     * shifting it down by `126 - exp` lands directly in that unit.  Below
+     * `exp == 95` the shift would exceed the significand's width anyway, and
+     * the value is under half of the smallest subnormal, so it is zero. */
+    if (exp < 95U) {
+      return static_cast<uint16_t>(sign);
+    }
+    const uint32_t shift = 126U - exp;
+    const uint32_t sig = 0x800000U | man;
+    const uint32_t rem = sig & ((1U << shift) - 1U);
+    uint32_t base = sig >> shift;
+    const uint32_t halfway = 1U << (shift - 1U);
+    if (rem > halfway || (rem == halfway && (base & 1U) != 0U)) {
+      ++base;
+    }
+    /* `base` reaches 0x400 only by rounding the largest subnormal up, and that
+     * pattern is the smallest normal -- 2^-14 -- so no exponent fix-up. */
+    return static_cast<uint16_t>(sign | base);
+  }
+
+  /* Normal.  Ten mantissa bits survive; the thirteen dropped ones decide. */
+  uint32_t e16 = exp - 112U;
+  const uint32_t rem = man & 0x1FFFU;
+  uint32_t base = man >> 13;
+  if (rem > 0x1000U || (rem == 0x1000U && (base & 1U) != 0U)) {
+    ++base;
+  }
+  if (base == 0x400U) {
+    /* The significand carried into the exponent.  65520.0f is the tie that
+     * lands here, and the exponent that comes out is the reserved one. */
+    base = 0;
+    ++e16;
+  }
+  if (e16 >= 0x1FU) {
+    return static_cast<uint16_t>(sign | 0x7C00U);
+  }
+  return static_cast<uint16_t>(sign | (e16 << 10) | base);
 }
 
 /* ``sum_k a[k] * b[k]`` for `k` values.
@@ -279,7 +356,6 @@ inline float dot4(const float *a, const float *b, int64_t k) { return dot(a, b, 
  *
  * `$POCKETLLM_CPU_SCALAR_DOT` routes it to two scalar `dot` calls, like `dot4`
  * and `dot_tile_r`, so the equivalence stays checkable through the public API. */
-#if POCKETLLM_HAVE_AVX2
 
 /* **This fold contracts and the score dots above do not, and the split is
  * deliberate.**  `dot4`, `dot_pair` and `dot_tile_r` all produce the *score*,
@@ -300,7 +376,15 @@ inline float dot4(const float *a, const float *b, int64_t k) { return dot(a, b, 
  * build (those prompts differ from the oracle's f32/flash-off convention under
  * *both* builds, so the change is neutral there rather than responsible).  The
  * attribute was originally put on both the score and the fold together; the
- * score needed it, the fold was never shown to. */
+ * score needed it, the fold was never shown to.
+ *
+ * **This is deliberately outside the `POCKETLLM_HAVE_AVX2` block `dot_pair`
+ * below lives in.**  It used to sit inside it, with its own `#else` scalar arm
+ * unreachable because the enclosing guard was already false -- so a non-AVX2
+ * build got an undeclared name at every call site in `attention` rather than
+ * the scalar fold the `#else` was written to be.  The fold has no need of AVX2:
+ * `d` is 128 in every call the graph makes and the scalar loop is the shipped
+ * answer on a target without AVX2. */
 inline void flash_fold(float *P, float x, const float *vvec, int64_t d) {
 #if POCKETLLM_HAVE_AVX2
   if (x > P[0]) {
@@ -346,6 +430,10 @@ inline void flash_fold(float *P, float x, const float *vvec, int64_t d) {
   }
 #endif
 }
+
+/* `dot_pair` pairs two `dot4` lanes inside one `__m256`, so it exists only
+ * where AVX2 does; `flash_fold` above it is deliberately outside this guard. */
+#if POCKETLLM_HAVE_AVX2
 
 __attribute__((optimize("fp-contract=off"))) inline void dot_pair(const float *qa,
                                                                   const float *qb,
@@ -1514,9 +1602,13 @@ void gemm_quant(const float *x, const uint8_t *blocks, const float *bias, float 
    * with the type id, and the disagreement would read a row from the middle of
    * its neighbour. */
   const int64_t row_bytes = (k / per_block) * block_bytes;
-  const int64_t row_blocks = k / per_block;
 
 #if POCKETLLM_Q8K_HAVE_INT
+  /* The activation's block stride.  Only the integer path needs it: it is the
+   * stride of the quantized `q8` scratch, which the exact path does not have.
+   * Declared here rather than beside `row_bytes` above so a non-AVX2 build does
+   * not carry an unused variable into -Werror. */
+  const int64_t row_blocks = k / per_block;
   /* Quantize every row of the activation once, before the parallel walk: the
    * result is read by every one of the `n` outputs on that row, so doing it
    * inside the loop would repeat it per output column, which is the whole cost
@@ -2573,10 +2665,12 @@ void float_to_kv_row(const float *src, int64_t d, void *row) {
     dst[i] = static_cast<uint16_t>(_mm_cvtsi128_si32(one) & 0xFFFF);
   }
 #else
-  (void)src;
-  (void)d;
-  (void)row;
-  throw Error("float_to_kv_row: this build has no f16 conversion (needs F16C)");
+  /* No F16C: the scalar narrow, bit-for-bit the same bytes the vector path
+   * writes, so an f16 cache row is host-independent. */
+  uint16_t *dst = static_cast<uint16_t *>(row);
+  for (int64_t i = 0; i < d; ++i) {
+    dst[i] = float_to_half(src[i]);
+  }
 #endif
 }
 

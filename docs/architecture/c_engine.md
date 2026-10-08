@@ -1491,7 +1491,10 @@ that would be wrong on the next machine.
 CPU warnings are errors, scoped to `CXX` with a generator expression so nvcc — which spells `-Werror`
 differently — is unaffected. `-march=native` is set for the same reason `-O3` is: this is a
 build-host choice, and a shipped or mobile build would pin a target architecture instead of taking
-the one it is compiled on.
+the one it is compiled on. That pin is `POCKETLLM_NATIVE_ARCH` (on by default) and `POCKETLLM_MARCH`
+(an explicit `-march` value): a cross build — the two aarch64 boards are not reachable from the x86
+host, so they are built either on themselves or for themselves — turns the first off, because
+`native` then names the *build* host's instruction set, which is a CPU the output will never run on.
 
 ### Measuring it: `pocketllm-bench`
 

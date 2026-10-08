@@ -53,11 +53,19 @@
 #include <vector>
 #endif
 
+/* A spin-wait hint, and the reason it is not `__builtin_arm_yield`.
+ *
+ * LLVM provides that builtin; GCC does not, and GCC is the compiler on the
+ * aarch64 boards this tree targets.  Spelling it as the underlying instruction
+ * keeps one definition working under both, and `yield` is in the ARMv8-A base
+ * set rather than an optional extension, so it needs no feature test.  The
+ * memory clobber is deliberate: every use is a spin loop whose whole point is
+ * to re-read an atomic the other side is writing. */
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #define POCKETLLM_PAUSE() _mm_pause()
-#elif defined(__aarch64__)
-#define POCKETLLM_PAUSE() __builtin_arm_yield()
+#elif defined(__aarch64__) || defined(__arm__)
+#define POCKETLLM_PAUSE() __asm__ __volatile__("yield" ::: "memory")
 #else
 #define POCKETLLM_PAUSE() ((void)0)
 #endif

@@ -42,6 +42,32 @@ option(POCKETLLM_CUDA "Build the CUDA backend" ON)
 set(POCKETLLM_CUDA_ARCHITECTURES 75 CACHE STRING
     "CUDA architectures to compile for; sm_75 is the project's 2080 Ti target")
 
+# `-march=native` is the right choice for a build on the machine that will run
+# it, which is this project's x86 host.  It is the wrong choice for every
+# cross-compilation: "native" then means the *build* host, so the flags describe
+# a CPU the output will never run on -- at best it compiles something the target
+# cannot execute, at worst it fails outright on a feature the target lacks.
+#
+# The two aarch64 boards this tree targets are not reachable from the x86 build
+# host, so both routes exist: a board builds on itself with this ON, and a
+# toolchain file cross-compiles with it OFF.  `POCKETLLM_MARCH` overrides both,
+# for a cross build that wants a specific level rather than the baseline.
+option(POCKETLLM_NATIVE_ARCH
+    "Compile for the build host's own instruction set (-march=native)" ON)
+set(POCKETLLM_MARCH "" CACHE STRING
+    "Explicit -march value; takes precedence over POCKETLLM_NATIVE_ARCH")
+
+set(POCKETLLM_MARCH_FLAG "")
+if(POCKETLLM_MARCH)
+  set(POCKETLLM_MARCH_FLAG "-march=${POCKETLLM_MARCH}")
+  message(STATUS "pocketllm: building with -march=${POCKETLLM_MARCH}")
+elseif(POCKETLLM_NATIVE_ARCH)
+  set(POCKETLLM_MARCH_FLAG "-march=native")
+  message(STATUS "pocketllm: building with -march=native")
+else()
+  message(STATUS "pocketllm: building for the compiler's baseline architecture")
+endif()
+
 set(POCKETLLM_CUDA_SOURCES)
 if(POCKETLLM_CUDA)
   include(CheckLanguage)
@@ -72,7 +98,9 @@ endif()
 # the last bits of a reduction: it enables AVX2 and FMA, and GCC's default
 # `-ffp-contract=fast` then fuses `a*b+c` into `vfmadd` where the SSE2 baseline
 # could not.  `-ffast-math` is *not* here -- it would add full reassociation and
-# `-ffinite-math-only`, which the shifted softmax depends on not having.
+# `-ffinite-math-only`, which the shifted softmax depends on not having.  Which
+# `-march` reaches the compiler is decided above, by `POCKETLLM_NATIVE_ARCH` and
+# `POCKETLLM_MARCH`; the flags below only apply it.
 add_library(pocketllm-kernel-options INTERFACE)
 find_package(Threads REQUIRED)
 target_link_libraries(pocketllm-kernel-options INTERFACE Threads::Threads)
@@ -81,7 +109,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   # built by the same targets.  The host keeps warnings-as-errors, and the
   # optimisation flags are host flags -- nvcc does its own.
   target_compile_options(pocketllm-kernel-options INTERFACE
-    $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Werror -O3 -march=native>)
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Werror -O3 ${POCKETLLM_MARCH_FLAG}>)
 endif()
 # The include root, so a kernel target can `#include "kernel/parallel.h"` without
 # repeating the directory.
