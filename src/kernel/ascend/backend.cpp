@@ -127,23 +127,55 @@
  * documented setup is `source <custom_opp>/vendors/customize/bin/set_env.bash`;
  * `describe()` reports the variable so a misconfigured host is visible.
  *
- * ## What the interface cannot express
+ * ## The GEMM path, and why the W4A16 op is not the graph's
  *
- * `gemm_quant`'s contract is a q4_K checkpoint tensor: 256-weight super-blocks,
- * `(n, k / 256, 144)` bytes. `MatmulW4a16Custom` wants GPTQ int4 packed as int8
- * + a per-128 fp16 scale row -- a different quantization entirely. There is no
- * byte-level reinterpretation between them, so this backend bridges by
- * *requantizing*: it decodes each q4_K block to float with the tree's own
- * `dequant_q4_k` and rounds the result to int8 in [-8, 7] with a per-128 scale.
- * That is a real accuracy change (the weights are effectively re-quantized to
- * ~4 bits with a coarser scale granularity) and it is done once, at first use.
- * The alternative -- feeding the op q4_K blocks as if they were GPTQ int4 --
- * would be silently wrong, and a wrong number is worse than a slower one.
+ * `gemm_quant`'s contract is a GGML tensor: q4_K or q6_K, 256-weight
+ * super-blocks. `MatmulW4a16Custom` wants GPTQ int4 packed as int8 + a per-128
+ * fp16 scale row -- a different quantization entirely, with a *coarser* scale
+ * granularity than q4_K's own six-bit sub-scales. The first bridge this backend
+ * carried was to requantize q4_K into it. Requantizing is lossy: measured at
+ * ~1e-1 relative error on the model's real matrices (n = 1024..151936,
+ * k = 1024), an order of magnitude past the 2.7e-4 of decoding the blocks
+ * faithfully, so it is not the accuracy the graph is built on.
  *
- * A second thing the interface cannot express: `gemm_quant` takes `k` weights
- * per row and the kernel's group size is fixed at 128, so `k % 128 == 0` is a
- * precondition this backend enforces rather than assumes. Qwen3's K values
- * (1024, 2048, ...) satisfy it; a checkpoint that did not would be refused.
+ * So the default path decodes the blocks *faithfully* (the tree's own
+ * `dequant_q4_k`/`dequant_q6_k`, cached on the device) and drives the dense
+ * cube, `MatmulCubeCustom`, which measured ~2.7e-4 relative and handles any
+ * `m`, any `k`, and the residual. That is the path the whole Qwen3 forward runs
+ * on, prefill and decode. The cost is real: ~2 GB of f32 weights resident on the
+ * NPU for a 0.6B q4_k_m checkpoint (~0.4 GB packed), and a slower GEMM than the
+ * (lossy) W4A16 op. `$POCKETLLM_ASCEND_W4A16=1` selects the requantized op for
+ * an experiment, where its error is the thing being measured.
+ *
+ * **The dense cube is not correct at every N, and the failure is silent.** The
+ * tied output projection is `gemm_quant` q6_K at n = 151936, and the op returns
+ * a right-shaped tensor of wrong numbers there: measured, n = 151936 came back
+ * 131% off while n = 32768 and below matched the CPU kernel to 5e-4. That one
+ * shape was the whole of the board's incoherence -- with everything else
+ * bit-identical to the CPU through the last layer, the corrupted logits made
+ * " Paris" decode as a control token. `run_cube` therefore walks N in
+ * `kCubeChunkN` blocks, each a shape the op answers correctly, and places the
+ * columns by hand. See that function for the bound and why it is an order of
+ * magnitude under the smallest N measured wrong.
+ *
+ * The second thing the interface cannot express is why a decode-and-dense path
+ * is not a waste: the W4A16 op is M=1 only and q4_K only, so it cannot serve a
+ * prefill batch (`m > 1`) or the q6_K tensors (`attn_v`, `ffn_down`) a q4_k_m
+ * file mixes in. Those have to go through the dense cube regardless, and once
+ * the faithful decode exists for them, it is the only path whose accuracy the
+ * whole model can be built on.
+ *
+ * ## A prefill is a loop of the decode step
+ *
+ * `AttentionStepCustom` is one query against a window. A prefill (`q_len > 1`)
+ * is that op run once per query position, each against its own causal window
+ * `[0, q_offset + t + 1)` -- the graph has already appended the whole chunk, so
+ * the window is a prefix of the token-major cache. This is a backend change
+ * (the graph is untouched), it costs `q_len` launches per layer, and it is
+ * exact: the kernel sees the same one-query-against-a-window call it sees at
+ * decode. Driving `q_len > 1` through the op directly would let a position
+ * attend to the future, so the loop is the causal structure, not an
+ * optimization of it.
  */
 
 #include <acl/acl.h>
@@ -473,22 +505,33 @@ class AscendBackend final : public Backend {
 
   void gemm_quant(DeviceBuffer x, DeviceBuffer blocks, DeviceBuffer bias, DeviceBuffer out,
                   int64_t m, int64_t n, int64_t k, int type_id, bool accumulate) override {
-    if (type_id != quant::kGgmlQ4K) {
-      throw Error("ascend: gemm_quant supports q4_k only, got type_id " + std::to_string(type_id));
-    }
-    if (m != 1) {
-      throw Error("ascend: gemm_quant not implemented for m>1 (got m=" + std::to_string(m) +
-                  "); the W4a16 custom op is an M=1 decode path");
-    }
-    if (accumulate) {
-      throw Error("ascend: gemm_quant accumulate is not implemented yet");
-    }
     if (bias.handle != 0) {
       throw Error("ascend: gemm_quant bias is not implemented yet");
     }
-    if (n % kGemmAlign != 0 || k % kGroup != 0) {
-      throw Error("ascend: gemm_quant needs n % 128 == 0 and k % 128 == 0, got n=" +
-                  std::to_string(n) + " k=" + std::to_string(k));
+    /* The W4A16 op takes q4_K, M=1, no residual -- and it *requantizes*: it
+     * decodes the q4_K block and rounds it to int8 in [-8, 7] with a per-128
+     * scale, which is a coarser quantizer than q4_K's own six-bit scales.  That
+     * was measured at a ~1e-1 relative error on the model's real matrices
+     * (n=1024..151936, k=1024), which is enough to make the generated text
+     * incoherent -- so it is not the graph's path.
+     *
+     * The graph's path is the dense cube: decode the blocks *faithfully* with
+     * the tree's `dequant_q4_k`/`dequant_q6_k` (cached on the device) and drive
+     * `MatmulCubeCustom`, which measured ~2.7e-4 relative and handles any m, any
+     * k and the residual.  The cost is real and is the honest trade: ~2 GB of
+     * f32 weights resident on the NPU for a 0.6B q4_k_m checkpoint (v. ~0.4 GB
+     * packed), and a slower GEMM.  `$POCKETLLM_ASCEND_W4A16=1` selects the
+     * lossy-but-fast W4A16 op for an experiment, where the requantization error
+     * is the point being measured rather than a surprise. */
+    const char *const w4a16_env = std::getenv("POCKETLLM_ASCEND_W4A16");
+    const bool w4a16_wanted =
+        w4a16_env != nullptr && w4a16_env[0] != '\0' && w4a16_env[0] != '0';
+    const bool w4a16_ok = w4a16_wanted && type_id == quant::kGgmlQ4K && m == 1 && !accumulate &&
+                          n % kGemmAlign == 0 && k % kGroup == 0;
+    if (!w4a16_ok) {
+      const DeviceBuffer dense = dense_for(blocks, n, k, type_id);
+      run_cube(read_f32(x, m * k, ACL_FLOAT), dense, ACL_FLOAT, m, n, k, accumulate, out);
+      return;
     }
 
     const PackedQ4K &packed = pack_for(blocks, n, k);
@@ -621,7 +664,7 @@ class AscendBackend final : public Backend {
      * silently, so the operand is brought up and transposed on the host once.
      * The weights are bound once and never change, so this is a host-side
      * transpose per weight per process, not per token. */
-    run_cube(read_f32(x, m * k, ACL_FLOAT), w, m, n, k, accumulate, out);
+    run_cube(read_f32(x, m * k, ACL_FLOAT), w, ACL_FLOAT, m, n, k, accumulate, out);
   }
   void embedding(DeviceBuffer tokens, int64_t n_tokens, DeviceBuffer table, int64_t vocab,
                  int64_t d, DeviceBuffer out) override {
@@ -841,11 +884,6 @@ class AscendBackend final : public Backend {
                  int64_t q_offset, float scale, DeviceBuffer out, DeviceBuffer scores,
                  KVDtype kv_dtype) override {
     (void)scores;  /* the op keeps its score row on the device, not in this buffer */
-    if (q_len != 1) {
-      throw Error("ascend: attention is not implemented for prefill (q_len=" +
-                  std::to_string(q_len) + "); only the one-token decode step maps to the "
-                  "AttentionStepCustom op");
-    }
     if (first_key != 0) {
       throw Error("ascend: attention with a sliding window (first_key=" +
                   std::to_string(first_key) + ") is not implemented");
@@ -873,12 +911,28 @@ class AscendBackend final : public Backend {
      * contiguously from position 0, and the op's `kCache` is
      * ``[n_head_kv, max_seq, d]``, so `max_seq == context` is the layout the
      * graph actually produces and the op's window is `[0, context)` either way. */
-    const int64_t context = q_offset + 1;
+    const int64_t context = q_offset + q_len;
     if (context > kMaxContext) {
       throw Error("ascend: attention context " + std::to_string(context) + " exceeds the op's " +
                   std::to_string(kMaxContext));
     }
-    run_attention(q, n_heads, n_head_kv, d, context, scale, k_cache, v_cache, kv_dtype, out);
+    /* `AttentionStepCustom` is one query against a window.  A prefill is
+     * `q_len` such steps, one per query position, each attending to its own
+     * causal window `[0, q_offset + t + 1)`.  The graph has already appended the
+     * whole chunk to the cache, so the window is the prefix of the token-major
+     * cache and this loop is the only place the causal structure lives -- which
+     * is why `context` above is the *last* token's span and every earlier query
+     * passes its own shorter one.  Driving `q_len > 1` through the op directly
+     * would score every query against all `q_len` keys, i.e. let a position
+     * attend to the future. */
+    for (int64_t t = 0; t < q_len; ++t) {
+      const int64_t visible = q_offset + t + 1;
+      run_attention(kernel::DeviceBuffer{q.handle + static_cast<uintptr_t>(t * n_heads * d * 4),
+                                         n_heads * d * 4},
+                    n_heads, n_head_kv, d, visible, scale, k_cache, v_cache, kv_dtype,
+                    kernel::DeviceBuffer{out.handle + static_cast<uintptr_t>(t * n_heads * d * 4),
+                                         n_heads * d * 4});
+    }
   }
 
   void kv_append(DeviceBuffer dst, DeviceBuffer src, int64_t n, int64_t n_head_kv, int64_t d,
@@ -1067,75 +1121,107 @@ class AscendBackend final : public Backend {
     aclDestroyTensor(to);
   }
 
+  /* `MatmulCubeCustom` is correct up to a column count this build has measured,
+   * and wrong above it: `gemm_quant` q6_k at n = 151936 (the tied output
+   * projection) came back 131% off, while n = 32768 and below matched the CPU
+   * kernel to 5e-4.  The op's host tiling does not bound N, and the failure is
+   * silent -- a right-shaped tensor of wrong numbers -- so the engine cannot
+   * lean on it and must not hand it an N it has not proven.  The matrix is
+   * therefore driven one `kCubeChunkN`-wide block of columns at a time: every
+   * chunk is a shape the op answers correctly, and the columns are placed into
+   * the caller's row-major [m, n] output with the stride the whole row needs.
+   *
+   * The activation is converted and staged once; only B and the result are
+   * per-chunk.  The bound is deliberately an order of magnitude under the
+   * smallest N measured wrong, so a tiling change on another board is far more
+   * likely to land inside the safe range than outside it. */
+  static constexpr int64_t kCubeChunkN = 8192;
+
   /* One `aclnnMatmulCubeCustom` drive: `out = x_f32[m, k] @ w^T`, where `w` is
    * the row-major [n, k] plane the graph holds and the op wants B as [k, n].
    * The transpose is done on the host (see `gemm`), the fp16 operands and the
    * fp16 result go on the device, and the result comes back widened to f32 --
-   * the graph's activation type. */
-  void run_cube(const std::vector<float> &x_f32, DeviceBuffer w, int64_t m, int64_t n,
+   * the graph's activation type.  The N axis is walked in `kCubeChunkN` blocks
+   * for the reason above. */
+  void run_cube(const std::vector<float> &x_f32, DeviceBuffer w, int w_dtype, int64_t m, int64_t n,
                 int64_t k, bool accumulate, DeviceBuffer out) {
-    const std::vector<float> w_f32 = read_f32(w, n * k, ACL_FLOAT);
+    const std::vector<float> w_f32 = read_f32(w, n * k, w_dtype);
     const std::vector<uint16_t> x_h = to_f16(x_f32.data(), m * k);
-    std::vector<uint16_t> b_h(static_cast<std::size_t>(k * n));
-    for (int64_t r = 0; r < n; ++r) {
-      for (int64_t c = 0; c < k; ++c) {
-        b_h[static_cast<std::size_t>(c * n + r)] = f32_to_f16(w_f32[static_cast<std::size_t>(r * k + c)]);
-      }
-    }
-    DeviceBuffer dx = allocate(m * k * 2);
-    DeviceBuffer db = allocate(k * n * 2);
-    DeviceBuffer dout = allocate(m * n * 2);
-    copy_to_device(dx, x_h.data(), m * k * 2);
-    copy_to_device(db, b_h.data(), k * n * 2);
 
-    const int64_t a_shape[2] = {m, k};
-    const int64_t b_shape[2] = {k, n};
-    const int64_t o_shape[2] = {m, n};
-    const int64_t a_stride[2] = {k, 1};
-    const int64_t b_stride[2] = {n, 1};
-    const int64_t o_stride[2] = {n, 1};
-    aclTensor *ta = aclCreateTensor(a_shape, 2, ACL_FLOAT16, a_stride, 0, ACL_FORMAT_ND, a_shape, 2,
-                                    reinterpret_cast<void *>(dx.handle));
-    aclTensor *tb = aclCreateTensor(b_shape, 2, ACL_FLOAT16, b_stride, 0, ACL_FORMAT_ND, b_shape, 2,
-                                    reinterpret_cast<void *>(db.handle));
-    aclTensor *to = aclCreateTensor(o_shape, 2, ACL_FLOAT16, o_stride, 0, ACL_FORMAT_ND, o_shape, 2,
-                                    reinterpret_cast<void *>(dout.handle));
-    if (ta == nullptr || tb == nullptr || to == nullptr) {
-      throw Error("ascend: aclCreateTensor returned null (gemm)");
-    }
-    uint64_t ws_size = 0;
-    aclOpExecutor *executor = nullptr;
-    aclnn_ok(aclnnMatmulCubeCustomGetWorkspaceSize(ta, tb, to, &ws_size, &executor),
-             "aclnnMatmulCubeCustomGetWorkspaceSize");
-    void *workspace = nullptr;
-    if (ws_size > 0) {
-      acl_ok(aclrtMalloc(&workspace, static_cast<std::size_t>(ws_size), ACL_MEM_MALLOC_HUGE_FIRST),
-             "aclrtMalloc workspace");
-    }
-    aclnn_ok(aclnnMatmulCubeCustom(workspace, ws_size, executor, stream_), "aclnnMatmulCubeCustom");
-    acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
-
-    std::vector<uint16_t> out_h(static_cast<std::size_t>(m * n));
-    copy_to_host(out_h.data(), dout, m * n * 2);
-    std::vector<float> out_f = half_to_f32(out_h);
+    /* The result accumulates column-block by column-block in host f32 and is
+     * written to the device once, which is also where the residual add lands --
+     * so a chunk boundary never splits a row's accumulation. */
+    std::vector<float> out_f(static_cast<std::size_t>(m * n), 0.0F);
     if (accumulate) {
-      std::vector<float> prior(static_cast<std::size_t>(m * n));
-      copy_to_host(prior.data(), out, m * n * 4);
-      for (std::size_t i = 0; i < out_f.size(); ++i) {
-        out_f[i] += prior[i];
-      }
+      copy_to_host(out_f.data(), out, m * n * 4);
     }
-    copy_to_device(out, out_f.data(), m * n * 4);
 
-    if (workspace != nullptr) {
-      aclrtFree(workspace);
+    DeviceBuffer dx = allocate(m * k * 2);
+    copy_to_device(dx, x_h.data(), m * k * 2);
+
+    for (int64_t n0 = 0; n0 < n; n0 += kCubeChunkN) {
+      const int64_t nc = std::min(kCubeChunkN, n - n0);
+      std::vector<uint16_t> b_h(static_cast<std::size_t>(k * nc));
+      for (int64_t r = 0; r < nc; ++r) {
+        for (int64_t c = 0; c < k; ++c) {
+          b_h[static_cast<std::size_t>(c * nc + r)] =
+              f32_to_f16(w_f32[static_cast<std::size_t>((n0 + r) * k + c)]);
+        }
+      }
+      DeviceBuffer db = allocate(k * nc * 2);
+      DeviceBuffer dout = allocate(m * nc * 2);
+      copy_to_device(db, b_h.data(), k * nc * 2);
+
+      const int64_t a_shape[2] = {m, k};
+      const int64_t b_shape[2] = {k, nc};
+      const int64_t o_shape[2] = {m, nc};
+      const int64_t a_stride[2] = {k, 1};
+      const int64_t b_stride[2] = {nc, 1};
+      const int64_t o_stride[2] = {nc, 1};
+      aclTensor *ta = aclCreateTensor(a_shape, 2, ACL_FLOAT16, a_stride, 0, ACL_FORMAT_ND, a_shape, 2,
+                                      reinterpret_cast<void *>(dx.handle));
+      aclTensor *tb = aclCreateTensor(b_shape, 2, ACL_FLOAT16, b_stride, 0, ACL_FORMAT_ND, b_shape, 2,
+                                      reinterpret_cast<void *>(db.handle));
+      aclTensor *to = aclCreateTensor(o_shape, 2, ACL_FLOAT16, o_stride, 0, ACL_FORMAT_ND, o_shape, 2,
+                                      reinterpret_cast<void *>(dout.handle));
+      if (ta == nullptr || tb == nullptr || to == nullptr) {
+        throw Error("ascend: aclCreateTensor returned null (gemm)");
+      }
+      uint64_t ws_size = 0;
+      aclOpExecutor *executor = nullptr;
+      aclnn_ok(aclnnMatmulCubeCustomGetWorkspaceSize(ta, tb, to, &ws_size, &executor),
+               "aclnnMatmulCubeCustomGetWorkspaceSize");
+      void *workspace = nullptr;
+      if (ws_size > 0) {
+        acl_ok(aclrtMalloc(&workspace, static_cast<std::size_t>(ws_size), ACL_MEM_MALLOC_HUGE_FIRST),
+               "aclrtMalloc workspace");
+      }
+      aclnn_ok(aclnnMatmulCubeCustom(workspace, ws_size, executor, stream_),
+               "aclnnMatmulCubeCustom");
+      acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
+
+      std::vector<uint16_t> out_h(static_cast<std::size_t>(m * nc));
+      copy_to_host(out_h.data(), dout, m * nc * 2);
+      const std::vector<float> chunk = half_to_f32(out_h);
+      for (int64_t row = 0; row < m; ++row) {
+        for (int64_t c = 0; c < nc; ++c) {
+          out_f[static_cast<std::size_t>(row * n + n0 + c)] +=
+              chunk[static_cast<std::size_t>(row * nc + c)];
+        }
+      }
+
+      if (workspace != nullptr) {
+        aclrtFree(workspace);
+      }
+      aclDestroyTensor(ta);
+      aclDestroyTensor(tb);
+      aclDestroyTensor(to);
+      release(db);
+      release(dout);
     }
-    aclDestroyTensor(ta);
-    aclDestroyTensor(tb);
-    aclDestroyTensor(to);
+
+    copy_to_device(out, out_f.data(), m * n * 4);
     release(dx);
-    release(db);
-    release(dout);
   }
 
   /* Bring a window of the K/V cache up as f32, whatever width it was bound in.
@@ -1347,10 +1433,60 @@ class AscendBackend final : public Backend {
     return inserted.first->second;
   }
 
+  /* Decode a packed weight to a persistent device f32 buffer, once per distinct
+   * source pointer.
+   *
+   * The W4A16 op is the graph's decode GEMM and it is different from the dense
+   * one in two ways that matter here: it is M=1, and it reads q4_K.  So this is
+   * the path for the two cases the W4A16 op cannot take -- a *prefill* batch
+   * (M>1) and the q6_k tensors a `q4_k_m` file mixes in -- and both are served
+   * by decoding the blocks to f32 once and driving the dense cube.
+   *
+   * The cost is real and is why this is not the default path: a 0.6B q4_k_m
+   * checkpoint is ~0.4 GB packed and ~2 GB decoded, and ~2 GB of f32 weights
+   * that nothing else holds live on the board's NPU DDR for the life of the
+   * process.  It is a correctness-and-coverage path, not a fast one. */
+  DeviceBuffer dense_for(DeviceBuffer blocks, int64_t n, int64_t k, int type_id) {
+    const int64_t block_bytes = quant::block_bytes_of(type_id);
+    if (block_bytes == 0 || k % quant::kBlockWeights != 0) {
+      throw Error("ascend: gemm_quant has no decoder for type_id " + std::to_string(type_id) +
+                  " at k=" + std::to_string(k));
+    }
+    const std::string key = "dense:" + std::to_string(blocks.handle) + ":" + std::to_string(n) +
+                            ":" + std::to_string(k) + ":" + std::to_string(type_id);
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      auto it = dense_cache_.find(key);
+      if (it != dense_cache_.end()) {
+        return it->second;
+      }
+    }
+    const int64_t blocks_per_row = k / quant::kBlockWeights;
+    const int64_t total = n * blocks_per_row * block_bytes;
+    std::vector<uint8_t> host(static_cast<std::size_t>(total));
+    copy_to_host(host.data(), blocks, total);
+    std::vector<float> dense(static_cast<std::size_t>(n * k));
+    for (int64_t row = 0; row < n; ++row) {
+      for (int64_t b = 0; b < blocks_per_row; ++b) {
+        const uint8_t *block = host.data() + (row * blocks_per_row + b) * block_bytes;
+        for (int64_t i = 0; i < quant::kBlockWeights; ++i) {
+          dense[static_cast<std::size_t>(row * k + b * quant::kBlockWeights + i)] =
+              quant::dequant_block(type_id, block, static_cast<int>(i));
+        }
+      }
+    }
+    DeviceBuffer device = allocate(n * k * 4);
+    copy_to_device(device, dense.data(), n * k * 4);
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto inserted = dense_cache_.emplace(key, device);
+    return inserted.first->second;
+  }
+
   aclrtStream stream_ = nullptr;
   std::string soc_;
   std::mutex mutex_;
   std::unordered_map<std::string, PackedQ4K> cache_;
+  std::unordered_map<std::string, DeviceBuffer> dense_cache_;
 };
 
 }  // namespace
