@@ -279,6 +279,22 @@ constexpr int64_t kAttentionGrain = 1;
  * which is the equivalence check `tests/native/test_cpu_parallel.py` runs. */
 constexpr int64_t kAttentionHeadBatch = 2;
 
+/* The largest GQA group (query heads per KV head) the decode attention path can
+ * score in one walk.
+ *
+ * `kAttentionHeadBatch` is the *prefill* unit and is independent of `group`: it
+ * batches two heads that share a KV head however many do.  The flash *decode*
+ * path is different -- it walks one KV head at a time and scores all `group`
+ * query heads that read it in a single stack array -- so that array has to be
+ * sized by the model's group, which the unit does not choose.  It used to be
+ * sized `kAttentionHeadBatch` (= 2), which is why a `group == 4` model (Qwen3-4B
+ * and 8B, 32 query heads over 8 KV heads) read uninitialized stack for heads
+ * 1..3 and decoded to garbage while its first (prefill) token stayed correct.
+ *
+ * 8 covers every Qwen3 width in the ladder with room to spare; a model outside
+ * it is refused by name rather than silently truncated. */
+constexpr int64_t kAttentionMaxGroup = 8;
+
 /* How many score rows of *one concurrent task* the caller's scratch has to hold.
  *
  * The kernel's attention unit is ``(a block of kAttentionRows query tokens, a
