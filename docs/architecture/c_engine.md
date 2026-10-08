@@ -309,6 +309,38 @@ measuring this engine:
 - **The thread count and the core count are two different numbers, and the interesting comparison is
   at matched core counts.** The table in "What it measures" is laid out that way for this reason.
 
+### `$POCKETLLM_CPU_PIN`: the pool's own affinity, off by default
+
+The pool can set its own affinity instead of leaving it to the scheduler.
+`$POCKETLLM_CPU_PIN=node` confines the pool to the first NUMA node's physical cores;
+`=all` additionally gives every worker its own core. Unset — the shipped default — leaves the
+affinity exactly as the process found it, which is what every published number in this file was
+taken under.
+
+**It is off because it is a trade against llama.cpp, not a speedup against ourselves.** Measured at
+22 threads on the 2 × 22-core host, interleaved against `llama-bench` in both regimes, both binaries
+frozen:
+
+| test | free (default) | | | confined to `0-21` | | |
+|---|---:|---:|---:|---:|---:|---:|
+| | us | llama | ratio | us | llama | ratio |
+| `pp512` | 531 † | 729 | 0.73× | 821 | 794 | 1.03× |
+| `pp2048` | 542 | 506 | 1.07× | 542 | 540 | 1.00× |
+| `tg64` | 92.3 | 62.4 | 1.48× | 91.5 | 76.4 | 1.20× |
+
+† not a real number: the free `pp512` arm stalled in one round at 25 t/s. Confinement helps
+llama.cpp *more* than it helps us — its `pp512` rises 9% and its decode 22%, while our decode falls
+3% — so **every head-to-head ratio is worse under it.** What it buys is not speed but stability: the
+unpinned placement is unstable enough to stall, and confined the run is rock steady (803–823 across
+rounds). A caller benchmarking on a shared host, or chasing a reproducible number, wants that; the
+default does not spend the decode margin on it.
+
+Pinning every worker to a *single* core is worse on both axes again (measured `pp512` 1.06× against
+1.08×, decode 0.89× against 0.96×), because a worker spinning in the barrier cannot be evicted off
+the core it blocks — so `node` mode pins only the calling thread, which is the one thread present in
+every job. The mode is allocation-only and does not touch arithmetic: the greedy sequence is
+byte-identical across default, `node` and `all`.
+
 ### RMSNorm's reduction belongs to the row
 
 The AVX2 RMSNorm computes its sum of squares with four independent eight-lane accumulators over

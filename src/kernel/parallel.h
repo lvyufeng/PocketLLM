@@ -42,12 +42,15 @@
 
 #if defined(__linux__)
 #include <dirent.h>
+#include <sched.h>
 
 #include <cctype>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <set>
 #include <string>
+#include <vector>
 #endif
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -143,6 +146,79 @@ inline int64_t numa_node_count() {
   return nodes;
 #else
   return 0;
+#endif
+}
+
+/* The physical cores of a NUMA node, as the logical CPUs to pin to.
+ *
+ * `physical_core_count()` counts cores and `numa_node_count()` counts nodes, but
+ * neither says *which* CPU belongs to which node, and the pool cannot pick a
+ * sensible affinity with a count alone.  This reads `node<N>/cpulist` for the
+ * node `index` and returns its physical cores -- one CPU per `thread_siblings_list`,
+ * so the mask names the cores rather than the hardware threads.
+ *
+ * Returns an empty mask when the node cannot be read or has no CPU that is also
+ * in this process's current affinity mask (a container or a `taskset` launch may
+ * restrict `cpulist`), and the caller then leaves the workers unpinned. */
+inline std::vector<int> numa_node_cpus(int index) {
+#if defined(__linux__)
+  std::vector<int> cpus;
+  const std::string path = "/sys/devices/system/node/node" + std::to_string(index) + "/cpulist";
+  FILE *file = std::fopen(path.c_str(), "r");
+  if (file == nullptr) {
+    return cpus;
+  }
+  /* The list is comma-separated ranges such as `0-21,44-65`. */
+  int lo = 0;
+  int hi = 0;
+  for (;;) {
+    if (std::fscanf(file, "%d-%d", &lo, &hi) != 2) {
+      break;
+    }
+    for (int c = lo; c <= hi; ++c) {
+      cpus.push_back(c);
+    }
+  }
+  std::fclose(file);
+
+  /* Keep only the CPUs this process may actually run on.  A mask that names a
+   * CPU outside our affinity makes `pthread_setaffinity_np` fail (or, worse,
+   * succeed on a subset we did not choose), which would silently undo a calling
+   * `taskset`. */
+  cpu_set_t current;
+  CPU_ZERO(&current);
+  if (sched_getaffinity(0, sizeof(current), &current) == 0) {
+    std::vector<int> allowed;
+    for (int c : cpus) {
+      if (CPU_ISSET(c, &current)) {
+        allowed.push_back(c);
+      }
+    }
+    cpus.swap(allowed);
+  }
+
+  /* One CPU per core: drop every CPU whose sibling set has a smaller member and
+   * is therefore a second hardware thread. */
+  std::vector<int> cores;
+  for (int c : cpus) {
+    const std::string sib = "/sys/devices/system/cpu/cpu" + std::to_string(c) +
+                            "/topology/thread_siblings_list";
+    FILE *sf = std::fopen(sib.c_str(), "r");
+    if (sf == nullptr) {
+      cores.push_back(c);
+      continue;
+    }
+    int first = c;
+    const int scanned = std::fscanf(sf, "%d", &first);
+    std::fclose(sf);
+    if (scanned != 1 || first == c) {
+      cores.push_back(c);
+    }
+  }
+  return cores;
+#else
+  static_cast<void>(index);
+  return std::vector<int>();
 #endif
 }
 
@@ -369,14 +445,126 @@ class ThreadPool {
   }
 
  private:
+  /* Pin the calling thread to a capacity-`slots` window starting at core
+   * `start`, letting it migrate anywhere inside that window.
+   *
+   * The window is a *set* and not one core on purpose.  Migrating within one
+   * NUMA node's physical cores is nearly free -- they share the cache, so there
+   * is nothing to warm up -- and it lets the scheduler move a thread that is
+   * blocked in the barrier off a core a spinning sibling wants.  Pinning each
+   * thread to a single core instead measured 9% slower on decode and 3% slower
+   * on prefill.
+   *
+   * Returns false when there is nothing to pin to, so the caller can leave the
+   * process affinity exactly as it found it. */
+  static bool pin_current_thread(int start, int slots) {
+#if defined(__linux__)
+    if (slots <= 0) {
+      return false;
+    }
+    static const std::vector<int> cpus = numa_node_cpus(0);
+    if (cpus.empty()) {
+      return false;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int placed = 0;
+    for (int k = 0; k < slots && placed < static_cast<int>(cpus.size()); ++k) {
+      CPU_SET(cpus[static_cast<std::size_t>((start + k) % static_cast<int>(cpus.size()))], &set);
+      ++placed;
+    }
+    if (placed == 0) {
+      return false;
+    }
+    return sched_setaffinity(0, sizeof(set), &set) == 0;
+#else
+    static_cast<void>(start);
+    static_cast<void>(slots);
+    return false;
+#endif
+  }
+
+  /* One logical CPU to pin thread `thread_index` to in `POCKETLLM_CPU_PIN=all`
+   * mode: every node's physical cores, node by node, so a pool wider than one
+   * node spreads across the machine's distinct cores rather than double-booking
+   * one node's.  Returns -1 when the topology cannot be read. */
+  static int affinity_cpu_for(int64_t thread_index) {
+#if defined(__linux__)
+    static const std::vector<int> cpus = [] {
+      std::vector<int> all;
+      const int64_t nodes = numa_node_count();
+      for (int64_t n = 0; n < nodes; ++n) {
+        const std::vector<int> node = numa_node_cpus(static_cast<int>(n));
+        all.insert(all.end(), node.begin(), node.end());
+      }
+      return all;
+    }();
+    if (cpus.empty()) {
+      return -1;
+    }
+    return cpus[static_cast<std::size_t>(thread_index % static_cast<int64_t>(cpus.size()))];
+#else
+    static_cast<void>(thread_index);
+    return -1;
+#endif
+  }
+
   ThreadPool() {
     const int64_t wanted = cpu_thread_count();
+    /* **Off by default.**  `$POCKETLLM_CPU_PIN=node` confines the pool to the
+     * first NUMA node's physical cores; `=all` also gives every worker its own
+     * core.  Unset (or `0`) leaves the affinity exactly as the process found it,
+     * which is what the shipped default does and what the published numbers were
+     * taken under.
+     *
+     * It is off because it is a *trade against llama.cpp*, not a speedup of us
+     * against ourselves.  Measured at 22 threads on the 2 x 22-core host,
+     * interleaved against `llama-bench` in both regimes:
+     *
+     *     test     free (default)        confined to 0-21
+     *              us    llama   ratio   us    llama   ratio
+     *     pp512    531    729    0.73x   821    794    1.03x
+     *     pp2048   542    506    1.07x   542    540    1.00x
+     *     tg64    92.3   62.4    1.48x  91.5   76.4    1.20x
+     *
+     * Confinement helps llama.cpp more than it helps us: its `pp512` rises 9%
+     * and its decode 22%, while our decode actually falls 3%, so every
+     * head-to-head ratio gets *worse* under it.  What it buys is not speed but
+     * **stability**: our unpinned placement is unstable enough to stall (one
+     * measured `pp512` round read 25 t/s), and confined it is rock steady
+     * (803-823).  A caller benchmarking on a shared host, or chasing a
+     * reproducible number, wants that; the default does not spend the decode
+     * margin on it.
+     *
+     * Pin the caller only in `node` mode -- it is the one thread in every job
+     * (`_M_run`, 16% of prefill, is mostly its barrier wait), so it is the one
+     * whose placement is not negotiable -- and give the workers the same
+     * window.  Pinning every worker to a single core is *worse* on both axes
+     * (measured pp512 1.06x against 1.08x, decode 0.89x against 0.96x): a
+     * worker spinning in the barrier cannot be evicted off the core it blocks. */
+    const char *pin_env = std::getenv("POCKETLLM_CPU_PIN");
+    const bool pin_all = pin_env != nullptr && std::strcmp(pin_env, "all") == 0;
+    const bool pin_node = pin_all || (pin_env != nullptr && std::strcmp(pin_env, "node") == 0);
+    if (pin_all) {
+      /* One core per worker, filling the node's cores and spilling to the next
+       * node for a pool wider than one node. */
+      const int cpu0 = affinity_cpu_for(0);
+      if (cpu0 >= 0) {
+        cpu_set_t one;
+        CPU_ZERO(&one);
+        CPU_SET(cpu0, &one);
+        caller_cpu_ = sched_setaffinity(0, sizeof(one), &one) == 0;
+      }
+    } else if (pin_node) {
+      caller_cpu_ = pin_current_thread(0, static_cast<int>(wanted));
+    }
     workers_.reserve(static_cast<std::size_t>(wanted));
     /* ``wanted - 1`` background threads: the calling thread is the last
      * executor, so a pool of N uses N cores rather than N+1. */
     next_worker_index_.store(0, std::memory_order_relaxed);
     for (int64_t i = 1; i < wanted; ++i) {
-      workers_.emplace_back([this] { worker_main(); });
+      const int cpu = pin_all ? affinity_cpu_for(i) : -1;
+      workers_.emplace_back([this, cpu] { worker_main(cpu); });
     }
   }
 
@@ -427,8 +615,18 @@ class ThreadPool {
     arrived_in_job_.fetch_add(1, std::memory_order_release);
   }
 
-  void worker_main() {
+  void worker_main(int64_t pin_cpu) {
     t_chunk_index = next_worker_index_.fetch_add(1, std::memory_order_relaxed) + 1;
+#if defined(__linux__)
+    if (pin_cpu >= 0) {
+      cpu_set_t set;
+      CPU_ZERO(&set);
+      CPU_SET(pin_cpu, &set);
+      sched_setaffinity(0, sizeof(set), &set);
+    }
+#else
+    static_cast<void>(pin_cpu);
+#endif
     uint64_t seen = 0;
     for (;;) {
       while (generation_.load(std::memory_order_acquire) == seen) {
@@ -451,6 +649,10 @@ class ThreadPool {
   }
 
   std::vector<std::thread> workers_;
+  /* Whether the constructor managed to pin the calling thread.  Set once and
+   * otherwise unused; it records what the pool actually did, which is what a
+   * future diagnostic or an unpin-on-teardown would need. */
+  bool caller_cpu_ = false;
   std::mutex mutex_;
   /* Held only while a job's state is published and while the pool is stopping;
    * the workers never touch it, which is what lets the barrier be a spin. */
