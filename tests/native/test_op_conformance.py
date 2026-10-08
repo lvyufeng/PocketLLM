@@ -559,6 +559,31 @@ def case_attention_grouped(rng):
     return _attention_case(rng, 3, 4, 2, 8, first_key=0, q_offset=0, capacity=3)
 
 
+def case_attention_decode_group2(rng):
+    """A decode step at the shipped GQA group -- Qwen3-0.6B/1.7B, 16 heads over
+    8 KV heads -- and d = 128, the width every Qwen3 layer uses.
+
+    One query token is the whole point: `q_len == 1` is what selects the flash
+    decode path, and neither `case_attention_grouped` (three tokens) nor any
+    other case reaches it.  The span (12 keys) is short enough to walk in one
+    flash block, which keeps the case about the per-head scoring rather than
+    about the chunk merge `case_attention_chunk` already covers."""
+    return _attention_case(rng, 1, 16, 8, 128, first_key=0, q_offset=11, capacity=12)
+
+
+def case_attention_decode_group4(rng):
+    """A decode step at GQA group 4 -- Qwen3-4B/8B, 32 query heads over 8 KV
+    heads.
+
+    The flash decode path scored its `group` query heads into a stack array
+    sized `kAttentionHeadBatch` (2) and then folded all `group` of them, so at
+    group 4 it folded two stale entries per key.  The first generated token
+    stayed correct -- it comes from prefill, which batches heads differently --
+    and every decode step after it was garbage, which is why a whole-model test
+    on the 0.6B/1.7B ladder never caught it.  This case is that regression."""
+    return _attention_case(rng, 1, 32, 8, 128, first_key=0, q_offset=11, capacity=12)
+
+
 def case_argmax(rng):
     values = rng.standard_normal(151936, dtype=np.float32)
     values[90432] = 100.0
@@ -692,6 +717,8 @@ CASES = {
     "attention_chunk": case_attention_chunk,
     "attention_first_key": case_attention_first_key,
     "attention_grouped": case_attention_grouped,
+    "attention_decode_group2": case_attention_decode_group2,
+    "attention_decode_group4": case_attention_decode_group4,
     "argmax": case_argmax,
     "argmax_ties": case_argmax_ties,
     "softmax": case_softmax,
@@ -728,6 +755,8 @@ OP_OF_CASE = {
     "attention_chunk": "attention",
     "attention_first_key": "attention",
     "attention_grouped": "attention",
+    "attention_decode_group2": "attention",
+    "attention_decode_group4": "attention",
     "argmax": "argmax",
     "argmax_ties": "argmax",
     "softmax": "softmax",
