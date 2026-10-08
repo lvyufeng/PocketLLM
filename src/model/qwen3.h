@@ -75,6 +75,12 @@ struct Weight {
    * the shape.  False for everything else, including the embedding table, whose
    * gather reads the file layout. */
   bool panel = false;
+  /* The bytes in `blocks` are `quant::Q6KRepacked` blocks (one `int8` per
+   * weight, byte-expanded), not the file's 210-byte `q6_K` blocks.  Unlike the
+   * q4_K panels this is a *different size*, so nothing about the shape says
+   * which layout a buffer holds -- this flag is the only authority.  CUDA-only;
+   * false everywhere else, including the embedding table. */
+  bool q6k_repacked = false;
 };
 
 class Qwen3Model {
@@ -147,6 +153,8 @@ class Qwen3Model {
    * when the session selected the panel path and the shape divides; throws if it
    * does not, rather than leaving a matrix half in each layout. */
   void repack_weight(Weight &weight) const;
+  void repack_weight_q6k(const GgufReader &checkpoint, const std::string &name,
+                         Weight &weight) const;
 
   /* Copy a tensor's stored bytes to the device untouched and describe them as
    * a `Weight`. Nothing is decoded at load: the type id travels with the
@@ -203,6 +211,11 @@ class Qwen3Model {
    * because it is a property of the session and a per-call string comparison
    * would be a per-op decision that cannot change. */
   bool panel_gemm_ = false;
+  /* Is the byte-expanded q6_K layout in use this run? Unlike the q4_K panels it
+   * is sent by the *backend*, not the model: only CUDA reads the repacked block,
+   * so a CPU session must keep the file layout or `gemm_quant` would walk 210-
+   * byte blocks as 274-byte ones. Decided once at load, beside `panel_gemm_`. */
+  bool q6k_repack_enabled_ = false;
 
   /* The KV cache, `[layer][position][kv_head][head_dim]`.
    *

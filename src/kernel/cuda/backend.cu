@@ -197,7 +197,29 @@ __global__ void gemm_kernel(const float *x, const float *w, const float *bias, f
  * position -- which is the piece a decoder indexing by position alone gets right
  * for one run in four; it is written the way `dequant_q6_k` writes it. */
 __device__ void quant_block_accumulate(int type_id, const uint8_t *block, const float *xs,
-                                       float &total) {
+                                       float &total, bool q6k_repacked) {
+  if (q6k_repacked) {
+    /* The repacked q6_K block: one `int8` per weight (`q - 32`), then sixteen
+     * `int8` scales, then `d`. The per-weight assembly is gone -- a byte load
+     * and a scale lookup replace the `ql`/`qh` shift-and-or -- but the value is
+     * the one `dequant_q6_k` produced, in the same association, so the sum is
+     * unchanged. The scale index `col / 16` is the file decoder's
+     * `half * 8 + i / 16 + 2 * sub`, which for a run-major walk is just the
+     * 16-weight group's ordinal. */
+    const int8_t *qs = reinterpret_cast<const int8_t *>(block);
+    const float d = quant::as_half(block, 272);
+    for (int col = 0; col < quant::kBlockWeights; ++col) {
+      /* The arithmetic is inlined, not routed through
+       * `quant::dequant_q6_k_repacked`, for the reason the Q4_K branch inlines
+       * its own: a device-function call hides the loop body from nvcc's
+       * unroller and the decode runs ~5x slower. The expression is the one that
+       * helper writes, so the value is the same bit for bit. */
+      const int scale = quant::as_int8(block, 256 + col / 16);
+      const float ds = d * static_cast<float>(scale);
+      total += xs[col] * (ds * static_cast<float>(static_cast<int>(qs[col])));
+    }
+    return;
+  }
   if (type_id == quant::kGgmlQ4K) {
     const float d = quant::as_half(block, 0);
     const float dmin = quant::as_half(block, 2);
@@ -282,7 +304,7 @@ __device__ void quant_block_accumulate(int type_id, const uint8_t *block, const 
  * are loading a valid address write to shared here. */
 __global__ void gemm_quant_kernel(const float *x, const uint8_t *blocks, const float *bias,
                                   float *out, int64_t m, int64_t n, int64_t k, int type_id,
-                                  int block_bytes, int accumulate) {
+                                  int block_bytes, int accumulate, int q6k_repacked) {
   const int64_t r = blockIdx.y;
   const int64_t j = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int lane = threadIdx.x;
@@ -315,7 +337,8 @@ __global__ void gemm_quant_kernel(const float *x, const uint8_t *blocks, const f
        * reassociates the accumulation. This thread's own weight block -- the
        * column `j` it owns -- is read from global (L2-resident after the first
        * block touches it) and decoded with the hoisted scale/min unpack. */
-      quant_block_accumulate(type_id, col_blocks + b * block_bytes, xs, total);
+      quant_block_accumulate(type_id, col_blocks + b * block_bytes, xs, total,
+                             q6k_repacked != 0);
     }
     __syncthreads();
   }
@@ -604,11 +627,16 @@ class CudaBackend final : public Backend {
   }
 
   void gemm_quant(DeviceBuffer x, DeviceBuffer blocks, DeviceBuffer bias, DeviceBuffer out,
-                  int64_t m, int64_t n, int64_t k, int type_id, bool accumulate) override {
+                  int64_t m, int64_t n, int64_t k, int type_id, bool accumulate,
+                  bool q6k_repacked = false) override {
     if (m <= 0 || n <= 0 || k <= 0) {
       return;
     }
-    const int block_bytes = quant::block_bytes_of(type_id);
+    /* A repacked q6_K tensor carries `Q6KRepacked` blocks, not the file's 210
+     * bytes, and `block_bytes_of` would answer for the file format. The flag is
+     * the only thing that says which, so it also picks the stride. */
+    const int block_bytes =
+        q6k_repacked ? quant::kQ6KRepackedBytes : quant::block_bytes_of(type_id);
     if (block_bytes == 0) {
       /* Refused by name, and refused *here* rather than at the caller: a build
        * whose device half does not carry a decoder has to say so on the device
@@ -658,7 +686,7 @@ class CudaBackend final : public Backend {
     const dim3 grid(static_cast<unsigned>((n + threads - 1) / threads), static_cast<unsigned>(m));
     gemm_quant_kernel<<<grid, threads>>>(f(x), reinterpret_cast<const uint8_t *>(blocks.handle),
                                          bias.handle ? f(bias) : nullptr, w(out), m, n, k, type_id,
-                                         block_bytes, accumulate ? 1 : 0);
+                                         block_bytes, accumulate ? 1 : 0, q6k_repacked ? 1 : 0);
     check(cudaGetLastError(), "gemm_quant");
   }
 

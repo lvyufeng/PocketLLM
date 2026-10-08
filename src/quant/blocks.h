@@ -141,8 +141,12 @@ POCKETLLM_HD float dequant_q4_k(const uint8_t *block, int index) {
  * indexing them by position alone gets right for one run in four.
  *
  * The scales are signed bytes and the value is offset, hence `q - 32`: a weight
- * may be negative without a separate sign plane. */
-POCKETLLM_HD float dequant_q6_k(const uint8_t *block, int index) {
+ * may be negative without a separate sign plane.
+ *
+ * The decode is split in two so the repacker can share one authority for the
+ * bit layout: `q6_k_raw_value` is the `q` bits, `dequant_q6_k_from` applies the
+ * scales. `dequant_q6_k` composes them, and is the only entry the callers use. */
+POCKETLLM_HD int q6_k_raw_value(const uint8_t *block, int index) {
   const int half = index / 128;      /* which 128-weight half */
   const int within = index % 128;    /* position inside that half */
   const int sub = within / 32;       /* which of the four 32-weight runs */
@@ -152,11 +156,24 @@ POCKETLLM_HD float dequant_q6_k(const uint8_t *block, int index) {
   const int qh = as_byte(block, 128 + half * 32 + i);
   const int high = ((qh >> (2 * sub)) & 3) << 4;
   const int low = sub < 2 ? (ql & 0x0F) : (ql >> 4);
-  const int q = low | high;
+  return low | high;
+}
 
+/* The weight a raw `q` and its index decode to -- the association
+ * `dequant_q6_k` uses, split out so the repacked decoder can reproduce it
+ * exactly. */
+POCKETLLM_HD float dequant_q6_k_from(const uint8_t *block, int q, int index) {
+  const int half = index / 128;
+  const int within = index % 128;
+  const int sub = within / 32;
+  const int i = within % 32;
   const int scale = as_int8(block, 192 + half * 8 + i / 16 + 2 * sub);
   const float d = as_half(block, 208);
   return d * static_cast<float>(scale) * static_cast<float>(q - 32);
+}
+
+POCKETLLM_HD float dequant_q6_k(const uint8_t *block, int index) {
+  return dequant_q6_k_from(block, q6_k_raw_value(block, index), index);
 }
 
 /* Dispatch for a block a caller only knows by its type id. The ids are GGML's,
@@ -178,6 +195,50 @@ POCKETLLM_HD int block_bytes_of(int type_id) {
   }
   return 0;
 }
+
+/* ---- The repacked Q6_K block, and why it exists -------------------------
+ *
+ * `block_q6_K`'s on-disk layout splits each weight's six bits across two
+ * arrays -- four in `ql`, two in `qh`, interleaved per 32-weight run -- so
+ * decoding one weight is a shift, a mask, a shift and an or before the scale
+ * multiply and the `int->float`. Measured on the 2080 Ti, that per-weight
+ * assembly is ~34% of CUDA decode and 25% of the model's weights, and it is
+ * what neither wider loads nor register blocking could reach (`repack_q4k.h`'s
+ * `Q4Kx8` is the same move applied to Q4_K).
+ *
+ * The repack keeps the six-bit *value* and drops the *packing*: one signed byte
+ * per weight holding `q - 32` (the range `[-32, 31]`, which is exactly an
+ * `int8`), plus the sixteen signed scales and the half `d` copied through. It
+ * is a host transform into a device buffer at load, so the GGUF format and
+ * every checkpoint are untouched -- the same shape as `Q4Kx8`, which is also
+ * why it lives here beside the file-format decoders rather than in a backend.
+ *
+ * The decode is then a plain byte load and a multiply, and -- deliberately --
+ * the *expression tree* is the one `dequant_q6_k` builds, so the value is
+ * identical bit for bit:
+ *
+ *     d * static_cast<float>(scale) * static_cast<float>(q - 32)
+ *
+ * `d` and `scale` are the same two floats (the scale is `scales[index / 16]`,
+ * the group index the on-disk decoder computes as
+ * `half * 8 + i / 16 + 2 * sub`), and `q - 32` is the byte. No reassociation,
+ * no rounding difference. */
+constexpr int kQ6KRepackedBytes = 274;
+
+/* One 256-weight super-block: 256 `int8` weights, sixteen `int8` group scales,
+ * and the half `d`. The scales are the file's own `scales[16]` copied verbatim;
+ * only the weights change representation. */
+struct Q6KRepacked {
+  int8_t qs[256];
+  int8_t scales[16];
+  uint16_t d;
+};
+static_assert(sizeof(Q6KRepacked) == kQ6KRepackedBytes, "Q6KRepacked size");
+
+/* The decode is left to the kernel rather than a `dequant_*_repacked` helper:
+ * like the Q4_K branch, the kernel writes the expression inline so nvcc can
+ * unroll the walk -- a device function call here costs ~5x. The value is the one
+ * above, in the same association. */
 
 /* One weight out of a block of `type_id`. Calling this with a type
  * `block_bytes_of` refused is a programming error; the callers check first. */

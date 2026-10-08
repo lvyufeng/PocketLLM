@@ -95,7 +95,11 @@ class CpuBackend final : public Backend {
   }
 
   void gemm_quant(DeviceBuffer x, DeviceBuffer blocks, DeviceBuffer bias, DeviceBuffer out,
-                  int64_t m, int64_t n, int64_t k, int type_id, bool accumulate) override {
+                  int64_t m, int64_t n, int64_t k, int type_id, bool accumulate,
+                  bool q6k_repacked = false) override {
+    /* The repacked q6_K layout is a CUDA-only path; the CPU never sets it and
+     * would not know the layout if it did. */
+    (void)q6k_repacked;
     kernel::gemm_quant(f(x), bytes(blocks), bias.handle ? f(bias) : nullptr, w(out), m, n, k, type_id,
                        accumulate);
   }

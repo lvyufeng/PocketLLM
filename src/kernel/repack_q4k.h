@@ -85,6 +85,15 @@ bool repack_available();
  * `panels` must hold `n * k / 8` bytes, the same byte count as `blocks`. */
 void repack_weights_q4k(const uint8_t *blocks, int64_t n, int64_t k, Q4Kx8 *panels);
 
+/* Repack a whole q6_K weight matrix: `n` columns of `k` weights, row-major
+ * `q6_K` blocks (`k / 256` per column), into the `Q6KRepacked` layout
+ * (`quant/blocks.h`). `out` must hold `n * (k / 256) * 274` bytes. Unlike the
+ * q4_K panels this **enlarges** the matrix (210 -> 274 bytes a block, +30%),
+ * which is the cost of trading the per-weight bit assembly for a byte load.
+ * `n` and `k` need no divisibility beyond the `k % 256` every q6_K tensor
+ * already has. */
+void repack_weights_q6k(const uint8_t *blocks, int64_t n, int64_t k, uint8_t *out);
+
 /* Quantize `nr` activation rows of `k` floats (row stride `k`) into groups of
  * four rows, laid out `packed[g * (k/256) + b]` -- group-major, the order
  * `gemm_q4k_8x8` walks.  `nr` must be a multiple of 4. */

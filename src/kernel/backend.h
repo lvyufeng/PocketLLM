@@ -103,7 +103,8 @@ class Backend {
    * `type_id` is a GGML storage id, the same numbering `abi/spec.h` and the
    * checkpoint use, so a caller never translates between two vocabularies. */
   virtual void gemm_quant(DeviceBuffer x, DeviceBuffer blocks, DeviceBuffer bias, DeviceBuffer out,
-                          int64_t m, int64_t n, int64_t k, int type_id, bool accumulate) = 0;
+                          int64_t m, int64_t n, int64_t k, int type_id, bool accumulate,
+                          bool q6k_repacked = false) = 0;
 
   /* ``out[i, :] = table[token[i], :]``. `tokens` holds `n_tokens` int32 ids. */
   virtual void embedding(DeviceBuffer tokens, int64_t n_tokens, DeviceBuffer table, int64_t vocab,
