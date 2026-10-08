@@ -30,6 +30,7 @@ by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script
 
 - [Overview](https://lvyufeng.github.io/PocketLLM/guides/)
 - [Cutting a release](https://lvyufeng.github.io/PocketLLM/guides/pypi_release/)
+- [The board fleet](https://lvyufeng.github.io/PocketLLM/guides/fleet_workflow/)
 
 ## Reports
 

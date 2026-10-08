@@ -92,6 +92,7 @@ nav:
   - Guides:
       - Overview: guides/index.md
       - Cutting a release: guides/pypi_release.md
+      - The board fleet: guides/fleet_workflow.md
   - Reports:
       - Overview: reports/index.md
   - Changelog: https://github.com/lvyufeng/PocketLLM/releases
