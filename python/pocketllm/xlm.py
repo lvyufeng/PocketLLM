@@ -26,6 +26,38 @@ host without the SDK gets an :class:`XlmUnavailable` from :func:`load`, not an
 3. ``libxlm.so`` on the system loader path.
 4. Nothing, and :class:`XlmUnavailable`.
 
+**Two environment variables, and ``open`` fails without them.**  ``libxlm.so``
+does not carry its own dependencies' paths, so the SDK's ``lib/`` directory has
+to be on the loader path or the ``dlopen`` fails — set ``LD_LIBRARY_PATH`` to
+``<sdk>/lib``.  The BPU runtime also needs its L2M slice sizes costed for the
+graph, which the SDK's own demo scripts set as
+``HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6`` for the four-core Qwen3 ``.hbm``s.  A
+session opened with either unset fails inside ``xlm_init`` (the loader error on
+the first, a BPU allocation error on the second), which is why
+:meth:`XlmEngine.open` reports the delegate's own status rather than guessing.
+
+**Sampling is fixed at load time, and not by :class:`Sampling`.**  The delegate
+samples from the ``.hbm`` graph on the BPU; it builds its sampler from
+``generation_config.json`` in the tokenizer directory, **not** from the
+:class:`Sampling` block that travels in :class:`CommonParams`.  A ``Sampling``
+value handed to ``xlm_init`` is accepted and then ignored — measured on the
+board, a request that asks for ``temp=0.6, top_k=20, do_sample=true`` returns
+token-for-token identical text to one that asks for greedy.  So the fleet's
+token/text-identity parity contract does **not** rest on this bridge's knobs: it
+rests on the two sides loading the same deterministic
+``generation_config.json``.  The board's stock file ships ``temperature: 0.6,
+top_k: 20, do_sample: true`` and is nondeterministic run to run; a file with
+``temperature: 0.0, do_sample: false, top_k: 1, top_p: 1.0`` is byte-stable.
+:class:`Sampling` is kept only because it is a field of the SDK's parameter
+struct and the struct's size is pinned; :meth:`XlmEngine.open` no longer offers
+it as a knob.
+
+**The prompt is the delegate's to build.**  For a Qwen3 checkpoint the delegate
+frames a bare prompt through llama.cpp's chat template, which prepends a default
+``<|im_start|>system\\nYou are a helpful assistant.<|im_end|>\\n`` block and ends
+with ``<|im_start|>assistant\\n``.  The request's own ``system_prompt`` field is
+ignored on this path, so a caller's system message does not reach the model.
+
 The struct layouts below are transcribed from ``offsetof`` output produced by
 the board's own compiler against the SDK header, not derived by hand: an
 anonymous union that is one field out does not fail to compile, it reads a
@@ -109,11 +141,15 @@ INFER_BACKEND_ANY = 0
 class Sampling(ctypes.Structure):
     """`common_params_sampling_t` (44 bytes).
 
-    **The delegate samples, not the host.**  There is no logits surface for the
-    host to draw from, so a caller's temperature and top-k travel here and the
-    text that comes back is already the delegate's choice.  ``temp <= 0`` is the
-    header's spelling of "sample greedily", and it is what :meth:`XlmEngine.infer`
-    sets when no sampling is asked for, so the default is deterministic.
+    **Dial this and nothing happens.**  The delegate samples from the Qwen3 graph
+    on the BPU and builds its sampler from ``generation_config.json`` in the
+    tokenizer directory; a value here reaches ``xlm_init`` and is then ignored —
+    measured on the board, ``temp=0.6, top_k=20, do_sample=true`` and a greedy
+    request return identical text.  The class exists only so
+    :class:`CommonParams` has the right size and field offsets (the sizes are
+    pinned in :data:`_EXPECTED_SIZES`); it is not offered as a knob by
+    :meth:`XlmEngine.open`.  Determinism comes from the tokenizer directory's
+    ``generation_config.json`` — see the module docstring.
     """
 
     _fields_ = [
@@ -430,7 +466,6 @@ class XlmEngine:
         *,
         model_type: int = XlmModelType.QWEN3,
         context_size: int = 0,
-        sampling: Sampling | None = None,
         callback: "Callable[[Result, int], None] | None" = None,
         lib: "CDLL | None" = None,
     ) -> "XlmEngine":
@@ -440,6 +475,14 @@ class XlmEngine:
         forcing the header's default: the `.hbm` was compiled for a specific
         chunk and cache size, so a caller overriding it from the host is more
         likely to disagree with the graph than to improve it.
+
+        ``tokenizer_dir`` is more than the tokenizer: the delegate reads
+        ``generation_config.json`` from it to build its sampler, so the
+        directory's file decides whether the session is deterministic.  There is
+        deliberately no ``sampling`` parameter here — the delegate ignores the
+        :class:`Sampling` block, and a knob that does nothing is worse than no
+        knob.  Requires ``LD_LIBRARY_PATH=<sdk>/lib`` and
+        ``HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6`` (see the module docstring).
         """
         loaded = lib if lib is not None else load()
         param = loaded.xlm_create_default_param()
@@ -449,8 +492,6 @@ class XlmEngine:
         param.model_type = int(model_type)
         if context_size:
             param.context_size = int(context_size)
-        if sampling is not None:
-            param.sampling = sampling
 
         state: dict[str, object] = {"sink": callback}
         ffi = _trampoline(state)
@@ -487,6 +528,13 @@ class XlmEngine:
         which is a property of the model, not of this bridge; splitting it is
         the protocol layer's job (``pocketllm.protocol.templating``), and doing
         it here would duplicate that decision in a second place.
+
+        **Whether two calls with the same prompt agree is the tokenizer
+        directory's decision, not this method's.**  The delegate's sampler is
+        built from ``generation_config.json`` in ``tokenizer_dir``; the stock
+        Qwen3 file samples (``temperature: 0.6, top_k: 20``) and so does not, and
+        a file with ``temperature: 0.0, do_sample: false`` does.  Nothing on the
+        :class:`XlmEngine` or :class:`Sampling` surface changes that.
         """
         if self._closed:
             raise XlmUnavailable("this XlmEngine has been closed")
