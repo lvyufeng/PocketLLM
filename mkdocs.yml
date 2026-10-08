@@ -85,6 +85,7 @@ nav:
       - Execution: architecture/execution.md
       - Device targets: architecture/devices.md
       - The C engine: architecture/c_engine.md
+      - Ascend 310B custom ops: architecture/ascend_310b.md
       - Serving: architecture/serving.md
   - Models:
       - Overview: models/README.md
