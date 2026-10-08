@@ -27,7 +27,9 @@ One checkpoint **does** run today through an entry point in this tree, and it is
 [**Qwen3 on the RDK S600**](s600_qwen3.md) runs on the Horizon Nash BPU through the `xlm`/`.hbm`
 delegate (0.6B and 1.7B; the board's 384 MiB BPU region refuses 4B and 8B). It is documented
 separately because it is a *delegate over a prebuilt artifact*, not a graph this tree builds — so it
-is not a row above, for the same reason the C engine's Qwen3 is not.
+is not a row above, for the same reason the C engine's Qwen3 is not. What it would take to get a
+smaller 4B graph onto that board is scoped in
+[the S600 native compile chain](../architecture/s600_native_chain.md).
 
 **Every architecture here is a Python one, and none of the Python backends implements a kernel yet**,
 so a checkpoint could not be run through this table even if an architecture existed for it.

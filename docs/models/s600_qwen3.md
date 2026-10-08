@@ -147,7 +147,9 @@ are out of scope to change.
 (`cache_1024` instead of `4096`, as the SDK's VLM 7B graph uses) or a smaller prefill chunk. The
 compiler chain that produces one (`GGUF → HF safetensors → leap_llm`/`oellm_build` → `hbdk4` → `.hbm`)
 runs on **x86-64 / cp310 only** and is gated on vendor-supplied components, so it is not a board-side
-knob. Until such a graph exists, 1.7B is the ceiling.
+knob. Until such a graph exists, 1.7B is the ceiling. **That chain is scoped in
+[the S600 native compile chain](../architecture/s600_native_chain.md)** — which finds the compiler is
+in the SDK we already have, not vendor-gated, and that a 4B graph would have to be compiled by us.
 
 ## Determinism
 
