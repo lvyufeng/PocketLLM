@@ -2,17 +2,20 @@
  *
  * The third implementation of `kernel/backend.h`, after the CPU and the card.
  * The *memory* half of the interface -- allocate, release, the three copies,
- * fill, synchronize -- is real, and so are five compute ops: `gemm_quant` for
- * q4_k, `rms_norm`, `silu_mul`, `gemm` (dense f32/f16) and `attention` (one
- * decode step).  Every other op throws, by name, so a caller that reaches it
+ * fill, synchronize -- is real, and so are nine compute ops: `gemm_quant` for
+ * q4_k, `rms_norm`, `silu_mul`, `gemm` (dense f32/f16), `attention` (one
+ * decode step), and -- new this round -- `embedding`, `rope_neox`, `softmax`
+ * and `argmax`.  Every other op throws, by name, so a caller that reaches it
  * learns which op is absent rather than getting a wrong number.
  *
  * ## What each implemented op is measured at
  *
  * Each op was probed standalone against a float64 CPU reference computed from
- * the *same* fp16 inputs -- the reference rounds only where the op itself
- * rounds, so what is left is the op's own arithmetic error and not the storage
- * format's.  Measured on the board (CANN 8.3.RC2, Ascend310B1):
+ * the *same* inputs (fp16 for the custom-op kernels, which are fp16-only;
+ * f32 for the built-ins, which the graph also calls in f32).  The reference
+ * rounds only where the op itself rounds, so what is left is the op's own
+ * arithmetic error and not the storage format's.  Measured on the board
+ * (CANN 8.3.RC2, Ascend310B1):
  *
  *   op                                  /max|ref|   worst per-element
  *   RmsNormNdCustom   8 x 1024            2.7e-04        4.8e-04
@@ -23,15 +26,71 @@
  *   MatmulCubeCustom  1 x 1024 x 3072     1.0e-04        9.3e-04
  *   MatmulCubeCustom 16 x 1024 x 3072     1.8e-04        9.6e-04
  *   AttentionStepCustom 16q/8kv/D128/ctx64 2.1e-04       9.0e-04
+ *   RopeCustom       3 x 2 x 128 @ pos 0  3.2e-04        4.4e-04
+ *   RopeCustom       3 x 2 x 128 @ pos 300 3.5e-04       4.7e-04
+ *   RopeCustom       5 x 2 x 32  @ pos 0   2.1e-04        4.7e-04
+ *   Embedding        5 tokens, vocab 32    0.0            0.0   (exact gather)
+ *   Softmax  3 x 64 (f32)                 1.0e-08 abs     --
+ *   Softmax  1 x 151936 (f32)             4.7e-12 abs     --
+ *   ArgMax   151936, and a tie at 4/9       exact index
  *
  * All under the 1e-3 gate.  The cube and attention per-element errors are the
  * fp16 output rounding of a long reduction -- the accumulate is f32 (L0C for
  * the cube, an fp32 score row for attention), which is why they do not grow
  * with K or context the way an fp16 accumulator's would; silu_mul is bit-exact
  * because the kernel and the reference both evaluate `g / (1 + exp(-g)) * u`
- * in f32.  The same four ops were then driven through this backend's own f32
+ * in f32.  The four custom ops were then driven through this backend's own f32
  * interface -- the f32<->f16 bridges, the gemm transpose, the attention repack
  * and the accumulate path included -- and every case stayed under 1e-3.
+ *
+ * ## Three of the four new ops are aclnn *built-ins*, and that is worth stating
+ *
+ * `embedding`, `softmax` and `argmax` are driven through the CANN built-in
+ * library (`aclnnEmbedding`, `aclnnSoftmax`, `aclnnArgMax`), not a custom op.
+ * This is only sound because they were *run* on the board first: the built-in
+ * matmul has no `ascend310b` binary on CANN 8.3.RC2 and fails there, so a
+ * header's existence is not evidence.  For this trio the 310B binary does
+ * exist -- the built-in `softmax_v2`, `arg_max_v2` and `embedding` kernels
+ * answered phase-1 and phase-2 status 0 with the right numbers (f32 softmax is
+ * 1e-8 absolute at the test's width and 5e-12 at the
+ * 151936-vocabulary row; argmax picks the low index of a tie; the gather is
+ * exact).
+ *
+ * `rope_neox` is the fourth op and it is a *custom* op, `aclnnRopeCustom`,
+ * whose kernel is exactly this layout: it rotates the split halves of a head
+ * (`out[i] = x[i]*cos - x[i+d/2]*sin`) and reads its angle from a per-row
+ * INT32 index into a whole cos/sin table -- which is how the backend passes the
+ * absolute position and why the table is left whole rather than sliced.
+ *
+ * ## The shapes an fp16 custom-op kernel cannot take
+ *
+ * The AscendC vector pipe moves 32 bytes -- sixteen fp16 lanes -- per repeat,
+ * so a custom-op kernel whose `DataCopy` length is not a multiple of sixteen
+ * half-words over-reads into the next row.  `RopeCustom` is the second op to
+ * have this edge (after `RmsNormNdCustom`), and this backend refuses the width
+ * by name rather than returning the garbage: `rope_neox` requires
+ * `d % 32 == 0` (so each split half is a whole number of lanes; d = 16 and
+ * d = 4 were measured at 100% error) and `d <= 512` (the kernel's `MAX_HALF`,
+ * a `halfRot` of 256).  Qwen3's head_dim is 128, which satisfies both, but the
+ * suite's `rope_small_head_dim` is d = 4 and is excluded for this reason.
+ *
+ * ## What the sizers still cannot reach, and why `topk_sample` is not here
+ *
+ * `logits_temperature` and `topk_sample` are not implemented.  They are not
+ * blocking a Qwen3 forward pass -- greedy decoding is `argmax` and is what this
+ * tree's default decode does -- but they are stated rather than left silent.
+ * `logits_temperature` is a plain `x / t` and would be a built-in div, but its
+ * only caller is the sampling path, which is not assembled; `topk_sample` is a
+ * *ranker*, not an elementwise op, and needs a sort plus an inverse-CDF, which
+ * is a real kernel and is the honest thing to leave named.
+ *
+ * `embedding_quant` *is* implemented, but not as a device kernel: it decodes
+ * the packed table with the tree's own `dequant_q4_k`/`dequant_q6_k`, refills
+ * the out-of-range rows with zeros (the C `embedding` contract, which the
+ * built-in gather does *not* honour -- measured, an out-of-range id returns
+ * garbage), and then drives the same f32 `aclnnEmbedding` gather.  So the
+ * gather is on the device and the decode is on the host; a device kernel that
+ * decoded the blocks in place is the follow-on.
  *
  * ## The layout bridge `attention` needs
  *
@@ -90,6 +149,7 @@
 #include <acl/acl.h>
 #include <aclnn/acl_meta.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -98,10 +158,15 @@
 #include <unordered_map>
 #include <vector>
 
+#include <aclnnop/aclnn_argmax.h>
+#include <aclnnop/aclnn_embedding.h>
+#include <aclnnop/aclnn_softmax.h>
+
 #include "aclnn_attention_step_custom.h"
 #include "aclnn_matmul_cube_custom.h"
 #include "aclnn_matmul_w4a16_custom.h"
 #include "aclnn_rms_norm_nd_custom.h"
+#include "aclnn_rope_custom.h"
 #include "aclnn_silu_mul_custom.h"
 #include "kernel/backend.h"
 #include "quant/blocks.h"
@@ -117,6 +182,22 @@ constexpr int64_t kTileLen = 64;       /* tileLen: % 16 == 0 and <= 448 */
 constexpr int64_t kGemmAlign = 128;    /* n must be a multiple of this */
 constexpr int64_t kRmsMaxD = 4096;     /* RmsNormNdCustom keeps one row in UB */
 constexpr int64_t kMaxContext = 8192;  /* AttentionStepCustom's MAX_CONTEXT */
+constexpr int64_t kRopeMaxD = 512;     /* RopeCustom's MAX_HALF = 256, so rot <= 512 */
+constexpr int64_t kRopeLane = 32;      /* RopeCustom moves halfRot in 16-half-word lanes */
+
+/* A 2-D or smaller `aclTensor` with a contiguous stride computed from the
+ * shape, which is what every op here works in.  `aclnn/acl_meta.h` has no
+ * "strides please" constructor, so the walk is written once here rather than
+ * eighteen times at the call sites. */
+aclTensor *make_tensor(const std::vector<int64_t> &shape, aclDataType dtype, void *data) {
+  std::vector<int64_t> strides(shape.size(), 1);
+  for (int64_t i = static_cast<int64_t>(shape.size()) - 2; i >= 0; --i) {
+    strides[static_cast<std::size_t>(i)] =
+        strides[static_cast<std::size_t>(i + 1)] * shape[static_cast<std::size_t>(i + 1)];
+  }
+  return aclCreateTensor(shape.data(), static_cast<int64_t>(shape.size()), dtype, strides.data(), 0,
+                         ACL_FORMAT_ND, shape.data(), static_cast<int64_t>(shape.size()), data);
+}
 
 /* Check an `aclError` and throw with the call's name in the message.  Every acl
  * entry point returns this and none of them throw, so without a wrapper the
@@ -542,12 +623,48 @@ class AscendBackend final : public Backend {
      * transpose per weight per process, not per token. */
     run_cube(read_f32(x, m * k, ACL_FLOAT), w, m, n, k, accumulate, out);
   }
-  void embedding(DeviceBuffer, int64_t, DeviceBuffer, int64_t, int64_t, DeviceBuffer) override {
-    throw Error("ascend: embedding not implemented yet");
+  void embedding(DeviceBuffer tokens, int64_t n_tokens, DeviceBuffer table, int64_t vocab,
+                 int64_t d, DeviceBuffer out) override {
+    std::vector<int32_t> ids(static_cast<std::size_t>(n_tokens));
+    copy_to_host(ids.data(), tokens, n_tokens * 4);
+    gather_rows(ids, table, vocab, d, out);
   }
-  void embedding_quant(DeviceBuffer, int64_t, DeviceBuffer, int64_t, int64_t, int,
-                       DeviceBuffer) override {
-    throw Error("ascend: embedding_quant not implemented yet");
+
+  void embedding_quant(DeviceBuffer tokens, int64_t n_tokens, DeviceBuffer blocks, int64_t vocab,
+                       int64_t d, int type_id, DeviceBuffer out) override {
+    const int block_bytes = quant::block_bytes_of(type_id);
+    if (block_bytes == 0) {
+      throw Error("ascend: embedding_quant has no decoder for GGML type id " +
+                  std::to_string(type_id));
+    }
+    if (d % quant::kBlockWeights != 0) {
+      throw Error("ascend: embedding_quant needs d a multiple of 256 (a super-block), got " +
+                  std::to_string(d));
+    }
+    /* Decode the packed table to a dense f32 one and gather from that.  The
+     * decode is on the host because `dequant_q4_k` reads host bytes and there is
+     * no device kernel that decodes a block in place; the *gather* is still the
+     * device built-in below.  This is a first-round op and it says so. */
+    const int64_t blocks_per_row = d / quant::kBlockWeights;
+    const int64_t total = vocab * blocks_per_row * block_bytes;
+    std::vector<uint8_t> host(static_cast<std::size_t>(total));
+    copy_to_host(host.data(), blocks, total);
+    std::vector<float> dense(static_cast<std::size_t>(vocab * d));
+    for (int64_t row = 0; row < vocab; ++row) {
+      for (int64_t b = 0; b < blocks_per_row; ++b) {
+        const uint8_t *block = host.data() + (row * blocks_per_row + b) * block_bytes;
+        for (int64_t i = 0; i < quant::kBlockWeights; ++i) {
+          dense[static_cast<std::size_t>(row * d + b * quant::kBlockWeights + i)] =
+              quant::dequant_block(type_id, block, static_cast<int>(i));
+        }
+      }
+    }
+    DeviceBuffer dtable = allocate(vocab * d * 4);
+    copy_to_device(dtable, dense.data(), vocab * d * 4);
+    std::vector<int32_t> ids(static_cast<std::size_t>(n_tokens));
+    copy_to_host(ids.data(), tokens, n_tokens * 4);
+    gather_rows(ids, dtable, vocab, d, out);
+    release(dtable);
   }
   void silu_mul(DeviceBuffer gate, DeviceBuffer up, DeviceBuffer out, int64_t n) override {
     if (n <= 0) {
@@ -613,10 +730,100 @@ class AscendBackend final : public Backend {
     release(dout);
   }
 
-  void rope_neox(DeviceBuffer, int64_t, int64_t, int64_t, int64_t, DeviceBuffer,
-                 DeviceBuffer) override {
-    throw Error("ascend: rope_neox not implemented yet (the custom RopeCustom op is installed; "
-                "its layout has not been wired to this interface)");
+  void rope_neox(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d,
+                 int64_t start_pos, DeviceBuffer cos_table, DeviceBuffer sin_table) override {
+    /* `aclnnRopeCustom` walks a flat `[rows, d]` operand with a per-row INT32
+     * index into the whole cos/sin table, so the token-major ``[token][head][d]``
+     * x is already the right shape: a row is one (token, head) pair, and every
+     * head of a token takes the same position.  The kernel rotates the split
+     * halves and copies the tail past `rot`; here `rot == d`, so there is no
+     * tail. */
+    if (n_tokens <= 0 || n_heads <= 0) {
+      return;
+    }
+    if (d <= 0 || d > kRopeMaxD || d % kRopeLane != 0) {
+      throw Error("ascend: rope_neox head_dim " + std::to_string(d) +
+                  " is not supported by RopeCustom (needs 0 < d <= 512 and d % 32 == 0; the "
+                  "kernel moves one split half per 16-lane repeat)");
+    }
+    if (start_pos < 0) {
+      throw Error("ascend: rope_neox got a negative start_pos " + std::to_string(start_pos));
+    }
+
+    const int64_t rows = n_tokens * n_heads;
+    const int64_t table_rows = table_rows_of(cos_table, d / 2);
+    std::vector<int32_t> row_t(static_cast<std::size_t>(rows));
+    for (int64_t t = 0; t < n_tokens; ++t) {
+      const int64_t pos = start_pos + t;
+      if (pos >= table_rows) {
+        throw Error("ascend: rope_neox position " + std::to_string(pos) +
+                    " is past the cos/sin table's " + std::to_string(table_rows) + " rows");
+      }
+      for (int64_t h = 0; h < n_heads; ++h) {
+        row_t[static_cast<std::size_t>(t * n_heads + h)] = static_cast<int32_t>(pos);
+      }
+    }
+
+    const std::vector<float> x_f = read_f32(x, rows * d, ACL_FLOAT);
+    const std::vector<float> c_f = read_f32(cos_table, table_rows * (d / 2), ACL_FLOAT);
+    const std::vector<float> s_f = read_f32(sin_table, table_rows * (d / 2), ACL_FLOAT);
+    const std::vector<uint16_t> x_h = to_f16(x_f.data(), rows * d);
+    const std::vector<uint16_t> c_h = to_f16(c_f.data(), table_rows * (d / 2));
+    const std::vector<uint16_t> s_h = to_f16(s_f.data(), table_rows * (d / 2));
+
+    DeviceBuffer dx = allocate(rows * d * 2);
+    DeviceBuffer dc = allocate(table_rows * (d / 2) * 2);
+    DeviceBuffer ds = allocate(table_rows * (d / 2) * 2);
+    DeviceBuffer dr = allocate(rows * 4);
+    DeviceBuffer dout = allocate(rows * d * 2);
+    copy_to_device(dx, x_h.data(), rows * d * 2);
+    copy_to_device(dc, c_h.data(), table_rows * (d / 2) * 2);
+    copy_to_device(ds, s_h.data(), table_rows * (d / 2) * 2);
+    copy_to_device(dr, row_t.data(), rows * 4);
+
+    aclTensor *tx = make_tensor({rows, d}, ACL_FLOAT16, reinterpret_cast<void *>(dx.handle));
+    aclTensor *tc =
+        make_tensor({table_rows, d / 2}, ACL_FLOAT16, reinterpret_cast<void *>(dc.handle));
+    aclTensor *ts =
+        make_tensor({table_rows, d / 2}, ACL_FLOAT16, reinterpret_cast<void *>(ds.handle));
+    aclTensor *tr = make_tensor({rows}, ACL_INT32, reinterpret_cast<void *>(dr.handle));
+    aclTensor *to = make_tensor({rows, d}, ACL_FLOAT16, reinterpret_cast<void *>(dout.handle));
+    if (tx == nullptr || tc == nullptr || ts == nullptr || tr == nullptr || to == nullptr) {
+      throw Error("ascend: aclCreateTensor returned null (rope_neox)");
+    }
+
+    uint64_t ws_size = 0;
+    aclOpExecutor *executor = nullptr;
+    aclnn_ok(aclnnRopeCustomGetWorkspaceSize(tx, tc, ts, tr, to, &ws_size, &executor),
+             "aclnnRopeCustomGetWorkspaceSize");
+    void *workspace = nullptr;
+    if (ws_size > 0) {
+      acl_ok(aclrtMalloc(&workspace, static_cast<std::size_t>(ws_size), ACL_MEM_MALLOC_HUGE_FIRST),
+             "aclrtMalloc workspace");
+    }
+    aclnn_ok(aclnnRopeCustom(workspace, ws_size, executor, stream_), "aclnnRopeCustom");
+    acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
+
+    std::vector<uint16_t> out_h(static_cast<std::size_t>(rows * d));
+    copy_to_host(out_h.data(), dout, rows * d * 2);
+    const std::vector<float> out_f = half_to_f32(out_h);
+    /* `rope_neox` is in-place: the interface's `x` is both the input and the
+     * result, which is why there is no `out` parameter to write. */
+    copy_to_device(x, out_f.data(), rows * d * 4);
+
+    if (workspace != nullptr) {
+      aclrtFree(workspace);
+    }
+    aclDestroyTensor(tx);
+    aclDestroyTensor(tc);
+    aclDestroyTensor(ts);
+    aclDestroyTensor(tr);
+    aclDestroyTensor(to);
+    release(dx);
+    release(dc);
+    release(ds);
+    release(dr);
+    release(dout);
   }
 
   /* `AttentionStepCustom` keeps its own score row per head in device UB, so it
@@ -712,11 +919,70 @@ class AscendBackend final : public Backend {
     const bool as_f16 = from_env != nullptr && from_env[0] != '\0' && from_env[0] != '0';
     return as_f16 ? KVDtype::kF16 : KVDtype::kF32;
   }
-  void argmax(DeviceBuffer, int64_t, DeviceBuffer) override {
-    throw Error("ascend: argmax not implemented yet");
+  void argmax(DeviceBuffer values, int64_t n, DeviceBuffer out) override {
+    if (n <= 0) {
+      throw Error("ascend: argmax needs a positive length, got " + std::to_string(n));
+    }
+    /* The built-in takes its result in an int64 tensor of one element; the
+     * interface writes an index the same width (`kernels.h`'s `argmax` returns
+     * an `int64_t`), so the two line up and no narrowing happens at the edge. */
+    int64_t best = 0;
+    DeviceBuffer dout = allocate(8);
+    aclTensor *tv = make_tensor({n}, ACL_FLOAT, reinterpret_cast<void *>(values.handle));
+    aclTensor *to = make_tensor({1}, ACL_INT64, reinterpret_cast<void *>(dout.handle));
+    if (tv == nullptr || to == nullptr) {
+      throw Error("ascend: aclCreateTensor returned null (argmax)");
+    }
+    uint64_t ws_size = 0;
+    aclOpExecutor *executor = nullptr;
+    aclnn_ok(aclnnArgMaxGetWorkspaceSize(tv, 0, false, to, &ws_size, &executor),
+             "aclnnArgMaxGetWorkspaceSize");
+    void *workspace = nullptr;
+    if (ws_size > 0) {
+      acl_ok(aclrtMalloc(&workspace, static_cast<std::size_t>(ws_size), ACL_MEM_MALLOC_HUGE_FIRST),
+             "aclrtMalloc workspace");
+    }
+    aclnn_ok(aclnnArgMax(workspace, ws_size, executor, stream_), "aclnnArgMax");
+    acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
+    copy_to_host(&best, dout, 8);
+    copy_to_device(out, &best, 8);
+    if (workspace != nullptr) {
+      aclrtFree(workspace);
+    }
+    aclDestroyTensor(tv);
+    aclDestroyTensor(to);
+    release(dout);
   }
-  void softmax(DeviceBuffer, DeviceBuffer, int64_t, int64_t) override {
-    throw Error("ascend: softmax not implemented yet");
+
+  void softmax(DeviceBuffer x, DeviceBuffer out, int64_t rows, int64_t cols) override {
+    if (rows <= 0 || cols <= 0) {
+      return;
+    }
+    /* f32 in, f32 out: the built-in softmax has an f32 kernel on this board and
+     * the graph's activation is f32, so nothing is narrowed -- which is the
+     * opposite of the story for the custom ops above and is why this one is
+     * measured at 1e-8 rather than at the fp16 lane width. */
+    aclTensor *tx = make_tensor({rows, cols}, ACL_FLOAT, reinterpret_cast<void *>(x.handle));
+    aclTensor *to = make_tensor({rows, cols}, ACL_FLOAT, reinterpret_cast<void *>(out.handle));
+    if (tx == nullptr || to == nullptr) {
+      throw Error("ascend: aclCreateTensor returned null (softmax)");
+    }
+    uint64_t ws_size = 0;
+    aclOpExecutor *executor = nullptr;
+    aclnn_ok(aclnnSoftmaxGetWorkspaceSize(tx, 1, to, &ws_size, &executor),
+             "aclnnSoftmaxGetWorkspaceSize");
+    void *workspace = nullptr;
+    if (ws_size > 0) {
+      acl_ok(aclrtMalloc(&workspace, static_cast<std::size_t>(ws_size), ACL_MEM_MALLOC_HUGE_FIRST),
+             "aclrtMalloc workspace");
+    }
+    aclnn_ok(aclnnSoftmax(workspace, ws_size, executor, stream_), "aclnnSoftmax");
+    acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
+    if (workspace != nullptr) {
+      aclrtFree(workspace);
+    }
+    aclDestroyTensor(tx);
+    aclDestroyTensor(to);
   }
   void logits_temperature(DeviceBuffer, DeviceBuffer, int64_t, float) override {
     throw Error("ascend: logits_temperature not implemented yet");
@@ -982,6 +1248,76 @@ class AscendBackend final : public Backend {
     release(dq);
     release(dk);
     release(dv);
+    release(dout);
+  }
+
+  /* How many rows the cos/sin table holds.  The interface does not pass the
+   * capacity, so it is read off the tensor the caller bound.  The tables are f32
+   * -- the graph's activation type and what `opcheck` uploads -- so a row is
+   * `half` four-byte elements. */
+  int64_t table_rows_of(DeviceBuffer table, int64_t half) const {
+    return table.bytes / (4 * half);
+  }
+
+  /* Gather `ids` rows of an f32 table through the built-in `aclnnEmbedding`.
+   *
+   * The one thing the built-in does not do is the interface's error handling:
+   * `kernel::embedding` (and the CPU/CUDA backends) *zero* a row whose id is
+   * outside `[0, vocab)`, because reading where the id points is a read past the
+   * mapping at one end and a valid row at the other.  Measured, the built-in
+   * does neither -- a negative id came back as `19023.8` and an id past the end
+   * as `4.4e-08`, both garbage -- so those rows are replaced with zeros here
+   * rather than left to a device that has no negative index to reject. */
+  void gather_rows(const std::vector<int32_t> &ids, DeviceBuffer table, int64_t vocab, int64_t d,
+                   DeviceBuffer out) {
+    const int64_t n = static_cast<int64_t>(ids.size());
+    if (n == 0) {
+      return;
+    }
+    std::vector<int32_t> safe(ids);
+    std::vector<int64_t> bad;
+    for (int64_t i = 0; i < n; ++i) {
+      if (safe[static_cast<std::size_t>(i)] < 0 || safe[static_cast<std::size_t>(i)] >= vocab) {
+        safe[static_cast<std::size_t>(i)] = 0;
+        bad.push_back(i);
+      }
+    }
+    DeviceBuffer dids = allocate(n * 4);
+    DeviceBuffer dout = allocate(n * d * 4);
+    copy_to_device(dids, safe.data(), n * 4);
+    aclTensor *tt = make_tensor({vocab, d}, ACL_FLOAT, reinterpret_cast<void *>(table.handle));
+    aclTensor *ti = make_tensor({n}, ACL_INT32, reinterpret_cast<void *>(dids.handle));
+    aclTensor *to = make_tensor({n, d}, ACL_FLOAT, reinterpret_cast<void *>(dout.handle));
+    if (tt == nullptr || ti == nullptr || to == nullptr) {
+      throw Error("ascend: aclCreateTensor returned null (embedding)");
+    }
+    uint64_t ws_size = 0;
+    aclOpExecutor *executor = nullptr;
+    aclnn_ok(aclnnEmbeddingGetWorkspaceSize(tt, ti, to, &ws_size, &executor),
+             "aclnnEmbeddingGetWorkspaceSize");
+    void *workspace = nullptr;
+    if (ws_size > 0) {
+      acl_ok(aclrtMalloc(&workspace, static_cast<std::size_t>(ws_size), ACL_MEM_MALLOC_HUGE_FIRST),
+             "aclrtMalloc workspace");
+    }
+    aclnn_ok(aclnnEmbedding(workspace, ws_size, executor, stream_), "aclnnEmbedding");
+    acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
+
+    std::vector<float> rows(static_cast<std::size_t>(n * d));
+    copy_to_host(rows.data(), dout, n * d * 4);
+    for (int64_t i : bad) {
+      std::fill(rows.begin() + static_cast<std::ptrdiff_t>(i * d),
+                rows.begin() + static_cast<std::ptrdiff_t>((i + 1) * d), 0.0F);
+    }
+    copy_to_device(out, rows.data(), n * d * 4);
+
+    if (workspace != nullptr) {
+      aclrtFree(workspace);
+    }
+    aclDestroyTensor(tt);
+    aclDestroyTensor(ti);
+    aclDestroyTensor(to);
+    release(dids);
     release(dout);
   }
 
