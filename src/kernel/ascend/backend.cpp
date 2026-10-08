@@ -472,7 +472,9 @@ class AscendBackend final : public Backend {
   }
 
   void gemm_quant(DeviceBuffer x, DeviceBuffer blocks, DeviceBuffer bias, DeviceBuffer out,
-                  int64_t m, int64_t n, int64_t k, int type_id, bool accumulate) override {
+                  int64_t m, int64_t n, int64_t k, int type_id, bool accumulate,
+                  bool q6k_repacked = false) override {
+    (void)q6k_repacked;
     if (type_id != quant::kGgmlQ4K) {
       throw Error("ascend: gemm_quant supports q4_k only, got type_id " + std::to_string(type_id));
     }
