@@ -26,6 +26,7 @@ by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script
 
 - [Overview](https://lvyufeng.github.io/PocketLLM/models/)
 - [Reference architectures](https://lvyufeng.github.io/PocketLLM/models/architectures/)
+- [Qwen3 on the RDK S600](https://lvyufeng.github.io/PocketLLM/models/s600_qwen3/)
 
 ## Guides
 
