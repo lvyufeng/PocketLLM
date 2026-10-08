@@ -163,6 +163,36 @@ not from a flag: the delegate builds its sampler from that file when the model i
 So a deterministic deployment ships a greedy `generation_config.json` beside the tokenizer. That is a
 file the caller edits, which is why `--seed` is refused rather than honoured — see below.
 
+## Accuracy against the 2080ti oracle
+
+The project's accuracy target is agreement with the 2080ti C-engine oracle. This path is **text-in /
+text-out and takes no token-id input**, so the comparison is made by feeding the oracle the exact ids
+the delegate's chat template produced and diffing the greedy continuations. The method and the raw
+ids are in `~/scratch/ref/parity/s600_parity.json` on the board (prompt ids, per-size text and ids,
+and the tokenizer directory).
+
+The 1.7B case is the clean one — the board's `.hbm` is **w4** and the oracle was driven on
+`Qwen3-1.7B-Q4_K_M`, the same 4-bit width, on `cpu`, greedy:
+
+| Index range | Result |
+|---|---|
+| 0–13 | **identical** — including the whole answer, `… The capital of France is Paris.` |
+| 14 | first divergence |
+
+At index 14 the oracle chose `358` (`It`) at logit 38.69 and the S600 chose `6771` (`France`) at
+37.65 — the top **two** candidates, **1.04 apart**, with third place at 29.81. So this is a
+quantization coin-flip between two coherent phrasings of the same fact, not a kernel error: both
+continuations open the same reasoning block and the same answer, and differ only in the phrasing that
+follows. The 0.6B behaves the same way (**identical for all 122 shared tokens** in the earlier
+measurement; on a longer run it splits at index 16 on one function word, `France is` vs `France, the`).
+The 0.6B comparison is the weaker of the two: the board's `.hbm` is **w8** while the only 0.6B GGUF on
+the oracle is `q4_k_m`, so that pair differs in quantization *width* as well as engine.
+
+The honest statement is therefore: **on the answer the two agree, and where they diverge it is at a
+logit near-tie between two top candidates, which is what a 4-bit weight difference produces.** This
+path cannot be compared to 1e-3 at the logit level — the delegate exposes no logits — so the token
+agreement above is the whole of the evidence, and the page says so rather than implying more.
+
 ## Sampling and caps the CLI enforces
 
 The delegate's sampler is **fixed when the `.hbm` is loaded**, so the sampling flags cannot be applied
