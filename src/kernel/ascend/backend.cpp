@@ -1477,8 +1477,19 @@ class AscendBackend final : public Backend {
     }
     DeviceBuffer device = allocate(n * k * 4);
     copy_to_device(device, dense.data(), n * k * 4);
+    /* Re-check under the lock rather than hold it across the decode above: the
+     * decode is the expensive part (a host walk over every block, then a ~`n*k`
+     * f32 copy to the device) and it does not touch shared state, so two callers
+     * for the same key may both reach here.  Whichever inserts first wins; the
+     * other releases the buffer it just built and returns the winner's, so the
+     * loser's ~2 GB does not leak for the life of the process.  `emplace` does
+     * not overwrite, so a second find is not needed -- the returned iterator is
+     * the entry that is actually in the map, winner or loser. */
     std::lock_guard<std::mutex> guard(mutex_);
     auto inserted = dense_cache_.emplace(key, device);
+    if (!inserted.second) {
+      release(device);
+    }
     return inserted.first->second;
   }
 
