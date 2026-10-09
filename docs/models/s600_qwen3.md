@@ -172,28 +172,120 @@ with no ION personality and no consumer we could observe.
 ### Is it resizable? In principle yes; not by us, safely
 
 The pool sizes are read from the device tree, not hard-coded, and the boot DTB is a normal writable
-file. We proved the mechanism without touching it: `fdtput` on a **copy** of
-`/boot/hobot/rdk-s600-mcb-v1p0.dtb` rewrites the `ion_carveout@4140000000` `reg` size and `dtc`
-round-trips it (`/boot` is ext4 `rw`, `dtc`/`fdtput` present). Enlarging `ion_carveout` from 2.0 to, say,
-3.5 GiB (there is ample free DRAM — `MemTotal` 55.5 GiB, ~54 GiB available, and the whole carve-out set
-totals 8.2 GiB) would in principle let the shipped 3.10 GiB 4B load **with no recompile**. The `reg`
-cells are available but the *content has not been validated* — the mapping and a 4B load were **not**
-tested:
+file (`/boot` is `boot_a`, the ext4 `boot_cur` slot, mounted `rw`). A candidate has now been **built
+and validated offline** — see [Preparing the resize](#preparing-the-resize-offline) below — but it was
+**not** applied and the board was **not** rebooted, for the reasons there. In outline: a 4 GiB
+`ion_carveout` would let the shipped 3.10 GiB 4B load **with no recompile**, if it boots.
 
 - **No kexec** (`CONFIG_KEXEC` unset; no `kexec` binary), so there is **no in-place, revert-on-failure
   test** — any change is only exercised by a full reboot.
-- `/proc/cmdline` shows **`hobotboot.secureboot=1`**, and the DTB is **not** one of the files passed to
-  the bootloader via `extlinux` (the loader says *"No DTB passed in from boot loader"*), so the path the
-  live DTB actually comes from is not editable from the rootfs tree we can see. Editing the DTB **and**
-  finding it is the one the bootloader loads is a separate, unknown step.
+- `/proc/cmdline` shows **`hobotboot.secureboot=1`**. The live DTB is selected through the A/B slot
+  machinery (see below), which is now identified; but the slot fall-back is driven by `bootcount`, not
+  by a bad device tree, so a `reserved-memory` map that stops the kernel reaching userspace is not
+  something the A/B logic is guaranteed to recover from.
 - The board's only console is `ttyS0` (serial); a bad `reserved-memory` map can panic the kernel or
-  fail to boot, and recovery would need the serial console or vendor reflash.
+  fail to boot, and recovery would need the serial console or a vendor reflash.
 
 **So the honest statement is: the ceiling is a device-tree ION pool size, in principle resizable, and
-it is the `2 GiB ion_carveout` — not `bpu_region` — that binds.** We did not attempt the reboot (a
-board session must not risk a test unit), so whether a larger `ion_carveout` actually boots and lets
-4B load is **unproven**. If it can be tried on a recoverable board, it is a far shorter path to 4B than
-a recompile — but it is a boot-configuration change, not a model knob.
+it is the `2 GiB ion_carveout` — not `bpu_region` — that binds.** The candidate is ready; whether a
+larger `ion_carveout` actually boots and lets 4B load remains **unproven**, because proving it needs a
+reboot this board cannot safely undo.
+
+### Preparing the resize offline
+
+Everything that does **not** need a boot has been done, so the eventual boot is a one-shot with a
+pre-validated artifact. **No file under `/boot` was written and the live device tree was not touched**;
+the work is on copies under `/tmp/s600_carveout_prep/` on the board:
+
+| File | What |
+|---|---|
+| `rdk-s600-mcb-v1p0.ORIGINAL.dtb` | the live boot DTB, copied from `/boot/hobot/rdk-s600-mcb-v1p0.dtb` (md5 `35ae26dac46500abe140d1d59b669ce8`) |
+| `rdk-s600-mcb-v1p0.carveout4g.dtb` | the candidate (same byte size as the original) |
+| `rdk-s600-mcb-v1p0.carveout4g.dts` | candidate source |
+| `reserved-memory-map.txt` / `-ORIGINAL.txt` | the `[address, size)` map of each tree |
+| `roundtrip.diff` | `dtc`(candidate) − `dtc`(original) |
+
+**The change.** Three `reg` lines move, and only three — `ion_carveout` doubles, and the two heaps
+above it shift up to clear it. The four ION heaps stay a single contiguous run, so nothing below
+`ion_carveout` and nothing outside the run moves:
+
+| Node | Was `[address, size)` | Becomes |
+|---|---|---|
+| `ion_carveout@4140000000` | `[0x4140000000, 2.00 GiB)` | `[0x4140000000, **4.00 GiB**)` — `reg = <0x41 0x40000000 0x01 0x00000000>` |
+| `ion_cma@41C0000000` | `[0x41C0000000, 1.00 GiB)` | `[0x4240000000, 1.00 GiB)` — shifted up 2 GiB |
+| `ion_uncache@400000000` | `[0x4200000000, 2.00 GiB)` | `[0x4280000000, 2.00 GiB)` — shifted up 2 GiB |
+
+**Overlap proof.** Every one of the 36 `reserved-memory` nodes' `[address, size)` was enumerated and
+the enlarged run checked against all of them (including `ion_reserved@40C0000000`, `bpu_region`,
+`ion_cma`, `ion_uncache`, the `vpu0/1/2_ddr_reserved` block and the `pcie*` regions): **no overlap,
+before or after**. The new carveout `[0x4140000000, 0x4240000000)` begins exactly where
+`ion_reserved` ends (`0x4140000000`) and ends exactly where the shifted `ion_cma` begins. The full
+map is in the `reserved-memory-map*.txt` files named above.
+
+**DRAM headroom.** The board's DRAM is 63.77 GiB (`dmesg`: `66871168K`), of which **55.48 GiB is
+`MemTotal`** (usable) and the rest is kernel/firmware reserved. Everything above `bpu_region` lives in
+the present-RAM window `[0x40a4000000, 0x4ffffeffff]` (61.44 GiB of DRAM). The ION run currently ends
+at `0x4200000000` and would end at `0x4300000000`, still **52.0 GiB short** of the RAM top. The 2 GiB
+the carveout gains is taken from general-purpose RAM (`MemTotal` falls ~2 GiB, to ~53.48 GiB) — the
+board keeps ~53 GiB for userspace, which is ample.
+
+**Round-trip.** `dtc -I dtb -O dts` on the candidate, diffed against the original, differs in
+**exactly the three `reg` lines** above and nothing else (`roundtrip.diff`). But this proves the
+artifact is well-formed and safe to *flash*, **not** that it boots.
+
+### Where the bootloader gets the DTB
+
+This was the open question; it is now answered. The S600 does **not** use the plain S100 `/boot`
+files. The boot chain is a signed `miniboot` firmware (`SBL`/`spl`, packaged under
+`/lib/firmware/rdk/miniboot/stable/debug/img_packages/`) that runs U-Boot, which:
+
+1. runs A/B slot selection (`ab_select_cmd = btype ab_select bootslot`), reading the active slot from
+   the SoC's always-on (`aon`) area — the live `hobotboot.slot_suffix=_a` in `/proc/cmdline` is the
+   result;
+2. runs `sysboot` against **`extlinux/extlinux.conf`** on the **current-slot boot partition**, which
+   `/etc/hb-fstab` mounts at `/boot` (`/dev/block/platform/by-name/boot_cur` → `boot_a` = `/dev/sda12`).
+
+So the file to edit **is** `/boot/hobot/rdk-s600-mcb-v1p0.dtb`. The board-specific label is
+`drobot-s600-rdk-v1p0-kernel` — built from the board flags `hobotboot.socname=S600`,
+`board.hwname=rdk`, `board.ver=V1P0` — whose lines are `lantin /lantinhv` and
+`domufdt /hobot/rdk-s600-mcb-v1p0.dtb` (the `domu*` = "domain U", a guest OS under the `lantinhv`
+seL4 hypervisor). `spl.img`'s U-Boot env carries exactly these label names
+(`drobot-s600-rdk-v1p0-kernel`, `drobot-s600-rdk-v0p1/v0p2-kernel`, …), so the loader selects the
+label from the same flags. **The reversion is a file swap**: back up the DTB, replace it, and to
+revert put the backup back — but a wrong map can prevent the board from reaching userspace, so the
+swap must be done **with the serial console (`ttyS0`) attached and a copy of the original in hand**,
+because that is the only way back without a vendor reflash.
+
+**The one remaining unknown for the eventual boot:** `extlinux.conf`'s `default` line is a *leftover*
+S100 label (`drobot-s100-rdk-v0p5-kernel`), which is inconsistent with an S600 booting the
+`drobot-s600-rdk-v1p0-kernel` label, and none of the `domu*`/`lantin` keywords is standard syslinux.
+The `pxe_label`/`fdt_feat` board flags and the label list compiled into `spl.img` strongly imply the
+firmware constructs the label rather than reading the `default` literally — but that is an **inference
+from strings**, not something observed at boot. It does not change *which file* holds the DTB (both
+the S600 label and this page name `/hobot/rdk-s600-mcb-v1p0.dtb`), but a future session should
+confirm at the U-Boot prompt which label is selected before flashing anything.
+
+### The procedure, for when a recoverable board is available
+
+**Not run here — recorded so the eventual boot is a one-shot.** With the serial console open:
+
+```bash
+# 1. back up the live DTB (this is the only revert path)
+cp /boot/hobot/rdk-s600-mcb-v1p0.dtb /boot/hobot/rdk-s600-mcb-v1p0.dtb.bak
+# 2. install the pre-validated candidate from /tmp/s600_carveout_prep/
+cp /tmp/s600_carveout_prep/rdk-s600-mcb-v1p0.carveout4g.dtb /boot/hobot/rdk-s600-mcb-v1p0.dtb
+sync
+# 3. reboot, watching ttyS0.  Verify the kernel came up with the new map:
+dmesg | grep -i "Memory:"          # expect ~2 GiB less general RAM
+# 4. load the shipped 4B .hbm; success is hbDNNInitializeFromFiles returning 0
+#    instead of HBRT4_STATUS_RESOURCE_EXHAUSTED.
+# REVERT, if it does not boot:
+cp /boot/hobot/rdk-s600-mcb-v1p0.dtb.bak /boot/hobot/rdk-s600-mcb-v1p0.dtb && sync && reboot
+```
+
+For 8B (5.31 GiB), grow `ion_carveout` to 6 GiB instead and shift the same two heaps up 4 GiB; the
+same overlap method applies, and the run would end at `0x4700000000` — still within present RAM, but
+leaving under 48 GiB of general RAM, so re-run the map check before using it.
 
 **The other path — and the one we can do entirely ourselves — is a `.hbm` recompiled with a smaller
 footprint** — a shorter context (`cache_1024` instead of `4096`, as the SDK's VLM 7B graph uses), which
