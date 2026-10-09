@@ -340,14 +340,61 @@ the answer, and accept one that merely spells out the default:
 | `--max-tokens` (≠ default) | **reported, not applied** — the delegate decodes until its own stop condition |
 
 The refusal is the *same shared function* `server/xlm_backend.py` uses per request
-(`_refuse_unsupported_sampling`), so `run` and `serve` cannot disagree about which values are refused.
-The `--max-tokens` note goes to **stderr** and the answer stays on stdout: truncating the text *after*
-the delegate produced it would be the CLI inventing a cap the model never saw.
+(`_refuse_unsupported_sampling`), so `run` and `serve` cannot disagree about which *sampling*
+values are refused. The `--max-tokens` note goes to **stderr** and the answer stays on stdout:
+truncating the text *after* the delegate produced it would be the CLI inventing a cap the model never
+saw.
 
 The delegate library writes its own runtime banner to file descriptor **1**; `quiet_delegate_stdout`
 (`python/pocketllm/xlm.py`) redirects fd 1 to stderr around the load and infer calls, so
 `pocketllm run … > out.txt` yields a clean answer and the banner is preserved for debugging on fd 2.
 See [`tests/native/test_delegate_stdout.py`](https://github.com/lvyufeng/PocketLLM/blob/main/tests/native/test_delegate_stdout.py).
+
+## Serving on the board
+
+`serve --device horizon` is the second entry point over this delegate
+([#571](https://github.com/lvyufeng/PocketLLM/pull/571)/[#572](https://github.com/lvyufeng/PocketLLM/pull/572)),
+and it is exercised end to end on the board — measured 2026-10-09 with the 1.7B (`w4`) `.hbm` and a
+greedy tokenizer directory, through `tests/serving/test_xlm_serve_horizon.py`:
+
+- **A single request is clean.** `POST /v1/chat/completions` returns `200`,
+  `Content-Type: application/json; charset=utf-8`, a body any JSON client parses, the answer in
+  `message.content` and the reasoning block split into `message.reasoning_content`. No SDK-monitor
+  token appears in the body.
+- **The threaded server does not leak the fd-1 banner.** 6 concurrent requests × 3 rounds, all 200,
+  all valid JSON, **the same answer**, and no `[UCP]`/`[DNN]`/`BPU_MONITOR`/`mod_mgr` fragment in any
+  body. The banner (`[UCP]`, `[DNN]`, `[VP]`, `[HPL]`, `BPU_MONITOR`, and the loader's `mod_mgr`/
+  `XlmImpl` lines) is present on the server's **stderr** and **absent from its stdout** — routed,
+  not dropped, which is the property `quiet_delegate_stdout` promises under `run` and this page now
+  confirms under `serve`.
+- **Requests serialize.** The six concurrent requests took ~2.67 s apart (a 1.7B decode), i.e. one at
+  a time behind the adapter's lock, not an error and not an interleave — the answer was identical
+  across the round, so no two requests shared the single delegate session.
+- **Per-request sampling is refused with a clean `400`.** `temperature: 0.9`, `top_p: 0.5`,
+  `top_k: 20` and `min_p: 0.1` each return `400` naming the field; `temperature: 0`, `top_p: 1`,
+  `top_k: 0` are accepted. No 500, no silently-ignored field.
+
+One correction this measurement forced, and it is the reason the sentence above says *sampling*: the
+two entry points did **not** fully agree on the sampling fields, because `top_k: 0` — the value the
+CLI's own help and the adapter's refusal both instruct a caller to use for "no limit" — was accepted
+by `run` but rejected by `serve` with `400 top_k must be >= 1` (a `SamplingParams` validator, not the
+delegate refusing it). The validator now accepts `0` as "no limit" and refuses only a negative `top_k`;
+`tests/serving/test_xlm_serve_horizon.py::test_naming_the_defaults_is_accepted` and
+`tests/serving/test_protocol_requests.py::test_top_k_zero_means_no_limit_and_is_accepted` pin it.
+
+Two further differences are **not** bugs, and are worth stating so the two entry points are not read
+as interchangeable:
+
+- **`serve` frames a chat prompt differently from `run`.** With no chat template available to the
+  adapter, a `messages` request is rendered by the protocol layer's fallback to `"user: <text>"`,
+  while `run --prompt` sends the bare `<text>`. The delegate then applies its own ChatML template to
+  each, so the same user text yields a **different (both coherent) continuation**. This is the
+  `render_fallback_prompt` path the adapter documents, not a serving defect — a bare-text comparison
+  between `run` and `serve` is comparing two different prompts.
+- **`seed` is asymmetric, and only one side changes what the path claims.** `run --seed N` is refused;
+  a `serve` request with `"seed": N` is **accepted and ignored** (the same class of bug the `top_k: 0`
+  fix closed, and noted here rather than fixed: it spans `native_backend` and any backend that does
+  sample, so it is not this adapter's alone to correct).
 
 ## What is not on this path
 

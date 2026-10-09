@@ -4,8 +4,26 @@ import copy
 
 import pytest
 
-from pocketllm.api import SamplingParams
+from pocketllm.api import ConfigurationError, SamplingParams
 from pocketllm.protocol import build_chat_request, render_fallback_prompt
+
+
+def test_top_k_zero_means_no_limit_and_is_accepted():
+    """``top_k: 0`` is the "no limit" value, not an invalid one.
+
+    The whole tree spells "no top-k" as ``0``: the native sampler defaults to it
+    (``Engine.sample(top_k=0)``), ``cli.py`` passes ``sampling.top_k or 0``, and
+    the S600 adapter's own refusal message tells a caller to set ``top_k`` to 0
+    to disable it.  A validator that rejected 0 would contradict the remedy the
+    server prints -- and did, returning ``400 top_k must be >= 1`` for the exact
+    value it recommended.  A negative top-k is still refused.
+    """
+    assert SamplingParams(top_k=0).top_k == 0
+    assert build_chat_request(
+        {"messages": [{"role": "user", "content": "hi"}], "top_k": 0}
+    ).sampling_params.top_k == 0
+    with pytest.raises(ConfigurationError):
+        SamplingParams(top_k=-1)
 
 
 def test_build_chat_request_accepts_openai_sampling_fields_without_explicit_params():
