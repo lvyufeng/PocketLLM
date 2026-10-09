@@ -510,6 +510,11 @@ larger cube drives — a batched or wider-N launch, or not re-launching per chun
 dtype. That is a different change than the one the page's own text proposed, and it is the one a
 profile actually points at; it is left for its own PR rather than bundled here.
 
+> **This reading was wrong, and the correction is below.** The 14.4 GFLOP number double-counts: a
+> decode step is ~8.0 GFLOP, and `op_sync` is the cube *executing* that, not launching it. The
+> "1.3 ms/launch" that follows from 452.8 / 343 does not survive the chunk and sync sweeps in
+> [the next section](#the-343-launches-are-not-the-cost-correcting-the-profile-above).
+
 **No behavior changed, and the gate says so.** The profiler is env-gated and, off, adds not one clock
 read: `StageClock` does not call `now_ms()` and `OpScope` holds a `const char *` rather than a
 `std::string`, so a call site allocates nothing and the timed path is the binary it was before. The
@@ -522,3 +527,80 @@ measurement is reported as it landed rather than re-rolled to the prior number. 
 gates hold as documented above: **0.6B identical, 1.7B the one near-tie, 4B identical.** The
 deliverable is the split above — the measured answer that the transfers are a ninth of the step, so
 the change the page named is not worth making, and the profile names a different bottleneck instead.
+
+## The 343 launches are not the cost — correcting the profile above
+
+The section above ends on a reading that the next two experiments falsify. It said the 452.8 ms of
+`op_sync` was **per-op launch overhead** — "~1.3 ms of fixed cost per cube drive, 343 times a token"
+— and named "fewer, larger cube drives" as the lever. Both halves of that are wrong, and each is
+wrong for a reason worth writing down: the arithmetic was double-counted, and the lever was never
+tested against a control.
+
+**First, the arithmetic.** The "14.4 GFLOP/step" above comes from charging *every* one of the 343
+drives a full n = 8192, k = 2560 tile. But only the ffn and head chunks are that wide — the 144
+hidden-matrix drives (`q`/`k`/`v`/`o`, n = 2560) and the 36 `ffn_down` drives are a *single* 2560-wide
+chunk each. Summed at each drive's real shape a decode step is **~8.0 GFLOP** (36 layers × 202 MFLOP +
+a 778 MFLOP head), so 452.8 ms is **~18 GFLOP/s**, not 32.
+
+A cube doing ~18 GFLOP/s on an **m=1** activation is not obviously launch-bound: an m=1 GEMM is a
+GEMV, it exercises one row of the cube per tile and leaves the M dimension of the array idle, so a
+small fraction of the rated fp16 throughput is exactly what a decode-shaped matmul should produce.
+"A small fraction of peak" was read as "overhead" when it is more likely the shape.
+
+**The chunk sweep removes the launch count and nothing happens.** `kCubeChunkN` is now overridable
+(`$POCKETLLM_ASCEND_CUBE_CHUNK_N`) so the width can be swept on the board, and the 4B identity gate
+is the correctness oracle at each width — the head is n = 151936, so a 32768-wide sweep drives the
+cube at N = 32768 where an 8192 sweep never does:
+
+| chunk N | cube drives / token | gate | decode (`--steps 8`/`32` marginal) |
+|---|---|---|---|
+| 8192 (shipped) | **343** | ✅ identical | 0.516 s/token |
+| 16384 | 262 | ✅ identical | 0.513 s/token |
+| 32768 | 257 | ✅ identical | 0.513 s/token |
+| 65536 | 255 | ❌ **garbage** | — |
+| 151936 | 255 | ❌ **garbage** | — |
+
+**Cutting the launch count by 25% (343 → 257) moved decode by 0.6% — noise.** If each drive carried
+~1.3 ms of fixed cost, removing 86 of them would have saved ~112 ms/step, a fifth of the step. It
+saved nothing. The launches are not the cost.
+
+The sweep also **tightens the cube's N wall** this page has carried since the first backend: the op
+was known to be right at n = 32768 and wrong at n = 151936, and 65536 now fails too, with the same
+degenerate output (`[119332呻 55101edu 92695 negativity …]` — one token repeated, the signature of a
+silently mis-tiled result). The boundary is therefore **32768 < N ≤ 65536**, and `kCubeChunkN = 8192`
+is the conservative side of it, as its comment claims.
+
+**Second, the sync A/B.** The chunk loop syncs *after every chunk*, which on its face is a host-side
+cost the compute could hide: the host enqueues, waits, reads back, and only then enqueues the next
+chunk. `run_cube_weight` can instead enqueue a GEMM's chunks before one sync — each writes its own
+output buffer, so nothing forces the interleave — selected by `$POCKETLLM_ASCEND_CUBE_SYNC=one`
+(the shipped default is the per-chunk sync, so the binary is unchanged; the override is for
+measurement). A/B, same binary, chunk 8192:
+
+| | `op_sync` calls | `op_sync` time (steps=8) | gate |
+|---|---|---|---|
+| sync per chunk (shipped) | 3087 | 4070.1 ms | identical |
+| sync once per GEMM | **2277** (−26%) | **4023.3 ms** (−1.2%) | identical |
+
+**26% fewer syncs, 1.2% less time.** Removing the per-chunk sync removes 26% of the `op_sync`
+*calls* and none of its *time*, which is the definition of the time not being the sync. `op_sync` is
+the cube executing; the sync is where the host waits for it. (The end-to-end walls say the same and
+no more: `--steps 8` was 215.012 s and 215.022 s for the two, identical to the millisecond, and the
+`--steps 32` marginal read 0.641 vs 0.770 s/t — a spread this host produced on the *same* binary
+[earlier](#where-a-4b-decode-step-actually-goes-and-why-nothing-was-changed), so the honest reading
+is the profile's `op_sync` time, which is flat, not the marginal, which is noise.)
+
+**So the corrected reading.** The 452.8 ms per decode step is **the cube doing the GEMMs** — ~8.0
+GFLOP at ~18 GFLOP/s on an m=1 shape — not 343 × 1.3 ms of per-launch host overhead. Neither lever
+touches it: not the launch count (the chunk sweep), not the sync placement (the A/B). The levers that
+*can* reach device GEMV throughput are a different class and are not host-side at all — feeding the
+cube a wider m so the array is not half-idle (a batched decode), or the device's own quantized matmul
+(`MatmulW8a8I32Custom`/`MatmulW4a16Custom`, which the [W4A16
+section](#precision-two-different-errors-and-which-one-is-the-graphs) closed on accuracy grounds) —
+and the honest statement is that **this is where a host-side launch-and-transfer optimization path
+ends**, because the measured cost was never on the host side of it.
+
+**No behavior changed.** Both knobs default to the shipped values (`kCubeChunkN = 8192`, the
+per-chunk sync), so the delivered binary is byte-for-byte the timed path it was; the 4B gate holds at
+`[12095 Paris 13. 576 The 6722 capital 315 of 9856 Germany 374 is 19846 Berlin]` at every chunk width
+above the wall, and 0.6B/1.7B are unchanged as documented.
