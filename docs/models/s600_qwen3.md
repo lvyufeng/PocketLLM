@@ -105,6 +105,16 @@ quote from the runtime; wall-clock load time above is quoted instead. Decode at 
 69 t/s (1.7B) is the load-bearing number: it is what a caller feels, and the spread across three runs
 is under 1.4% at 0.6B and under 0.4% at 1.7B, so it is stable rather than a lucky run.
 
+**A graph we compile ourselves is faster, and the ladder's 1.7B row is therefore a *shipped-graph*
+number, not a 1.7B number.** Our own `Qwen3-1.7B` build at `cache_1024` (1.66 GiB, md5
+`0b41e627f2227c029b14ed63928fd33f`) also loads and runs on this board: decode **88 t/s** (88.84 /
+87.90 / 87.59) and prefill 8982 t/s, against the shipped `cache_4096` graph's 69.4 t/s / 5172 t/s
+measured in the same session. It is the first artifact out of
+[the native compile chain](../architecture/s600_native_chain.md#the-first-build-result), it answers the
+same prompts with the same final answers, and its **reasoning text differs** from the shipped graph's —
+two build-time quantizations of one checkpoint, not two caches of one graph. Whether a smaller graph
+gets **4B** under the ceiling is still open.
+
 ## The 4B / 8B ceiling
 
 4B and 8B **refuse to load**, and the refusal is the board's, not this tree's:

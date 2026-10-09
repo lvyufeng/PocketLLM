@@ -9,8 +9,13 @@ what it takes as input, and — plainly — whether the chain is in our hands or
 It is a **scoping document, not a build record**. Nothing here was compiled, installed, or run. Every
 claim is either a **measured** fact from this board (labelled) or something **read off an artifact** —
 a wheel, the vendor doc set, or the vendor's own manifest in the SDK tree. Each is marked as such.
-Whether a cache-1024 4B graph would actually land under the ceiling is **unproven**; the last section
-says so.
+Whether a cache-1024 4B graph would actually land under the ceiling is still **unproven**.
+
+**The scoping has since been acted on.** The chain has produced its first artifact — our own
+`Qwen3-1.7B` graph at `cache_1024` — and it **loads and runs on the board**; see
+[the first build result](#the-first-build-result). The page keeps its scoping framing below
+because that is the state the rest of it was written in and still describes; the build result
+is appended, not woven in.
 
 ## The finding that reorders the question
 
@@ -168,6 +173,10 @@ These are the reasons the verdict below is "half", not "yes":
 - **Is the chain obtainable?** **Yes.** Every compiler artifact is already in the SDK tarball on this
   board, with no login. The one leg that does *not* exist in the SDK — a GGUF reader — is not needed,
   because the tool takes HF directly.
+- **Does the chain work end to end?** **Yes, for 1.7B, measured.** Our own `cache_1024` `Qwen3-1.7B`
+  `.hbm` (1.66 GiB) loads on the board and generates — see
+  [the first build result](#the-first-build-result). The mechanism the page scoped is now a build
+  record.
 - **What runs where?** Compile on **x86_64 / cp310 with an NVIDIA GPU** (the board cannot compile).
   Deploy and run on the **aarch64 S600**, which already carries the matching `hbdk4_runtime_nash`.
 - **Is 4B reachable by us?** Half:
@@ -182,14 +191,73 @@ These are the reasons the verdict below is "half", not "yes":
   on this board by a memory ceiling that is the vendor's packaging choice. But it is **not** a hard
   vendor gate: the toolchain to produce a smaller graph is in our hands. The honest framing is:
   **1.7B is the ceiling for what the vendor ships and this board can load; 4B becomes reachable only
-  if we compile our own smaller graph, and that build has not been attempted.** (The one other path —
+  if we compile our own smaller graph — that build has now been done at 1.7B ([result](#the-first-build-result))
+  and a 4B one is compiling.** (The one other path —
   enlarging the 2 GiB `ion_carveout` pool the `.hbm` is loaded through, from the device tree — is
   examined and left untested on [the model page](../models/s600_qwen3.md#is-it-resizable-in-principle-yes-not-by-us-safely),
   because it needs a reboot the board cannot safely undo.)
 
-**No build was attempted for this page, and none of the numbers above are a build result.** They are
-the SDK's stated tool versions, the vendor's published artifacts, and this board's measured refusal.
-Whether the chain *works end to end for a 4B graph on the S600* remains to be shown.
+**The numbers in the scoping sections above are not build results** — they are the SDK's stated tool
+versions, the vendor's published artifacts, and this board's measured refusal. The first build result is
+at [the first build result](#the-first-build-result): a 1.7B `cache_1024` graph out of this chain that
+loads and runs. Whether the chain carries a **4B** graph under the 2 GiB ceiling is still to be shown,
+and that build is in progress.
+
+## The first build result
+
+The chain's first artifact is our own **Qwen3-1.7B** language graph at **`cache_1024`**, built on the
+x86 host (an RTX 2080 Ti, not the doc's recommended 3090) with the SDK's `leap_llm`/`hbdk4` toolchain,
+and measured on the board 2026-10-09.
+
+| | shipped (vendor) | ours |
+|---|---|---|
+| file | `…1.7B_language…_cache_4096_w4_…` | `…1.7B_language…_cache_1024_w4_…` |
+| bytes | 1,827,743,336 | **1,779,556,552** (1.66 GiB) |
+| md5 | vendor-published | `0b41e627f2227c029b14ed63928fd33f` |
+| `hrt_model_exec model_info` | loads | **loads** — prefill `1x512` + decode `1x1`, 28 layers, `logits (1,1,151936)` |
+| `pocketllm run --device horizon` | runs | **runs**, coherent text |
+
+**It loads.** At 1.66 GiB the artifact is under the 2.00 GiB `ion_carveout` (the shipped 1.70 GiB
+graph fits too; the ceiling only bites at 4B), and `hrt_model_exec model_info` initializes it with no
+`RESOURCE_EXHAUSTED`. That was the prediction, and it holds.
+
+**It runs — with one configuration caveat.** The graph was compiled for 4 BPU cores and the `.hbm`
+records that; a config whose `bpu_core` does not match fails prefill with *"The number of BPU cores set
+in the backend should be the same as … compiled model bpu core num: 4"*. The shipped `llm_demo`
+configs carry `"bpu_core": [0,1,2,3]` for exactly this reason, and a config for this artifact must too.
+Ours does, and `pocketllm run` then produces coherent text.
+
+**It is faster.** Decode is **87.6–88.8 t/s** (three runs: 88.84 / 87.90 / 87.59) and prefill
+**8982 t/s**, against the shipped `cache_4096` graph's **67.7–69.8 t/s** decode / ~5172 t/s prefill
+measured in the same session. The smaller cache is not a cost — it is the reason the graph is smaller
+*and* the decode step is cheaper.
+
+**But it is not token-identical to the shipped graph, and that is the interesting part.** The
+expectation was that only the KV cache length differs, so a short greedy generation should match. It
+does not. Three prompts, both graphs greedy and each verified deterministic (re-running a graph gives
+the same text):
+
+| Prompt | first divergence | shipped / ours |
+|---|---|---|
+| `The capital of France is` | char 56 | both answer **Paris** |
+| `The largest planet in the solar system is` | char 138 | both answer **Jupiter** |
+| `2 + 2 =` | char 21 | both answer **4** |
+
+The divergence is early — at the first generated token for `2 + 2 =`, within about ten tokens for the
+others — and is confined to the **reasoning block**: every prompt converged on the same final answer.
+The cause is visible in the artifact itself. `model_info` prints the baked scale of every quantized
+tensor, and the **KV-cache** tensors carry *different* scales on the two graphs (`layer_0_cache_key`:
+shipped `0.0120087`, ours `0.0120163`; 110 of 112 such tensors differ). A quantization scale is set by
+the activation range the compiler measured, not by the tensor's length — so this is a difference in the
+two builds' quantization, not in the cache size. The graphs are two build-time quantizations of the same
+`Qwen/Qwen3-1.7B` weights, and the cache length is not the only difference. Greedy decode is chaotic — a tiny logit difference at the first token flips the
+branch and the rest diverges — which is exactly the shape seen. Token-for-token equality would require
+the vendor's exact calibration statistics, which are not published.
+
+So the honest result: the **compile chain is validated end to end** — our own artifact loads, runs and
+is faster — while the behavioral match to the vendor graph is at the answer level, not token-for-token.
+Whether a `cache_1024` **4B** graph lands under the ceiling is still the open question; that build is
+compiling.
 
 ## Where each claim comes from
 
@@ -207,4 +275,8 @@ Whether the chain *works end to end for a 4B graph on the S600* remains to be sh
 - x86 build procedure: `doc/…/en/guide/env_install/x86_env.html`.
 - The load-ceiling errors: measured on this board (see
   [the model page](../models/s600_qwen3.md#the-4b-8b-ceiling)).
+- The build result: the artifact and its md5 from the x86 host's `build_out/`, `hrt_model_exec
+  model_info` over both the shipped and our `.hbm`, and `pocketllm run --device horizon` on the board —
+  all measured 2026-10-09. The differing KV-cache scales are the `scale data:` lines `model_info`
+  prints for the `layer_N_cache_key`/`layer_N_cache_value` inputs of each graph.
 - Not on PyPI: `pip index versions hbdk4-compiler | hbdk4 | leap-llm` ⇒ no distribution.
