@@ -234,6 +234,40 @@ The batch (10 prompts, their prompt ids, greedy continuation ids and text, both 
 tokenizer and the greedy `generation_config.json`) is `~/scratch/ref/s600_parity_batch.tgz` on the
 board; the single-prompt artifacts are `~/scratch/ref/parity/s600_parity.json`.
 
+### The width confound, and why only one pair can remove it
+
+The two rows above do **not** confound width equally, and the weaker row is the 0.6B one:
+
+| Pair | Board `.hbm` | Oracle GGUF | Width | Scheme |
+|---|---|---|---|---|
+| 0.6B | `w8` (int8) | `q4_k_m` | **mismatched** (8 vs 4) | mismatched |
+| 1.7B | `w4` (int4) | `Qwen3-1.7B-Q4_K_M` | matched (4 vs 4) | mismatched |
+
+So the 0.6B divergence could be **width or scheme**, while the 1.7B row — where the 14.06-logit
+Row 05 disagreement lives — isolates **scheme**, because both sides are 4-bit. A same-width 0.6B
+pair would settle it, but **the vendor does not publish one**, and neither does it publish the
+mirror-image lever (a `w8` 1.7B):
+
+- **The manifest lists exactly one language `.hbm` per LLM size**, and the widths are not
+  interchangeable — `resolve_model_nash-p.md` (in the SDK at
+  `oellm_runtime/model/`) gives `Qwen3-0.6B → w8` and `Qwen3-1.7B → w4`, with no second row for
+  either. Only the 4B lists both `w4` and `w8`.
+- **The published `md5sum.txt` agrees**, listing exactly one `.hbm` under each of
+  `Qwen3-0.6B/` and `Qwen3-1.7B/`.
+- **The bucket itself agrees.** Probing
+  `.../llm_s600/{1.0.0,1.0.2}/models/Qwen3-{0.6B,1.7B}/{w4,w8}/` across every plausible
+  `chunk`/`cache` name, exactly two language files exist — the ones already on the board — and
+  every other candidate returns **404** while the two shipped paths return **200**. There is no
+  hidden `w4` 0.6B and no hidden `w8` 1.7B to fetch, so **no same-width pair can be built on the
+  board**, and the width confound on the 0.6B row stands.
+
+That is a finding, not a gap awaiting a retry: the removal of the confound is **vendor-gated**, and
+the only path that would produce a `w4` 0.6B or a `w8` 1.7B `.hbm` is the same
+[compile chain](../architecture/s600_native_chain.md) that a smaller 4B would need — built by us,
+on x86-64, not fetched. Until then the honest reading is: **the 0.6B row mixes width and scheme; the
+1.7B row isolates scheme; and the one large-margin divergence we have measured (Row 05) is on the
+row that isolates it.**
+
 **Most divergences are near-ties — but not all.** Row 01 (1.7B) splits on a **1.33**-logit gap, the
 "two coherent phrasings of the same fact" case the single prompt showed. **Row 05 (1.7B) does not**:
 the two engines diverge at the same 12-token context with the oracle scoring its own choice
