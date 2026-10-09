@@ -267,8 +267,8 @@ the shipped `llm_demo` shape with this artifact's two load-bearing keys — `bpu
 four cores it was compiled for, and `model_type 9` (Qwen3):
 
 ```bash
-SDK=~/llm_sdk/D-Robotics_LLM_S600_1.0.2_SDK/oellm_runtime
-export LD_LIBRARY_PATH=$SDK/lib          # the SDK's libs; there is no <sdk>/oellm_runtime/lib
+SDK=~/llm_sdk/D-Robotics_LLM_S600_1.0.2_SDK
+export LD_LIBRARY_PATH=$SDK/oellm_runtime/lib   # the SDK's libs live under oellm_runtime/, not $SDK/lib
 export HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6
 
 python -m pocketllm run --device horizon \
@@ -280,7 +280,7 @@ python -m pocketllm run --device horizon \
 {
   "hbm_path": "Qwen3-1.7B_language_chunk_512_cache_1024_w4_nash-p_corenum_4_4.hbm",
   "bpu_core": [0, 1, 2, 3],
-  "tokenizer_dir": "<sdk>/configs/Qwen3_config",
+  "tokenizer_dir": "<sdk>/oellm_runtime/configs/Qwen3_config",
   "model_type": 9,
   "enable_multi_turn": false,
   "enable_thinking": true
