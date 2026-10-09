@@ -650,3 +650,78 @@ device itself does ~230 GFLOP/s fp16 at m ≥ 16. Nothing on this board is at th
 **No behavior changed.** The harness is a new tool (`src/tools/mscale.cpp`, `pocketllm-mscale`) that
 does not touch the backend, so no kernel or graph code moved and no identity gate was at risk; the
 0.6B/1.7B/4B gates are as documented above.
+
+## Current state — the canonical numbers after the series
+
+The numbers above were taken across five separate branches (#597–#601), each adding an env knob or a
+tool, so they do not all come from one binary and two of them (the 0.6B and 4B decode rates in their
+own sections) were measured with the residual *method* this section corrects. This is the single
+consistent measurement, on merged `main` at `d16f182`, from one build with **every knob at its
+shipped default** (see the check below). It supersedes the per-section figures where they differ.
+
+**Method.** `pocketllm-run`, `--prompt "The capital of France is"` (5 prompt tokens), `--device
+ascend`, on a quiet board. *Decode* is the `--steps N` / `--steps M` marginal — the walls differenced
+and divided by the steps between them — so it carries neither the one-time plane build nor the
+prefill. *Prefill* is the slope between a 5-token and a 100-token prompt at `--steps 1`: **both runs
+pay the identical plane build, so the difference cancels it** and the slope is the true prefill rate.
+(The page's earlier 0.6B "1.63 s/token prefill" was the residual of an *under-estimated* build floor,
+not a measured slope; this method does not have that failure mode.) *Plane build* is `--steps 1` at
+the 5-token prompt minus that prompt's own prefill.
+
+| checkpoint | decode, marginal | prefill (5→100 tok) | one-time plane build | `--steps 8` wall |
+|---|---|---|---|---|
+| Qwen3-0.6B | **0.129 s/token** | 0.065 s/token | ~24.2 s | 24.5 s |
+| Qwen3-1.7B | **0.390 s/token** | 0.065 s/token | ~85.6 s | 85.9 s |
+| Qwen3-4B | **0.640 s/token** | 0.129 s/token | ~202 s | 208.9 s |
+| Qwen3-8B | **not cleanly separable — see below** | — | ~500 s | 486.5 s (clean run) |
+
+The `--steps 8` wall is essentially the plane build at every size, which is why 8 steps costs about
+what 1 step does. The decode rates move with the checkpoint exactly as the weight count predicts
+(0.6B → 1.7B is 2.8× the weights, 0.129 → 0.390 is 3.0×; 1.7B → 4B is 2.35×, 0.390 → 0.640 is 1.6×
+because the 4B's layer count rises to 36 and its prefill-heavy head is a smaller share of a slower
+step).
+
+**Decode is not one rate — it rises with context.** The marginal is a function of where the window
+sits, because every decode step attends to a KV cache that has grown by one. On the 0.6B, holding the
+`--steps 8` anchor at 24.56 s across the series:
+
+| bracket | marginal |
+|---|---|
+| 8 → 32 | 0.127 s/token |
+| 32 → 64 | 0.193 s/token |
+| 64 → 128 | 0.240 s/token |
+
+So "0.6B = 0.13 s/token" is the *short-context* figure and the page's older "0.26 s/token" is a
+longer-context one; both are real points on the same curve, and neither is wrong. The table above
+quotes the 8→32 bracket because it is the range every checkpoint shares and the one a generation
+actually opens in.
+
+**The 8B has no clean decode marginal on this board, and that is a memory fact, not a decode one.**
+At 8 steps it completes in **486.5 s** and is token-identical to CPU (the gate above). But its
+**~15.3 GiB** device footprint against the pool's ~16.7 GiB usable, plus a 4.7 GiB mmap'd checkpoint
+on a 23.7 GiB host, pushes `MemAvailable` to ~0.6 GB and the process into swap: measured, the same
+`--steps 8` run takes **486.5 s** on a quiet board (nearly all plane build) and its `--steps 32` leg
+has been timed at **2402 s**, with an intermediate `--steps 1`/`8` pair at 634 s / ~16 min. The
+marginal between two such walls is dominated by how much the kernel paged out, not by decode, and it
+can even come out negative (a longer run whose plane build reclaimed more cleanly beats a shorter one
+that paid the eviction). That is why no 8B *rate* is claimed here — the same caveat the 8B section
+above already carries. The 8B's contribution to this table is the coverage and gate result, not a
+throughput number.
+
+**Every knob defaults to the shipped path.** The series added five env knobs; each is checked here to
+default to the value the page's numbers were taken at, so the default binary *is* the measured one:
+
+| variable | default | effect when unset |
+|---|---|---|
+| `POCKETLLM_ASCEND_PROFILE` | unset | no timers, no clock read (#597) |
+| `POCKETLLM_ASCEND_CUBE_CHUNK_N` | `8192` | the shipped chunk width (#599) |
+| `POCKETLLM_ASCEND_CUBE_SYNC` | unset | sync per chunk, the shipped shape (#599) |
+| `POCKETLLM_ASCEND_W4A16` | unset | the faithful dense path, not the requantized op (#599) |
+| `POCKETLLM_ASCEND_KV_F16` | unset | f32 cache (`preferred_kv_dtype` = kF32) (#582) |
+
+The four identity gates hold on this build, from the same binary each table row came from:
+**0.6B token-identical**, **1.7B the documented near-tie** (`17689 Spain` vs `279 the` at generated
+index 5 — reproduced exactly, same two ids, same order), **4B exactly**
+`[12095 Paris 13. 576 The 6722 capital 315 of 9856 Germany 374 is 19846 Berlin]`, and **8B
+token-identical**. So the series is behavior-preserving: nothing #597–#601 added moves the output,
+and the default path is the shipped one.
