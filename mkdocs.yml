@@ -87,6 +87,7 @@ nav:
       - The C engine: architecture/c_engine.md
       - Ascend 310B custom ops: architecture/ascend_310b.md
       - Serving: architecture/serving.md
+      - Filling m on the 310B: architecture/ascend_m_filling.md
       - The S600 native compile chain: architecture/s600_native_chain.md
   - Models:
       - Overview: models/README.md
