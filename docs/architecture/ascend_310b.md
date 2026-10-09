@@ -122,15 +122,30 @@ itself to fp32 would need 224 KB at the widest tile.
 `MatmulCubeCustom` is `MatmulImpl<half,half,half>`, so the cube's L0C accumulator is fp32, and it
 costs 1.4× *less* than the fp16 vector loop — a different order of magnitude from either W4A16
 variant. It takes dequantized fp16 weights (`a[M,K] · b[K,N] → out[M,N]`), so the backend decodes a
-packed checkpoint tensor to a persistent f32 buffer once per weight and drives the cube as
+packed checkpoint tensor to a persistent buffer once per weight and drives the cube as
 `a[M,K] · b[K,N]` with `b` the transposed weight plane.
 
-**The backend uses it, and it is the measured correct path** — `gemm` and `gemm_quant` both route
-here, and the whole Qwen3 forward runs on it. Measured against the CPU kernel at real model shapes
-(1×1024×1024, 1 or 16 × 1024×3072) it is **~2.7e-4 relative**, the same order as the fp32-accumulate
-W4A16 row above and for the same underlying reason (fp32 accumulate, fp16 operands). The table's
-fp16-*vector*-loop row is not what the backend runs; it is the sibling work's measurement of a
-different kernel.
+**The transposed plane is the thing to cache, not the f32 weight.** The op's B operand is `[K,N]`
+where the graph holds `[N,K]`, and it is *fp16*, so it is not the decoded weight's bytes with a
+different stride — it is a transposed copy in a narrower format. Building that plane on the host
+inside every GEMM call was **~85% of a decode step** (31.5 s of ~37 s over three tokens): a scalar
+walk over every element of every weight, per token. The plane is a pure function of the weight, so
+it is built once and cached; the decode step does no weight-side host work at all. As a side effect
+the cached artifact is *half* the size of the f32 buffer it replaced (~1 GB instead of ~2 GB for a
+0.6B q4_k_m checkpoint).
+
+**The embedding table is the same cache, for the same reason.** `embedding_quant` decodes the packed
+`token_embd.weight` table (`151_936 × 1024`) on the host to gather from it, and it used to do that
+in full **on every call** — once per token. It was the largest cost *left* after the cube plane was
+cached. The decoded table is now cached once and only the (device `aclnnEmbedding`) gather runs per
+token.
+
+**The backend uses the cube, and it is the measured correct path** — `gemm` and `gemm_quant` both
+route here, and the whole Qwen3 forward runs on it. Measured against the CPU kernel at real model
+shapes (1×1024×1024, 1 or 16 × 1024×3072) it is **~2.7e-4 relative**, the same order as the
+fp32-accumulate W4A16 row above and for the same underlying reason (fp32 accumulate, fp16
+operands). The table's fp16-*vector*-loop row is not what the backend runs; it is the sibling work's
+measurement of a different kernel.
 
 **The standalone cube probe still fails phase 1 with `161001`**, and that discrepancy is
 unexplained: the same op the backend drives successfully will not come up through the probe's
@@ -175,6 +190,37 @@ large-N edge — but the *coverage* gap is closed: there is no op the graph call
 refuses. The paths the whole forward still lacks are the ones the graph never calls: `gemm` bias,
 attention with a sliding window (`first_key != 0`), and `topk_sample`/`logits_temperature`.
 
-The cost is real. Decoding a packed checkpoint to f32 weights is ~2 GB resident on the NPU for a
-0.6B q4_k_m file (~0.4 GB packed), and the prefill of a five-token prompt takes minutes against the
-CPU's milliseconds. This is a correctness path, not a fast one.
+**The cost was real, and the two caches above are what paid it down.**
+`Qwen3-0.6B-Q4_K_M`, `--prompt "The capital of France is"`, measured on the board:
+
+| | decode, marginal | prefill | `--steps 8` wall | weights resident |
+|---|---|---|---|---|
+| before | **14.6 s/token** | 21.3 s/token | 150.5 s | ~2 GB f32 |
+| after | **0.26 s/token** | 1.63 s/token | 27.6 s | ~1 GB fp16 plane |
+
+Decode went **~56×** faster (14.6 → 0.26 s/token, 0.07 → 3.8 t/s) and prefill **~13×**
+(21.3 → 1.63 s/token). Both numbers come from the same binary at two step counts — the decode rate
+is the marginal cost between `--steps 8` and `--steps 32`, so it is not carrying a fixed prefill
+term; the prefill rate is the residual after that marginal is removed. The step-8 wall time
+includes the **one-time** cost of building the cube planes and decoding the embedding table, ~18.5 s
+for this checkpoint, which is why 8 steps is 27.6 s and not 5 × 1.63 + 3 × 0.26.
+
+Where the *remaining* time goes, from an env-gated per-stage clock run (wall times, so they carry
+the profiler's own overhead — read them as shares, not as the totals above):
+
+| stage | before | after |
+|---|---|---|
+| weight transpose + fp16 convert | 31.5 s | 0 (cached) |
+| embedding-table decode | 53.8 s | 0 (cached) † |
+| cube | 0.69 s | 0.69 s |
+| rms_norm / silu / rope / kv / softmax | ~1.0 s | ~1.0 s |
+
+† the embedding table was the largest cost *after* the weight plane was cached, and it is a
+per-token cost until it is cached in turn — the two together are the change. The activation-side
+transfers the ops still do (each op brings f32 in, converts to fp16, drives the op, widens back) are
+what is left; that is the next thing to attack, not something this change touched.
+
+This is a correctness path that is now also ~fast enough to use (3.8 t/s decode), but it is still
+the fp16 cube on ~1 GB of resident plane rather than the device's own quantized ops. Feeding
+`MatmulW8a8I32Custom` / `MatmulW4a16Custom` the *packed* weights would remove both the ~1 GB and the
+per-op f32↔fp16 round trip, and is the larger remaining win — it is not this change.
