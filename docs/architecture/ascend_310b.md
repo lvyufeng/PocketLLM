@@ -353,3 +353,108 @@ no shape guard is in the way — and it is not a new op. It is the precision of 
 up as a token. The path to "identical at 1.7B" is the same as everywhere else on this page: give the
 graph more precision (the packed-weights path the W4A16 section closed, or an fp32 accumulation
 upgrade), not a new op.
+
+## A third checkpoint: Qwen3-4B, and the memory the RSS does not count
+
+`Qwen3-4B-Q4_K_M` is a third size family: `q4_k_m` like the other two, on **36** layers with hidden
+**2560** and `ffn` **9728**, 32 attention heads over 8 KV heads. It **ties** `token_embd` (there is
+no distinct `output.weight`, as on the 0.6B and unlike the 1.7B), so its output projection is the
+same `q6_k` `2560×151936` table the embedding reads. The file is 2.33 GiB.
+
+**It runs, and the identity gate holds.** Unlike the 1.7B, the canonical prompt does not land a
+near-tie under the fp16 floor: `--prompt "The capital of France is" --steps 8` is **token-identical**
+to the board's own CPU backend.
+
+```
+--prompt "The capital of France is" --steps 8
+  cpu     -> [12095 Paris 13. 576 The 6722 capital 315 of 9856 Germany 374 is 19846 Berlin]
+  ascend  -> [12095 Paris 13. 576 The 6722 capital 315 of 9856 Germany 374 is 19846 Berlin]
+```
+
+At `--steps 32` it stays coherent — the continuation walks France → Italy → Spain → Portugal →
+Lisbon, correct capitals throughout — which is the same evidence the 0.6B gate carries: the tokens
+are not just equal, they are *right*.
+
+**No shape guard trips.** Hidden 2560 is ≤ 4096 and a multiple of 16 (the `rms_norm` guard); every
+GEMM width is a multiple of 128 (2560, 9728, 151936 — the `kGemmAlign` guard); the cube's 8192-column
+chunk divides them all. The 4B family fits inside the same guards the 0.6B was written against.
+
+**The memory bound — and the number `VmHWM` alone gets wrong.** The board's `MemTotal` is 23.72 GiB
+with `MemAvailable` 21.45 GiB at rest, so headroom was never the question for 4B and the process peak
+host RSS is **5.12 GiB** (`VmHWM` 5364240 kB, exact via `getrusage`). But that is only *half* the
+footprint, and this is the correction the 1.7B row above needed too: **the process RSS does not
+contain the weights.** The checkpoint is `mmap`'d (`MAP_PRIVATE`, `src/gguf/reader.cpp`), so its
+~2.3 GiB of touched pages sit in RSS as reclaimable file pages; the **cube planes and the embedding
+table are device allocations** (`aclrtMalloc`) in the NPU's own memory pool, which is a separate
+carve-out of the same LPDDR and never appears in `/proc/<pid>/status`. The two halves:
+
+| what | where | 4B |
+|---|---|---|
+| checkpoint pages (mmap) | host RSS, file-backed | ~2.3 GiB |
+| layer cube planes, fp16 (`cube_for`, non-embedding weights) | device pool | **6.06 GiB** |
+| head plane, fp16 (`cube_for`, `token_embd` driven as the GEMM head) | device pool | **0.72 GiB** |
+| embedding table, f32 (`dense_table_for`: `vocab × d × 4`) | device pool | **1.45 GiB** |
+| host transient (the f32 `dense` decode of the embedding table) | host RSS | ~1.5 GiB peak |
+| **host peak RSS** | | **5.12 GiB** |
+| **device residency** | | **~8.2 GiB** |
+
+The 6.06 GiB is not an estimate: it is the checkpoint's non-embedding quantized element count
+(3,255,828,480) at two bytes. The other two rows are the *same* `token_embd` tensor held twice — once
+as a fp16 GEMM plane for the tied head, once as the f32 gather table — so a tied checkpoint pays for
+its vocabulary matrix both ways; the 1.45 GiB is `2560 × 151936 × 4`, twice the fp16 plane of the same
+tensor, because the gather table is cached f32. A checkpoint with a **distinct** `output.weight` pays
+the head plane on *that* tensor instead: the 1.7B's device residence is 2.41 GiB of layer plane plus a
+0.58 GiB head plane on `output.weight` plus a 1.16 GiB f32 table on `token_embd`, **~4.2 GiB** — which
+its "3.6 GiB peak RSS" row above does **not** count, because the RSS is not where the weights live.
+Read the 1.7B row's "peak RSS" as host RSS and this table as what the device is actually holding.
+These device figures are computed from the checkpoints' element counts, not sampled: `npu-smi`
+returns nothing once the process holds the device, so they are the sizes the allocator is asked for.
+`npu-smi info` reports the pool as **23.73 GB**, with **~7.0 GB in use at idle and no process
+running** (the driver/firmware carve-out), leaving ~16.7 GB for the plane; the 4B's 8.2 GiB sits
+comfortably inside it.
+
+**Timings — this is a coverage result, not a speed one.** Decode is the marginal between `--steps 8`
+and `--steps 32`, paired in one session: (234.88 − 220.80) / 24 = **0.587 s/token** (1.7 t/s), 1.5×
+the 1.7B's 0.39 s/token and, as on that checkpoint, ~the weight ratio over the same session length.
+The walls are dominated by the **one-time plane build**, not decode:
+
+| checkpoint | plane, fp16 | build floor (`--steps 1`) | decode, marginal | `--steps 8` wall |
+|---|---|---|---|---|
+| Qwen3-0.6B | 0.71 GiB | ~18.5 s | 0.26 s/token | 27.6 s |
+| Qwen3-1.7B | 2.41 GiB | ~91.5 s | 0.39 s/token | 92.0 s |
+| Qwen3-4B | 6.06 GiB | **~212–225 s** | **0.587 s/token** | **~218–221 s** |
+
+The 4B build floor is ~3.5 minutes, and at 8 or 32 steps the wall is essentially that floor — 220.80 s
+at 8, 234.88 s at 32 — so **decoding is free next to building the plane**. The build scales with the
+plane, not the layer count: 6.06 / 2.41 = 2.51× the 1.7B plane, 212 / 91.5 ≈ 2.3× the time. (The
+`--steps 1` wall came in at 225.05 s, *above* the 8-step 220.80 s — a ~2% run-to-run spread on a
+host build that is a host walk over every block, not a signal.)
+
+**And the next size up runs too — this is where the board stops being comfortable.** An 8192-wide
+`Qwen3-8B-Q4_K_M` needs **11.81 GiB** of layer plane, a **1.16 GiB** head plane on its distinct
+`output.weight`, and a **2.32 GiB** f32 embedding table — **~15.3 GiB device** — against the ~16.7 GB
+the pool leaves after the driver's 7 GB carve-out, and 4.7 GiB of mmap'd checkpoint on the host.
+Measured, it **completes** and, on the same prompt, is **token-identical to CPU** at 8 steps:
+
+```
+--prompt "The capital of France is" --steps 8
+  cpu     -> [12095 Paris 13. 576 The 6722 capital 315 of 15344 Italy 374 is 21718 Rome]
+  ascend  -> [12095 Paris 13. 576 The 6722 capital 315 of 15344 Italy 374 is 21718 Rome]
+```
+
+But the host is at the edge, and the *spread itself* is the honest number: peak RSS was **13.23 GiB**
+on one run and **8.28 GiB** on the next — the difference is how much the kernel paged out, not how
+much the process wanted — and `MemAvailable` fell to **~0.6 GB** with **~2 GB of swap** touched. The
+wall reflected it: **~500 s** on the first run and **~1197 s** on the second, and that 697 s gap over
+the same 8 tokens is **swap, not decode** — which is why no clean 8B decode marginal is claimed here.
+The 500 s clean wall is, as at 4B, almost entirely the one-time plane build. What the run establishes
+is a **coverage** fact: *an 8B runs on one 310B*, which nothing in this tree's history claimed and
+the S600's 2 GiB ION pool makes impossible. Above 8B the layer plane alone would exceed the pool, so
+this is where the ladder ends at `q4_k_m` fp16 planes — the packed-weight path the
+[W4A16 section](#precision-two-different-errors-and-which-one-is-the-graphs) closed is what would
+move it, and it is not this change.
+
+The honest statement of coverage is now four sizes: **0.6B, 4B and 8B token-identical, and 1.7B runs
+and fits with one documented near-tie** — the same fp16-plane precision limit this whole page is
+about, met at one prompt at 1.7B and not met at the other three, with no new op and no shape guard in
+the way at any of them.
