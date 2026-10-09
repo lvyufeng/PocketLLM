@@ -1296,6 +1296,34 @@ class AscendBackend final : public Backend {
    * likely to land inside the safe range than outside it. */
   static constexpr int64_t kCubeChunkN = 8192;
 
+  /* The chunk width actually used.  `kCubeChunkN` is the shipped default and the
+   * value the plane is laid out in; `$POCKETLLM_ASCEND_CUBE_CHUNK_N` overrides it
+   * so the real N limit can be *bisected on the board* rather than carried as a
+   * number from a different build.  Both the plane layout and the drive read it,
+   * so an override stays self-consistent. */
+  static int64_t cube_chunk_n() {
+    static const int64_t value = [] {
+      const char *env = std::getenv("POCKETLLM_ASCEND_CUBE_CHUNK_N");
+      if (env != nullptr && env[0] != '\0') {
+        return static_cast<int64_t>(std::strtoll(env, nullptr, 10));
+      }
+      return kCubeChunkN;
+    }();
+    return value;
+  }
+
+  /* Whether the cube drive syncs after *every* chunk (the shipped shape) or once
+   * per GEMM.  The default is the per-chunk sync, so the binary's behavior is
+   * unchanged; `$POCKETLLM_ASCEND_CUBE_SYNC=one` selects the batched form the
+   * page's A/B measured, and nothing about the default moves. */
+  static bool cube_sync_each() {
+    static const bool each = [] {
+      const char *env = std::getenv("POCKETLLM_ASCEND_CUBE_SYNC");
+      return env == nullptr || std::strcmp(env, "one") != 0;
+    }();
+    return each;
+  }
+
   /* The chunked cube drive, B pre-built.  `wq` is the transposed fp16 plane in
    * per-chunk device blocks (see `CubeWeight`); `x_f32` is the f32 activation
    * the graph holds.  This is the whole hot path: convert the activation, launch
@@ -1317,8 +1345,17 @@ class AscendBackend final : public Backend {
     copy_to_device(dx, x_h.data(), m * k * 2);
 
     int64_t woff = 0; /* fp16 elements consumed from `wq.blocks` */
-    for (int64_t n0 = 0; n0 < n; n0 += kCubeChunkN) {
-      const int64_t nc = std::min(kCubeChunkN, n - n0);
+    struct Pending {
+      DeviceBuffer dout;
+      void *workspace;
+      aclTensor *ta;
+      aclTensor *tb;
+      aclTensor *to;
+      int64_t nc;
+    };
+    std::vector<Pending> pending;
+    for (int64_t n0 = 0; n0 < n; n0 += cube_chunk_n()) {
+      const int64_t nc = std::min(cube_chunk_n(), n - n0);
 
       /* The chunk's B operand is already device-resident and contiguous at
        * `woff`; only the output needs a fresh buffer. */
@@ -1367,35 +1404,49 @@ class AscendBackend final : public Backend {
         aclnn_ok(aclnnMatmulCubeCustom(workspace, ws_size, executor, stream_),
                  "aclnnMatmulCubeCustom");
       }
-      {
+      if (cube_sync_each()) {
         StageClock _c(9); /* op_sync */
         acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
       }
+      pending.push_back(Pending{dout, workspace, ta, tb, to, nc});
+      woff += k * nc;
+    }
 
-      std::vector<uint16_t> out_h(static_cast<std::size_t>(m * nc));
-      copy_to_host(out_h.data(), dout, m * nc * 2);
+    /* The batched form: with `$POCKETLLM_ASCEND_CUBE_SYNC=one` the chunks of this
+     * GEMM are all enqueued before a single sync, since each writes its own
+     * `dout` and only the readback needs them complete.  It is off by default --
+     * the A/B on the page measured it and it does not move decode (the sync is
+     * not the cost), so the shipped path keeps the per-chunk shape. */
+    if (!cube_sync_each()) {
+      StageClock _c(9); /* op_sync */
+      acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
+    }
+
+    int64_t n0 = 0;
+    for (Pending &p : pending) {
+      std::vector<uint16_t> out_h(static_cast<std::size_t>(m * p.nc));
+      copy_to_host(out_h.data(), p.dout, m * p.nc * 2);
       const std::vector<float> chunk = half_to_f32(out_h);
       for (int64_t row = 0; row < m; ++row) {
-        for (int64_t c = 0; c < nc; ++c) {
+        for (int64_t c = 0; c < p.nc; ++c) {
           out_f[static_cast<std::size_t>(row * n + n0 + c)] +=
-              chunk[static_cast<std::size_t>(row * nc + c)];
+              chunk[static_cast<std::size_t>(row * p.nc + c)];
         }
       }
-
       {
         StageClock _c(7); /* ws_alloc: the free rides with the alloc */
-        if (workspace != nullptr) {
-          aclrtFree(workspace);
+        if (p.workspace != nullptr) {
+          aclrtFree(p.workspace);
         }
       }
       {
         StageClock _c(5); /* tensor_destroy */
-        aclDestroyTensor(ta);
-        aclDestroyTensor(tb);
-        aclDestroyTensor(to);
+        aclDestroyTensor(p.ta);
+        aclDestroyTensor(p.tb);
+        aclDestroyTensor(p.to);
       }
-      release(dout);
-      woff += k * nc;
+      release(p.dout);
+      n0 += p.nc;
     }
 
     copy_to_device(out, out_f.data(), m * n * 4);
@@ -1409,8 +1460,8 @@ class AscendBackend final : public Backend {
     out.n = n;
     out.k = k;
     out.blocks = allocate(n * k * 2);
-    for (int64_t n0 = 0; n0 < n; n0 += kCubeChunkN) {
-      const int64_t nc = std::min(kCubeChunkN, n - n0);
+    for (int64_t n0 = 0; n0 < n; n0 += cube_chunk_n()) {
+      const int64_t nc = std::min(cube_chunk_n(), n - n0);
       std::vector<uint16_t> b_h(static_cast<std::size_t>(k * nc));
       for (int64_t r = 0; r < nc; ++r) {
         for (int64_t c = 0; c < k; ++c) {
