@@ -604,3 +604,49 @@ ends**, because the measured cost was never on the host side of it.
 per-chunk sync), so the delivered binary is byte-for-byte the timed path it was; the 4B gate holds at
 `[12095 Paris 13. 576 The 6722 capital 315 of 9856 Germany 374 is 19846 Berlin]` at every chunk width
 above the wall, and 0.6B/1.7B are unchanged as documented.
+
+## The m=1 rate is the shape, not the device — so batching is the lever
+
+The correction above ended by saying the ~18 GFLOP/s was "more likely the shape" of an m=1 GEMV than
+overhead. That was a hypothesis; this is the test. `pocketllm-mscale` drives the same public
+`gemm_quant` the engine uses, on synthetic q4_K weights and a **fixed** (n, k), varying only m:
+
+| m | n = k = 2560 | n = 9728 | n = 151936 |
+|---|---|---|---|
+| 1 | **19.0 GFLOP/s** | 15.3 | 15.4 |
+| 2 | 36.1 | | |
+| 4 | 65.2 | | |
+| 8 | 107.9 | 101.9 | 107.0 |
+| 16 | 169.4 | | |
+| 32 | **224.2** | 228.0 | 245.7 |
+
+**Throughput is not flat in m — it rises ~12× from m=1 to m=32 and then saturates near 225–245
+GFLOP/s.** So the 18 GFLOP/s is the **shape**, exactly as the correction guessed: an m=1 GEMM is a
+GEMV that leaves the cube's M dimension idle, and the rate climbs steeply once m ≥ 8 fills it. The
+m=1 row is the cross-check that ties this to the decode profile — 19 GFLOP/s here is the ~18 GFLOP/s
+the decode step runs at, from a completely different harness, which is what makes the two numbers the
+same fact.
+
+It is also **shape-saturated, not `n`-limited**: the same m gives the same rate at n = 2560, 9728 and
+151936, so the chunking the last two sections argued about does not touch throughput either (it never
+did — that was already the chunk sweep's conclusion).
+
+**What batching would require — and how much of the gap it is.** The engine walks **one token at a
+time on the decode path**: `Qwen3Model::forward` calls `matmul(..., n, ...)` with `n` = the tokens in
+the call, so a **prefill already drives m = the prompt length** (it is batched), and only the
+per-token decode is m=1 — the head is even called at literal `m = 1`. Every decode step is therefore
+36 layers plus a head of m=1 GEMVs at ~19 GFLOP/s, when the same weights do ~108 GFLOP/s at m=8.
+Restructuring decode to process a batch of tokens would need **the serving layer to batch requests**:
+the runtime is `supports_batch = False` — one request at a time behind a lock, one KV cache, one
+position — so there is nothing on this board to fill m with today. That is the whole gap, and it is
+why "batch a few requests" is the real 310B decode lever: it would take the GEMM half of a decode
+step toward the m=8 rate, though the attention and memory traffic that share the step (the ~12% of
+the profile that is not `op_sync`) bound the end-to-end win well below the pure-GEMM 5.7×.
+
+Greedy decode cannot batch within one sequence, so the honest framing is: **the 310B's decode GEMM
+rate is a shape limit that batch serving could lift, not a device limit that caps the board.** The
+device itself does ~230 GFLOP/s fp16 at m ≥ 16. Nothing on this board is at that width today.
+
+**No behavior changed.** The harness is a new tool (`src/tools/mscale.cpp`, `pocketllm-mscale`) that
+does not touch the backend, so no kernel or graph code moved and no identity gate was at risk; the
+0.6B/1.7B/4B gates are as documented above.
