@@ -815,6 +815,59 @@ as interchangeable:
   fix closed, and noted here rather than fixed: it spans `native_backend` and any backend that does
   sample, so it is not this adapter's alone to correct).
 
+### 4B and 8B over `serve`
+
+The block above is the *surface* behavior, measured on 0.6B because a small `.hbm` keeps the
+concurrency rounds cheap. The **large** models had never been through the serving path at all before
+this, so they were measured on 2026-10-10, once the `balanced` pool made them loadable — the shipped
+4B and 8B, each opened with `pocketllm serve --device horizon`, canonical prompt, greedy tokenizer
+directory:
+
+| Graph | `/v1/completions` | `/v1/chat/completions` | Answer |
+|---|---|---|---|
+| shipped 4B | **200**, 4.46 s, `application/json; charset=utf-8` | **200**, 4.94 s | `The capital of France is **Paris**.` |
+| shipped 8B | **200**, 5.14 s | **200**, 5.16 s | `The capital of France is **Paris**.` |
+
+**Both endpoints work on both graphs**, and the answers are coherent, not garbage. On
+`/v1/chat/completions` the reasoning block is split into `message.reasoning_content` as on 0.6B (809
+characters for the 4B, 602 for the 8B), and `message.content` is the answer alone. No body carries an
+SDK-monitor token — `[UCP]`/`[DNN]`/`BPU_MONITOR`/`mod_mgr` and the rest stayed on the server's fd 2 —
+the `usage` object is present-and-zero exactly as on the small models, and `finish_reason` is `length`
+for the same reason recorded above (the delegate reports no stop signal). Wall time is the BPU decode:
+4.5 s at the 4B's 42.6 t/s and 5.1 s at the 8B's 29.6 t/s, which is the *same* generation the ladder
+measures — nothing about the HTTP shell changes what the graph does.
+
+### The 8B sits comfortably in `balanced` — the numbers
+
+The question the mode switch leaves open is how much room a large model actually has, because it
+decides whether `balanced` covers the road ahead or only today's models. Measured while an 8B was held
+open by `serve`, from the kernel's own `ion` accounting
+(`/sys/kernel/debug/ion/heaps/all_heap_info`), which is readable on this board as root:
+
+| | pool total | used with **4B** held | used with **8B** held | idle |
+|---|---|---|---|---|
+| `carveout` (the `.hbm`'s pool) | **10,737,418,240 B (10.00 GiB)** | 6,686,113,792 B (**62.3%**) | **9,417,129,984 B (87.7%)** | 0 |
+| `ion_uncache` (per-core scratch) | 2,147,483,648 B | 316,735,488 B (14.7%) | 316,735,488 B (14.7%) | 8.4% |
+| `MemAvailable` | — | 44.87 GiB | 44.88 GiB | 45.10 GiB |
+
+**An 8B leaves 1,320,288,256 B (1.23 GiB) of the carve-out free — 12.3% — and 44.88 GiB of the
+board's 46.48 GiB `MemTotal` still available.** Both graphs release the pool completely on close
+(`carveout` returns to 0), so this is a load-time peak and not a leak. The verdict is that 8B is
+**near the top of what `balanced` holds, not against the wall**: it fits with room to spare, but the
+room is about a fifth of the pool, not multiples of the graph.
+
+**The honest "largest model that fits" number** is then a budget, not a guess. The carve-out's
+10.00 GiB is split between the `.hbm` itself and a fixed per-load overhead — the HBRT workspace plus
+per-core scratch that land in the same pool. Measured: 5,704,908,800 B (`.hbm`) + **3,712,221,184 B
+(3.46 GiB overhead)** = 9,417,129,984 B at 8B, and 3,328,311,296 B + **3,357,802,496 B (3.13 GiB)**
+= 6,686,113,792 B at 4B. So the **overhead is ~3.1–3.5 GiB and grows a little with the model**
+(+0.33 GiB from 4B to 8B), which leaves roughly **6.5 GiB for a `.hbm` file** once it is accounted
+for. Since a w4 graph's file runs a bit above its weight size, that is about an **8B–9B class model**
+— an 8B fits with ~1.2 GiB to spare, and there is no headroom for a 14B (which at w4 would be roughly
+8 GiB of weights alone). **Anything past that is `bpu_first` (17.93 GiB), not `balanced`** — which is
+the one number that answers the "what else can this board run" follow-up, and it is why the switch was
+worth making for 8B specifically rather than as a general 14B door.
+
 ### The host shell's cost is below the noise floor
 
 The serving shell is a `ThreadingHTTPServer` that serializes one request at a time behind the
