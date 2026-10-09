@@ -113,8 +113,10 @@
  * on CANN 8.3.RC2 -- the factory `op_impl` for the 310B carries only
  * `batch_matmul_v2` -- so they fail on this board.  The custom ops built in the
  * minicpm-o-4.5-orangepi tree supply the 310B binaries, and this backend drives
- * `aclnnMatmulW4a16Custom` for the quantized GEMM and `aclnnMatmulCubeCustom`
- * for the dense one.
+ * `aclnnMatmulCubeCustom` for the graph's GEMM -- both the dense and the
+ * quantized one, via a faithful decode -- and carries `aclnnMatmulW4a16Custom`
+ * behind an env flag because its requantization is too lossy to be the default
+ * (see "The GEMM path" below).
  *
  * ## The environment is a hard requirement, not a convenience
  *
@@ -133,17 +135,28 @@
  * super-blocks. `MatmulW4a16Custom` wants GPTQ int4 packed as int8 + a per-128
  * fp16 scale row -- a different quantization entirely, with a *coarser* scale
  * granularity than q4_K's own six-bit sub-scales. The first bridge this backend
- * carried was to requantize q4_K into it. Requantizing is lossy: measured at
- * ~1e-1 relative error on the model's real matrices (n = 1024..151936,
- * k = 1024), an order of magnitude past the 2.7e-4 of decoding the blocks
- * faithfully, so it is not the accuracy the graph is built on.
+ * carried was to requantize q4_K into it. Requantizing is lossy: the int4
+ * round-trip is measured at ~1.2e-1 relative against the checkpoint's own
+ * weights, and the whole forward see it -- 9e-2 to 1.7e-1 on the model's real
+ * matrices, flat in n (the 151936 tied head is the same ~1.2e-1 as a 1024-wide
+ * projection). Two orders past the 1e-3 budget, so it is not the accuracy the
+ * graph is built on.
+ *
+ * **Do not confuse that with the op's *arithmetic* error, which is ~3e-4.** The
+ * 1.2e-1 is the quantizer (int4 [-8, 7] per 128 is coarser than q4_K); the
+ * 3e-4 is how far the kernel's sum is from a float64 reference over the *same*
+ * int4 weights, with fp32 accumulate. Both are true and they answer different
+ * questions -- int8 requantization instead of int4 only gets the total to
+ * ~5e-3, still past 1e-3, because q4_K's per-32 six-bit scale carries more than
+ * an int8-per-128 re-encode of it does. See docs/architecture/ascend_310b.md,
+ * "Precision: two different errors".
  *
  * So the default path decodes the blocks *faithfully* (the tree's own
  * `dequant_q4_k`/`dequant_q6_k`, cached on the device) and drives the dense
  * cube, `MatmulCubeCustom`, which measured ~2.7e-4 relative and handles any
  * `m`, any `k`, and the residual. That is the path the whole Qwen3 forward runs
- * on, prefill and decode. The cost is real: ~2 GB of f32 weights resident on the
- * NPU for a 0.6B q4_k_m checkpoint (~0.4 GB packed), and a slower GEMM than the
+ * on, prefill and decode. The cost is real -- the cached fp16 plane is ~1 GB for
+ * a 0.6B q4_k_m checkpoint (~0.4 GB packed layer) -- and a slower GEMM than the
  * (lossy) W4A16 op. `$POCKETLLM_ASCEND_W4A16=1` selects the requantized op for
  * an experiment, where its error is the thing being measured.
  *
@@ -536,15 +549,18 @@ class AscendBackend final : public Backend {
     /* The W4A16 op takes q4_K, M=1, no residual -- and it *requantizes*: it
      * decodes the q4_K block and rounds it to int8 in [-8, 7] with a per-128
      * scale, which is a coarser quantizer than q4_K's own six-bit scales.  That
-     * was measured at a ~1e-1 relative error on the model's real matrices
-     * (n=1024..151936, k=1024), which is enough to make the generated text
-     * incoherent -- so it is not the graph's path.
+     * was measured at a ~1.2e-1 relative error against the checkpoint's own
+     * weights on the model's real matrices (9e-2..1.7e-1 for k=1024..3072,
+     * n up to 151936), which is enough to make the generated text incoherent --
+     * so it is not the graph's path.  This is the *quantizer*, not the kernel's
+     * arithmetic: the op's fp32-accumulate error over those same int4 weights is
+     * ~3e-4.  The distinction is written up in docs/architecture/ascend_310b.md.
      *
      * The graph's path is the dense cube: decode the blocks *faithfully* with
      * the tree's `dequant_q4_k`/`dequant_q6_k` (cached on the device) and drive
      * `MatmulCubeCustom`, which measured ~2.7e-4 relative and handles any m, any
-     * k and the residual.  The cost is real and is the honest trade: ~2 GB of
-     * f32 weights resident on the NPU for a 0.6B q4_k_m checkpoint (v. ~0.4 GB
+     * k and the residual.  The cost is real and is the honest trade: a ~1 GB
+     * fp16 plane resident on the NPU for a 0.6B q4_k_m checkpoint (v. ~0.4 GB
      * packed), and a slower GEMM.  `$POCKETLLM_ASCEND_W4A16=1` selects the
      * lossy-but-fast W4A16 op for an experiment, where the requantization error
      * is the point being measured rather than a surprise. */

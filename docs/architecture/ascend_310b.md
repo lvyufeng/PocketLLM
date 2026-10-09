@@ -91,31 +91,84 @@ From the host tiling and the call-site guards:
 The int4 weight is repacked once, by `(group, core, tile, k)`, so each 128-row group/tile is one
 contiguous DMA instead of 128 strided row copies.
 
-## Precision: fp32 accumulate is required
+## Precision: two different errors, and which one is the graph's
 
-The op originally accumulated in fp16 — `partial` and `acc` were `LocalTensor<half>` and the inner
-loop was `Axpy`/`Mul`/`Add` on `half`. Measured against a float64 CPU reference at K=512, N=128,
-G=128 (`max|op − fp64| / max|ref|`):
+There are **two** error numbers in play for this op, and the sign of the whole "should the backend
+drive the packed weights?" question turns on keeping them apart. They are measured at different
+things and they are three orders of magnitude apart.
 
-| accumulate | K=512 | K=2048 | time K=512 | time K=2048 |
+**(1) The op's own arithmetic** — how far the kernel's sum is from a float64 reference computed
+from the *same* int8 weights. The op originally accumulated in fp16 — `partial` and `acc` were
+`LocalTensor<half>` and the inner loop was `Axpy`/`Mul`/`Add` on `half`. Measured at K=512, N=128,
+G=128 (`max|op − fp64| / max|ref|`), and again at two real model matrices:
+
+| accumulate | K=512 | K=2048 | 1024×3072 `ffn_gate` | 3072×1024 `ffn_down` |
 |---|---|---|---|---|
-| fp16 | 2.5e-3 | 2.5e-3 | 0.159 ms | 0.53 ms |
-| **fp32** | **3.0e-4** | **2.8e-4** | 0.219 ms | 0.70 ms |
+| fp16 | 2.5e-3 | 2.5e-3 | **1.19e-3** | **1.82e-3** |
+| **fp32** | **3.0e-4** | **2.8e-4** | **3.05e-4** | **3.33e-4** |
 
-Both are **flat in K** — the fp16 error is not drift that grows with depth, it is a per-step
-rounding floor: the loop rounded the product through fp16 on every one of the K steps, where a
-cube-style fp16 accumulate keeps the product in fp32.
+(The K=512/2048 columns are the op's original N=128 probe; the two matrix columns are the real
+weights and shapes, measured this round. `ffn_down` is q6_k and sits a little higher — same order.)
+fp16 accumulation fails a 1e-3 budget at the toy shape *and* at the real ones; fp32 accumulation
+passes at both. Both are **flat in K** and flat in shape — it is a per-step rounding floor, not
+drift: the fp16 loop rounded the product through fp16 on every one of the K steps. The fp16 loop is
+the *faster* one, 0.159 ms (K=512) and 0.53 ms (K=2048) against fp32's 0.219 and 0.70 ms — 1.4×,
+because fp32 `Axpy` processes half the elements per cycle.
 
-**fp32 accumulation is what a Qwen3 310B backend must use** — 2.5e-3 fails a 1e-3 budget, 3.0e-4
-clears it by ~3×, and it holds as K grows. The cost is 1.4× the fp16 loop, because fp32 `Axpy`
-processes half the elements per cycle.
+**(2) Requantization** — how far the int4 weights the op is *given* are from the q4_K/q6_K weights
+the checkpoint actually holds. The op's input is GPTQ int4 packed as int8 with a per-128 fp16 scale;
+the checkpoint's tensor is a q4_K super-block with six-bit sub-scales. Bridging them means decoding
+the block faithfully and rounding to `[-8, 7]` per 128 — **a coarser quantizer**, and this is where
+the real error lives. Measured against the tree's own `dequant_q4_k`/`dequant_q6_k`, at the model's
+own matrices (weights loaded straight from `Qwen3-0.6B-Q4_K_M.gguf`):
 
-The change is small and is preserved in the minicpm tree as
-`op_kernel/matmul_w4a16_custom.cpp` (branch `fix/w4a16-fp32-accumulate`): make `partial`/`acc`/the
-scale row fp32 and cast to fp16 once at the store. What makes it fit in the 192 KB UB is that the
-weight tile stays fp16-sized — `Axpy` with an fp32 destination and an fp16 source dispatches to the
-dav_m310 mixed-width path, which converts and multiplies in fp32. Converting the weight buffer
-itself to fp32 would need 224 KB at the widest tile.
+| matrix | shape (k×n) | type | requant ‖Wr−Wf‖/‖Wf‖ | op arithmetic (fp32 acc) | **total** |
+|---|---|---|---|---|---|
+| `blk.0.ffn_gate` | 1024×3072 | q4_k | 1.19e-1 | 3.05e-4 | **9.4e-2** |
+| `blk.0.attn_q` | 1024×2048 | q4_k | 1.23e-1 | 4.24e-4 | **1.7e-1** |
+| `blk.0.ffn_down` | 3072×1024 | q6_k | 1.24e-1 | 3.33e-4 | **1.3e-1** |
+| `token_embd` (tied head) | 1024×151936 | q6_k | 1.17e-1 | 3.91e-4 | **1.4e-1** |
+
+**The two numbers do not contradict each other — they answer different questions.** `3.0e-4` is row
+(1), the arithmetic, and it *does* meet a 1e-3 budget. The `~1e-1` is row (2), the requantization,
+and it does *not*: the total error a model built on this path sees is dominated by the quantizer,
+so it fails 1e-3 by two orders of magnitude at every real shape, and it is flat in n (the 151936
+tied head is the same ~1.2e-1 as a k=1024 projection — the failure is the quantizer, not any
+large-N behaviour, unlike the cube's silent edge above).
+
+**Even int8 does not rescue it.** The kernel's weight load is `Cast(wFp16, wInt8, CAST_NONE)` — a
+plain int8→fp16 cast with no 4-bit mask — so the op can in fact be handed full int8 weights; the
+"W4" is the kernel's *name*, not a constraint it enforces. Requantizing to `[-127, 127]` per 128
+instead of `[-8, 7]` drops the requantization from 1.19e-1 to **6.6e-3** and the total to 4.9e-3 on
+`ffn_gate` — better by ~20×, still 5–7× past 1e-3. The int8 requantization is a *finer* quantizer
+than q4_K's six-bit sub-scales only in step size, not in total error: q4_K already carries a per-32
+six-bit scale, so re-expressing the same values through int8 does not recover the resolution q4_K's
+own encode has.
+
+**So the W4A16 op is not the decode GEMM's answer, and the packed weights cannot be fed to it.**
+`$POCKETLLM_ASCEND_W4A16=1` still selects it, for an experiment where the requantization is the
+thing being measured rather than a surprise. The graph's path stays the dense cube on the decoded
+plane — the fp16 plane is 2× smaller than the f32 it replaced, and the two numbers above are why it
+is decoded faithfully instead of requantized.
+
+**The op arithmetic table is still true and still worth having** — it is why the fp32-accumulate
+rebuild exists. fp16 accumulation (2.5e-3) alone fails a 1e-3 budget; the rebuild is preserved in
+the minicpm tree as `op_kernel/matmul_w4a16_custom.cpp` (branch `fix/w4a16-fp32-accumulate`): make
+`partial`/`acc`/the scale row fp32 and cast to fp16 once at the store. What makes it fit in the
+192 KB UB is that the weight tile stays fp16-sized — `Axpy` with an fp32 destination and an fp16
+source dispatches to the dav_m310 mixed-width path, which converts and multiplies in fp32.
+Its cost is 1.4× the fp16 loop, because fp32 `Axpy` processes half the elements per cycle. It is
+the right *op* — but it is fed weights it cannot be given without losing more than it saves.
+
+### Where the names came from, and how this page got it wrong
+
+`#582` chose the cube "because W4A16 requantizes to int8 at ~1e-1". The `~1e-1` was right and the
+reason was right, but the page recorded it next to the `2.5e-3`/`3.0e-4` arithmetic table without
+saying the two measure different things — so a reader saw "W4A16 ~1e-1" and "W4A16 fp32-acc ~3.0e-4"
+in the same tree and read them as a contradiction. They are not: **`3.0e-4` is the kernel's
+arithmetic on already-int4 weights, `~1e-1` is the int4 quantization of the checkpoint's q4_K
+weights, and the second is 300× larger, so it is the one the model sees.** Both rows are measured
+above, from the same probe, at the model's real shapes.
 
 ## The cube path is the backend's default
 
