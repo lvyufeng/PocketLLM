@@ -1092,12 +1092,12 @@ void gemm_q4k_8x8_avx2(int n, float *s, size_t bs, const void *vx, const void *v
 void repack_weights_q6k(const uint8_t *blocks, int64_t n, int64_t k, uint8_t *out) {
   const int64_t nb = k / 256;
   const size_t row_bytes = static_cast<size_t>(nb * quant::kQ6KBlockBytes);
-  const size_t out_row_bytes = static_cast<size_t>(nb) * quant::kQ6KRepackedBytes;
+  const size_t out_row_bytes = static_cast<size_t>(nb) * quant::kQ6KRepackedStride;
   parallel_for(n, 1, [&](int64_t r_lo, int64_t r_hi, int64_t) {
     for (int64_t r = r_lo; r < r_hi; ++r) {
       for (int64_t b = 0; b < nb; ++b) {
         const uint8_t *in = blocks + r * row_bytes + b * quant::kQ6KBlockBytes;
-        uint8_t *o = out + r * out_row_bytes + b * quant::kQ6KRepackedBytes;
+        uint8_t *o = out + r * out_row_bytes + b * quant::kQ6KRepackedStride;
         int8_t *qs = reinterpret_cast<int8_t *>(o);
         for (int i = 0; i < 256; ++i) {
           qs[i] = static_cast<int8_t>(quant::q6_k_raw_value(in, i) - 32);
@@ -1107,6 +1107,11 @@ void repack_weights_q6k(const uint8_t *blocks, int64_t n, int64_t k, uint8_t *ou
         }
         o[272] = in[208];
         o[273] = in[209];
+        /* The 14 padding bytes are dead, but zeroed so the transform stays
+         * deterministic (a buffer reloaded twice sees the same bytes). */
+        for (int s = 274; s < quant::kQ6KRepackedStride; ++s) {
+          o[s] = 0;
+        }
       }
     }
   });

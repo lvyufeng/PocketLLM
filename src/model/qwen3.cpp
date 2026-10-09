@@ -242,7 +242,7 @@ void Qwen3Model::repack_weight_q6k(const GgufReader &checkpoint, const std::stri
   uint64_t nbytes = 0;
   const uint8_t *src = checkpoint.tensor_data(name, &nbytes);
   const int64_t blocks = weight.rows * (weight.cols / 256);
-  const int64_t expanded = blocks * quant::kQ6KRepackedBytes;
+  const int64_t expanded = blocks * quant::kQ6KRepackedStride;
   std::vector<uint8_t> host(static_cast<std::size_t>(expanded));
   kernel::repack_weights_q6k(src, weight.rows, weight.cols, host.data());
   kernel::DeviceBuffer repacked = backend_->allocate(expanded);
