@@ -630,6 +630,35 @@ as interchangeable:
   fix closed, and noted here rather than fixed: it spans `native_backend` and any backend that does
   sample, so it is not this adapter's alone to correct).
 
+### The host shell's cost is below the noise floor
+
+The serving shell is a `ThreadingHTTPServer` that serializes one request at a time behind the
+adapter's lock. That lock is a *throughput* limit — it stops two requests overlapping — but the
+question worth answering is whether the shell also adds *per-request* cost on top of the delegate.
+Measured 2026-10-09, shipped 1.7B graph (the ladder's `.hbm`), canonical prompt, greedy tokenizer
+directory, the same request driven two ways:
+
+| path | median wall time |
+|---|---|
+| `XlmEngine.infer` — the raw delegate, what the ladder and `run` use | 2684 ms |
+| `POST /v1/completions` through `pocketllm serve` — HTTP in, response bytes out | 2677 ms |
+
+Two runs of that comparison (5 and 15 iterations each) put the difference at **+2.5 ms** and
+**−7.1 ms** — opposite signs, both well under the ±10 ms run-to-run spread of a 2.68 s request. So
+the shell's per-request cost (HTTP parse, request build, the lock acquire, response serialization,
+the socket) is **not resolvable above the noise: under ~0.4% of the request, and negligible against
+the delegate's ~14.3 ms/token decode.** There is no serving-perf lever in this shell — the BPU is the
+whole cost, which is the shape you would expect from a shell that moves a few hundred bytes of text
+and holds a lock while the delegate runs the graph.
+
+Both paths did the same generation work (both ran ~2.68 s for the same 188-token answer); they differ
+only in how the answer is presented. `XlmEngine.infer` returns the delegate's raw text with its
+` thinking… response` block included, while the HTTP path splits that block out —
+`/v1/chat/completions` returns the answer in `message.content` and the reasoning in
+`message.reasoning_content`, and `/v1/completions` returns the answer alone. That is the same
+`split_reasoning` presentation the [streaming](#serving-on-the-board) path uses, not a second
+generation.
+
 ## What is not on this path
 
 - **No Python backend implements the delegate.** `--device horizon` selects the `xlm` serving adapter,
