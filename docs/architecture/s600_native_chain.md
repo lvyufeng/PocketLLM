@@ -1,33 +1,37 @@
 # The S600 native compile chain
 
-[Qwen3 on the RDK S600](../models/s600_qwen3.md) stops at 1.7B because the board's BPU memory pool
-refuses the shipped 4B and 8B graphs. **This page is the answer to that refusal**: what the D-Robotics
-SDK actually ships for building a `.hbm`, where the build runs, what it takes as input, and — plainly —
-whether the chain is in our hands or the vendor's.
+[Qwen3 on the RDK S600](../models/s600_qwen3.md) once stopped at 1.7B because the board's BPU memory
+pool refused the shipped 4B and 8B graphs. **This page is the answer to that refusal**: what the
+D-Robotics SDK actually ships for building a `.hbm`, where the build runs, what it takes as input, and —
+plainly — whether the chain is in our hands or the vendor's.
 
-**The refusal has two independent answers, and this page is only one of them.** The first is the
-vendor's own, and it is one command: `hb_switch_ion.sh balanced` moves the board's model pool
-(`ion_carveout`) from the 2.00 GiB it boots with to **10.00 GiB**, which fits both 4B (3.00 GiB) and 8B
-(5.31 GiB) — the SDK documents `balanced` as *the* setting for large models, and lists all four Qwen3
-sizes as supported. The second is the compile chain this page scopes: shrink the graph instead of
-growing the pool. The recompile *does* shrink a 4B (3.3269 GB shipped → 3.2216 GB ours, measured), but
-it is **not enough on its own** — 3.00 GiB of weights still exceed 2.00 GiB — so the two answers are not
-equivalent: the mode switch is the one that reaches 4B/8B, and the recompile is a lever that turned out
-to be too small. Both are recorded here; the mode switch is on
-[the model page](../models/s600_qwen3.md#how-to-resize-it-the-sdk-ships-the-switch).
+**The refusal had two independent answers, and this page is only one of them — and it is the one that
+turned out not to be needed.** The first is the vendor's own, and it is one command:
+`hb_switch_ion.sh balanced` moves the board's model pool (`ion_carveout`) from the 2.00 GiB it boots
+with to **10.00 GiB**, which fits both 4B (3.00 GiB) and 8B (5.31 GiB) — the SDK documents `balanced`
+as *the* setting for large models, and lists all four Qwen3 sizes as supported. That switch was applied
+and the board rebooted **2026-10-10**; 4B and 8B load and generate now. The second is the compile chain
+this page scopes: shrink the graph instead of growing the pool. The recompile *does* shrink a 4B
+(3.3269 GB shipped → 3.2216 GB ours, measured), but it is **not enough on its own** — 3.00 GiB of
+weights still exceed 2.00 GiB — so the two answers are not equivalent: the mode switch is the one that
+reached 4B/8B, and the recompile is a lever that turned out to be too small. Both are recorded here;
+the mode switch and its measured result are on
+[the model page](../models/s600_qwen3.md#the-4b-8b-ceiling-applied).
 
-It is a **scoping document, not a build record**. Nothing here was compiled, installed, or run. Every
-claim is either a **measured** fact from this board (labelled) or something **read off an artifact** —
-a wheel, the vendor doc set, or the vendor's own manifest in the SDK tree. Each is marked as such.
-Whether a cache-1024 4B graph lands under the **2.00 GiB `cpu_first` ceiling** is no longer open: it
-does **not** (3.2216 GB measured, 3.00 GiB of weights). It fits under the **10.00 GiB `balanced`**
-carve-out the vendor's switch installs, which is the mode the SDK recommends.
+It is a **scoping document, not a build record** in its body. The scoping sections below were written
+before anything was compiled, installed, or run, so every claim there is either a **measured** fact
+from this board (labelled) or something **read off an artifact** — a wheel, the vendor doc set, or the
+vendor's own manifest in the SDK tree — and each is marked as such. The **results** are appended at the
+end and are labelled measured: the chain's own 1.7B and 4B builds, and the pool switch's outcome.
+Whether a cache-1024 4B graph lands under the **2.00 GiB `cpu_first` ceiling** is closed: it does
+**not** (3.2216 GB measured, 3.00 GiB of weights). Under the **10.00 GiB `balanced`** carve-out the
+vendor's switch installs — now the mode this board runs — it does, and so do the shipped 4B and 8B.
 
-**The scoping has since been acted on.** The chain has produced its first artifact — our own
-`Qwen3-1.7B` graph at `cache_1024` — and it **loads and runs on the board**; see
+**The scoping has since been acted on.** The chain has produced its artifacts — our own `Qwen3-1.7B`
+and `Qwen3-4B` graphs at `cache_1024` — and both **load and run on the board**; see
 [the first build result](#the-first-build-result). The page keeps its scoping framing below
-because that is the state the rest of it was written in and still describes; the build result
-is appended, not woven in.
+because that is the state the rest of it was written in and still describes; the build results
+are appended, not woven in.
 
 ## The finding that reorders the question
 
@@ -50,7 +54,7 @@ each (`examples/llm_demo/qwen3_4b_config.json`, `qwen3_8b_config.json`, both `bp
 `model_type 9`).
 
 The binding constraint is therefore **not** "no 4B graph exists". It is the load ceiling
-[the model page](../models/s600_qwen3.md#the-4b-8b-ceiling) already measures: `hrt_model_exec
+[the model page](../models/s600_qwen3.md#the-4b-8b-ceiling-applied) already measures: `hrt_model_exec
 model_info` gives, verbatim,
 
 ```text
@@ -193,29 +197,34 @@ These are the reasons the verdict below is "half", not "yes":
   Deploy and run on the **aarch64 S600**, which already carries the matching `hbdk4_runtime_nash`.
 - **Is 4B reachable by us, by compiling a smaller graph?** **No — measured.** A **4B `.hbm` from
   D-Robotics is already on the board** (public, login-free, md5-verified) but does not load in
-  `cpu_first`, because of the BPU pool ceiling. A **smaller-cache 4B `.hbm` we build ourselves** is
-  now built — **3,221,638,408 B (3.002 GiB)**, md5 `539775a7c9b596aa470895ad9fc6cf8e`, against the
-  shipped 3,326,941,192 B — and it **still refuses** with `RESOURCE_EXHAUSTED`: the cache shrink saves
+  `cpu_first`, because of the BPU pool ceiling. A **smaller-cache 4B `.hbm` we build ourselves** was
+  built — **3,221,638,408 B (3.002 GiB)**, md5 `539775a7c9b596aa470895ad9fc6cf8e`, against the
+  shipped 3,326,941,192 B — and it **also refused** with `RESOURCE_EXHAUSTED`: the cache shrink saves
   ~99 MiB, but the 3.00 GiB of weights alone exceed the 2.00 GiB pool. So the recompile is a real
-  lever that is simply too small, not a path to 4B/8B.
-- **What *does* reach 4B/8B?** **The vendor's own mode switch.** `/usr/hobot/bin/hb_switch_ion.sh
+  lever that is simply too small, not a path to 4B/8B. (It runs fine once the pool fits it — see
+  [the model page](../models/s600_qwen3.md#the-large-models-after-the-switch) — but by then the
+  shipped graph loads too, so the recompile bought speed, not reach.)
+- **What *does* reach 4B/8B?** **The vendor's own mode switch, and it did.** `/usr/hobot/bin/hb_switch_ion.sh
   balanced` grows `ion_carveout` from 2.00 GiB to **10.00 GiB**, which fits 4B (3.00 GiB) and 8B
   (5.31 GiB) with no recompile. The SDK ships the tool, documents `balanced` as the setting for large
-  models, and lists all four sizes as supported — the board is simply in `cpu_first`. See
-  [the model page](../models/s600_qwen3.md#how-to-resize-it-the-sdk-ships-the-switch); the switch is
-  **staged, not applied**, pending the user's authorisation.
-- **Is 1.7B the ceiling by vendor limitation, not ours?** **No** — it is neither. The ceiling is the
-  *mode* the board boots in, and the vendor ships the switch out of it. The honest framing is:
-  **1.7B is the ceiling in `cpu_first`; `balanced` is a one-command, vendor-supported mode change away,
-  and it is the SDK's documented recommendation for large models.**
+  models, and lists all four sizes as supported — the board simply booted in `cpu_first`. It was
+  **applied and the board rebooted 2026-10-10**; measured result on
+  [the model page](../models/s600_qwen3.md#the-large-models-after-the-switch): 4B **42.6 t/s** decode
+  and 8B **29.6 t/s**, both coherent and both byte-identical over three greedy runs.
+- **Is 1.7B the ceiling by vendor limitation, not ours?** **No** — it is neither, and 1.7B is not the
+  ceiling any more. The ceiling was the *mode* the board booted in, and the vendor ships the switch out
+  of it. The honest framing is: **1.7B was the ceiling in `cpu_first`; `balanced` was a one-command,
+  vendor-supported mode change, it has been made, and all four Qwen3 sizes now run.**
 
 **The numbers in the scoping sections above are not build results** — they are the SDK's stated tool
 versions, the vendor's published artifacts, and this board's measured refusal. The first build result is
 at [the first build result](#the-first-build-result): a 1.7B `cache_1024` graph out of this chain that
 loads and runs. The chain's **4B** build is now also measured
-([result](#the-first-build-result)): it loads nothing under the 2 GiB `cpu_first` pool — the smaller
-graph is still 3.00 GiB of weights — and reaching 4B/8B is the vendor's `balanced` switch, not this
-recompile.
+([result](#the-first-build-result)): it loaded nothing under the 2 GiB `cpu_first` pool — the smaller
+graph is still 3.00 GiB of weights — and what reached 4B/8B was the vendor's `balanced` switch, not this
+recompile. Once that pool was in place the 4B build ran too, at 50.0 t/s decode
+([model page](../models/s600_qwen3.md#the-large-models-after-the-switch)); the chain's contribution to
+4B was therefore speed on a graph that already loaded, not reach.
 
 ## The first build result
 
@@ -271,10 +280,11 @@ the vendor's exact calibration statistics, which are not published.
 So the honest result: the **compile chain is validated end to end** — our own artifact loads, runs and
 is faster — while the behavioral match to the vendor graph is at the answer level, not token-for-token.
 
-**The `cache_1024` 4B came out, and it does not fit either.** The build that was in progress when this
-section was first written has landed: `Qwen3-4B_language_chunk_512_cache_1024_w4_nash-p_corenum_4_4.hbm`,
-**3,221,638,408 bytes (3.002 GiB)**, md5 `539775a7c9b596aa470895ad9fc6cf8e`, i.e. **99 MiB smaller** than
-the shipped 3.10 GiB 4B. `hrt_model_exec model_info` refuses it in `cpu_first` just as it refuses the
+**The `cache_1024` 4B came out, and under `cpu_first` it did not fit either.** The build that was in
+progress when this section was first written has landed:
+`Qwen3-4B_language_chunk_512_cache_1024_w4_nash-p_corenum_4_4.hbm`, **3,221,638,408 bytes (3.002 GiB)**,
+md5 `539775a7c9b596aa470895ad9fc6cf8e`, i.e. **99 MiB smaller** than the shipped 3.10 GiB 4B. In the
+`cpu_first` pool that was then live, `hrt_model_exec model_info` refused it just as it refused the
 shipped graph:
 
 ```text
@@ -282,11 +292,21 @@ Cannot malloc bpu memory with length 3221638408 bytes: AllocError { len: 3222994
   -> HBRT4_STATUS_RESOURCE_EXHAUSTED   -> ion_alloc ret=-12 (ENOMEM)
 ```
 
-So the recompile path **does not** reach 4B on this board: shrinking the cache recovered ~99 MiB against
-the ~1.0 GiB the graph would have to lose to fit 2.00 GiB, because the weights — not the KV cache — are
-the binding term. The path that reaches 4B/8B is the vendor's `balanced` mode switch, which lifts the
-pool to 10.00 GiB and fits both. **This is the chain's honest endpoint: the toolchain works, a 4B builds
-cleanly, and the pool — not the graph — is what has to move.**
+So the recompile path **did not** reach 4B on its own: shrinking the cache recovered ~99 MiB against the
+~1.0 GiB the graph would have to lose to fit 2.00 GiB, because the weights — not the KV cache — are the
+binding term. The path that reaches 4B/8B is the vendor's `balanced` mode switch, which lifts the pool
+to 10.00 GiB and fits both. **This is the chain's honest endpoint: the toolchain works, a 4B builds
+cleanly, and the pool — not the graph — is what had to move.**
+
+**And the 4B build runs now that it did.** After the switch was applied and the board rebooted
+(2026-10-10), the same file **initializes**: `hrt_model_exec model_info` reports `Load model to DDR`,
+and through `XlmEngine` it decodes at **50.0 t/s** (49.98 / 49.91 / 49.96 over three byte-identical
+greedy runs) against the shipped 4B's 42.6 t/s — the same ~17% decode edge the compiled 1.7B had over
+its shipped twin. So the chain's 4B artifact is real and is the fastest 4B on this board; it is simply
+not *what made 4B reachable*, which the pool switch had already done. Full numbers on
+[the model page](../models/s600_qwen3.md#the-large-models-after-the-switch). Like the compiled 1.7B, it
+is a different build-time quantization of the same `Qwen3-4B` weights, so its reasoning text differs
+from the shipped graph's where both converge on the same answer.
 
 ### Running this artifact on the board
 
@@ -339,7 +359,7 @@ mismatch is refused rather than silently wrong.
 - License terms: `doc/…/en/guide/license_agreement.html` §3.2/3.3/3.6.
 - x86 build procedure: `doc/…/en/guide/env_install/x86_env.html`.
 - The load-ceiling errors: measured on this board (see
-  [the model page](../models/s600_qwen3.md#the-4b-8b-ceiling)).
+  [the model page](../models/s600_qwen3.md#the-4b-8b-ceiling-applied)).
 - The build result: the artifact and its md5 from the x86 host's `build_out/`, `hrt_model_exec
   model_info` over both the shipped and our `.hbm`, and `pocketllm run --device horizon` on the board —
   all measured 2026-10-09. The differing KV-cache scales are the `scale data:` lines `model_info`
