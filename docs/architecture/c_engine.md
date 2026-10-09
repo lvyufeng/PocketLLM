@@ -495,7 +495,8 @@ accumulate in **int16** and take one `madd_epi16` scale multiply, where our own 
 only for q4_K: 4-bit weights (0–15) against int8 activations (±127) give at most 1905 per `maddubs`
 lane, so four sum to 7620 < 32767. q6_K's 6-bit values would overflow, which is why **only q4_K has a
 panel path** — everything else stays on the row kernel, and qwen3-0.6B's `output.weight` is q6_k, so
-the head is never repacked.
+the head is never repacked **on the CPU**. (The card has a separate `q6_K` byte-expansion repack with
+its own reason — see [the section below](#the-q6_k-byte-expansion-repack-and-why-the-card-needs-one-the-cpu-does-not).)
 
 It is a **selected whole GEMM, never mixed with the row kernel**: when the panel path is on it computes
 the entire sub-batch and `dot_row_q8k` is not called for that weight at all. That is what leaves the
@@ -553,7 +554,8 @@ llama.cpp, the batched-versus-incremental equality and the logits check. Where i
 *long* greedy sequence on a near-tie: on a 32-token prompt the two paths share their first 30
 generated tokens and split at the 31st, which is the chaos amplification of a 1.6 × 10⁻⁶ per-op
 difference and the regime `tests/native/llama_oracle.py` already documents. **f16 is the control and
-is never repacked** — `repack_enabled()` gates on `type_id == kTypeQ4K`, and the f16 checkpoint is
+is never repacked** — the CPU `repack_enabled()` gates on `type_id == kTypeQ4K` (the card's `q6_K`
+repack is a different selector and does not touch f16 either), and the f16 checkpoint is
 byte-identical with the flag on and off at every length tested. Thread invariance is unaffected
 either way: the output is bit-identical at 1, 4, 22 and 44 threads, with the reduce never split.
 
@@ -569,6 +571,75 @@ costs one `__expf` per (row, key) pair against llama.cpp's `exp_ps` over a whole
 
 **`POCKETLLM_CPU_REPACK=1` is still accepted and is the same thing as unset**, so a script written
 before this default does not silently switch engines.
+
+### The q6_K byte-expansion repack, and why the card needs one the CPU does not
+
+The panel GEMM above is a **CPU** layout: its integer `maddubs` path is legal only for `q4_K` (six-bit
+weights overflow the int16 accumulator), which is why the section says "only q4_K has a panel path"
+and "the head is never repacked". The **CUDA** backend has a different problem and its own answer, and
+the two must not be read as one: on the card there is no panel kernel at all, and the repack there is
+a **byte-expansion of `q6_K` alone**, selected by the backend.
+
+`q6_K`'s file layout splits each weight's six bits across two arrays — four low bits in `ql`, two high
+bits in `qh`, interleaved per 32-weight run — so decoding one weight is a shift, a mask, a shift and
+an `or` *before* the scale multiply and the `int→float`. Measured by ablation on the 2080 Ti, that
+per-weight assembly was **~34% of CUDA decode**, the single largest piece, and it survived both levers
+that were tried against it — wider loads (uint4, which won 4.9× on prefill because it is a
+*load-issue* fix) and register blocking over output columns (a clean negative) — because it is
+**instruction issue, not memory**. Neither geometry change can reach it.
+
+The fix is to drop the *packing* and keep the *value*: the loader writes one signed byte per weight
+holding `q - 32` (exactly an `int8`, range `[-32, 31]`), followed by the file's own sixteen `int8`
+group scales and the half `d` copied through. The block grows **210 → 274 bytes** (`Q6KRepacked` in
+`src/quant/blocks.h`, `kQ6KRepackedBytes`). The kernel then walks a byte, a scale lookup and the same
+two products. It is a **host transform into a device buffer at load** — `repack_weights_q6k` in
+`src/kernel/repack_q4k.{h,cpp}`, reading the GGUF's host bytes, so the file format and every checkpoint
+stay untouched — and it is **selected by the backend, not a build flag**: `qwen3.cpp` sets
+`q6k_repack_enabled_ = (backend.name() == "cuda")`, so `cpu` and `ascend` keep the file layout and the
+`bool q6k_repacked` on `gemm_quant` is ignored there. Unlike the q4_K panels this is not
+size-preserving (210 → 274 is +30% on the q6_K tensors, +129 MB device for the 1.7B), and the reason is
+that there is nothing to pack *into* the same bytes: the point is to remove an unpack, so the bits
+have to be laid out the way they are read.
+
+The decode is written **inline in the kernel**, not through a `dequant_*_repacked` helper: a
+device-function call at that point hides the loop from nvcc's unroller and measures ~5× slower — the
+same reason the `q4_K` branch is inlined. The expression is the one `dequant_q6_k` builds,
+`d * float(scale) * float(q - 32)`, in the same association, so each weight is the float the file
+decoder produced and every column's sum keeps its order.
+
+**Measured** (`Qwen3-1.7B-Q4_K_M.gguf`, `cuda`, `build/pocketllm-bench`, three interleaved A/B rounds
+against the same binary with the repack forced off, idle host):
+
+| | repack off | repacked (default) | ratio |
+|---|---:|---:|---:|
+| `pp512` t/s (median of 3) | 205.7 | 219.3 | 1.07 |
+| `tg128` t/s (median of 3) | 42.5 | 57.7 | **1.36** |
+
+The three `tg128` rounds were 42.75/42.53/42.39 before and 58.39/57.69/57.65 after, so the spread is
+under 0.9% and the ratio is stable. The mission's pre-measurement note put the old `tg128` at 45.65 and
+its target at ~65–70; this host now measures the **before** at 42.5, which is host-load variance rather
+than a regression (the same bench read 45.7 when the tree was quieter), so the **ratio**, not the
+absolute, is the result to quote. **This is 1.36×, not the ~1.5× the scope projected** — short of the
+target, and reported as such rather than rounded up.
+
+The win is a **bandwidth** win, not an arithmetic one, and that is the honest framing: the repacked
+graph streams **~1231 MB/token** against the file layout's **~1101 MB** (the +130 MB is six bits
+widened to eight), so achieved bandwidth rises from **46.8 → 71.0 GB/s** — on a card whose nominal
+HBM peak is ~616 GB/s, that is **7.6% → 11.5%**. Decode is load-bound (a NOCOMPUTE ablation runs
+45.68 vs 45.87 real, i.e. the arithmetic is fully hidden), so more bytes in flight at the same issue
+rate is exactly the trade, and it is why the ratio tracks the byte ratio (274/210 = 1.30) rather than
+something larger. A skip-ablation puts `q6_K` at **~37% of decode**, down from **~53%**.
+
+**The gate is bit-identity, and it holds on the card.** The layout change must not move a single
+output value, and it does not: with the same checkpoint and prompt, the greedily decoded ids are
+**identical for 300 steps** on `"The capital of France is"` and **200 steps** on `"Once upon a time"`
+and on `"def fibonacci(n):"`, repack on vs off — the same token at every position, not merely the same
+text. (This is the CUDA gate; the CPU's q4_K panel path is the one kernel that is *not* bit-exact, and
+that section says so — the two are different fixes and only this one is claimed exact.) The repack
+adds one host pass over each `q6_K` tensor plus its upload at load. Measured on this host, the 1.7B
+wall-clock to first token is **0.95 s off vs 1.52 s on** and its peak host RSS **1.40 GB vs 1.42 GB** —
+about **+0.6 s and +10 MB host**, with device memory +129 MB. The extra host time is the repack pass
+itself and is a one-time load cost, not a per-token one.
 
 ### The horizontal reduce, and why the lane pairing is load-bearing
 
