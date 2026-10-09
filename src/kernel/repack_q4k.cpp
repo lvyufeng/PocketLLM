@@ -1530,5 +1530,16 @@ void gemm_q4k_8x8(int, float *, size_t, const Q4Kx8 *, const Q8Kx4 *, int, int) 
 void gemv_q4k_8x8(int, float *, size_t, const Q4Kx8 *, const quant::Q8KBlock *, int, int) {}
 #endif
 
+#if !defined(__AVX2__)
+/* Same shape of gap as `gemv_q4k_8x8` above, and for the q6_K repack this time:
+ * the transform lives inside the `__AVX2__` block and has no scalar port, but
+ * `qwen3.cpp` calls it whenever a CUDA backend asked for the repacked layout --
+ * a runtime guard the linker cannot see, so the symbol has to exist for every
+ * build.  `q6k_repack_enabled_` is set only on `cuda`, so no ascend or plain CPU
+ * build ever reaches this; it is here so the link succeeds, and it does nothing
+ * if called. */
+void repack_weights_q6k(const uint8_t *, int64_t, int64_t, uint8_t *) {}
+#endif
+
 }  // namespace kernel
 }  // namespace pocketllm
