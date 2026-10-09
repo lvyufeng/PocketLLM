@@ -13,6 +13,7 @@ forces. The pages here are the design record, in the order the layers depend on 
 | [The C engine](c_engine.md) | The native `libpocketllm.so`: what it runs today, and the backend interface the graph is written against |
 | [Ascend 310B custom ops](ascend_310b.md) | The measured 310B result: the custom ops, the 161001 env trap, the cube's large-N edge, and the full Qwen3 forward that runs on it |
 | [Serving from the C engine](serving.md) | The design for `pocketllm serve`: the adapter the HTTP surface is missing, and the concurrency it must admit it does not have |
+| [Filling m on the 310B](ascend_m_filling.md) | The scoping answer to the shape limit: batch serving vs speculative decoding, their real wins, what each breaks, and why neither is next |
 | [The S600 native compile chain](s600_native_chain.md) | The scoping answer to "how would a 4B `.hbm` be built": the SDK's compiler, where it runs, and whether 4B is reachable |
 
 ## The three words

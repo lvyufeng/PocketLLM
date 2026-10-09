@@ -21,6 +21,7 @@ by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script
 - [The C engine](https://lvyufeng.github.io/PocketLLM/architecture/c_engine/)
 - [Ascend 310B custom ops](https://lvyufeng.github.io/PocketLLM/architecture/ascend_310b/)
 - [Serving](https://lvyufeng.github.io/PocketLLM/architecture/serving/)
+- [Filling m on the 310B](https://lvyufeng.github.io/PocketLLM/architecture/ascend_m_filling/)
 - [The S600 native compile chain](https://lvyufeng.github.io/PocketLLM/architecture/s600_native_chain/)
 
 ## Models
