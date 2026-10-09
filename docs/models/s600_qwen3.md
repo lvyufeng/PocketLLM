@@ -2,9 +2,12 @@
 
 This page is the durable record of what this tree can actually run on the **RDK S600** board and how
 to run it: the command, the two environment variables it cannot start without, the measured
-performance ladder, the memory ceiling that stops it at 1.7B, and the determinism contract. Every
-number and every failure below was measured on the board on 2026-10-09 — whether it transfers to
-another S600 is a claim to re-check in place, and the SDK version is part of the result.
+performance ladder, the memory mode the board has to boot in to reach its large models, and the
+determinism contract. Every
+number and every failure below was measured on the board — first on 2026-10-09, then again on
+2026-10-10 **after the `balanced` memory switch and its reboot**, when all four Qwen3 sizes became
+runnable; whether either transfers to another S600 is a claim to re-check in place, and the SDK
+version is part of the result.
 
 Two facts frame the rest, and both are easy to get wrong:
 
@@ -28,14 +31,15 @@ D-Robotics LLM SDK (`D-Robotics_LLM_S600_1.0.2_SDK`) ships the runtime (`oellm_r
 compiler tree (`oellm_build/`), tokenizer + `generation_config.json` under
 `oellm_runtime/configs/Qwen3_config/`, and per-size `.hbm` graphs under `oellm_runtime/model/Qwen3_*/`.
 
-Two of the four shipped Qwen3 sizes load and generate:
+**All four shipped Qwen3 sizes load and generate in `balanced` mode** — the board boots `cpu_first`,
+where the two large ones are refused; see [the memory mode](#the-4b-8b-ceiling-applied):
 
 | Size | `.hbm` | Precision | File size | Loads? |
 |---|---|---|---|---|
 | Qwen3-0.6B | `Qwen3-0.6B_language_chunk_512_cache_4096_w8_nash-p_corenum_4_4.hbm` | w8 | 1.02 GiB | **yes** |
 | Qwen3-1.7B | `Qwen3-1.7B_language_chunk_512_cache_4096_w4_nash-p_corenum_4_4.hbm` | w4 | 1.70 GiB | **yes** |
-| Qwen3-4B | `Qwen3-4B_language_chunk_512_cache_4096_w4_nash-p_corenum_4_4.hbm` | w4 | 3.10 GiB | **no** — see [the ceiling](#the-4b-8b-ceiling) |
-| Qwen3-8B | `Qwen3-8B_language_chunk_512_cache_4096_w4_nash-p_corenum_4_4.hbm` | w4 | 5.31 GiB | **no** |
+| Qwen3-4B | `Qwen3-4B_language_chunk_512_cache_4096_w4_nash-p_corenum_4_4.hbm` | w4 | 3.10 GiB | **yes, in `balanced`** |
+| Qwen3-8B | `Qwen3-8B_language_chunk_512_cache_4096_w4_nash-p_corenum_4_4.hbm` | w4 | 5.31 GiB | **yes, in `balanced`** |
 
 The naming is the compiler's: `chunk_512` is the prefill chunk, `cache_4096` the max context,
 `corenum_4_4` the BPU-core assignment. Every large model in the SDK ships as `corenum_4_4`; **there
@@ -96,12 +100,22 @@ Fixed prompt **"The capital of France is"**, greedy `generation_config.json`, th
 |---|---|---|---|---|---|
 | Qwen3-0.6B (w8) | yes | 5.25–5.30 s | 6169 t/s | **87.0 t/s** (86.27 / 87.17 / 87.39) | not available |
 | Qwen3-1.7B (w4) | yes | 5.62–5.69 s | 5172 t/s | **69.4 t/s** (69.35 / 69.55 / 69.31) | not available |
-| Qwen3-4B (w4) | no | — | — | — | — |
-| Qwen3-8B (w4) | no | — | — | — | — |
+| Qwen3-4B (w4) | yes | 6.46–7.34 s | 2381–2415 t/s | **42.6 t/s** (42.59 / 42.44 / 42.72) | not available |
+| Qwen3-8B (w4) | yes | 7.66–7.70 s | 1932–1939 t/s | **29.6 t/s** (29.43 / 29.70 / 29.65) | not available |
+| Qwen3-4B (w4), ours `cache_1024` | yes | 6.32–6.38 s | 4339–4376 t/s | **50.0 t/s** (49.98 / 49.91 / 49.96) | not available |
+
+The 4B and 8B rows are new: measured 2026-10-10 **after the board was switched to `balanced` and
+rebooted**, in the same session and by the same method as the two rows above. Decode falls with size —
+87 → 69 → 42.6 → 29.6 t/s — which is the shape the earlier "1.7B is the ceiling" reading mistook for
+the end of the ladder. The three runs of each graph produced **byte-identical text**
+(sha256 `63ef9253ce67b4d7` for 4B, `e229830a3fb396a2` for 8B), so the numbers are a rate rather than a
+draw. The last row is our own compiled 4B, [below](#the-large-models-after-the-switch) — the recompile is *not*
+the path to 4B (the pool switch is), but once the pool fits it, it runs and is the fastest of the
+three 4B-class results here.
 
 The two "no" rows are the **current `cpu_first` mode's 2.00 GiB carve-out** refusing a 3 GiB+ graph,
 not a limit on the model size — the S600 supports all four, and the switch that reaches 4B/8B is
-[the ceiling section](#the-4b-8b-ceiling) below.
+[the ceiling section](#the-4b-8b-ceiling-applied) below.
 
 **TTFT is not available on this SDK build.** The `ttft`, `tpot` and `end_to_end_cost` fields of
 `xlm_model_performance_t` come back `0.0`, so a time-to-first-token is not something this page can
@@ -117,7 +131,8 @@ measured in the same session. It is the first artifact out of
 [the native compile chain](../architecture/s600_native_chain.md#the-first-build-result), it answers the
 same prompts with the same final answers, and its **reasoning text differs** from the shipped graph's —
 two build-time quantizations of one checkpoint, not two caches of one graph. Whether a smaller graph
-gets **4B** under the ceiling is still open.
+gets **4B** under the `cpu_first` ceiling is now answered — it does not, and the pool had to move
+instead; see [the large models after the switch](#the-large-models-after-the-switch).
 
 ## The runtime knob space
 
@@ -198,18 +213,41 @@ Two refusals are the useful part, because they are walls that a caller will othe
   above the floor (27 KiB of headroom) and comfortably under the ceiling. It is not a tuned number, but
   it is also not a wrong one.
 
-## The 4B / 8B ceiling
+## The 4B / 8B ceiling — APPLIED
 
-**The refusal below is a memory *mode*, not a wall.** 4B and 8B refuse to load in the `cpu_first` mode
-this board boots in, where `ion_carveout` — the pool the whole `.hbm` is loaded into — is **2.00 GiB**.
-The SDK ships a supported tool, `hb_switch_ion.sh`, that moves the board to `balanced`, where that same
-pool is **10.00 GiB**; both graphs fit there, and the S600 lists 4B and 8B as supported for exactly this
-reason. So the ceiling is real *as configured* and one command away from gone, not a vendor limit on the
-model size. How the switch works, and the exact command, is
-[How to resize it](#how-to-resize-it-the-sdk-ships-the-switch) below; what follows *here* is the
-measured consequence of the current mode.
+**The board runs `balanced`, and 4B and 8B load.** The refusal below is what the board did in the
+`cpu_first` mode it booted in, where `ion_carveout` — the pool the whole `.hbm` is loaded into — is
+**2.00 GiB**. The SDK ships a supported tool, `hb_switch_ion.sh`, that moves the board to `balanced`,
+where that same pool is **10.00 GiB**; the switch was applied and the board rebooted **2026-10-10**, and
+both large graphs now initialize and generate (see [the ladder](#measured-ladder) and
+[the large models after the switch](#the-large-models-after-the-switch)). So the ceiling was a *mode*, not a vendor limit on
+the model size, and it is now gone on this board.
 
-4B and 8B **refuse to load**, and the refusal is the board's, not this tree's:
+**Before → after, measured.** The reboot moved the pool, and the cost is general RAM — the reservation
+grows by exactly the pool's growth:
+
+| | `cpu_first` (before) | `balanced` (applied) |
+|---|---|---|
+| `ion_carveout` (DT `reg`) | `41 40000000 0 80000000` = 2.00 GiB | `41 40000000 2 80000000` = **10.00 GiB** |
+| dmesg `Memory:` | reserved 8.3 GiB | `48703360K/66871168K available`, **18167808K reserved** |
+| `MemTotal` | 55.48 GiB | **46.48 GiB** |
+| dmesg reserved | 8.3 GiB | **17.32 GiB** |
+| 4B (3.10 GiB) | `RESOURCE_EXHAUSTED` | **loads, 42.6 t/s** |
+| 8B (5.31 GiB) | `RESOURCE_EXHAUSTED` | **loads, 29.6 t/s** |
+
+The board is healthy: it came up, reached userspace, and `MemAvailable` is 43 GiB with the two large
+graphs still unloaded. The 9 GiB the pool took is the `+8 GiB` of `ion_carveout` plus `+1 GiB` of
+`ion_cma` the switch also moves; nothing else changed.
+
+**The switch and its recovery are kept below**, because the mode is a boot-time device-tree setting and
+a future board will boot `cpu_first` again. The backups are on disk —
+`/boot/hobot/rdk-s600-mcb-v1p0.dtb.bak` and `~/rdk-s600-mcb-v1p0.original.dtb` (285763 B each) — and
+`hb_switch_ion.sh default` restores, with the A/B `boot_b` slot and the serial console as the other
+recoveries.
+
+### What the refusal was
+
+In `cpu_first`, 4B and 8B **refused to load**, and the refusal was the board's, not this tree's:
 
 ```text
 Cannot malloc bpu memory with length 3326941192 bytes   # 4B
@@ -239,9 +277,9 @@ pool — which is the whole of the refusal.
 
 `cli.py` / `xlm.py` surface the delegate's refusal as a clean message and `rc 1`, with no traceback.
 
-**No *runtime* knob moves it.** Every env var and config key below was tried and none changes the
-refusal — because the refusal is the pool's *size*, a device-tree setting, not a runtime one. The size
-has its own supported lever — the `hb_switch_ion.sh` mode switch
+**No *runtime* knob moved it.** Every env var and config key below was tried and none changed the
+`cpu_first` refusal — because the refusal is the pool's *size*, a device-tree setting, not a runtime
+one. The size has its own supported lever — the `hb_switch_ion.sh` mode switch
 ([below](#how-to-resize-it-the-sdk-ships-the-switch)) — which is a *different* kind of thing from these
 knobs; the table is what does **not** work. Measured, all through the SDK's own binary so none of our
 code is in the path:
@@ -276,10 +314,9 @@ SDK's published `md5sum.txt`. So the `cache_1024` shrink is not enough — the w
 pool before any vision or embed artifact is touched — and this lead is closed: no 4B language graph,
 plain or VL, loads on this board *in `cpu_first`*.
 
-**Our own `cache_1024` 4B build — the artifact the recompile path produces — is now measured, and it
-also refuses in `cpu_first`.** Built on the x86 host and landed 2026-10-09, the file is
-**3,221,638,408 bytes (3.002 GiB)**, md5 `539775a7c9b596aa470895ad9fc6cf8e`. `hrt_model_exec model_info`
-on it reports
+**Our own `cache_1024` 4B build refused in `cpu_first` too — and runs in `balanced`.** Built on the
+x86 host and landed 2026-10-09, the file is **3,221,638,408 bytes (3.002 GiB)**, md5
+`539775a7c9b596aa470895ad9fc6cf8e`. In `cpu_first`, `hrt_model_exec model_info` on it reported
 
 ```text
 Cannot malloc bpu memory with length 3221638408 bytes: AllocError { len: 3222994944 }
@@ -289,28 +326,32 @@ Cannot malloc bpu memory with length 3221638408 bytes: AllocError { len: 3222994
 ```
 
 so the smaller cache *does* shrink the graph — 3.3269 GB shipped → 3.2216 GB ours, about **99 MiB**
-less — but not enough for a 2.00 GiB pool: the weights alone need **3.00 GiB**. The number a bigger pool
-must exceed is therefore **3,222,994,944 B (3.002 GiB)** for 4B and **5,703,561,320 B (5.31 GiB)** for
-8B — both well inside `balanced`'s 10.00 GiB. That is the whole point of the mode switch: the graph did
-not have to get smaller, the *pool* had to get bigger, and the SDK's own tool does exactly that.
+less — but not enough for a 2.00 GiB pool: the weights alone need **3.00 GiB**. The number the bigger
+pool had to exceed was therefore **3,222,994,944 B (3.002 GiB)** for 4B and **5,703,561,320 B
+(5.31 GiB)** for 8B — both well inside `balanced`'s 10.00 GiB. That is the whole point of the mode
+switch: the graph did not have to get smaller, the *pool* had to get bigger, and the SDK's own tool
+does exactly that. It is applied, and all three large graphs load; see
+[the large models after the switch](#the-large-models-after-the-switch).
 
 ### What the pools are
 
 The board's DRAM carve-outs are fixed device-tree `reserved-memory` nodes (**not** kernel cmdline —
 `/proc/cmdline` has no memory argument at all). Read from the live DT and confirmed against the boot
 blob `/boot/hobot/rdk-s600-mcb-v1p0.dtb` (source `/boot/rdk-s600-mcb-v1p0.dts`), the model draws on
-three 2 GiB ION heaps and ignores the one node this page used to blame:
+three 2 GiB ION heaps and ignores the one node this page used to blame. The sizes below are the
+`cpu_first` values the refusal was measured under; in `balanced` `ion_carveout` is 10.00 GiB and
+`ion_cma`/`ion_uncache` move up to make room, as the switch table above shows:
 
-| DT node | `compatible` | Address | Size | Role (measured) |
+| DT node | `compatible` | Address | Size (`cpu_first`) | Role (measured) |
 |---|---|---|---|---|
 | `bpu_region@4300000000` | *(none)* | `0x408c000000` | **384 MiB** | `no-map`; **not an ION heap**, and a 1.7B load allocates nothing in it — **not involved in the .hbm load** |
 | `ion_reserved@40C0000000` | `ion-pool` | `0x40c0000000` | 2.00 GiB | HBRT workspace — 1.7B uses **1.48 GiB** (activations + KV) |
-| `ion_carveout@4140000000` | `ion-carveout` | `0x4140000000` | **2.00 GiB** | **the `.hbm` weights** — 1.7B = one 1.70 GiB `hbm` buffer; **the binding limit** |
+| `ion_carveout@4140000000` | `ion-carveout` | `0x4140000000` | **2.00 GiB** (10.00 in `balanced`) | **the `.hbm` weights** — 1.7B = one 1.70 GiB `hbm` buffer; **the binding limit** |
 | `ion_uncache@400000000` | `ion-uncache` | `0x4200000000` | 2.00 GiB | per-core BPU scratch — 1.7B uses ~0.17 GiB |
 
 A full Qwen3 load therefore consumes **≈ 1.70 GiB (carveout) + 1.48 GiB (pool) ≈ 3.2 GiB**; the 2 GiB
-`ion_carveout` is what a 3.10 GiB 4B `.hbm` cannot fit into. `bpu_region` is a legacy `no-map` reserve
-with no ION personality and no consumer we could observe.
+`ion_carveout` is what a 3.10 GiB 4B `.hbm` could not fit into. `bpu_region` is a legacy `no-map`
+reserve with no ION personality and no consumer we could observe.
 
 ### How to resize it: the SDK ships the switch
 
@@ -334,25 +375,27 @@ For the S600 the three modes set `ion_carveout` (the `.hbm` pool) to:
 
 | Mode | `ion_carveout` | Fits |
 |---|---|---|
-| `cpu_first` (**this board boots here now**) | **2.00 GiB** | 0.6B, 1.7B — not 4B/8B |
-| `balanced` (the doc's recommendation) | **10.00 GiB** | 4B (3.00 GiB) **and** 8B (5.31 GiB) |
+| `cpu_first` (the board's boot default) | **2.00 GiB** | 0.6B, 1.7B — not 4B/8B |
+| `balanced` (**applied on this board 2026-10-10**) | **10.00 GiB** | 4B (3.00 GiB) **and** 8B (5.31 GiB) |
 | `bpu_first` | 17.93 GiB | 4B/8B, at the cost of general RAM |
 
-So the S600's 4B/8B support is **one supported command plus a reboot** away. The board is simply in the
-wrong mode: it boots `cpu_first`, whose 2.00 GiB pool is what refuses the graphs — nothing about the
-model size, the SDK build, or our code. This is *not* the manual DTB edit this page used to describe;
-`hb_switch_ion.sh` is the vendor's own tool, it auto-detects the board, backs the DTB up, and reverts on
-any `fdtput` failure.
+So the S600's 4B/8B support was **one supported command plus a reboot** away. The board boots
+`cpu_first`, whose 2.00 GiB pool is what refused the graphs — nothing about the model size, the SDK
+build, or our code. This is *not* the manual DTB edit this page used to describe; `hb_switch_ion.sh` is
+the vendor's own tool, it auto-detects the board, backs the DTB up, and reverts on any `fdtput`
+failure.
 
-**The switch is STAGED, NOT APPLIED.** The user has not authorised it, so the board is still in
-`cpu_first`; everything below is the offline proof and the recorded procedure, and **nothing under
-`/boot` was written and the board was not rebooted.**
+**The switch is APPLIED, and the reboot succeeded.** `hb_switch_ion.sh balanced` was run and the board
+rebooted 2026-10-10; it came up healthy with `ion_carveout` at 10.00 GiB and `MemTotal` at 46.48 GiB
+(the before/after table is [above](#the-4b-8b-ceiling-applied)), and 4B, 8B and our compiled 4B all
+load and generate. What follows is the offline well-formedness proof that made the reboot a one-shot,
+kept because the mode is a boot-time setting a future board will have to move again.
 
-### Proving the balanced map without booting
+### The balanced map was proved without booting first
 
-Everything that does **not** need a reboot has been run, on a **copy** of the DTB, so the eventual boot
-is a one-shot with a proven artifact. **No file under `/boot` was written and the live device tree was
-not touched.**
+Everything that did **not** need a reboot was run first, on a **copy** of the DTB, so the actual boot
+was a one-shot with a proven artifact. **No file under `/boot` was written for the proof, and the live
+device tree was not touched** — the write and the reboot came later, once the user authorised them.
 
 Rather than hand-copy the values, the **real** `/usr/hobot/bin/hb_switch_ion.sh` was exercised against a
 sandbox: the live DTB was copied to `/tmp/s600_ion_dryrun/boot/hobot/`, and a copy of the script had its
@@ -384,9 +427,10 @@ usable. Against that:
   **none** of the other `reserved-memory` nodes (`bpu_region`, the `vpu*_ddr` block, `optee`, the
   `pcie*` ranges, … — all 36 checked).
 
-So the change is **well-formed with zero risk in the artifact** — the numbers cannot be wrong. What
-remains *unproven* is only whether the kernel boots with the larger reservation, and that is the reboot
-the user has, correctly, not authorised yet.
+So the change is **well-formed with zero risk in the artifact** — the numbers cannot be wrong. What was
+left *unproven* at that point was only whether the kernel boots with the larger reservation. **It does:**
+the reboot was done, and the board came up with the reservation applied and `MemTotal` at 46.48 GiB
+([before/after](#the-4b-8b-ceiling-applied)).
 
 A smaller variant of the same idea is also on disk — `/tmp/s600_carveout_prep/` holds a 4 GiB candidate
 with a `dtc` round-trip that differs in exactly three `reg` lines (md5 `35ae26dac46500abe140d1d59b669ce8`
@@ -430,10 +474,10 @@ carries **`boot_b` = `/dev/sda13`**, an identical 120 MiB partition with its own
 set. That is a built-in second copy of the map, and the reason a bad edit to the live DTB is not a
 one-way door — the recovery section below leans on it.
 
-### The procedure, once the switch is authorised
+### The procedure that was run
 
-**Staged, not run** — the user has not authorised the mode change, so this is the record of the exact
-sequence for when they do. With the serial console (`ttyS0`) open:
+**This is the sequence that was applied on 2026-10-10**, with the serial console (`ttyS0`) open. It is
+kept as the record for the next board, which will boot `cpu_first` again:
 
 ```bash
 # 1. the tool backs the DTB up itself (to rdk-s600-mcb-v1p0.dtb.bak) and reverts on any fdtput
@@ -444,9 +488,13 @@ cp /boot/hobot/rdk-s600-mcb-v1p0.dtb /boot/hobot/rdk-s600-mcb-v1p0.dtb.pre-balan
 # 3. flush and reboot, watching ttyS0
 sync && reboot
 # 4. verify the kernel came up with the larger carve-out and less general RAM:
-dmesg | grep -i "Memory:"     # MemTotal falls ~9 GiB (carveout +8, ion_cma +1): 55.48 -> ~46.5 GiB
+dmesg | grep -i "Memory:"     # measured: reserved 8.3 -> 17.32 GiB, MemTotal 55.48 -> 46.48 GiB
 # 5. load a 4B/8B .hbm; success is hbDNNInitializeFromFiles returning 0, not RESOURCE_EXHAUSTED
 ```
+
+Step 4 verified on the rebooted board: `Memory: 48703360K/66871168K available (… 18167808K reserved)`
+and `MemTotal: 48741632 kB`, exactly the ~9 GiB fall predicted — and step 5 verified three times over
+(4B, 8B, and our compiled 4B, all loading).
 
 **Recovery, if it does not come up** — four independent ways back, which is what makes a reboot-needing
 change low-risk here:
@@ -466,12 +514,76 @@ change low-risk here:
 With all four in hand, the switch is a file swap under `/boot` plus a reboot, reversible from the serial
 console — not a one-way door.
 
-**The other path — a smaller graph — is now measured not to be enough.** A `.hbm` recompiled with a
-shorter context (`cache_1024`, as the SDK's VLM 7B graph uses) *does* shrink the graph — ours came out
-3.2216 GB against the shipped 3.3269 GB — but it still needs 3.00 GiB of weights, so it still refuses in
-`cpu_first`. That recompile chain is scoped in
-[the S600 native compile chain](../architecture/s600_native_chain.md); the mode switch is the shorter
-road to the same place.
+**The other path — a smaller graph — is measured not to be enough, and it was not needed.** A `.hbm`
+recompiled with a shorter context (`cache_1024`, as the SDK's VLM 7B graph uses) *does* shrink the graph
+— ours came out 3.2216 GB against the shipped 3.3269 GB — but it still needs 3.00 GiB of weights, so it
+still refused in `cpu_first`. That recompile chain is scoped in
+[the S600 native compile chain](../architecture/s600_native_chain.md); the mode switch was the shorter
+road to the same place, and the compiled 4B runs now that the pool fits it.
+
+## The large models after the switch
+
+Measured 2026-10-10 on the rebooted board, same plank as the ladder: canonical prompt **"The capital of
+France is"**, greedy `generation_config.json`, `pocketllm`'s `XlmEngine` with `bpu_core [0,1,2,3]` and
+`HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6`, three runs per graph. Each graph was driven through the
+**SDK's own tool first** (`hrt_model_exec model_info`, step 1 of the load test) and then through
+**`pocketllm run --device horizon`** on the shipped `qwen3_4b_config.json` / `qwen3_8b_config.json`,
+which answers the prompt with `rc 0`.
+
+**All three initialize.** The SDK's own `hrt_model_exec model_info` — the tool that refused them before
+— reports `Load model to DDR` for each, with no `Cannot malloc bpu memory` and no
+`HBRT4_STATUS_RESOURCE_EXHAUSTED`:
+
+| Graph | Size | `model_info` | Load | Prefill | Decode | 3 runs identical |
+|---|---|---|---|---|---|---|
+| shipped 4B | 3,326,941,192 B | **initializes** (5646 ms) | 6.46–7.34 s | 2381–2415 t/s | **42.6 t/s** | yes (`63ef9253ce67b4d7`) |
+| shipped 8B | 5,703,561,320 B | **initializes** (6876 ms) | 7.66–7.70 s | 1932–1939 t/s | **29.6 t/s** | yes (`e229830a3fb396a2`) |
+| ours `cache_1024` 4B | 3,221,638,408 B | **initializes** (5738 ms) | 6.32–6.38 s | 4339–4376 t/s | **50.0 t/s** | yes (`1b615e0a550e345a`) |
+
+**The output is coherent, not garbage.** All three answer the canonical prompt with the fact asked for,
+and all three answer a second, third and fourth prompt correctly too — so the coherence is not a
+one-prompt artifact. Asked `The largest planet in the solar system is`, all three say **Jupiter**; asked
+`2 + 2 =`, all three say **4**; asked for a Python string-reverse function, all three produce a working
+slicing one.
+
+```text
+# shipped 4B, "The capital of France is"
+…  </think>
+The capital of France is **Paris**.
+
+# shipped 8B, "The capital of France is"
+…  </think>
+The capital of France is **Paris**.
+
+# our compiled 4B, "The capital of France is"
+…  </think>
+The capital of France is **Paris**. It is the largest city in the country and serves as the
+political, cultural, and administrative center of France. …
+```
+
+Each answer is preceded by the model's own ` thinking…</think>` reasoning block, which is intact and
+on-topic rather than repeated or truncated — the delegate's `xlm_result_t` hands back the whole text
+and `pocketllm run` prints it as-is. The final answers are the fact asked for in every case.
+
+**Throughput falls as the model grows, and that is the whole result:** 87.0 (0.6B) → 69.4 (1.7B) →
+42.6 (4B) → 29.6 (8B) t/s decode on the shipped graphs. The board's per-token cost is the BPU work,
+which scales with the parameter count, so a 4B decodes at roughly 0.6× the 1.7B and an 8B at roughly
+0.7× the 4B. Nothing here is a surprise, and nothing here needed the recompile: the **pool** was the
+blocker, and moving it restored all four sizes at once.
+
+**Our compiled 4B is the fastest of the three large results** — 50.0 t/s decode and 4339–4376 t/s
+prefill against the shipped 4B's 42.6 / 2381–2415, a **~17% decode / ~1.8× prefill** edge over its
+shipped twin — the same direction as, though a smaller decode margin than, the compiled 1.7B's ~27%
+over its own shipped graph (88 vs 69.4 t/s). But this is a *bonus*, not the reason to compile: the recompile was pursued as
+the path to 4B and it was not one (3.00 GiB of weights would not fit 2.00 GiB). Its edge is the smaller
+`cache_1024` graph, and it comes with the same caveat as the compiled 1.7B — it is a **different
+build-time quantization** of the same `Qwen3-4B` weights, so its reasoning text differs from the
+shipped graph's even where both converge on the right answer.
+
+The artifacts are **not shipped**: the compiled 4B lives on the x86 build host
+(`/mnt/data1/oellm_models/build_out_4b/`) and was copied to `/tmp/` on the board for this measurement,
+so a reboot clears it. Its byte size and md5 in the table above are the identity to rebuild it from —
+`docs/architecture/s600_native_chain.md` is the build recipe.
 
 ## Determinism
 
@@ -479,7 +591,10 @@ Reproducibility on this path comes entirely from the **tokenizer directory's `ge
 not from a flag: the delegate builds its sampler from that file when the model is loaded.
 
 - **Greedy** (`temperature 0`, `do_sample false`) is byte-identical across runs. Measured over three
-  CLI runs each: 0.6B sha256 `a154da66b9307a50`, 1.7B sha256 `bc75540e622e9551`.
+  runs each: 0.6B sha256 `a154da66b9307a50`, 1.7B sha256 `bc75540e622e9551` (CLI runs), and — added
+  2026-10-10 through the same delegate — 4B sha256 `63ef9253ce67b4d7`, 8B sha256 `e229830a3fb396a2`,
+  our compiled 4B sha256 `1b615e0a550e345a`. The three runs per graph agreed byte for byte, so the
+  determinism contract holds at every size, not only the two small ones.
 - **The SDK's default is not deterministic.** The shipped `generation_config.json` uses
   `temperature 0.6`, `top_k 20`; same-prompt runs differ in the reasoning block and in surface form.
   A page that claimed "runs are reproducible" without naming the file would be wrong.
