@@ -113,11 +113,16 @@ Cannot malloc bpu memory with length 5703561320 bytes   # 8B
   -> hbDNNInitializeFromFiles error code -400001
 ```
 
-`hbDNNInitializeFromFiles` mallocs the whole graph into one contiguous "unified BPU memory" pool
-through ION. The board reserves `bpu_region@4300000000` = **384 MiB** for that pool; the 4B graph
-needs 3.33 GB and the 8B graph 5.70 GB, and both exceed the budget the SDK can allocate. 1.7B
-(1.83 GB) fits, so **the ceiling on this board as configured is 1.7B** — measured to lie between
-1.83 GB and 3.33 GB.
+`hbDNNInitializeFromFiles` (**HBRT 4.7.5**, `hbrt4_mem::unified`) reads the whole `.hbm` into **one
+contiguous ION buffer** and hands it to the BPU. Measured on the board with `hb_mem`'s own
+`/sys/kernel/debug/ion/heaps/` accounting, holding 1.7B open: the `.hbm` lands as a **single
+1,829,109,760-byte (`label hbm`) allocation in the `ion_carveout` pool**, which is **2.00 GiB**. The
+4B graph needs a **3.10 GiB** contiguous allocation and the 8B **5.31 GiB**, both larger than the 2 GiB
+pool — which is the whole of the refusal.
+
+> **Correction to an earlier reading of this page.** 384 MiB was attributed here to `bpu_region` and
+> called the pool that overflows. That was wrong: the `.hbm` is not `bpu_region`, and enlarging it
+> would not have helped — see [what the pools are](#what-the-pools-are) below.
 
 **This is not our Python.** Three independent checks:
 
@@ -138,13 +143,57 @@ in the path:
 | HBRT memory-mode env var | — | no such variable exists (`strings` over `libxlm.so` / `libhbrt4` / `libhbipm` show only `HBTL_*` diagnostics) |
 
 Corenum cannot help because the refusal happens at `hbDNNInitializeFromFiles`, **before** any core is
-assigned. The L2m split cannot help because the failure is the graph's total footprint, not its L2m
-partition — and the SDK's docs set `6:6:6:6` for every model regardless of size, so it is not a
-size-dependent lever. `bpu_region` / ION heap sizes are board memory settings, not model knobs, and
-are out of scope to change.
+assigned. The L2m split cannot help because the failure is one contiguous allocation's size, not its
+L2m partition — and the SDK's docs set `6:6:6:6` for every model regardless of size, so it is not a
+size-dependent lever.
 
-**The only path to 4B/8B is a `.hbm` recompiled with a smaller footprint** — a shorter context
-(`cache_1024` instead of `4096`, as the SDK's VLM 7B graph uses) or a smaller prefill chunk. The
+### What the pools are
+
+The board's DRAM carve-outs are fixed device-tree `reserved-memory` nodes (**not** kernel cmdline —
+`/proc/cmdline` has no memory argument at all). Read from the live DT and confirmed against the boot
+blob `/boot/hobot/rdk-s600-mcb-v1p0.dtb` (source `/boot/rdk-s600-mcb-v1p0.dts`), the model draws on
+three 2 GiB ION heaps and ignores the one node this page used to blame:
+
+| DT node | `compatible` | Address | Size | Role (measured) |
+|---|---|---|---|---|
+| `bpu_region@4300000000` | *(none)* | `0x408c000000` | **384 MiB** | `no-map`; **not an ION heap**, and a 1.7B load allocates nothing in it — **not involved in the .hbm load** |
+| `ion_reserved@40C0000000` | `ion-pool` | `0x40c0000000` | 2.00 GiB | HBRT workspace — 1.7B uses **1.48 GiB** (activations + KV) |
+| `ion_carveout@4140000000` | `ion-carveout` | `0x4140000000` | **2.00 GiB** | **the `.hbm` weights** — 1.7B = one 1.70 GiB `hbm` buffer; **the binding limit** |
+| `ion_uncache@400000000` | `ion-uncache` | `0x4200000000` | 2.00 GiB | per-core BPU scratch — 1.7B uses ~0.17 GiB |
+
+A full Qwen3 load therefore consumes **≈ 1.70 GiB (carveout) + 1.48 GiB (pool) ≈ 3.2 GiB**; the 2 GiB
+`ion_carveout` is what a 3.10 GiB 4B `.hbm` cannot fit into. `bpu_region` is a legacy `no-map` reserve
+with no ION personality and no consumer we could observe.
+
+### Is it resizable? In principle yes; not by us, safely
+
+The pool sizes are read from the device tree, not hard-coded, and the boot DTB is a normal writable
+file. We proved the mechanism without touching it: `fdtput` on a **copy** of
+`/boot/hobot/rdk-s600-mcb-v1p0.dtb` rewrites the `ion_carveout@4140000000` `reg` size and `dtc`
+round-trips it (`/boot` is ext4 `rw`, `dtc`/`fdtput` present). Enlarging `ion_carveout` from 2.0 to, say,
+3.5 GiB (there is ample free DRAM — `MemTotal` 55.5 GiB, ~54 GiB available, and the whole carve-out set
+totals 8.2 GiB) would in principle let the shipped 3.10 GiB 4B load **with no recompile**. The `reg`
+cells are available but the *content has not been validated* — the mapping and a 4B load were **not**
+tested:
+
+- **No kexec** (`CONFIG_KEXEC` unset; no `kexec` binary), so there is **no in-place, revert-on-failure
+  test** — any change is only exercised by a full reboot.
+- `/proc/cmdline` shows **`hobotboot.secureboot=1`**, and the DTB is **not** one of the files passed to
+  the bootloader via `extlinux` (the loader says *"No DTB passed in from boot loader"*), so the path the
+  live DTB actually comes from is not editable from the rootfs tree we can see. Editing the DTB **and**
+  finding it is the one the bootloader loads is a separate, unknown step.
+- The board's only console is `ttyS0` (serial); a bad `reserved-memory` map can panic the kernel or
+  fail to boot, and recovery would need the serial console or vendor reflash.
+
+**So the honest statement is: the ceiling is a device-tree ION pool size, in principle resizable, and
+it is the `2 GiB ion_carveout` — not `bpu_region` — that binds.** We did not attempt the reboot (a
+board session must not risk a test unit), so whether a larger `ion_carveout` actually boots and lets
+4B load is **unproven**. If it can be tried on a recoverable board, it is a far shorter path to 4B than
+a recompile — but it is a boot-configuration change, not a model knob.
+
+**The other path — and the one we can do entirely ourselves — is a `.hbm` recompiled with a smaller
+footprint** — a shorter context (`cache_1024` instead of `4096`, as the SDK's VLM 7B graph uses), which
+shrinks `ion_reserved` and, at a smaller `chunk`, the graph. The
 compiler chain that produces one (`HF safetensors → leap_llm`/`oellm_build` → `hbdk4` → `.hbm`) runs on
 **x86-64 / cp310 only**, so it is not a board-side knob. Until such a graph exists, 1.7B is the ceiling.
 **That chain is scoped in [the S600 native compile chain](../architecture/s600_native_chain.md)** — it
