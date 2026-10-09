@@ -269,6 +269,27 @@ struct PackedQ4K {
   std::vector<uint16_t> sc; /* [k/128, n] fp16 */
 };
 
+/* A GEMM weight pre-built into the cube's operand layout, once per weight.
+ *
+ * The graph holds a weight row-major `[n, k]` and the cube op wants B as
+ * `[k, n]`, and the two are not the same bytes: the op reads a *transposed,
+ * fp16* plane.  Building that plane used to happen inside every `run_cube`
+ * call -- a host scalar transpose-and-convert over the whole weight, per token
+ * -- which measured ~85% of a decode step (31.5 s of ~37 s for 3 tokens).  The
+ * weight never changes, so the plane is built once here and only the (tiny)
+ * per-token activation stays on the hot path.
+ *
+ * The N axis is stored as contiguous `kCubeChunkN`-wide blocks because that is
+ * how `run_cube_weight` drives it: each block is a `[k, nc]` column-major chunk, i.e.
+ * the transpose of the caller's `[nc, k]` rows, and the blocks tile `blocks_`.
+ * One buffer, one upload, and every per-chunk B operand is a bare pointer into
+ * it -- no per-chunk allocation or copy on the hot path either. */
+struct CubeWeight {
+  int64_t n = 0;
+  int64_t k = 0;
+  DeviceBuffer blocks{}; /* sum over chunks of k * nc fp16, chunk-major */
+};
+
 /* Round-to-nearest-even float -> fp16.  The same conversion `quant/half.h` does
  * for the kernels; kept local so this file needs nothing from the ABI headers. */
 uint16_t f32_to_f16(float v) {
@@ -533,8 +554,9 @@ class AscendBackend final : public Backend {
     const bool w4a16_ok = w4a16_wanted && type_id == quant::kGgmlQ4K && m == 1 && !accumulate &&
                           n % kGemmAlign == 0 && k % kGroup == 0;
     if (!w4a16_ok) {
-      const DeviceBuffer dense = dense_for(blocks, n, k, type_id);
-      run_cube(read_f32(x, m * k, ACL_FLOAT), dense, ACL_FLOAT, m, n, k, accumulate, out);
+      const DeviceBuffer plane = cube_for(blocks, n, k, type_id);
+      run_cube_weight(read_f32(x, m * k, ACL_FLOAT), CubeWeight{n, k, plane}, m, n, k, accumulate,
+                      out);
       return;
     }
 
@@ -679,8 +701,7 @@ class AscendBackend final : public Backend {
 
   void embedding_quant(DeviceBuffer tokens, int64_t n_tokens, DeviceBuffer blocks, int64_t vocab,
                        int64_t d, int type_id, DeviceBuffer out) override {
-    const int block_bytes = quant::block_bytes_of(type_id);
-    if (block_bytes == 0) {
+    if (quant::block_bytes_of(type_id) == 0) {
       throw Error("ascend: embedding_quant has no decoder for GGML type id " +
                   std::to_string(type_id));
     }
@@ -691,27 +712,18 @@ class AscendBackend final : public Backend {
     /* Decode the packed table to a dense f32 one and gather from that.  The
      * decode is on the host because `dequant_q4_k` reads host bytes and there is
      * no device kernel that decodes a block in place; the *gather* is still the
-     * device built-in below.  This is a first-round op and it says so. */
-    const int64_t blocks_per_row = d / quant::kBlockWeights;
-    const int64_t total = vocab * blocks_per_row * block_bytes;
-    std::vector<uint8_t> host(static_cast<std::size_t>(total));
-    copy_to_host(host.data(), blocks, total);
-    std::vector<float> dense(static_cast<std::size_t>(vocab * d));
-    for (int64_t row = 0; row < vocab; ++row) {
-      for (int64_t b = 0; b < blocks_per_row; ++b) {
-        const uint8_t *block = host.data() + (row * blocks_per_row + b) * block_bytes;
-        for (int64_t i = 0; i < quant::kBlockWeights; ++i) {
-          dense[static_cast<std::size_t>(row * d + b * quant::kBlockWeights + i)] =
-              quant::dequant_block(type_id, block, static_cast<int>(i));
-        }
-      }
-    }
-    DeviceBuffer dtable = allocate(vocab * d * 4);
-    copy_to_device(dtable, dense.data(), vocab * d * 4);
+     * device built-in below.
+     *
+     * The decoded table is cached, because the table never changes and the
+     * alternative is what this used to do: re-decode all 151936 x 1024 weights
+     * of it *on every call*, and a decode step calls this once per token, so a
+     * single generated token paid a full host walk of the vocabulary table.
+     * That was the largest cost left after the cube plane was cached, and it is
+     * the same fix for the same reason as `cube_for`. */
+    DeviceBuffer dtable = dense_table_for(blocks, vocab, d, type_id);
     std::vector<int32_t> ids(static_cast<std::size_t>(n_tokens));
     copy_to_host(ids.data(), tokens, n_tokens * 4);
     gather_rows(ids, dtable, vocab, d, out);
-    release(dtable);
   }
   void silu_mul(DeviceBuffer gate, DeviceBuffer up, DeviceBuffer out, int64_t n) override {
     if (n <= 0) {
@@ -1141,15 +1153,13 @@ class AscendBackend final : public Backend {
    * likely to land inside the safe range than outside it. */
   static constexpr int64_t kCubeChunkN = 8192;
 
-  /* One `aclnnMatmulCubeCustom` drive: `out = x_f32[m, k] @ w^T`, where `w` is
-   * the row-major [n, k] plane the graph holds and the op wants B as [k, n].
-   * The transpose is done on the host (see `gemm`), the fp16 operands and the
-   * fp16 result go on the device, and the result comes back widened to f32 --
-   * the graph's activation type.  The N axis is walked in `kCubeChunkN` blocks
-   * for the reason above. */
-  void run_cube(const std::vector<float> &x_f32, DeviceBuffer w, int w_dtype, int64_t m, int64_t n,
-                int64_t k, bool accumulate, DeviceBuffer out) {
-    const std::vector<float> w_f32 = read_f32(w, n * k, w_dtype);
+  /* The chunked cube drive, B pre-built.  `wq` is the transposed fp16 plane in
+   * per-chunk device blocks (see `CubeWeight`); `x_f32` is the f32 activation
+   * the graph holds.  This is the whole hot path: convert the activation, launch
+   * one cube op per chunk, read each chunk's fp16 result back and add it into
+   * the host f32 accumulator.  No weight work happens here at all. */
+  void run_cube_weight(const std::vector<float> &x_f32, const CubeWeight &wq, int64_t m, int64_t n,
+                       int64_t k, bool accumulate, DeviceBuffer out) {
     const std::vector<uint16_t> x_h = to_f16(x_f32.data(), m * k);
 
     /* The result accumulates column-block by column-block in host f32 and is
@@ -1163,18 +1173,15 @@ class AscendBackend final : public Backend {
     DeviceBuffer dx = allocate(m * k * 2);
     copy_to_device(dx, x_h.data(), m * k * 2);
 
+    int64_t woff = 0; /* fp16 elements consumed from `wq.blocks` */
     for (int64_t n0 = 0; n0 < n; n0 += kCubeChunkN) {
       const int64_t nc = std::min(kCubeChunkN, n - n0);
-      std::vector<uint16_t> b_h(static_cast<std::size_t>(k * nc));
-      for (int64_t r = 0; r < nc; ++r) {
-        for (int64_t c = 0; c < k; ++c) {
-          b_h[static_cast<std::size_t>(c * nc + r)] =
-              f32_to_f16(w_f32[static_cast<std::size_t>((n0 + r) * k + c)]);
-        }
-      }
-      DeviceBuffer db = allocate(k * nc * 2);
+
+      /* The chunk's B operand is already device-resident and contiguous at
+       * `woff`; only the output needs a fresh buffer. */
+      const uintptr_t b_handle = wq.blocks.handle + static_cast<uintptr_t>(woff * 2);
+
       DeviceBuffer dout = allocate(m * nc * 2);
-      copy_to_device(db, b_h.data(), k * nc * 2);
 
       const int64_t a_shape[2] = {m, k};
       const int64_t b_shape[2] = {k, nc};
@@ -1185,7 +1192,7 @@ class AscendBackend final : public Backend {
       aclTensor *ta = aclCreateTensor(a_shape, 2, ACL_FLOAT16, a_stride, 0, ACL_FORMAT_ND, a_shape, 2,
                                       reinterpret_cast<void *>(dx.handle));
       aclTensor *tb = aclCreateTensor(b_shape, 2, ACL_FLOAT16, b_stride, 0, ACL_FORMAT_ND, b_shape, 2,
-                                      reinterpret_cast<void *>(db.handle));
+                                      reinterpret_cast<void *>(b_handle));
       aclTensor *to = aclCreateTensor(o_shape, 2, ACL_FLOAT16, o_stride, 0, ACL_FORMAT_ND, o_shape, 2,
                                       reinterpret_cast<void *>(dout.handle));
       if (ta == nullptr || tb == nullptr || to == nullptr) {
@@ -1220,12 +1227,60 @@ class AscendBackend final : public Backend {
       aclDestroyTensor(ta);
       aclDestroyTensor(tb);
       aclDestroyTensor(to);
-      release(db);
       release(dout);
+      woff += k * nc;
     }
 
     copy_to_device(out, out_f.data(), m * n * 4);
     release(dx);
+  }
+
+  /* Build the cube operand plane `[k, n]` (chunked) from a host f32 weight in
+   * the caller's row-major `[n, k]` layout.  See `CubeWeight`. */
+  CubeWeight build_cube_weight_from_f32(const std::vector<float> &w_f32, int64_t n, int64_t k) {
+    CubeWeight out;
+    out.n = n;
+    out.k = k;
+    out.blocks = allocate(n * k * 2);
+    for (int64_t n0 = 0; n0 < n; n0 += kCubeChunkN) {
+      const int64_t nc = std::min(kCubeChunkN, n - n0);
+      std::vector<uint16_t> b_h(static_cast<std::size_t>(k * nc));
+      for (int64_t r = 0; r < nc; ++r) {
+        for (int64_t c = 0; c < k; ++c) {
+          b_h[static_cast<std::size_t>(c * nc + r)] =
+              f32_to_f16(w_f32[static_cast<std::size_t>((n0 + r) * k + c)]);
+        }
+      }
+      /* Chunks are stored back-to-back, so chunk `i`'s plane starts at the sum
+       * of the earlier chunks' `k * nc` elements -- the same walk `run_cube_weight`
+       * does with `woff`. */
+      copy_to_device(DeviceBuffer{out.blocks.handle + static_cast<uintptr_t>(n0 * k * 2),
+                                  k * nc * 2},
+                     b_h.data(), k * nc * 2);
+    }
+    return out;
+  }
+
+  /* Build the plane for a device-resident f32 weight (the dense `gemm` path,
+   * whose weight is not cached here). */
+  CubeWeight build_cube_weight(DeviceBuffer w, int w_dtype, int64_t n, int64_t k) {
+    return build_cube_weight_from_f32(read_f32(w, n * k, w_dtype), n, k);
+  }
+
+  /* One `aclnnMatmulCubeCustom` drive: `out = x_f32[m, k] @ w^T`, where `w` is
+   * the row-major [n, k] plane the graph holds and the op wants B as [k, n].
+   * The transpose is done on the host (see `gemm`), the fp16 operands and the
+   * fp16 result go on the device, and the result comes back widened to f32 --
+   * the graph's activation type.  The N axis is walked in `kCubeChunkN` blocks
+   * for the reason above.  This variant builds the plane per call and is the
+   * cold path (the dense `gemm`, whose weight is already f32 and is not cached
+   * here); `gemm_quant` builds the plane once via `cube_for` and uses
+   * `run_cube_weight`. */
+  void run_cube(const std::vector<float> &x_f32, DeviceBuffer w, int w_dtype, int64_t m, int64_t n,
+                int64_t k, bool accumulate, DeviceBuffer out) {
+    const CubeWeight wq = build_cube_weight(w, w_dtype, n, k);
+    run_cube_weight(x_f32, wq, m, n, k, accumulate, out);
+    release(wq.blocks);
   }
 
   /* Bring a window of the K/V cache up as f32, whatever width it was bound in.
@@ -1437,32 +1492,39 @@ class AscendBackend final : public Backend {
     return inserted.first->second;
   }
 
-  /* Decode a packed weight to a persistent device f32 buffer, once per distinct
-   * source pointer.
+  /* Decode a packed weight once into a persistent device plane **already in the
+   * cube's operand layout**, and cache it by the source pointer.
    *
-   * The W4A16 op is the graph's decode GEMM and it is different from the dense
-   * one in two ways that matter here: it is M=1, and it reads q4_K.  So this is
-   * the path for the two cases the W4A16 op cannot take -- a *prefill* batch
-   * (M>1) and the q6_k tensors a `q4_k_m` file mixes in -- and both are served
-   * by decoding the blocks to f32 once and driving the dense cube.
+   * A packed `q4_k_m` file holds q4_K and q6_K tensors; `gemm_quant` decodes
+   * each faithfully with the tree's `dequant_q4_k`/`dequant_q6_k` and drives
+   * `MatmulCubeCustom`, which measured ~2.7e-4 relative (fp32 L0C accumulate,
+   * fp16 operands) at the model's own shapes.
    *
-   * The cost is real and is why this is not the default path: a 0.6B q4_k_m
-   * checkpoint is ~0.4 GB packed and ~2 GB decoded, and ~2 GB of f32 weights
-   * that nothing else holds live on the board's NPU DDR for the life of the
-   * process.  It is a correctness-and-coverage path, not a fast one. */
-  DeviceBuffer dense_for(DeviceBuffer blocks, int64_t n, int64_t k, int type_id) {
+   * The decode used to produce a row-major f32 device buffer that `run_cube`
+   * then transposed and narrowed to fp16 *on the host, on every call* -- a
+   * scalar walk over the whole weight, per token, which dominated a decode step
+   * (31.5 s of ~37 s for three tokens).  Both steps now happen here, once, and
+   * the cached artifact is the transposed fp16 plane itself.  The plane is half
+   * the size of the f32 buffer it replaces (~1 GB instead of ~2 GB for a 0.6B
+   * q4_k_m checkpoint), so this is a memory win as well as a time one.
+   *
+   * The plane is still the decoded weight, not the packed one: the cube takes
+   * fp16 operands, so the packed form cannot be fed to it directly.  The
+   * packed-form path is the W4A16 op, and it requantizes too lossily to be the
+   * graph's default (see `gemm_quant`). */
+  DeviceBuffer cube_for(DeviceBuffer blocks, int64_t n, int64_t k, int type_id) {
     const int64_t block_bytes = quant::block_bytes_of(type_id);
     if (block_bytes == 0 || k % quant::kBlockWeights != 0) {
       throw Error("ascend: gemm_quant has no decoder for type_id " + std::to_string(type_id) +
                   " at k=" + std::to_string(k));
     }
-    const std::string key = "dense:" + std::to_string(blocks.handle) + ":" + std::to_string(n) +
+    const std::string key = "cube:" + std::to_string(blocks.handle) + ":" + std::to_string(n) +
                             ":" + std::to_string(k) + ":" + std::to_string(type_id);
     {
       std::lock_guard<std::mutex> guard(mutex_);
-      auto it = dense_cache_.find(key);
-      if (it != dense_cache_.end()) {
-        return it->second;
+      auto it = cube_cache_.find(key);
+      if (it != cube_cache_.end()) {
+        return it->second.blocks;
       }
     }
     const int64_t blocks_per_row = k / quant::kBlockWeights;
@@ -1479,18 +1541,62 @@ class AscendBackend final : public Backend {
         }
       }
     }
-    DeviceBuffer device = allocate(n * k * 4);
-    copy_to_device(device, dense.data(), n * k * 4);
+    /* Decode once, straight into the transposed fp16 plane the cube wants -- no
+     * intermediate f32 device buffer and no per-token re-transpose. */
+    CubeWeight wq = build_cube_weight_from_f32(dense, n, k);
     /* Re-check under the lock rather than hold it across the decode above: the
-     * decode is the expensive part (a host walk over every block, then a ~`n*k`
-     * f32 copy to the device) and it does not touch shared state, so two callers
-     * for the same key may both reach here.  Whichever inserts first wins; the
-     * other releases the buffer it just built and returns the winner's, so the
-     * loser's ~2 GB does not leak for the life of the process.  `emplace` does
-     * not overwrite, so a second find is not needed -- the returned iterator is
-     * the entry that is actually in the map, winner or loser. */
+     * decode is the expensive part (a host walk over every block, then the
+     * transpose) and it does not touch shared state, so two callers for the same
+     * key may both reach here.  Whichever inserts first wins; the other releases
+     * the plane it just built, so the loser does not leak for the life of the
+     * process.  `emplace` does not overwrite, so the returned iterator is the
+     * entry that is actually in the map, winner or loser. */
     std::lock_guard<std::mutex> guard(mutex_);
-    auto inserted = dense_cache_.emplace(key, device);
+    auto inserted = cube_cache_.emplace(key, wq);
+    if (!inserted.second) {
+      release(wq.blocks);
+    }
+    return inserted.first->second.blocks;
+  }
+
+  /* Decode a packed vocab table to a persistent device f32 buffer, once per
+   * distinct source pointer -- the same shape of cache as `cube_for`, for the
+   * same reason.  The table is the `token_embd.weight` super-block plane: the
+   * graph gathers one row per token, but the alternative to caching it is a host
+   * walk of the whole `vocab x d` matrix per call, which is what the decode
+   * step's second-largest cost turned out to be. */
+  DeviceBuffer dense_table_for(DeviceBuffer blocks, int64_t vocab, int64_t d, int type_id) {
+    const int64_t block_bytes = quant::block_bytes_of(type_id);
+    const std::string key = "emb:" + std::to_string(blocks.handle) + ":" + std::to_string(vocab) +
+                            ":" + std::to_string(d) + ":" + std::to_string(type_id);
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      auto it = table_cache_.find(key);
+      if (it != table_cache_.end()) {
+        return it->second;
+      }
+    }
+    const int64_t blocks_per_row = d / quant::kBlockWeights;
+    const int64_t total = vocab * blocks_per_row * block_bytes;
+    std::vector<uint8_t> host(static_cast<std::size_t>(total));
+    copy_to_host(host.data(), blocks, total);
+    std::vector<float> dense(static_cast<std::size_t>(vocab * d));
+    for (int64_t row = 0; row < vocab; ++row) {
+      for (int64_t b = 0; b < blocks_per_row; ++b) {
+        const uint8_t *block = host.data() + (row * blocks_per_row + b) * block_bytes;
+        for (int64_t i = 0; i < quant::kBlockWeights; ++i) {
+          dense[static_cast<std::size_t>(row * d + b * quant::kBlockWeights + i)] =
+              quant::dequant_block(type_id, block, static_cast<int>(i));
+        }
+      }
+    }
+    DeviceBuffer device = allocate(vocab * d * 4);
+    copy_to_device(device, dense.data(), vocab * d * 4);
+    /* Same emplace-and-release-the-loser contract as `cube_for`: the decode does
+     * not touch shared state, so two callers may both build; the loser frees its
+     * copy rather than leaking it. */
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto inserted = table_cache_.emplace(key, device);
     if (!inserted.second) {
       release(device);
     }
@@ -1501,7 +1607,8 @@ class AscendBackend final : public Backend {
   std::string soc_;
   std::mutex mutex_;
   std::unordered_map<std::string, PackedQ4K> cache_;
-  std::unordered_map<std::string, DeviceBuffer> dense_cache_;
+  std::unordered_map<std::string, CubeWeight> cube_cache_;
+  std::unordered_map<std::string, DeviceBuffer> table_cache_;
 };
 
 }  // namespace
