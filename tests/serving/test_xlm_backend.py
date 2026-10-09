@@ -163,6 +163,28 @@ def test_a_demo_config_json_resolves_the_hbm_and_tokenizer(tmp_path: pathlib.Pat
     assert resolved.model_type == 9
 
 
+def test_the_configs_enable_thinking_sets_the_reasoning_mode(tmp_path: pathlib.Path) -> None:
+    """The demo config's ``enable_thinking`` is a property of the model, not the request.
+
+    The delegate builds its chat template from this at load, so it is read here
+    and carried on the resolved paths.  It matters for streaming: a ``.hbm``
+    built for thinking always emits a `` thinking`` block, and reading it as a
+    plain chat model streams the block into ``content``.  Absent is the SDK's
+    own default of a non-thinking model.
+    """
+    (tmp_path / "tok").mkdir()
+    (tmp_path / "m.hbm").write_bytes(b"")
+    config = tmp_path / "c.json"
+
+    def mode_for(spec: dict) -> str:
+        config.write_text(json.dumps({"hbm_path": "m.hbm", "tokenizer_dir": "tok", **spec}))
+        return _resolve_model(EngineArgs(model=str(config))).thinking_mode
+
+    assert mode_for({"enable_thinking": True}) == "thinking"
+    assert mode_for({"enable_thinking": False}) == "chat"
+    assert mode_for({}) == "chat"
+
+
 def test_a_missing_config_is_reported_before_anything_is_loaded() -> None:
     """An `.hbm` with no config is refused with the reason, at construction.
 

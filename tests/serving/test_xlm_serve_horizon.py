@@ -33,8 +33,10 @@ import json
 import os
 import pathlib
 import re
+import socket
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import pytest
@@ -229,3 +231,179 @@ def test_naming_the_defaults_is_accepted(served: str) -> None:
     ):
         status, _content_type, raw = _chat(served, _PROMPT, **sampling)
         assert status == 200, f"{sampling} was refused: {raw[:120]!r}"
+
+
+# -- stream=true ------------------------------------------------------------
+#
+# The SSE path is the one most OpenAI clients take by default, and until this
+# file nothing on the S600 had ever set ``stream``.  The delegate is text-in /
+# text-out with no token-id surface, so the interesting question is not "is it
+# fast" but "is the framing well-formed and does it terminate" -- the same
+# silent-200 class the banner test hunts, one layer up.
+#
+# These read the raw socket rather than a client that hides framing: a client
+# that parses SSE would paper over exactly the defects worth catching (a banner
+# between two events, a missing DONE, a stream that never closes).
+
+
+def _raw_stream(base: str, content: str, **extra) -> tuple[str, bytes]:
+    """POST a streamed chat completion and return ``(headers, body)`` as sent.
+
+    A bare socket, so the bytes are the server's own and not a client library's
+    rendering of them.  The read is bounded by a socket timeout: a stream that
+    never closes has to *fail* the test rather than hang it, which is failure
+    mode (a) and the reason this does not use ``urlopen``.
+    """
+    parsed = urllib.parse.urlsplit(base)
+    body = json.dumps(
+        {
+            "model": "qwen3-0.6b",
+            "messages": [{"role": "user", "content": content}],
+            "stream": True,
+            **extra,
+        }
+    ).encode()
+    request = (
+        f"POST /v1/chat/completions HTTP/1.1\r\nHost: {parsed.hostname}\r\n"
+        f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode() + body
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=300) as sock:
+        sock.sendall(request)
+        chunks = []
+        while True:
+            block = sock.recv(65536)
+            if not block:  # the server closed: a terminated stream, not a hung one
+                break
+            chunks.append(block)
+    raw = b"".join(chunks)
+    head, _, payload = raw.partition(b"\r\n\r\n")
+    return head.decode("latin-1"), payload
+
+
+def _sse_events(payload: bytes) -> list[str]:
+    """The ``data:`` lines of an SSE body, in order.
+
+    Split on the blank-line frame separator the wire format uses, so a line that
+    is neither a ``data:`` frame nor the empty separator is visible as a missing
+    frame rather than silently skipped -- which is how a leaked banner between
+    two events would show up.
+    """
+    frames = payload.decode("utf-8", "replace").split("\n\n")
+    events = []
+    for frame in frames:
+        frame = frame.strip("\n")
+        if not frame:
+            continue
+        assert frame.startswith("data: "), f"a line that is not an SSE frame: {frame[:120]!r}"
+        events.append(frame[len("data: ") :])
+    return events
+
+
+def _nonstream_content(base: str, content: str) -> tuple[str, str]:
+    """``(content, reasoning_content)`` from the same prompt without ``stream``."""
+    status, _content_type, raw = _chat(base, content)
+    assert status == 200, raw[:200]
+    message = json.loads(raw.decode())["choices"][0]["message"]
+    return message["content"], message.get("reasoning_content") or ""
+
+
+def _reassembled(payload: bytes) -> tuple[str, str, list[str]]:
+    """``(content, reasoning, finish_reasons)`` from an SSE body's chunks."""
+    content = reasoning = ""
+    finish_reasons: list[str] = []
+    for event in _sse_events(payload):
+        if event == "[DONE]":
+            continue
+        choice = json.loads(event)["choices"][0]
+        delta = choice["delta"]
+        content += delta.get("content") or ""
+        reasoning += delta.get("reasoning_content") or ""
+        if choice.get("finish_reason"):
+            finish_reasons.append(choice["finish_reason"])
+    return content, reasoning, finish_reasons
+
+
+@needs_delegate
+@needs_checkpoint
+@needs_board_env
+def test_a_stream_is_well_framed_and_terminates(served: str) -> None:
+    """Every frame is ``data: <json>`` or the terminal DONE, and the socket closes.
+
+    This is failure modes (a) and (b) together: the request must not hang waiting
+    for a DONE that never comes, and no SDK-monitor token may appear between two
+    frames.  ``_sse_events`` asserts the framing (a stray line that is not a
+    frame raises there); here the DONE and the closed connection are asserted,
+    and each payload is parsed so a half-written JSON object fails loudly.
+    """
+    headers, payload = _raw_stream(served, _PROMPT)
+    assert "200" in headers.splitlines()[0], headers
+    assert "text/event-stream" in headers.lower(), headers
+    events = _sse_events(payload)
+    assert events[-1] == "[DONE]", f"the stream did not end with a DONE event: {events[-1]!r}"
+    assert events.count("[DONE]") == 1
+    for event in events[:-1]:
+        json.loads(event)  # each frame is a whole JSON object, not a fragment
+    text = payload.decode("utf-8", "replace")
+    assert not _BANNER.search(text), f"the delegate's banner broke an SSE frame: {text[:200]!r}"
+
+
+@needs_delegate
+@needs_checkpoint
+@needs_board_env
+def test_a_streamed_answer_equals_the_collected_one(served: str) -> None:
+    """Assembling the content deltas reproduces the non-streamed ``content``.
+
+    The delegate emits a `` thinking`` block, so this is not a formality: the
+    splitter has to read the pre-marker text as reasoning and the post-marker
+    text as content, and a stream that reads the block as content duplicates it.
+    The reasoning half is checked the same way, and the finish reason has to
+    appear exactly once.
+    """
+    expected_content, expected_reasoning = _nonstream_content(served, _PROMPT)
+    _headers, payload = _raw_stream(served, _PROMPT)
+    content, reasoning, finish_reasons = _reassembled(payload)
+    assert content == expected_content, f"{content!r} != the collected {expected_content!r}"
+    assert reasoning == expected_reasoning
+    assert len(finish_reasons) == 1, f"{len(finish_reasons)} finish_reason events"
+
+
+@needs_delegate
+@needs_checkpoint
+@needs_board_env
+def test_the_streamed_chunks_carry_the_same_optional_fields_as_the_collected_one(
+    served: str,
+) -> None:
+    """A stream is not a response with fields quietly dropped: ``usage`` survives.
+
+    Failure mode (d): the non-streamed body carries a ``usage`` object and an
+    OpenAI client may read it, so a streamed form that omits it is a second,
+    lossier contract for the same request.  The delegate has no token counts to
+    offer, so the object is present-and-zero rather than informative -- but
+    present it must be, and its ``prompt_tokens`` is the one number the two
+    forms can be held to together.
+    """
+    _status, _content_type, raw = _chat(served, _PROMPT)
+    collected = json.loads(raw.decode())
+    _headers, payload = _raw_stream(served, _PROMPT)
+    chunks = [json.loads(e) for e in _sse_events(payload) if e != "[DONE]"]
+    assert "usage" in collected, "the collected body lost its usage object"
+    assert "usage" in chunks[-1], "the streamed form dropped the usage object"
+    assert chunks[-1]["usage"] == collected["usage"]
+
+
+@needs_delegate
+@needs_checkpoint
+@needs_board_env
+def test_a_stream_echoes_the_reasoning_block_once(served: str) -> None:
+    """The thinking block is streamed as ``reasoning_content`` and *only* there.
+
+    The specific corruption the delegate hit: read as ``"chat"``, the pre-marker
+    text was sent as ``content`` and then re-sent as ``reasoning_content`` when
+    the marker arrived, so the same sentences reached a client twice under two
+    keys and the ``content`` no longer matched the collected answer.
+    """
+    _headers, payload = _raw_stream(served, _PROMPT)
+    content, reasoning, _finish_reasons = _reassembled(payload)
+    assert reasoning, "the delegate emitted no reasoning at all; the splitter is not splitting"
+    assert reasoning not in content, "the reasoning block was duplicated into content"

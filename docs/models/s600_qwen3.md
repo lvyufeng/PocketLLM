@@ -473,6 +473,19 @@ and it is exercised end to end on the board — measured 2026-10-09 with the **0
 - **Per-request sampling is refused with a clean `400`.** `temperature: 0.9`, `top_p: 0.5`,
   `top_k: 20` and `min_p: 0.1` each return `400` naming the field; `temperature: 0`, `top_p: 1`,
   `top_k: 0` are accepted. No 500, no silently-ignored field.
+- **`stream: true` is well-formed and terminates.** `Content-Type: text/event-stream`, every frame a
+  `data: <json>` object or the single terminal `data: [DONE]`, no banner token between two frames, and
+  the socket closes (the server sends `Connection: close`) rather than hanging. The content deltas
+  reassemble to exactly the non-streamed `message.content`, and the reasoning block arrives once, under
+  `reasoning_content`. This is the surface most OpenAI clients use by default, and until this it had
+  never been set on the board.
+- **The streamed `finish_reason` is `length`, and that is the delegate's honesty, not a stuck cap.**
+  The SDK's `xlm_result_t` carries text and a performance block and **no stop signal at all** — no
+  end-of-text flag, no reason, and this build leaves even `prefill_token_num`/`decode_token_num` at
+  zero — so the adapter has nothing to turn into `stop` and reports the value it defaults to. It is
+  exactly one `finish_reason` per stream, as OpenAI requires; a client reading `length` as "ask for
+  more" would ask in vain, which is why it is written down here rather than papered over with a
+  `stop` the delegate never observed.
 
 One correction this measurement forced, and it is the reason the sentence above says *sampling*: the
 two entry points did **not** fully agree on the sampling fields, because `top_k: 0` — the value the
@@ -481,6 +494,20 @@ by `run` but rejected by `serve` with `400 top_k must be >= 1` (a `SamplingParam
 delegate refusing it). The validator now accepts `0` as "no limit" and refuses only a negative `top_k`;
 `tests/serving/test_xlm_serve_horizon.py::test_naming_the_defaults_is_accepted` and
 `tests/serving/test_protocol_requests.py::test_top_k_zero_means_no_limit_and_is_accepted` pin it.
+
+A second defect the streaming measurement forced, and it was a real one. The delegate's demo config
+sets `enable_thinking: true`, so the `.hbm` always emits a full ` thinking… response` block — but the
+adapter read every request as a *chat* model. `split_reasoning` cannot tell the two modes apart once
+the `</think>` marker has arrived, so the collected answer was always right; a **stream**, which has
+to classify the text before the marker lands, was not. Read as `chat`, the splitter sends the
+pre-marker text as `content`, and when the marker finally arrives the block is re-sent as
+`reasoning_content` — so the same sentences reached a client twice under two keys and the streamed
+`content` was the raw text (` thinking` tag, reasoning block and answer together) rather than the
+answer. Measured on the board: streamed content
+`3c 74 68 69 6e 6b 3e 0a 4f 6b 61 …` versus the non-streamed `0a 0a 4f 4b`. The fix reads the mode
+from the checkpoint's own `enable_thinking` — the same rule the adapter already applies to sampling,
+because the delegate builds its template and its sampler at load and a request cannot un-think it —
+and the streamed content now equals the collected one byte for byte.
 
 Two further differences are **not** bugs, and are worth stating so the two entry points are not read
 as interchangeable:

@@ -301,7 +301,7 @@ class XlmBackend:
 
             emitted = ""
             first_at: float | None = None
-            splitter = _ReasoningSplitter(_thinking_mode(request))
+            splitter = _ReasoningSplitter(self._reasoning_mode(request))
             finish_reason = "length"
             performance: Any = None
 
@@ -368,7 +368,7 @@ class XlmBackend:
                 trimmed = text[:stop_at]
                 finish_reason = "stop"
 
-            reasoning, content = split_reasoning(trimmed, _thinking_mode(request))
+            reasoning, content = split_reasoning(trimmed, self._reasoning_mode(request))
             metadata: dict[str, Any] = _performance_metadata(performance)
             if reasoning:
                 metadata["reasoning_content"] = reasoning
@@ -393,6 +393,10 @@ class XlmBackend:
             self._state.clear(request.request_id)
 
     # -- helpers ------------------------------------------------------------
+
+    def _reasoning_mode(self, request: GenerationRequest) -> str:
+        """How to read this answer: the checkpoint's mode, then the request's."""
+        return _thinking_mode(request, model_thinks=self._model.thinking_mode == "thinking")
 
     def _prompt(self, request: GenerationRequest) -> str:
         """The prompt text.  Token ids are refused, not silently dropped.
@@ -429,7 +433,7 @@ class XlmBackend:
                 messages,
                 request.metadata.get("tools"),
                 bool(request.metadata.get("add_generation_prompt", True)),
-                _thinking_mode(request) == "thinking",
+                self._reasoning_mode(request) == "thinking",
             )
         return request.prompt or ""
 
@@ -462,14 +466,18 @@ class XlmBackend:
 class _ModelPaths:
     """Where the delegate's three inputs are, resolved from :class:`EngineArgs`."""
 
-    __slots__ = ("hbm", "tokenizer_dir", "config", "model_type")
+    __slots__ = ("hbm", "tokenizer_dir", "config", "model_type", "thinking_mode")
 
     def __init__(self, hbm: pathlib.Path, tokenizer_dir: pathlib.Path,
-                 config: pathlib.Path, model_type: int) -> None:
+                 config: pathlib.Path, model_type: int, thinking_mode: str) -> None:
         self.hbm = hbm
         self.tokenizer_dir = tokenizer_dir
         self.config = config
         self.model_type = model_type
+        #: The reasoning mode the *checkpoint* is built for, from the demo config's
+        #: ``enable_thinking``. See :meth:`XlmBackend._reasoning_mode` for why this is
+        #: the model's declaration and not the request's.
+        self.thinking_mode = thinking_mode
 
 
 def _resolve_model(args: EngineArgs) -> _ModelPaths:
@@ -518,7 +526,11 @@ def _resolve_model(args: EngineArgs) -> _ModelPaths:
         raise ConfigurationError(f"no config file at {str(config)!r}")
 
     model_type = int(spec.get("model_type", XlmModelType.QWEN3))
-    return _ModelPaths(hbm, tokenizer, config, model_type)
+    # The demo config's own switch; absent means the delegate's default of a plain
+    # chat model. The delegate builds its prompt template from this at load, so it
+    # is a property of the session and not of any one request.
+    thinking_mode = "thinking" if spec.get("enable_thinking") else "chat"
+    return _ModelPaths(hbm, tokenizer, config, model_type, thinking_mode)
 
 
 def _context_length(config: pathlib.Path) -> int:
@@ -623,8 +635,28 @@ def _performance_metadata(performance: Any) -> dict[str, Any]:
     }
 
 
-def _thinking_mode(request: GenerationRequest) -> str:
-    """The request's reasoning mode, defaulting to the protocol layer's ``"chat"``."""
+def _thinking_mode(request: GenerationRequest, *, model_thinks: bool = False) -> str:
+    """The mode to read this answer in, defaulting to the protocol layer's ``"chat"``.
+
+    **The checkpoint's declaration outranks the request's**, which is the same
+    rule this adapter already applies to sampling: the delegate's chat template
+    and its sampler are both built at load from the demo config, so a request
+    cannot un-think a model whose config sets ``enable_thinking: true`` any more
+    than it can raise its temperature.  The difference the mode makes is real and
+    is *only* visible on a stream: :func:`split_reasoning` reads an answer whose
+    ``</think>`` marker has arrived identically either way, so the collected path
+    cannot tell the two apart -- but a stream that has not yet reached the marker
+    has to decide whether the text so far is reasoning or content, and ``"chat"``
+    would call it content and then re-send the whole block as reasoning once the
+    marker lands.  The board's Qwen3-0.6B ``.hbm`` sets ``enable_thinking: true``
+    and always emits the block, so reading it as ``"chat"`` streamed the reasoning
+    into ``content`` and made the stream disagree with the collected answer.
+
+    A request that names a mode still wins when the model claims none: a plain
+    chat checkpoint is read the way its caller asked.
+    """
+    if model_thinks:
+        return "thinking"
     mode = request.metadata.get("thinking_mode")
     return mode if isinstance(mode, str) and mode else "chat"
 
