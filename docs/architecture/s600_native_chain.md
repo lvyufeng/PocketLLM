@@ -269,7 +269,8 @@ four cores it was compiled for, and `model_type 9` (Qwen3):
 ```bash
 SDK=~/llm_sdk/D-Robotics_LLM_S600_1.0.2_SDK
 export LD_LIBRARY_PATH=$SDK/oellm_runtime/lib   # the SDK's libs live under oellm_runtime/, not $SDK/lib
-export HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6
+export HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6   # the accepted band is ~5.974-<7 MiB/core, so this
+                                              # vendor default is also the recommended value
 
 python -m pocketllm run --device horizon \
   --model Qwen3-1.7B_language_chunk_512_cache_1024_w4_nash-p_corenum_4_4.json \

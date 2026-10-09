@@ -115,6 +115,85 @@ same prompts with the same final answers, and its **reasoning text differs** fro
 two build-time quantizations of one checkpoint, not two caches of one graph. Whether a smaller graph
 gets **4B** under the ceiling is still open.
 
+## The runtime knob space
+
+The `.hbm` is AOT-compiled, but the **runtime** has knobs — and it is worth knowing, before tuning,
+that none of them buys decode speed on this board. The space is what the SDK reads at load, found by
+`strings` over `oellm_runtime/lib` plus the four demo `run_*.sh` scripts:
+
+- **`HB_DNN_USER_DEFINED_L2M_SIZES`** — the L2m working-memory split, one size per BPU core (read by
+  `libdnn.so`; its `[Plan]` log prints the per-node requirement and any allocation failure). Every
+  demo script sets `6:6:6:6`.
+- **`HB_UCP_ENABLE_BPU_BACKEND_CORE_NUM`** — a cap on the BPU cores the backend may use (`libhbucp.so`).
+- **`HB_UCP_TASK_SCHEDULE_COMMON_PROCESS_THREAD_NUM`**, **`HB_UCP_SCHEDULE_THREAD_SET_AFFINITY`**,
+  **`HB_UCP_SCHEDULE_PRIORITY`**, **`HB_UCP_CPU_PROCESS_THREAD_SET_AFFINITY`** — UCP scheduler threads
+  and their CPU affinity and priority.
+- **`bpu_core`** in the config JSON — which cores the graph binds to (see the
+  [deployment recipe](../architecture/s600_native_chain.md#running-this-artifact-on-the-board)).
+
+There is no config key that trades accuracy for speed, either. The keys `libxlm.so` parses are
+`hbm_path`, `tokenizer_dir`, `bpu_core`, `model_type`, `enable_thinking`, `enable_multi_turn` and
+`use_sequence` (which reorders the sampler chain); nothing sets a token cap, a temperature or a warm-up,
+because the sampler is read from the tokenizer directory and the graph is fixed. Memory and cores are
+the whole of it.
+
+### The sweep
+
+One knob at a time from the default (`6:6:6:6`, `bpu_core [0,1,2,3]`), three greedy runs each,
+canonical prompt, on three graphs. Cells are decode t/s (run 2 of 3); **refused** means the graph did not
+run (the SDK's own refusal, not a crash); **every accepted cell produced the byte-identical greedy text
+of its graph's default row**, so no setting changed the answer.
+
+| runtime setting | 0.6B shipped | 1.7B shipped | 1.7B ours |
+|---|---|---|---|
+| `HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6` (default) | 82.9 | 67.7 | 87.6 |
+| `HB_DNN_USER_DEFINED_L2M_SIZES=8:8:8:8` | refused | refused | refused |
+| `HB_DNN_USER_DEFINED_L2M_SIZES=4:4:4:4` | refused | refused | refused |
+| `HB_DNN_USER_DEFINED_L2M_SIZES=7:7:7:7` | refused | refused | refused |
+| `HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:4` | refused | refused | refused |
+| `HB_DNN_USER_DEFINED_L2M_SIZES=6:6:2:2` | refused | refused | refused |
+| `bpu_core [0,1,2,3]` (default) | 82.9 | 67.7 | 88.2 |
+| `bpu_core [0,1]` | refused | refused | refused |
+| `bpu_core [0]` | refused | refused | refused |
+| `bpu_core [0,1,2,3,0,1,2,3]` | 82.9 | 67.7 | 88.2 |
+| `bpu_core [3,2,1,0]` | 82.9 | 67.7 | 87.6 |
+| `HB_UCP_ENABLE_BPU_BACKEND_CORE_NUM` unset (default) | 82.9 | 67.7 | 87.6 |
+| `HB_UCP_ENABLE_BPU_BACKEND_CORE_NUM=4` | 82.9 | 67.5 | 87.6 |
+| `HB_UCP_ENABLE_BPU_BACKEND_CORE_NUM=2` | refused | refused | refused |
+| `HB_UCP_ENABLE_BPU_BACKEND_CORE_NUM=1` | refused | refused | refused |
+| `HB_UCP_ENABLE_BPU_BACKEND_CORE_NUM=8` | 82.9 | 67.7 | 88.2 |
+| `HB_UCP_TASK_SCHEDULE_COMMON_PROCESS_THREAD_NUM=1` | 82.9 | 67.7 | 87.6 |
+| `HB_UCP_TASK_SCHEDULE_COMMON_PROCESS_THREAD_NUM=8` | 83.8 | 67.7 | 87.6 |
+| `HB_UCP_TASK_SCHEDULE_COMMON_PROCESS_THREAD_NUM=14` | 82.9 | 67.7 | 87.6 |
+| `HB_UCP_TASK_SCHEDULE_COMMON_PROCESS_THREAD_NUM=28` | 82.9 | 67.5 | 87.6 |
+| `HB_UCP_SCHEDULE_THREAD_SET_AFFINITY=1` | 83.8 | 67.7 | 87.6 |
+| `HB_UCP_SCHEDULE_PRIORITY=1` | 83.8 | 67.7 | 88.2 |
+| `HB_UCP_CPU_PROCESS_THREAD_SET_AFFINITY=1` | 82.9 | 67.7 | 87.6 |
+| `HB_UCP_SCHEDULE_PRIORITY=-1` | 82.9 | 67.7 | 88.2 |
+
+The three columns are three different artifacts, so the number to read is the *within-column* delta,
+and it is zero. Every accepted setting sits inside the run-to-run spread: 1.7B
+ours 87.6–88.2 t/s, 1.7B shipped 67.5–67.7, 0.6B 82.9–83.8 (the widest, 1.1%). **No runtime setting
+on this board beats the vendor default, and the default is what the docs and the deployment recipe
+already use.** That is the honest result: the knobs move validation, not throughput, and there is
+nothing here to micro-optimize.
+
+Two refusals are the useful part, because they are walls that a caller will otherwise discover badly:
+
+- **`bpu_core` and the core cap are the same wall.** The graph was compiled for four cores, so a config
+  bound to `[0]` or `[0,1]` — or `HB_UCP_ENABLE_BPU_BACKEND_CORE_NUM=1|2` — fails the prefill with the
+  core-count mismatch documented in
+  [the chain page](../architecture/s600_native_chain.md#the-first-build-result). The only accepted
+  spellings are four cores' worth: `[0,1,2,3]`, a reversed `[3,2,1,0]`, the redundant
+  `[0,1,2,3,0,1,2,3]`, and a cap of 4 or 8 (both meaning "no fewer than four").
+- **The L2m split is a hard window, not a dial.** Below it, the prefill node's requirement is unmet —
+  the SDK prints `required l2 memspace info: [6263808, 6259712, 6161408, 6263808]` (per core, bytes)
+  and refuses: 5.97 MiB/core is still short, 6.00 accepts. Above it, the allocation fails —
+  `Allocate l2M memory failed, size: 7340032` at 7 MiB/core and up. So the accepted band is **about
+  5.974 MiB to just under 7 MiB per core**, and `6:6:6:6` is the vendor's round value just
+  above the floor (27 KiB of headroom) and comfortably under the ceiling. It is not a tuned number, but
+  it is also not a wrong one.
+
 ## The 4B / 8B ceiling
 
 4B and 8B **refuse to load**, and the refusal is the board's, not this tree's:
