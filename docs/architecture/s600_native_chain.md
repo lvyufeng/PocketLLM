@@ -225,7 +225,7 @@ graph fits too; the ceiling only bites at 4B), and `hrt_model_exec model_info` i
 records that; a config whose `bpu_core` does not match fails prefill with *"The number of BPU cores set
 in the backend should be the same as … compiled model bpu core num: 4"*. The shipped `llm_demo`
 configs carry `"bpu_core": [0,1,2,3]` for exactly this reason, and a config for this artifact must too.
-Ours does, and `pocketllm run` then produces coherent text.
+Ours does, and `pocketllm run` then produces coherent text. The exact invocation — the two environment variables, the config, and the command — is [the deployment recipe](#running-this-artifact-on-the-board).
 
 **It is faster.** Decode is **87.6–88.8 t/s** (three runs: 88.84 / 87.90 / 87.59) and prefill
 **8982 t/s**, against the shipped `cache_4096` graph's **67.7–69.8 t/s** decode / ~5172 t/s prefill
@@ -258,6 +258,41 @@ So the honest result: the **compile chain is validated end to end** — our own 
 is faster — while the behavioral match to the vendor graph is at the answer level, not token-for-token.
 Whether a `cache_1024` **4B** graph lands under the ceiling is still the open question; that build is
 compiling.
+
+### Running this artifact on the board
+
+The graph is not shipped; it lives where the build put it. The two environment variables the SDK's
+own `run_llm.sh` sets are read by `dlopen`/`libhbrt4` *before* the process starts, and the config is
+the shipped `llm_demo` shape with this artifact's two load-bearing keys — `bpu_core` matching the
+four cores it was compiled for, and `model_type 9` (Qwen3):
+
+```bash
+SDK=~/llm_sdk/D-Robotics_LLM_S600_1.0.2_SDK
+export LD_LIBRARY_PATH=$SDK/oellm_runtime/lib   # the SDK's libs live under oellm_runtime/, not $SDK/lib
+export HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6
+
+python -m pocketllm run --device horizon \
+  --model Qwen3-1.7B_language_chunk_512_cache_1024_w4_nash-p_corenum_4_4.json \
+  --prompt "The capital of France is"
+```
+
+```json
+{
+  "hbm_path": "Qwen3-1.7B_language_chunk_512_cache_1024_w4_nash-p_corenum_4_4.hbm",
+  "bpu_core": [0, 1, 2, 3],
+  "tokenizer_dir": "<sdk>/oellm_runtime/configs/Qwen3_config",
+  "model_type": 9,
+  "enable_multi_turn": false,
+  "enable_thinking": true
+}
+```
+
+Drop `bpu_core` and the prefill is refused, as in the caveat above — and since the fix in
+`pocketllm.xlm.XlmInferenceError` that refusal is a non-zero exit with a message rather than an empty
+answer printed as if it were one. `tests/native/test_compiled_artifact_horizon.py` is this recipe as a
+test: it skips when the artifact is absent (naming the path it looked at), and otherwise asserts the
+graph answers the canonical prompt, that three greedy runs are byte-identical, and that the `bpu_core`
+mismatch is refused rather than silently wrong.
 
 ## Where each claim comes from
 
