@@ -19,10 +19,11 @@ interleaving into a wrong one.
 
 The behaviour needs the delegate, the SDK, the `.hbm`, **and** the two
 environment variables the SDK's own ``run_llm.sh`` sets.  The skip names them,
-because a skip is not a pass: without ``LD_LIBRARY_PATH`` pointing at the SDK's
-``lib/`` the ``dlopen`` dies on ``libopencv_world.so.409``, and without
-``HB_DNN_USER_DEFINED_L2M_SIZES`` the BPU allocation fails -- both before any
-test body runs, and neither is a property this host can fake.
+because a skip is not a pass: without ``LD_LIBRARY_PATH`` pointing at
+``<sdk>/oellm_runtime/lib`` (the directory the SDK's libraries actually live in --
+there is no ``<sdk>/lib``) the ``dlopen`` dies on ``libopencv_world.so.409``, and
+without ``HB_DNN_USER_DEFINED_L2M_SIZES`` the BPU allocation fails -- both before
+any test body runs, and neither is a property this host can fake.
 """
 
 from __future__ import annotations
@@ -68,7 +69,7 @@ needs_checkpoint = pytest.mark.skipif(
 )
 needs_board_env = pytest.mark.skipif(
     not os.environ.get("LD_LIBRARY_PATH") or not os.environ.get("HB_DNN_USER_DEFINED_L2M_SIZES"),
-    reason="set LD_LIBRARY_PATH=<sdk>/lib and HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6 "
+    reason="set LD_LIBRARY_PATH=<sdk>/oellm_runtime/lib and HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6 "
     "(they are read by dlopen/libhbrt4 before this process starts)",
 )
 

@@ -49,7 +49,7 @@ rather than setting them:
 ```bash
 SDK=~/llm_sdk/D-Robotics_LLM_S600_1.0.2_SDK
 
-export LD_LIBRARY_PATH=$SDK/lib:$LD_LIBRARY_PATH      # read by dlopen at process start
+export LD_LIBRARY_PATH=$SDK/oellm_runtime/lib:$LD_LIBRARY_PATH   # read by dlopen at process start
 export HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6          # the L2m split the .hbm was compiled for
 
 PYTHONPATH=python python -m pocketllm run \
@@ -64,10 +64,14 @@ above); the config names the `.hbm`, the tokenizer directory, `bpu_core` and `mo
 resolve `--model` through the **same** function (`_resolve_model`), so both accept the same spelling.
 
 **Both variables are required, and the failure is only loud if we make it so.**
-`LD_LIBRARY_PATH` is read by `dlopen` **before the process starts** — exporting it from inside Python
-is a no-op, so "set it for the user" moves the error to a confusing missing-`libopencv_world.so.409`
-later. `HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6` is the L2m split the graph was compiled with, and the
-SDK's own `run_llm.sh` sets exactly `6:6:6:6` for every model. `_require_delegate_env()` fails with a
+`LD_LIBRARY_PATH` must point at **`$SDK/oellm_runtime/lib`** — the SDK's libraries (both
+`libxlm.so` and `libopencv_world.so.409`) live under `oellm_runtime/`, and there is **no** `$SDK/lib`
+directory. A path guessed as `$SDK/lib` is not an error on its own; it fails later as the confusing
+missing-`libopencv_world.so.409` this paragraph used to blame, which is why the correct directory is
+named here and in the block above. `LD_LIBRARY_PATH` is read by `dlopen` **before the process
+starts** — exporting it from inside Python is a no-op, so "set it for the user" cannot fix it.
+`HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6` is the L2m split the graph was compiled with, and the SDK's
+own `run_llm.sh` sets exactly `6:6:6:6` for every model. `_require_delegate_env()` fails with a
 message naming the missing variable(s) before touching a 1 GiB `.hbm`; it does not silently default.
 
 ### Reading it in `pocketllm devices`
@@ -354,8 +358,9 @@ See [`tests/native/test_delegate_stdout.py`](https://github.com/lvyufeng/PocketL
 
 `serve --device horizon` is the second entry point over this delegate
 ([#571](https://github.com/lvyufeng/PocketLLM/pull/571)/[#572](https://github.com/lvyufeng/PocketLLM/pull/572)),
-and it is exercised end to end on the board — measured 2026-10-09 with the 1.7B (`w4`) `.hbm` and a
-greedy tokenizer directory, through `tests/serving/test_xlm_serve_horizon.py`:
+and it is exercised end to end on the board — measured 2026-10-09 with the **0.6B (`w8`)** `.hbm`
+(`Qwen3-0.6B_language_chunk_512_cache_4096_w8_nash-p_corenum_4_4.hbm`, the same checkpoint
+`tests/serving/test_xlm_serve_horizon.py` hardcodes) and a greedy tokenizer directory:
 
 - **A single request is clean.** `POST /v1/chat/completions` returns `200`,
   `Content-Type: application/json; charset=utf-8`, a body any JSON client parses, the answer in
@@ -367,9 +372,12 @@ greedy tokenizer directory, through `tests/serving/test_xlm_serve_horizon.py`:
   `XlmImpl` lines) is present on the server's **stderr** and **absent from its stdout** — routed,
   not dropped, which is the property `quiet_delegate_stdout` promises under `run` and this page now
   confirms under `serve`.
-- **Requests serialize.** The six concurrent requests took ~2.67 s apart (a 1.7B decode), i.e. one at
-  a time behind the adapter's lock, not an error and not an interleave — the answer was identical
-  across the round, so no two requests shared the single delegate session.
+- **Requests serialize.** The six concurrent requests completed in steps of ~1.37 s (a 0.6B decode:
+  1.37 / 2.74 / 4.10 / 5.47 / 6.84 / 8.21 s), i.e. one at a time behind the adapter's lock, not an
+  error and not an interleave — the answer was identical across the round, so no two requests shared
+  the single delegate session. (The 1.7B `.hbm` was also exercised by hand and behaves the same way,
+  at a larger ~2.67 s step; the committed test uses 0.6B because a smaller `.hbm` makes the 6×3 round
+  cheap enough to run in CI's time budget.)
 - **Per-request sampling is refused with a clean `400`.** `temperature: 0.9`, `top_p: 0.5`,
   `top_k: 20` and `min_p: 0.1` each return `400` naming the field; `temperature: 0`, `top_p: 1`,
   `top_k: 0` are accepted. No 500, no silently-ignored field.
