@@ -161,6 +161,19 @@ class XlmUnavailable(RuntimeError):
     """The S600 `libxlm.so` is not installed, or cannot be loaded here."""
 
 
+#: The failure a delegate *decode* raises when the BPU cannot run the graph.
+class XlmInferenceError(RuntimeError):
+    """``xlm_infer`` reported ``XLM_STATE_ERROR``: the graph did not run.
+
+    Raised by :meth:`XlmEngine.infer` rather than returned as an empty answer,
+    because the delegate reports this failure through its callback and then
+    returns **0** from ``xlm_infer`` -- a success status -- so the only two ways
+    to notice it are the state the callback saw or the empty text.  This tree used
+    to notice neither: a run whose graph never executed printed the prompt and an
+    empty line, and exited 0.
+    """
+
+
 class XlmModelType:
     """`xlm_model_type`, as named constants.
 
@@ -638,6 +651,21 @@ class XlmEngine:
         _ = keep_alive, requests
         if status != 0:
             raise XlmUnavailable(f"xlm_infer refused the request (status {status})")
+        if state.get("error"):
+            # `xlm_infer` returned 0, but the callback was handed `XLM_STATE_ERROR`
+            # while the graph was running.  The two places this happens on this
+            # board are a `bpu_core` list that disagrees with the graph's compiled
+            # core count and a prefill the BPU could not execute; both are stderr
+            # log lines the caller of a library never sees, so the state has to
+            # become the exception or the empty text is read as an answer.  The SDK
+            # exposes no error struct (`xlm_result_t` is text, id, performance) and
+            # no error-string API, so there is no delegate message to forward.
+            raise XlmInferenceError(
+                "the delegate reported an inference error (XLM_STATE_ERROR): the graph did "
+                "not run, so there is no answer. The SDK logs the cause to stderr -- the "
+                "common one on the S600 is a config `bpu_core` list that disagrees with the "
+                "core count the .hbm was compiled for."
+            )
         chunks: list[str] = state.get("chunks", [])  # type: ignore[assignment]
         return "".join(chunks)
 

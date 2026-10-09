@@ -528,7 +528,7 @@ def _run_delegate(namespace: argparse.Namespace, engine_args: EngineArgs) -> int
         _refuse_unsupported_sampling,
         _resolve_model,
     )
-    from .xlm import XlmEngine, XlmModelType, XlmUnavailable
+    from .xlm import XlmEngine, XlmInferenceError, XlmModelType, XlmUnavailable
 
     # The flag policy is settled **before** anything touches the disk: a bad flag
     # is a caller's mistake about the request, not about the checkpoint, and
@@ -595,6 +595,11 @@ def _run_delegate(namespace: argparse.Namespace, engine_args: EngineArgs) -> int
 
     try:
         text = engine.infer(namespace.prompt)
+    except XlmInferenceError as exc:
+        # A delegate whose graph did not run is a one-line refusal, not a traceback:
+        # the same class as the load failure above, caught here because it can only
+        # be observed after the session is open.
+        raise SystemExit(f"`pocketllm run` failed: {exc}") from exc
     finally:
         engine.close()
 
