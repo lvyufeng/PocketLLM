@@ -151,6 +151,24 @@ assigned. The L2m split cannot help because the failure is one contiguous alloca
 L2m partition — and the SDK's docs set `6:6:6:6` for every model regardless of size, so it is not a
 size-dependent lever.
 
+The **Qwen3-VL-4B-Instruct language graph** was the one 4B-shaped lead that looked like it might
+duck this, because the vendor ships it with `cache_1024` rather than `cache_4096` — the same
+smaller-footprint shape our own recompile targets. It does not. Measured on the board 2026-10-09: the
+file is **2,463,911,336 bytes (2.29 GiB / 2349.8 MiB)**, and `hrt_model_exec model_info` on it reports
+
+```text
+Cannot malloc bpu memory with length 2463911336 bytes: AllocError { len: 2465267712 }
+  -> HBRT4_STATUS_RESOURCE_EXHAUSTED
+  -> ion_alloc ret=-12 (ENOMEM)
+  -> hbDNNInitializeFromFiles error code -400001
+```
+
+the same refusal as the plain 4B, over the same 2.00 GiB `ion_carveout`, by **301.8 MiB** (the loader
+pads its request to 2351.1 MiB). The file's md5 is `c54dcf7686c0339a2307de10319a813c`, matching the
+SDK's published `md5sum.txt`. So the `cache_1024` shrink is not enough — the weights alone exceed the
+pool before any vision or embed artifact is touched — and this lead is closed: no 4B language graph,
+plain or VL, loads on this board without the carveout resize.
+
 ### What the pools are
 
 The board's DRAM carve-outs are fixed device-tree `reserved-memory` nodes (**not** kernel cmdline —
