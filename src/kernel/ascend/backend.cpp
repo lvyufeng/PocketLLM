@@ -195,7 +195,9 @@
 #include <aclnn/acl_meta.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -229,6 +231,115 @@ constexpr int64_t kRmsMaxD = 4096;     /* RmsNormNdCustom keeps one row in UB */
 constexpr int64_t kMaxContext = 8192;  /* AttentionStepCustom's MAX_CONTEXT */
 constexpr int64_t kRopeMaxD = 512;     /* RopeCustom's MAX_HALF = 256, so rot <= 512 */
 constexpr int64_t kRopeLane = 32;      /* RopeCustom moves halfRot in 16-half-word lanes */
+
+/* An env-gated per-stage clock for the ascend backend.  Off unless
+ * `POCKETLLM_ASCEND_PROFILE` is set, and then it prints one line per op label at
+ * process exit.  The counters are read and written only from the single thread
+ * that drives the graph (the backend is not re-entrant -- one process, one
+ * device), so they carry no lock.  The point is to split a decode step into the
+ * three costs the page names -- the host f32<->fp16 conversion of an activation,
+ * the aclrtMemcpy transfers, and the crowd of aclnn/acl glue calls around each
+ * op -- so a fix can be aimed at whichever is actually largest. */
+bool profile_on() {
+  static const bool on = std::getenv("POCKETLLM_ASCEND_PROFILE") != nullptr;
+  return on;
+}
+
+double now_ms() {
+  using clk = std::chrono::steady_clock;
+  return std::chrono::duration<double, std::milli>(clk::now().time_since_epoch()).count();
+}
+
+/* Per-stage timers, in this order: to_f16 (f32->fp16 host convert), to_f32 (the
+ * widen), sdma_up (host->device copies), sdma_down (device->host copies),
+ * tensor_create, tensor_destroy, ws_get (GetWorkspaceSize), ws_alloc (the
+ * workspace aclrtMalloc/aclrtFree), op_enqueue (the op's own entry point, which
+ * on this API only *enqueues*), op_sync (aclrtSynchronizeStream -- where the
+ * NPU's own work is actually waited on).  Anything an op's own scope holds
+ * outside a slot is not attributed; the op-scope total is printed per op so that
+ * remainder is visible as the gap. */
+constexpr int kNumStages = 10;
+struct StageStats {
+  double ms[kNumStages] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  long calls[kNumStages] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  std::unordered_map<std::string, std::pair<double, long>> ops;
+
+  void add(int i, double dt) {
+    ms[i] += dt;
+    calls[i] += 1;
+  }
+  void totals_in(const std::string &op, const double before[kNumStages]) {
+    double t = 0;
+    for (int i = 0; i < kNumStages; ++i) {
+      t += ms[i] - before[i];
+    }
+    auto &p = ops[op];
+    p.first += t;
+    p.second += 1;
+  }
+  ~StageStats() {
+    if (!profile_on()) {
+      return;
+    }
+    static const char *const names[kNumStages] = {
+        "to_f16",    "to_f32",         "sdma_up",   "sdma_down", "tensor_create",
+        "tensor_destroy", "ws_get",    "ws_alloc",  "op_enqueue", "op_sync"};
+    double total = 0;
+    for (int i = 0; i < kNumStages; ++i) {
+      total += ms[i];
+    }
+    std::printf("\n[pocketllm ascend profile] per-stage, summed over the process\n");
+    for (int i = 0; i < kNumStages; ++i) {
+      std::printf("  %-15s %10.1f ms  %6.1f%%  %8ld calls\n", names[i], ms[i],
+                  total > 0 ? 100.0 * ms[i] / total : 0.0, calls[i]);
+    }
+    std::printf("  %-15s %10.1f ms\n", "TOTAL", total);
+    std::printf("\n[pocketllm ascend profile] by op\n");
+    for (const auto &kv : ops) {
+      std::printf("  %-16s %10.1f ms  %8ld calls  %8.3f ms/call\n", kv.first.c_str(), kv.second.first,
+                  kv.second.second,
+                  kv.second.second ? kv.second.first / static_cast<double>(kv.second.second) : 0.0);
+    }
+  }
+};
+
+StageStats &profiler() {
+  static StageStats s;
+  return s;
+}
+
+/* A scope timer.  `OpScope` books an op's whole wall time under its label and
+ * snapshots the stage counters so it can attribute the delta to that op; the
+ * `StageClock` records one stage into one slot.  Both cost nothing when
+ * profiling is off: the clock is not even read, and `OpScope` holds a `const
+ * char *` rather than a string so a call site adds no allocation. */
+struct StageClock {
+  int slot;
+  double t0;
+  explicit StageClock(int s) : slot(s), t0(profile_on() ? now_ms() : 0.0) {}
+  ~StageClock() {
+    if (profile_on()) {
+      profiler().add(slot, now_ms() - t0);
+    }
+  }
+};
+
+struct OpScope {
+  const char *name;
+  double before[kNumStages];
+  explicit OpScope(const char *n) : name(n) {
+    if (profile_on()) {
+      for (int i = 0; i < kNumStages; ++i) {
+        before[i] = profiler().ms[i];
+      }
+    }
+  }
+  ~OpScope() {
+    if (profile_on()) {
+      profiler().totals_in(name, before);
+    }
+  }
+};
 
 /* A 2-D or smaller `aclTensor` with a contiguous stride computed from the
  * shape, which is what every op here works in.  `aclnn/acl_meta.h` has no
@@ -365,6 +476,7 @@ float f16_to_f32(uint16_t h) {
 
 std::vector<float> half_to_f32(const std::vector<uint16_t> &half) {
   std::vector<float> out(half.size());
+  StageClock _sc(1); /* to_f32 */
   for (std::size_t i = 0; i < half.size(); ++i) {
     out[i] = f16_to_f32(half[i]);
   }
@@ -373,6 +485,7 @@ std::vector<float> half_to_f32(const std::vector<uint16_t> &half) {
 
 std::vector<uint16_t> to_f16(const float *src, int64_t count) {
   std::vector<uint16_t> out(static_cast<std::size_t>(count));
+  StageClock _sc(0); /* to_f16 */
   for (int64_t i = 0; i < count; ++i) {
     out[static_cast<std::size_t>(i)] = f32_to_f16(src[i]);
   }
@@ -505,12 +618,14 @@ class AscendBackend final : public Backend {
   }
 
   void copy_to_device(DeviceBuffer dst, const void *src, int64_t bytes) override {
+    StageClock _sc(2); /* sdma_up */
     acl_ok(aclrtMemcpy(reinterpret_cast<void *>(dst.handle), static_cast<std::size_t>(bytes), src,
                        static_cast<std::size_t>(bytes), ACL_MEMCPY_HOST_TO_DEVICE),
            "aclrtMemcpy H2D");
   }
 
   void copy_to_host(void *dst, DeviceBuffer src, int64_t bytes) override {
+    StageClock _sc(3); /* sdma_down */
     acl_ok(aclrtMemcpy(dst, static_cast<std::size_t>(bytes),
                        reinterpret_cast<const void *>(src.handle), static_cast<std::size_t>(bytes),
                        ACL_MEMCPY_DEVICE_TO_HOST),
@@ -540,6 +655,7 @@ class AscendBackend final : public Backend {
   void gemm_quant(DeviceBuffer x, DeviceBuffer blocks, DeviceBuffer bias, DeviceBuffer out,
                   int64_t m, int64_t n, int64_t k, int type_id, bool accumulate,
                   bool q6k_repacked = false) override {
+    OpScope _op("gemm_quant");
     /* The byte-expanded q6_K layout is a CUDA-only path; the ascend backend
      * decodes the GGUF blocks itself and never sets this. */
     (void)q6k_repacked;
@@ -650,6 +766,7 @@ class AscendBackend final : public Backend {
 
   void rms_norm(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer out, int64_t n_tokens,
                 int64_t d, float eps) override {
+    OpScope _op("rms_norm");
     if (n_tokens <= 0 || d <= 0) {
       return;
     }
@@ -694,6 +811,7 @@ class AscendBackend final : public Backend {
 
   void gemm(DeviceBuffer x, DeviceBuffer w, DeviceBuffer bias, DeviceBuffer out, int64_t m,
             int64_t n, int64_t k, bool accumulate) override {
+    OpScope _op("gemm");
     if (m <= 0 || n <= 0 || k <= 0) {
       return;
     }
@@ -710,6 +828,7 @@ class AscendBackend final : public Backend {
   }
   void embedding(DeviceBuffer tokens, int64_t n_tokens, DeviceBuffer table, int64_t vocab,
                  int64_t d, DeviceBuffer out) override {
+    OpScope _op("embedding");
     std::vector<int32_t> ids(static_cast<std::size_t>(n_tokens));
     copy_to_host(ids.data(), tokens, n_tokens * 4);
     gather_rows(ids, table, vocab, d, out);
@@ -717,6 +836,7 @@ class AscendBackend final : public Backend {
 
   void embedding_quant(DeviceBuffer tokens, int64_t n_tokens, DeviceBuffer blocks, int64_t vocab,
                        int64_t d, int type_id, DeviceBuffer out) override {
+    OpScope _op("embedding_quant");
     if (quant::block_bytes_of(type_id) == 0) {
       throw Error("ascend: embedding_quant has no decoder for GGML type id " +
                   std::to_string(type_id));
@@ -742,6 +862,7 @@ class AscendBackend final : public Backend {
     gather_rows(ids, dtable, vocab, d, out);
   }
   void silu_mul(DeviceBuffer gate, DeviceBuffer up, DeviceBuffer out, int64_t n) override {
+    OpScope _op("silu_mul");
     if (n <= 0) {
       return;
     }
@@ -807,6 +928,7 @@ class AscendBackend final : public Backend {
 
   void rope_neox(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d,
                  int64_t start_pos, DeviceBuffer cos_table, DeviceBuffer sin_table) override {
+    OpScope _op("rope_neox");
     /* `aclnnRopeCustom` walks a flat `[rows, d]` operand with a per-row INT32
      * index into the whole cos/sin table, so the token-major ``[token][head][d]``
      * x is already the right shape: a row is one (token, head) pair, and every
@@ -915,6 +1037,7 @@ class AscendBackend final : public Backend {
                  DeviceBuffer v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
                  int64_t q_offset, float scale, DeviceBuffer out, DeviceBuffer scores,
                  KVDtype kv_dtype) override {
+    OpScope _op("attention");
     (void)scores;  /* the op keeps its score row on the device, not in this buffer */
     if (first_key != 0) {
       throw Error("ascend: attention with a sliding window (first_key=" +
@@ -969,6 +1092,7 @@ class AscendBackend final : public Backend {
 
   void kv_append(DeviceBuffer dst, DeviceBuffer src, int64_t n, int64_t n_head_kv, int64_t d,
                  int64_t elem) override {
+    OpScope _op("kv_append");
     if (n <= 0) {
       return;
     }
@@ -1006,6 +1130,7 @@ class AscendBackend final : public Backend {
     return as_f16 ? KVDtype::kF16 : KVDtype::kF32;
   }
   void argmax(DeviceBuffer values, int64_t n, DeviceBuffer out) override {
+    OpScope _op("argmax");
     if (n <= 0) {
       throw Error("ascend: argmax needs a positive length, got " + std::to_string(n));
     }
@@ -1041,6 +1166,7 @@ class AscendBackend final : public Backend {
   }
 
   void softmax(DeviceBuffer x, DeviceBuffer out, int64_t rows, int64_t cols) override {
+    OpScope _op("softmax");
     if (rows <= 0 || cols <= 0) {
       return;
     }
@@ -1075,6 +1201,7 @@ class AscendBackend final : public Backend {
   }
   void topk_sample(DeviceBuffer logits, int64_t vocab, float uniform, int64_t top_k, float top_p,
                    float min_p, DeviceBuffer order, DeviceBuffer out) override {
+    OpScope _op("topk_sample");
     (void)logits;
     (void)vocab;
     (void)uniform;
@@ -1205,27 +1332,45 @@ class AscendBackend final : public Backend {
       const int64_t a_stride[2] = {k, 1};
       const int64_t b_stride[2] = {nc, 1};
       const int64_t o_stride[2] = {nc, 1};
-      aclTensor *ta = aclCreateTensor(a_shape, 2, ACL_FLOAT16, a_stride, 0, ACL_FORMAT_ND, a_shape, 2,
-                                      reinterpret_cast<void *>(dx.handle));
-      aclTensor *tb = aclCreateTensor(b_shape, 2, ACL_FLOAT16, b_stride, 0, ACL_FORMAT_ND, b_shape, 2,
-                                      reinterpret_cast<void *>(b_handle));
-      aclTensor *to = aclCreateTensor(o_shape, 2, ACL_FLOAT16, o_stride, 0, ACL_FORMAT_ND, o_shape, 2,
-                                      reinterpret_cast<void *>(dout.handle));
+      aclTensor *ta;
+      aclTensor *tb;
+      aclTensor *to;
+      {
+        StageClock _c(4); /* tensor_create */
+        ta = aclCreateTensor(a_shape, 2, ACL_FLOAT16, a_stride, 0, ACL_FORMAT_ND, a_shape, 2,
+                             reinterpret_cast<void *>(dx.handle));
+        tb = aclCreateTensor(b_shape, 2, ACL_FLOAT16, b_stride, 0, ACL_FORMAT_ND, b_shape, 2,
+                             reinterpret_cast<void *>(b_handle));
+        to = aclCreateTensor(o_shape, 2, ACL_FLOAT16, o_stride, 0, ACL_FORMAT_ND, o_shape, 2,
+                             reinterpret_cast<void *>(dout.handle));
+      }
       if (ta == nullptr || tb == nullptr || to == nullptr) {
         throw Error("ascend: aclCreateTensor returned null (gemm)");
       }
       uint64_t ws_size = 0;
       aclOpExecutor *executor = nullptr;
-      aclnn_ok(aclnnMatmulCubeCustomGetWorkspaceSize(ta, tb, to, &ws_size, &executor),
-               "aclnnMatmulCubeCustomGetWorkspaceSize");
-      void *workspace = nullptr;
-      if (ws_size > 0) {
-        acl_ok(aclrtMalloc(&workspace, static_cast<std::size_t>(ws_size), ACL_MEM_MALLOC_HUGE_FIRST),
-               "aclrtMalloc workspace");
+      {
+        StageClock _c(6); /* ws_get */
+        aclnn_ok(aclnnMatmulCubeCustomGetWorkspaceSize(ta, tb, to, &ws_size, &executor),
+                 "aclnnMatmulCubeCustomGetWorkspaceSize");
       }
-      aclnn_ok(aclnnMatmulCubeCustom(workspace, ws_size, executor, stream_),
-               "aclnnMatmulCubeCustom");
-      acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
+      void *workspace = nullptr;
+      {
+        StageClock _c(7); /* ws_alloc */
+        if (ws_size > 0) {
+          acl_ok(aclrtMalloc(&workspace, static_cast<std::size_t>(ws_size), ACL_MEM_MALLOC_HUGE_FIRST),
+                 "aclrtMalloc workspace");
+        }
+      }
+      {
+        StageClock _c(8); /* op_enqueue */
+        aclnn_ok(aclnnMatmulCubeCustom(workspace, ws_size, executor, stream_),
+                 "aclnnMatmulCubeCustom");
+      }
+      {
+        StageClock _c(9); /* op_sync */
+        acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
+      }
 
       std::vector<uint16_t> out_h(static_cast<std::size_t>(m * nc));
       copy_to_host(out_h.data(), dout, m * nc * 2);
@@ -1237,12 +1382,18 @@ class AscendBackend final : public Backend {
         }
       }
 
-      if (workspace != nullptr) {
-        aclrtFree(workspace);
+      {
+        StageClock _c(7); /* ws_alloc: the free rides with the alloc */
+        if (workspace != nullptr) {
+          aclrtFree(workspace);
+        }
       }
-      aclDestroyTensor(ta);
-      aclDestroyTensor(tb);
-      aclDestroyTensor(to);
+      {
+        StageClock _c(5); /* tensor_destroy */
+        aclDestroyTensor(ta);
+        aclDestroyTensor(tb);
+        aclDestroyTensor(to);
+      }
       release(dout);
       woff += k * nc;
     }

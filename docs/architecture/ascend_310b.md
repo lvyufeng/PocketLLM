@@ -273,7 +273,10 @@ the profiler's own overhead — read them as shares, not as the totals above):
 † the embedding table was the largest cost *after* the weight plane was cached, and it is a
 per-token cost until it is cached in turn — the two together are the change. The activation-side
 transfers the ops still do (each op brings f32 in, converts to fp16, drives the op, widens back) are
-what is left; that is the next thing to attack, not something this change touched.
+what is left; that is the next thing to attack, not something this change touched. **That "next
+thing" has since been measured and is not worth attacking**: at 4B the convert and transfer are
+~9% of a decode step, and the step is ~86% the NPU waiting on the cube itself — see
+[Where a 4B decode step actually goes](#where-a-4b-decode-step-actually-goes-and-why-nothing-was-changed).
 
 This is a correctness path that is now also ~fast enough to use (3.8 t/s decode), but it is still
 the fp16 cube on ~1 GB of resident plane rather than the device's own quantized ops. Feeding
@@ -458,3 +461,64 @@ The honest statement of coverage is now four sizes: **0.6B, 4B and 8B token-iden
 and fits with one documented near-tie** — the same fp16-plane precision limit this whole page is
 about, met at one prompt at 1.7B and not met at the other three, with no new op and no shape guard in
 the way at any of them.
+
+## Where a 4B decode step actually goes — and why nothing was changed
+
+The paragraph above the caches names the candidate: "the activation-side transfers the ops still do
+(each op brings f32 in, converts to fp16, drives the op, widens back) are what is left". A 4B decode
+step is ~343 cube drives and ~253 `gemm_quant` calls — the 36 layers' seven GEMMs plus the head, each
+split at the 8192-column `kCubeChunkN` — so *if* that guess were right the fix would be to thread fp16
+through the graph, or to reuse the per-call `aclTensor` descriptors, or both. **Measured, the guess is
+wrong, and the honest answer to "fix it" is no.** The splits, from `$POCKETLLM_ASCEND_PROFILE=1`
+(a per-stage clock now in `backend.cpp`, printing at exit):
+
+| stage | steps=1 | steps=8 | **per decode step** | share |
+|---|---|---|---|---|
+| **op_sync** — `aclrtSynchronizeStream`, the NPU's own work | 913.6 ms | 4083.0 ms | **452.8 ms** | **85.5%** |
+| to_f16 — the f32→fp16 convert of an activation | 128.5 ms | 421.1 ms | 41.8 ms | 7.9% |
+| sdma_down — the D2H read-back of each chunk | 696.1 ms | 776.0 ms | 11.4 ms | 2.2% |
+| to_f32 — the fp16→f32 widen | 49.5 ms | 114.6 ms | 9.3 ms | 1.8% |
+| op_enqueue — the host cost of the op call itself | 27.1 ms | 70.2 ms | 6.2 ms | 1.2% |
+| sdma_up — H2D | 2687.8 ms | 2717.9 ms | 4.3 ms | 0.8% |
+| aclTensor create+destroy, `GetWorkspaceSize`, ws alloc | 19.9 ms | 45.1 ms | ~3.6 ms | 0.7% |
+
+The per-decode-step column is the two run totals differenced and divided by seven: `--steps 1` and
+`--steps 8` share the whole one-time prologue (the plane build, the embedding-table decode, the
+~0.38 s of `embedding_quant`) and the same 5-token prefill, so their difference **is** seven decode
+steps. That differencing is what makes the split readable at all — the steps=1 column is 59% `sdma_up`
+because the plane build is a host→device `aclrtMemcpy` of every weight, and the table decode is
+`embedding_quant`'s 190 ms/call. Neither is a decode cost, and neither paginates a fix. The tracked
+stages sum to **~0.53 s** of the ~0.59–0.63 s headline marginal; the ~0.07 s gap is the host work that
+sits *between* the slots — chiefly `run_cube_weight`'s chunk-accumulate loop (343 × 8192 f32 adds per
+step) and the graph's own inter-op walk — which no slot measures and this split does not claim.
+
+**The activation-side work is 14.5% of the step — everything that is not `op_sync` — and the *transfers* are the smaller half of it.**
+The convert is 41.8 ms and the widen 9.3 ms — CPU work on one token's `k`-element row, and the two
+halves that a fp16-threaded graph would remove — while the `sdma_*` beside them is only 15.7 ms, and
+its 4360-up/4122-down call counts are dominated by the *plane build's* copies, not decode. Threading
+fp16 through the graph would take the step from **~530 ms to ~480 ms: a ~9% win**, for a graph-wide
+dtype change that touches every op and every boundary. The `aclTensor` glue the task flagged as "the
+sleeper" came in at **0.4%** — ~5.2 µs per create/destroy across 343 drives; it is noise, and
+descriptor reuse would not pay for its own risk.
+
+**What the 452.8 ms is.** 343 chunks × (m=1, n=8192, k=~2560) is 14.4 GFLOP/step, so the cube is
+moving **~32 GFLOP/s** — a small fraction of what its fp16 units can do, and far under what the
+earlier per-op measurement saw (that one ran a single large gemm, not 343 launches of a 24×8K tile).
+The cost is therefore **per-op launch/scheduling overhead on the NPU**, not arithmetic: the host
+enqueues in 6.2 ms and then waits 452.8 ms for work that is mostly fixed-cost. The lever is fewer,
+larger cube drives — a batched or wider-N launch, or not re-launching per chunk — not the activation
+dtype. That is a different change than the one the page's own text proposed, and it is the one a
+profile actually points at; it is left for its own PR rather than bundled here.
+
+**No behavior changed, and the gate says so.** The profiler is env-gated and, off, adds not one clock
+read: `StageClock` does not call `now_ms()` and `OpScope` holds a `const char *` rather than a
+`std::string`, so a call site allocates nothing and the timed path is the binary it was before. The
+4B decode — the `--steps 8`/`32` marginal — reads **0.587 s/token** before (this page's row above,
+measured in the coverage change) and **0.634 s/token** after (walls 209.0 s and 224.2 s), and that
+8% is this host's run-to-run spread rather than a cost of the profiler: the walls at *both* step
+counts are **lower** after (220.8→209.0 and 234.9→224.2 s), so the two moved independently. There is
+no mechanism for the profiling code to change a run with `POCKETLLM_ASCEND_PROFILE` unset, and the
+measurement is reported as it landed rather than re-rolled to the prior number. All three identity
+gates hold as documented above: **0.6B identical, 1.7B the one near-tie, 4B identical.** The
+deliverable is the split above — the measured answer that the transfers are a ninth of the step, so
+the change the page named is not worth making, and the profile names a different bottleneck instead.
