@@ -225,7 +225,8 @@ final chunk — the only conformance cases whose N reaches the failing region.
 ## End to end: a full Qwen3 forward runs
 
 The backend runs a complete Qwen3-0.6B forward — prefill and decode — and produces text **identical
-to the CPU backend**:
+to the CPU backend**. This is the board's **regression gate** and it still passes; the 1.7B section
+below is a second size and where it does not.
 
 ```
 pocketllm-run <Qwen3-0.6B q4_k_m> --device ascend --prompt "The capital of France is" --steps 8
@@ -239,9 +240,10 @@ graph ops, so the sampler tail is not a backend gap.
 
 Wrong answers are still possible where the trilogy of numeric width, tuned kernel, and API surface
 disagree — this is the page that documented the W4A16 fp16-accumulate floor and the cube's
-large-N edge — but the *coverage* gap is closed: there is no op the graph calls that the backend
-refuses. The paths the whole forward still lacks are the ones the graph never calls: `gemm` bias,
-attention with a sliding window (`first_key != 0`), and `topk_sample`/`logits_temperature`.
+large-N edge, and the second checkpoint below is a third instance — but the *coverage* gap is closed:
+there is no op the graph calls that the backend refuses. The paths the whole forward still lacks are
+the ones the graph never calls: `gemm` bias, attention with a sliding window (`first_key != 0`), and
+`topk_sample`/`logits_temperature`.
 
 **The cost was real, and the two caches above are what paid it down.**
 `Qwen3-0.6B-Q4_K_M`, `--prompt "The capital of France is"`, measured on the board:
@@ -277,3 +279,77 @@ This is a correctness path that is now also ~fast enough to use (3.8 t/s decode)
 the fp16 cube on ~1 GB of resident plane rather than the device's own quantized ops. Feeding
 `MatmulW8a8I32Custom` / `MatmulW4a16Custom` the *packed* weights would remove both the ~1 GB and the
 per-op f32↔fp16 round trip, and is the larger remaining win — it is not this change.
+
+## A second checkpoint: Qwen3-1.7B, and where it does not match
+
+The board runs a second Qwen3 size, and it is a different shape family rather than a bigger copy of
+the first. `Qwen3-1.7B-Q4_K_M` is a `q4_k_m` file like the 0.6B's — the same quantizer mix, so the
+same faithful q4_K/q6_K decode path, over ~2.8× the weights — but its hidden width is **2048**, not
+1024; its `ffn_down` is 6144 wide; and its output projection is a distinct q4_k tensor where the 0.6B
+ties `token_embd`. None of that was known to work: the backend's shape guards (`rms_norm` ≤ 4096 and
+a multiple of 16, the cube's 8192-column chunk, `n % 128`) had only ever been exercised at the 0.6B
+family.
+
+**It runs, and it fits.** The 1.7B fp16 plane is ~3.4 GB against the 0.6B's ~1 GB, on a board whose
+`MemTotal` is 23.7 GiB (`MemAvailable` 21.4 GiB at rest) — the process peak RSS is **3.6 GiB**
+(`VmHWM` 3776924 kB) and no swap is touched. Resident weights scale linearly with the checkpoint, as
+they should: the plane is a pure function of the weights and is built once.
+
+| checkpoint | decode, marginal | `--steps 8` wall | `--steps 32` wall | peak RSS |
+|---|---|---|---|---|
+| Qwen3-0.6B | 0.26 s/token | 27.6 s | — | ~1 GB plane |
+| Qwen3-1.7B | **0.39 s/token** | 92.0 s | 101.4 s | **3.6 GiB** |
+
+Decode is the marginal between `--steps 8` and `--steps 32`: (101.38 − 92.03) / 24 = **0.39 s/token**,
+1.5× the 0.6B's — the ratio the 2.8× weight count over the same 28 layers predicts. The ~92 s wall at
+either step count is mostly a one-time cost, not decode: at `--steps 1` the floor is **~91.5 s, flat
+from 11 prompt tokens up** (92.19 s at 11 tokens), which is the plane build — the 1.7B plane is ~3.4×
+the 0.6B's and takes ~4.7× as long to build. Prefill is *not* that fixed cost, and it is
+**superlinear**: `--steps 1` costs 98.26 s at 101 prompt tokens (+0.067 s/token over the floor),
+113.63 s at 201, and **178.15 s at 401** — the marginal rate rises from ~0.07 to ~0.32 s/token, because
+prefill is the model's loop of one `AttentionStepCustom` per position and every position attends to
+its whole prefix.
+
+**The identity gate is against the board's own CPU backend, and it does not hold for this checkpoint
+on the canonical prompt — but it fails the way the page already predicts it can, not in a new way.**
+The two sequences:
+
+```
+--prompt "The capital of France is" --steps 8
+  cpu          -> [12095 Paris 13. 576 The 6722 capital 315 of 17689 Spain 374 is 24081 Madrid]
+  ascend 1.7B  -> [12095 Paris 13. 576 The 6722 capital 315 of  279 the   3639 United 4180 States]
+```
+
+They agree for **five** generated tokens and first differ at **generated index 5**: the CPU picks
+`17689` ("Spain"), the board picks `279` ("the"). The two sides' logits at that position:
+
+| rank | CPU (f32) | | ascend (fp16 cube) | |
+|---|---|---|---|---|
+| 1 | 17689 "Spain" | 22.0520 | **279 "the"** | 22.0469 |
+| 2 | **279 "the"** | 22.0486 | 17689 "Spain" | 22.0469 |
+| 3–8 | 9856, 15344, 6323, 15948, 32961, 6864 | 21.87 … 20.55 | the same six ids, same order | within 0.013 |
+
+**It is the same two tokens swapped, on a margin of 0.0034.** Ranks 3–8 are identical ids in
+identical order, so nothing is structurally wrong — this is one near-tie the two backends resolve
+differently, and past it every token is a different question because the two are then reading
+different text. 0.0034 on a ~22-magnitude logit is **1.5e-4 relative**, below the **~2.7e-4** the cube
+is itself good to (the fp16-operand, fp32-accumulate figure this page measured for the cube and, in
+the W4A16 section above, for the same arithmetic). A backend 2.7e-4 off cannot be *expected* to break
+a 1.5e-4 tie the way f32 does, so the flip sits inside the backend's documented accuracy rather than
+outside it.
+
+**Two controls say the same thing.** A second prompt — `"Name three colors of the rainbow"`,
+`--steps 8` — is **token-identical** on both backends
+(`[13. 576 The 47613 rainbow 374 is 1865 made 705 up 315 of 8094 seven]`); and the 0.6B regression
+gate above still passes. The divergence is therefore not "1.7B is broken" and not "the ascend backend
+is broken" — it is this one prompt landing a near-tie under the fp16 floor. (The 0.6B is not immune
+in principle; it simply has fewer near-ties to land, and its canonical prompt does not land one in 32
+steps — which the 0.6B was checked at too, identical on both backends.)
+
+So the honest statement of coverage is: **one Qwen3 size is token-identical on the board and a second
+runs, fits, and matches everywhere the two backends are not asked to break a tie smaller than the
+fp16 plane's own error.** It is not a coverage gap — every op the graph calls runs at hidden 2048, so
+no shape guard is in the way — and it is not a new op. It is the precision of the fp16 plane, showing
+up as a token. The path to "identical at 1.7B" is the same as everywhere else on this page: give the
+graph more precision (the packed-weights path the W4A16 section closed, or an fp32 accumulation
+upgrade), not a new op.
