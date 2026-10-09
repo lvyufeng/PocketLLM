@@ -324,6 +324,26 @@ if(POCKETLLM_ASCEND_SOURCES)
   pocketllm_add_ascend(pocketllm-opcheck)
 endif()
 
+# Drive `MatmulCubeCustom` at a fixed weight shape while varying only m, to tell
+# a shape limit (throughput rises with m) from a device limit (it does not).
+add_executable(pocketllm-mscale
+  tools/mscale.cpp
+  runtime/status.cpp
+  kernel/kernels.cpp
+  kernel/repack_q4k.cpp
+  kernel/cpu/backend.cpp
+  kernel/registry.cpp
+  ${POCKETLLM_CUDA_SOURCES}
+)
+if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)
+  target_compile_definitions(pocketllm-mscale PRIVATE POCKETLLM_WITH_CUDA=1)
+  set_target_properties(pocketllm-mscale PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+endif()
+target_link_libraries(pocketllm-mscale PRIVATE pocketllm-kernel-options)
+if(POCKETLLM_ASCEND_SOURCES)
+  pocketllm_add_ascend(pocketllm-mscale)
+endif()
+
 # Measure the engine's own throughput, as `llama-bench` measures llama.cpp's.
 # Same object list as `pocketllm-run` -- it needs the model and both backends --
 # and the same CUDA guard, so a CUDA build links here too.
