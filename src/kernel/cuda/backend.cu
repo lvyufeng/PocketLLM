@@ -205,18 +205,27 @@ __device__ void quant_block_accumulate(int type_id, const uint8_t *block, const 
      * the one `dequant_q6_k` produced, in the same association, so the sum is
      * unchanged. The scale index `col / 16` is the file decoder's
      * `half * 8 + i / 16 + 2 * sub`, which for a run-major walk is just the
-     * 16-weight group's ordinal. */
-    const int8_t *qs = reinterpret_cast<const int8_t *>(block);
+     * 16-weight group's ordinal.
+     *
+     * The 256 weights are read as sixteen `uint4` (64 bytes each) rather than
+     * one `int8` at a time. The block sits on a 16-byte stride
+     * (`kQ6KRepackedStride`), so every such read is aligned and the compiler
+     * emits `LDG.128` -- four sectors of 16 bytes per warp-instruction instead of
+     * the 32 one-byte lanes of `LDG.E.S8`. The bytes are recovered from the eight
+     * little-endian words exactly as `as_byte` would, so a weight's value and the
+     * serial `total` order are unchanged: the vector load is a *load*, not a
+     * reassociation. */
     const float d = quant::as_half(block, 272);
-    for (int col = 0; col < quant::kBlockWeights; ++col) {
-      /* The arithmetic is inlined, not routed through
-       * `quant::dequant_q6_k_repacked`, for the reason the Q4_K branch inlines
-       * its own: a device-function call hides the loop body from nvcc's
-       * unroller and the decode runs ~5x slower. The expression is the one that
-       * helper writes, so the value is the same bit for bit. */
-      const int scale = quant::as_int8(block, 256 + col / 16);
+    for (int g = 0; g < 16; ++g) {
+      const uint4 v = *reinterpret_cast<const uint4 *>(block + g * 16);
+      const unsigned w[4] = {v.x, v.y, v.z, v.w};
+      const int scale = quant::as_int8(block, 256 + g);
       const float ds = d * static_cast<float>(scale);
-      total += xs[col] * (ds * static_cast<float>(static_cast<int>(qs[col])));
+      for (int i = 0; i < 16; ++i) {
+        const int q = static_cast<int>((w[i >> 2] >> ((i & 3) * 8)) & 0xFFu);
+        const int signed_q = q < 128 ? q : q - 256;
+        total += xs[g * 16 + i] * (ds * static_cast<float>(signed_q));
+      }
     }
     return;
   }
@@ -636,7 +645,7 @@ class CudaBackend final : public Backend {
      * bytes, and `block_bytes_of` would answer for the file format. The flag is
      * the only thing that says which, so it also picks the stride. */
     const int block_bytes =
-        q6k_repacked ? quant::kQ6KRepackedBytes : quant::block_bytes_of(type_id);
+        q6k_repacked ? quant::kQ6KRepackedStride : quant::block_bytes_of(type_id);
     if (block_bytes == 0) {
       /* Refused by name, and refused *here* rather than at the caller: a build
        * whose device half does not carry a decoder has to say so on the device

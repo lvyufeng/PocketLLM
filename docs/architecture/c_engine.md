@@ -641,6 +641,52 @@ wall-clock to first token is **0.95 s off vs 1.52 s on** and its peak host RSS *
 about **+0.6 s and +10 MB host**, with device memory +129 MB. The extra host time is the repack pass
 itself and is a one-time load cost, not a per-token one.
 
+### The repacked q6_K loads a vector, not a byte, and the stride is why
+
+The byte-expansion above removed the `ql`/`qh` bit assembly and won 1.36×, but it left the kernel
+issuing **one 1-byte global load per weight**. The SASS said so plainly: the decode compiled to 276
+scalar `LDG.E.S8` against 8 `LDG.E.128`, and profiling the kernel put it at **3–16% of the card's
+HBM** with a single active warp per scheduler and **84% of cycles with no eligible warp** — a grid of
+just 32–192 blocks of **32 threads** (the wide-block fix described below, which had made decode
+2.44× faster by filling the card at 256 columns *down* to 32) leaves the few resident warps to hide
+every sector fetch alone. The dominant warp stall was `long_scoreboard`, at **2.58 of 6.17
+cycles/instruction**: the kernel was waiting on 1-byte global loads, not on arithmetic and not on
+bandwidth. Every `LDG.E.S8` moves 32 bytes per warp at best — one sector, 1/32 of a 128-byte line —
+so the weight stream was issuing from a third to a quarter of the loads it needed.
+
+The fix is to read the block as vectors. The natural shape is already there: the 256 weights are 64
+bytes, four `uint4`, and each 16-byte group shares one of the sixteen scales and one `1/16`th of the
+serial sum. The repacked block therefore moves from a 274-byte to a **288-byte stride**
+(`kQ6KRepackedStride`), so every block of every column starts 16-byte aligned and the reads compile to
+`LDG.128`. The bytes are recovered from the eight little-endian words exactly as `as_byte` would, and
+the sum stays **one serial `total +=` in the same order** — so this is a change of *load width*, not of
+arithmetic, and the output is bit-identical (the real gate, not a near-miss). The stride costs 14 dead
+bytes a block (+5% on the q6_K tensors, on top of the expansion's own +30%): the point is to remove an
+unpack, and alignment is what lets the unpack go.
+
+**Measured** (`Qwen3-1.7B-Q4_K_M.gguf`, `cuda`, three interleaved A/B rounds against the same binary at
+`origin/main`, idle host):
+
+| | before | after | ratio |
+|---|---:|---:|---:|
+| `tg128` t/s (median of 3) | 57.66 | 66.30 | **1.15** |
+| `pp512` t/s (median of 3) | 219.0 | 292.6 | **1.34** |
+
+The three `tg128` rounds were 58.43/57.66/57.64 before and 66.29/66.30/66.32 after; `pp512`
+225.8/219.0/216.4 versus 297.1/292.6/291.3 — the spreads do not overlap. Prefill wins more than decode
+(1.34 vs 1.15) because it was already load-issue-bound and the vector read cuts the *number of
+instructions*, not just the latency per one; at decode the same bytes still have to cross HBM.
+
+**The gate holds: the greedily decoded ids are identical for 300 steps** on `"The capital of France
+is"` and **200 steps** on `"Once upon a time"` and on `"def fibonacci(n):"`, before versus after — the
+same token at every position. `q6_K`'s share of decode falls again, from **~37% to ~28%** (an
+event-timed ablation over every `m == 1` GEMM call: `q6_K` is 35% of GEMM time now against 33% for the
+older measurement's q4_K share that has since grown). **The top cost is no longer `q6_K` at all — it is
+`q4_K`, at ~65% of decode GEMM.** The head (`output.weight`, `1.02 GB`, the one q6_K tensor that is
+*grid-`x` = 4748* rather than a projection's 32–192) is a single launch of 1.88 ms that alone is ~16% of
+a 66 t/s token; the aligned read cut it from 3.24 ms. That kernel, and not this one, is where the next
+lever is.
+
 ### The horizontal reduce, and why the lane pairing is load-bearing
 
 `dot_Rrows_q8k` ends each row with one horizontal reduce, and the tree it builds has to be the one

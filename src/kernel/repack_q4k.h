@@ -87,9 +87,11 @@ void repack_weights_q4k(const uint8_t *blocks, int64_t n, int64_t k, Q4Kx8 *pane
 
 /* Repack a whole q6_K weight matrix: `n` columns of `k` weights, row-major
  * `q6_K` blocks (`k / 256` per column), into the `Q6KRepacked` layout
- * (`quant/blocks.h`). `out` must hold `n * (k / 256) * 274` bytes. Unlike the
- * q4_K panels this **enlarges** the matrix (210 -> 274 bytes a block, +30%),
- * which is the cost of trading the per-weight bit assembly for a byte load.
+ * (`quant/blocks.h`). `out` must hold `n * (k / 256) * 288` bytes -- the block's
+ * 274 bytes of payload on a 16-byte stride, so the kernel's `uint4` reads are
+ * aligned. Unlike the q4_K panels this **enlarges** the matrix (210 -> 288 bytes
+ * a block, +37%), which is the cost of trading the per-weight bit assembly for
+ * aligned vector byte loads.
  * `n` and `k` need no divisibility beyond the `k % 256` every q6_K tensor
  * already has. */
 void repack_weights_q6k(const uint8_t *blocks, int64_t n, int64_t k, uint8_t *out);

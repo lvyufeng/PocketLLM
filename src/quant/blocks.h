@@ -224,6 +224,12 @@ POCKETLLM_HD int block_bytes_of(int type_id) {
  * `half * 8 + i / 16 + 2 * sub`), and `q - 32` is the byte. No reassociation,
  * no rounding difference. */
 constexpr int kQ6KRepackedBytes = 274;
+/* The block is stored on a 16-byte stride, not the 274 its fields need, so every
+ * `uint4` read is aligned. 274 is not a multiple of 16, so consecutive blocks of
+ * a row would start unaligned and a vectorised walk of a column's blocks could
+ * not use `LDG.128`. The padding is 14 bytes per block (+5% on the q6_K tensors,
+ * on top of the byte expansion itself). */
+constexpr int kQ6KRepackedStride = 288;
 
 /* One 256-weight super-block: 256 `int8` weights, sixteen `int8` group scales,
  * and the half `d`. The scales are the file's own `scales[16]` copied verbatim;
@@ -234,6 +240,7 @@ struct Q6KRepacked {
   uint16_t d;
 };
 static_assert(sizeof(Q6KRepacked) == kQ6KRepackedBytes, "Q6KRepacked size");
+static_assert(kQ6KRepackedStride % 16 == 0, "Q6KRepacked stride must be 16-aligned");
 
 /* The decode is left to the kernel rather than a `dequant_*_repacked` helper:
  * like the Q4_K branch, the kernel writes the expression inline so nvcc can

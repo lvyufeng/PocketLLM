@@ -76,10 +76,11 @@ struct Weight {
    * gather reads the file layout. */
   bool panel = false;
   /* The bytes in `blocks` are `quant::Q6KRepacked` blocks (one `int8` per
-   * weight, byte-expanded), not the file's 210-byte `q6_K` blocks.  Unlike the
-   * q4_K panels this is a *different size*, so nothing about the shape says
-   * which layout a buffer holds -- this flag is the only authority.  CUDA-only;
-   * false everywhere else, including the embedding table. */
+   * weight, byte-expanded), on a 16-byte stride, not the file's 210-byte `q6_K`
+   * blocks.  Unlike the q4_K panels this is a *different size*, so nothing about
+   * the shape says which layout a buffer holds -- this flag is the only
+   * authority.  CUDA-only; false everywhere else, including the embedding
+   * table. */
   bool q6k_repacked = false;
 };
 
