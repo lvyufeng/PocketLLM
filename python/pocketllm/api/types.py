@@ -209,6 +209,14 @@ class SamplingParams:
     max_tokens: int | None = None
     temperature: float = 0.0
     top_p: float | None = None
+    #: Top-k with **0 meaning "no limit"**, which is the value the native
+    #: sampler defaults to (``Engine.sample(top_k=0)``), what ``cli.py`` passes
+    #: (``sampling.top_k or 0``), and what the CLI help and the S600 delegate's
+    #: refusal both tell a caller to use to disable it.  So ``0`` is valid here,
+    #: not a typo for ``1`` -- rejecting it would contradict the value this
+    #: tree's own help text hands out, and did: ``serve`` returned
+    #: ``400 top_k must be >= 1`` for the ``top_k: 0`` its own refusal message
+    #: recommends.
     top_k: int | None = None
     min_p: float | None = None
     seed: int | None = None
@@ -230,8 +238,8 @@ class SamplingParams:
             raise ConfigurationError("temperature must be >= 0")
         if self.top_p is not None and not 0 < self.top_p <= 1:
             raise ConfigurationError("top_p must be in (0, 1]")
-        if self.top_k is not None and self.top_k < 1:
-            raise ConfigurationError("top_k must be >= 1")
+        if self.top_k is not None and self.top_k < 0:
+            raise ConfigurationError("top_k must be >= 0")
         if self.min_p is not None and not 0 <= self.min_p <= 1:
             raise ConfigurationError("min_p must be in [0, 1]")
         if self.repetition_penalty <= 0:

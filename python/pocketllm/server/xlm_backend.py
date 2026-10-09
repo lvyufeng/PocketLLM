@@ -50,7 +50,7 @@ the native adapter applies it, so the two paths agree about where the answer
 starts.
 
 **Two environment variables, and they must be set before the process starts.**
-``libxlm.so`` needs the SDK's ``lib/`` on the loader path (``LD_LIBRARY_PATH``)
+``libxlm.so`` needs the SDK's ``oellm_runtime/lib`` on the loader path (``LD_LIBRARY_PATH``)
 or the ``dlopen`` fails on ``libopencv_world.so.409``, and the four-core Qwen3
 ``.hbm``s need their L2m split (``HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6``) —
 both are the SDK demo's own ``run_llm.sh``.  Neither can be set from inside this

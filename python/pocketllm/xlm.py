@@ -27,10 +27,11 @@ host without the SDK gets an :class:`XlmUnavailable` from :func:`load`, not an
 4. Nothing, and :class:`XlmUnavailable`.
 
 **Two environment variables, and ``open`` fails without them.**  ``libxlm.so``
-does not carry its own dependencies' paths, so the SDK's ``lib/`` directory has
-to be on the loader path or the ``dlopen`` fails — set ``LD_LIBRARY_PATH`` to
-``<sdk>/lib``.  The BPU runtime also needs its L2M slice sizes costed for the
-graph, which the SDK's own demo scripts set as
+does not carry its own dependencies' paths, so the SDK's ``oellm_runtime/lib``
+directory has to be on the loader path or the ``dlopen`` fails — set
+``LD_LIBRARY_PATH`` to ``<sdk>/oellm_runtime/lib``.  (The SDK's libraries live
+under ``oellm_runtime/``, not a top-level ``lib/``.)  The BPU runtime also needs
+its L2M slice sizes costed for the graph, which the SDK's own demo scripts set as
 ``HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6`` for the four-core Qwen3 ``.hbm``s.  A
 session opened with either unset fails inside ``xlm_init`` (the loader error on
 the first, a BPU allocation error on the second), which is why
@@ -485,7 +486,7 @@ def load(path: pathlib.Path | str | None = None) -> "CDLL":
     except OSError as exc:
         raise XlmUnavailable(
             f"{resolved} failed to load: {exc}. The SDK's own libraries must be on the "
-            "loader path — source the SDK environment or add its lib/ directory to "
+            "loader path — source the SDK environment or add its oellm_runtime/lib directory to "
             "LD_LIBRARY_PATH."
         ) from exc
     _bind(lib)
@@ -538,7 +539,7 @@ class XlmEngine:
         directory's file decides whether the session is deterministic.  There is
         deliberately no ``sampling`` parameter here — the delegate ignores the
         :class:`Sampling` block, and a knob that does nothing is worse than no
-        knob.  Requires ``LD_LIBRARY_PATH=<sdk>/lib`` and
+        knob.  Requires ``LD_LIBRARY_PATH=<sdk>/oellm_runtime/lib`` and
         ``HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6`` (see the module docstring).
 
         The library's fd-1 banner is moved to stderr for the duration -- see

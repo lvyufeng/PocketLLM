@@ -333,9 +333,10 @@ def _require_delegate_env(command: str = "serve") -> None:
     opens the ``.hbm`` and say where they come from, not to set them and pretend.
 
     The values are the SDK demo's own (``oellm_runtime/examples/llm_demo/
-    run_llm.sh``): ``LD_LIBRARY_PATH`` must contain the SDK ``lib/`` directory,
-    and the demo sets ``HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6`` for the
-    four-core Qwen3 ``.hbm``s.
+    run_llm.sh``): ``LD_LIBRARY_PATH`` must contain the SDK's ``oellm_runtime/lib``
+    directory (the libraries live there, *not* under a top-level ``lib/``), and the
+    demo sets ``HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6`` for the four-core Qwen3
+    ``.hbm``s.
 
     **This checks that each variable is set, not that it has a particular value**,
     and the message says exactly that.  The split is the one value the delegate
@@ -349,7 +350,7 @@ def _require_delegate_env(command: str = "serve") -> None:
     is still *required* rather than defaulted here because the delegate reads it
     at init and this process cannot set it in time.
     """
-    sdk_lib = "the SDK's lib/ directory"
+    sdk_lib = "the SDK's oellm_runtime/lib directory"
     problems: list[str] = []
     if not os.environ.get("LD_LIBRARY_PATH"):
         problems.append(
