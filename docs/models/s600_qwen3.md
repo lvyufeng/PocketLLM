@@ -162,11 +162,15 @@ where the shipped leaves 1.23. It decodes **33.2 t/s** and prefills ~3.06k t/s a
 29.7 / ~2.0k, three byte-identical runs, and holds that rate start-to-end with **no swapping**
 (`MemAvailable` flat at 42.6 GiB through a cap-length generation — the earlier 8B memory ceiling was the
 cache, not the weights). It answers the canonical prompt `Paris` with the usual early reasoning
-divergence. **One caveat is real and new: a single deterministic corrupted token.** Driving the
-integer-list prompt to the cap, ours writes 1…55 cleanly, emits `.bunifuFlatButton` for the 56th number,
-then resumes 57… — a `w4` precision slip, reproducible across runs (sha256 `79b0efae…`), that the shipped
-graph does not make. It is content-local (one token in the enumeration, not a loop — max 40-char
-recurrence 2×), but it is the thing to fix before this graph is trusted.
+divergence. **One caveat is real: a single deterministic corrupted token, at no fixed place.** Driving enumerations,
+ours writes 1…55 cleanly on `1..400`, emits `.bunifuFlatButton` for the 56th number and resumes 57… —
+reproducible across runs (sha256 `79b0efae…`), and the shipped graph does not make it. It is **not**
+position- or item-indexed: on `1..100` the same graph slips at the **37th** number with the same token,
+and writes both 37 and 56 correctly in a `1..50` run — so it is a **state-dependent numerical near-tie
+resolved wrongly** (a digit's logit and a garbage token's within a hair), the same *root* as the 1.7B loop
+but a sharper expression: one token, no repetition build-up, and it resumes. `cache_1024 w8` is the build
+that isolates it (width is the natural lever for a numerical flip); it is the thing to fix before this
+graph is trusted.
 
 ### Our compiled 0.6B vs the shipped 0.6B
 
