@@ -308,6 +308,18 @@ not *what made 4B reachable*, which the pool switch had already done. Full numbe
 is a different build-time quantization of the same `Qwen3-4B` weights, so its reasoning text differs
 from the shipped graph's where both converge on the same answer.
 
+**The chain's third artifact — a `cache_1024` `Qwen3-0.6B` — is its strongest result.** Measured on
+the board 2026-10-10, `Qwen3-0.6B_language_chunk_512_cache_1024_w8_nash-p_corenum_4_4.hbm`,
+**1,052,244,472 B (0.98 GiB)**, md5 `0d9d7e87e4f658eced34f04e17f17b2d`, decodes at **121.6 t/s**
+against the shipped `cache_4096` graph's 88.3 t/s — **1.38×**, the largest decode edge of the three
+builds — with prefill **~1.8×** (11636–13128 t/s against 6169–7111) and a **1.20 GiB lighter** pool
+footprint (1.59 GiB against 2.79 GiB). It loads and runs with no `RESOURCE_EXHAUSTED`, and its answer
+is correct. The one difference from the 1.7B and 4B cases is that **this pair is width- and
+scheme-matched** — both sides `w8` symmetric per-channel int8 — so the reasoning-text divergence is
+the `cache_len` change and the compiler's own graph, not a quantizer difference; the token-for-token
+caveat stands regardless. Full numbers on
+[the model page](../models/s600_qwen3.md#our-compiled-06b-vs-the-shipped-06b).
+
 ### Running this artifact on the board
 
 The graph is not shipped; it lives where the build put it. The two environment variables the SDK's
