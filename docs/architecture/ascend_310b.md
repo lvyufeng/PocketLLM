@@ -438,7 +438,7 @@ host build that is a host walk over every block, not a signal.)
 **And the next size up runs too — this is where the board stops being comfortable.** An 8192-wide
 `Qwen3-8B-Q4_K_M` needs a **12.94 GiB** layer plane, a **1.16 GiB** head plane on its distinct
 `output.weight`, and a **2.32 GiB** f32 embedding table — **16.4 GiB of planes and table**, and the
-**~21.7 GiB** measured device peak once the arena is counted (both derived below) — against the
+**~21.7 GiB** measured device peak once the resident packed weights are counted (both derived below) — against the
 ~17.4 GiB the pool leaves after the ~5.8 GiB the driver holds at idle, and 4.7 GiB of mmap'd
 checkpoint on the host.
 Measured, it **completes** and, on the same prompt, is **token-identical to CPU** at 8 steps:
@@ -497,8 +497,9 @@ Three things fall out of this and each one closed a door:
   23.7 − (driver reserve) − (device allocations) − (host Rss). The device side, not the host side,
   is what the number is reporting. The memtrace confirms the device peak: `aclrtMalloc` reaches
   **21.7 GiB live**, of which 14.1 GiB is the layer+head cube planes, 2.3 GiB the f32 embedding
-  table, and the rest is the KV cache at a 256-row initial capacity, the context-length cos/sin
-  tables, and the arena. That is 92% of `MemTotal` before a single byte of swap is used, and the swap
+  table, and the rest is the **resident raw packed GGUF weights** (~4.68 GiB, held for the
+  model's life), the KV cache at a 256-row initial capacity, and the context-length cos/sin
+  tables. That is 92% of `MemTotal` before a single byte of swap is used, and the swap
   is the direct consequence.
 
 **What was changed anyway, because it is correct in its own right.** `GgufReader` now exposes
@@ -566,15 +567,28 @@ head):
 | — *planes alone* | *4.671 GB* | ***14.10 GiB*** *(the page's measured "14.1")* | *3.02×* |
 | `token_embd.weight` → f32 embedding table | 0.350 GB | 2.489 GB **(2.32 GiB)** f32 | 7.11× |
 | *planes + table* | *5.021 GB* | ***16.42 GiB*** | *3.51×* |
-| arena / workspace (measured: 21.7 − 16.42) | — | **~5.28 GiB** | — |
+| **resident raw packed weights** (the on-disk `q4_k`/`q6_k` bytes, held for the model's life) | 5.021 GB | **4.68 GiB** (the same bytes, verbatim) | 1.00× |
+| *planes + table + packed* | — | ***21.10 GiB*** | — |
 | **measured device peak** (`aclrtMalloc`, the section above) | — | **21.7 GiB** | — |
 
-**The two numbers on this page are the same number, split.** Planes + table is **16.42 GiB**, and the
-paragraph above records the **21.7 GiB** measured `aclrtMalloc` peak; the **~5.28 GiB** between them is
-the arena and workspace, which the computed table does not itemize and the memtrace does. So the 8B's
-settled footprint is the *measured* **21.7 GiB**, not the computed 16.4 — and either figure is already
-over the ~17.4 GiB pool, which is the point: the planes alone (14.10 GiB) are **~81% of the pool**, and
-a decode that must also hold the arena cannot fit it.
+**The two numbers on this page are the same number, split — and the missing term is the packed
+weights, not an arena.** Planes + table is **16.42 GiB**, and the paragraph above records the
+**21.7 GiB** measured `aclrtMalloc` peak. The ascend backend reserves **no arena and no persistent
+workspace** — grep `src/kernel/ascend/backend.cpp` and the only scratch is the per-op
+`aclnn…GetWorkspaceSize` temporary, `aclrtMalloc`'d and freed inside the single call. The ~4.68 GiB
+between the two figures is the **raw packed GGUF bytes, resident for the model's whole life**:
+`bind_packed` (`src/model/qwen3.cpp`) does exactly `backend_->allocate(nbytes)` followed by
+`copy_to_device` of the *compressed* tensor, and stores it in `Weight.blocks`; nothing frees it. The
+graph then decodes each weight to its fp16 plane **in addition** (`cube_for`, cached), reading *from*
+those packed blocks, so the 8B holds both the ~4.68 GiB of packed `q4_k`/`q6_k` bytes *and* the
+~14.1 GiB of fp16 planes built from them. Per tensor, from the checkpoint's own table:
+`token_embd.weight` (`q4_k`) is **0.326 GiB** packed, `output.weight` (`q6_k`) **0.475 GiB**, and the
+396 layer tensors **3.876 GiB** — **4.677 GiB** together. Add the KV cache and rotary tables at the
+256-position initial capacity (~0.04 GiB) and the computed resident set is **~21.1 GiB**, within ~0.6 GiB
+of the measured 21.7 GiB peak (that residual is transient per-op workspace the memtrace caught mid-run,
+not anything the model keeps). So the 8B's settled footprint is the *measured* **21.7 GiB**, not any one
+computed column — and either figure is already over the ~17.4 GiB pool, which is the point: the planes
+alone (14.10 GiB) are **~81% of the pool**, before the weights they were decoded from.
 
 The expansion is not an implementation detail, it is `MatmulCubeCustom`'s contract: the cube is
 `half × half → half`, so a packed `q4_k`/`q6_k` block cannot be fed to it — the graph decodes each
@@ -586,7 +600,14 @@ fit in the pool does not fail — it succeeds from the host's point of view and 
 which is the 500 s clean run versus the ~1197 s one: the wall is the paging, not the decode. (Swap at
 rest, with no model, is already ~0.9 GiB used of 24 GiB.)
 
-**The only lever is the plane, and the measured middle is untried.** Shrinking host-side buffers moves
+**The one missing lever here is a *release*, not an arena shrink.** The ~4.68 GiB of resident packed
+blocks is needed only until its fp16 plane is built, so in principle it could be freed then — except
+`token_embd.blocks` is read on **every forward** (the embedding gather decodes it to the dense table),
+and the cube cache (`cube_cache_`) is **keyed on the same buffer handle**, so freeing a weight's blocks
+must also drop its cache entry or the next decode reads through a freed pointer. That is the real
+residency lever on this board, and it is care about handle lifetimes, not a buffer resize.
+
+**The other lever is the plane's *width*, and the measured middle is untried.** Shrinking host-side buffers moves
 nothing (the prior section: the heap is ~33 MiB and every staging buffer is a local). The W4A16 packed
 path would cut the 14.1 GiB of fp16 planes to ~4.4 GiB — but it *requantizes* `q4_K → int4` at
 ~1.2e-1 relative error ([#590](#precision-two-different-errors-and-which-one-is-the-graphs)), which
@@ -598,11 +619,12 @@ measurement rather than a rate — which is why the canonical table above carrie
 number, only its gate result.
 
 *Verified on the board, read-only, for this section: the idle `npu-smi` charge, `/proc/meminfo`,
-`/proc/cmdline`, the swap device and swappiness, and the full GGUF tensor table (whose per-tensor
-element counts give the 12.94 GiB layer plane, the 1.16 GiB head, and the 2.32 GiB f32 table). The
-**21.7 GiB** `aclrtMalloc` peak is the **prior** measurement recorded in the section above — it was
-not re-taken here, and no 8B run was made, because a run thrashes swap for 500–1200 s; the ~5.28 GiB
-arena row is that measured peak minus the computed planes+table, not an independent measurement.*
+`/proc/cmdline`, the swap device and swappiness, and the full GGUF tensor table. The plane, head and
+f32-table figures come from the per-tensor element counts; the **packed-weights term is independent of
+the peak** — it is the direct sum of every `q4_k`/`q6_k` tensor's `nbytes` in the checkpoint's own
+table (5.021 GB = 4.677 GiB), and `bind_packed` is what makes those bytes resident. The **21.7 GiB**
+`aclrtMalloc` peak is the **prior** measurement recorded in the section above — it was not re-taken
+here, and no 8B run was made, because a run thrashes swap for 500–1200 s.*
 
 ## Where a 4B decode step actually goes — and why nothing was changed
 
