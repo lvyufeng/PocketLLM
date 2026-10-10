@@ -274,6 +274,79 @@ Two refusals are the useful part, because they are walls that a caller will othe
   above the floor (27 KiB of headroom) and comfortably under the ceiling. It is not a tuned number, but
   it is also not a wrong one.
 
+### The same sweep on the 4B and the 8B
+
+The table above was measured before the `balanced` switch, on the three graphs that ran in `cpu_first`;
+the large graphs it could not reach were never swept. They were on 2026-10-10. Same method — one knob
+at a time from the default (`HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6`, `bpu_core [0,1,2,3]`), canonical
+prompt, greedy, three runs per cell, one process per cell (the ladder's
+[process-per-graph rule](#running-the-ladder-in-one-process-does-not-work-and-that-is-a-finding) —
+env knobs are read at process start, so a cell has to be a fresh process to take effect anyway). Cells
+are decode t/s of run 2; the spread is over all three runs.
+
+| runtime setting | 4B | 8B |
+|---|---|---|
+| `HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6` (default) | 42.7 | 29.7 |
+| `HB_DNN_USER_DEFINED_L2M_SIZES=7:7:7:7` | refused | refused |
+| `HB_DNN_USER_DEFINED_L2M_SIZES=8:8:8:8` | refused | refused |
+| `HB_DNN_USER_DEFINED_L2M_SIZES=5:5:5:5` | refused | refused |
+| `HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:4` | refused | refused |
+| `HB_DNN_USER_DEFINED_L2M_SIZES=6:6:4:4` | refused | refused |
+| `HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:8` | refused | refused |
+| `bpu_core [0,1,2,3]` (default) | 42.7 | 29.7 |
+| `bpu_core [0,1,2,3,0,1,2,3]` | 42.7 | 29.7 |
+| `bpu_core [3,2,1,0]` | 42.8 | 29.7 |
+| `bpu_core [0,1,2]` | refused | refused |
+| `bpu_core [0,1]` | refused | refused |
+| `bpu_core [0]` | refused | refused |
+| `HB_UCP_ENABLE_BPU_BACKEND_CORE_NUM` unset (default) | 42.8 | 29.7 |
+| `HB_UCP_ENABLE_BPU_BACKEND_CORE_NUM=4` | 42.9 | 29.7 |
+| `HB_UCP_ENABLE_BPU_BACKEND_CORE_NUM=8` | 42.8 | 29.7 |
+| `HB_UCP_ENABLE_BPU_BACKEND_CORE_NUM=2` | refused | refused |
+| `HB_UCP_ENABLE_BPU_BACKEND_CORE_NUM=1` | refused | refused |
+| `HB_UCP_TASK_SCHEDULE_COMMON_PROCESS_THREAD_NUM=1` | 42.8 | 29.7 |
+| `HB_UCP_TASK_SCHEDULE_COMMON_PROCESS_THREAD_NUM=8` | 42.8 | 29.7 |
+| `HB_UCP_TASK_SCHEDULE_COMMON_PROCESS_THREAD_NUM=14` | 42.8 | 29.7 |
+| `HB_UCP_TASK_SCHEDULE_COMMON_PROCESS_THREAD_NUM=28` | 42.9 | 29.7 |
+| `HB_UCP_SCHEDULE_THREAD_SET_AFFINITY=1` | 42.8 | 29.7 |
+| `HB_UCP_SCHEDULE_PRIORITY=1` | 42.8 | 29.7 |
+| `HB_UCP_SCHEDULE_PRIORITY=-1` | 42.8 | 29.7 |
+| `HB_UCP_CPU_PROCESS_THREAD_SET_AFFINITY=1` | 42.7 | 29.7 |
+
+**The result is the small graphs' result again, and this closes the S600 perf question for the large
+models: no runtime setting moves them either.** The fourteen accepted cells per graph span **42.67–42.88
+t/s** (4B, 0.5%) and **29.65–29.75 t/s** (8B, 0.3%) — one band apiece, with no cell standing apart, so
+there is nothing to pick. The `=4` cap's 42.83 mean is the nominal high on the 4B and 29.66 the low on
+the 8B; both are inside the noise of the default's own three runs, and reporting either as a win would
+be reporting the spread. Every accepted cell produced the **same greedy text as its graph's default
+row** — 4B sha256 `63ef9253ce67b4d7`, 8B `e229830a3fb396a2`, the same ids the ladder records — so, as
+on the small graphs, no accepted setting changed the answer.
+
+The two walls are the same two walls, and the large graphs sharpen both:
+
+- **The core count must be exactly four.** `[0]`, `[0,1]`, `[0,1,2]` and a backend cap of 1 or 2 all
+  fail `hbUCPSubmitTask` for the prefill with the same message the small graphs hit, here verbatim:
+  `The number of BPU cores set in the backend should be the same as the number of cores in the actual
+  model compilation, given: …1, compiled model bpu core num: 4`. Reversing the list (`[3,2,1,0]`) or
+  repeating it (`[0,1,2,3,0,1,2,3]`) is accepted and changes nothing — it is an *equality* check on the
+  count, not a set or an order.
+- **The L2m split is a hard window, and on the 4B it has no headroom at all.** The prefill node's
+  requirement is `required l2 memspace info: [6291456, 6291456, 6291456, 6291456]` for the 4B and
+  `[6164480, 6164480, 6164480, 6164480]` for the 8B — **exactly 6 MiB and 5.88 MiB per core**. So below
+  it the prefill is refused (`L2 memory not enough` on any core short of 6 MiB), and above it the
+  allocation itself fails (`Allocate l2M memory failed, size: 7340032` at 7 MiB and up, `8388608` at
+  8 MiB). The accepted band is therefore **[6.0, 7.0) MiB per core** — and `6:6:6:6`, the vendor
+  default, is the **floor** of that band, not a round value inside it: the 4B needs all six megabytes
+  on every core, so unlike the small graphs (which had 27 KiB of slack below 6 MiB) there is no setting
+  below the default that could have worked, and nothing above it fits. It is both the only value and
+  the right one.
+
+A note on what this does *not* cover: the large graphs appear to want a **larger** L2m split than the
+small ones — 6 MiB/core against the small 0.6B's 5.97 MiB — but the hardware's allocation ceiling (just
+under 7 MiB/core) is the same for both, so the window `[6.0, 7.0)` is narrower on the 4B than anything
+the small sweep saw. There is no split between 6 and 7 to test at this granularity, and the SDK's
+allocator only takes whole megabytes; the conclusion stands as a negative rather than an untested gap.
+
 ## The 4B / 8B ceiling — APPLIED
 
 **The board runs `balanced`, and 4B and 8B load.** The refusal below is what the board did in the
