@@ -366,8 +366,10 @@ single over-long prompt **takes the server down for every subsequent client** �
 the first caller sees a dropped connection rather than a 200, but fatal for the process.
 
 **What is clean.** Inside the window the cap is honest: `finish_reason: "length"`, HTTP 200, text coherent
-up to where it stops, and the KV is not left dirty — a canonical `The capital of France is` issued *after*
-an over-cap one in the same process still returns `Paris`. Two smaller quirks sit beside it and are not
+up to where it stops, and the KV is not left dirty — a canonical `The capital of France is` issued in the
+same process *after* a request whose **generation** hit the cap (a prompt that fits) still returns `Paris`.
+It is the over-cap **prompt** that is fatal, not the truncation: there is no "next request" after that one,
+because the process is gone. Two smaller quirks sit beside it and are not
 corruption: `max_tokens` is not applied on this path (a request for `max_tokens: 3` returns the full
 answer, because the delegate owns its own stop), and a generation consumed entirely by an unterminated
 reasoning block surfaces as **empty content at 200** once the chat splitter strips it. Neither is the
