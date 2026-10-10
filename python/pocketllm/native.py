@@ -168,6 +168,14 @@ def _bind(lib: "CDLL") -> None:
     lib.pocketllm_reset.restype = ctypes.c_int
     lib.pocketllm_reset.argtypes = [ctypes.c_void_p]
 
+    lib.pocketllm_forward_argmax.restype = ctypes.c_int
+    lib.pocketllm_forward_argmax.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int32),
+    ]
+
     lib.pocketllm_argmax.restype = ctypes.c_int
     lib.pocketllm_argmax.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_int]
 
@@ -344,6 +352,34 @@ class Engine:
         if written < 0:
             raise EngineUnavailable(f"pocketllm_forward failed ({written})")
         return [float(out[i]) for i in range(written)]
+
+    def next_token(self, tokens: list[int]) -> int:
+        """Run ``tokens`` and return the greedy token id, without the logits.
+
+        This is the fast path ``forward`` cannot be: the device argmax means
+        only four bytes cross the bus, so no 151936-element float buffer is
+        allocated and no Python list is built.  The id is the same one
+        ``Engine.argmax(forward(tokens))`` returns -- both are the engine's
+        ``argmax`` over the same logits, ties to the lowest index -- so a caller
+        may route greedy decoding here and keep byte-identical output.
+
+        A caller that needs the distribution (temperature, top-k, top-p, or a
+        logprob) still calls ``forward``; that is why the two exist as separate
+        methods rather than one with a flag.
+        """
+        n = len(tokens)
+        if n == 0:
+            raise ValueError("next_token needs at least one token")
+        arr = (ctypes.c_int32 * n)(*tokens)
+        out = ctypes.c_int32(0)
+        rc = self._lib.pocketllm_forward_argmax(self._handle, arr, n, ctypes.byref(out))
+        if rc == _ERR_CONTEXT_LENGTH:
+            raise ContextLengthExceeded(
+                f"a sequence of {n} tokens would run past the checkpoint's context window"
+            )
+        if rc < 0:
+            raise EngineUnavailable(f"pocketllm_forward_argmax failed ({rc})")
+        return int(out.value)
 
     def reset(self) -> None:
         if self._lib.pocketllm_reset(self._handle) < 0:

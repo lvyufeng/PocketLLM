@@ -167,6 +167,31 @@ int pocketllm_forward(pocketllm_session *session, const int32_t *tokens, int n, 
   }
 }
 
+int pocketllm_forward_argmax(pocketllm_session *session, const int32_t *tokens, int n,
+                             int32_t *out_token) {
+  if (session == nullptr || tokens == nullptr || n <= 0 || out_token == nullptr) {
+    return -1;
+  }
+  try {
+    pocketllm::Session *self = as_session(session);
+    if (self->model() == nullptr) {
+      return -2;
+    }
+    /* The whole point: the id comes back from `Session::forward`'s device
+     * argmax, and the vocabulary is never brought to the host.  The int64 the
+     * device writes is narrowed to the int32 the header promises; the vocabulary
+     * is far below INT32_MAX, so the cast is exact. */
+    int64_t token = 0;
+    self->forward(tokens, n, &token);
+    *out_token = static_cast<int32_t>(token);
+    return 0;
+  } catch (const pocketllm::ContextLengthError &e) {
+    return pocketllm::kErrContextLength;
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+
 int pocketllm_reset(pocketllm_session *session) {
   if (session == nullptr) {
     return -1;

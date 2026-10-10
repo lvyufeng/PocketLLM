@@ -80,25 +80,29 @@ std::vector<float> Session::forward(const int32_t *tokens, int64_t n, int64_t *a
   const kernel::DeviceBuffer logits = model_->forward(tokens, n, position_);
   position_ = model_->cache_length();
 
-  /* The logits come back in one transfer.  Not because they are wanted on the
-   * host -- a decode wants one integer -- but because the ABI hands them to the
-   * caller, and a caller that does not want them is not the one this call is
-   * for.  `argmax_out`, when the caller asks, is filled from the device. */
-  std::vector<float> host(static_cast<std::size_t>(model_->n_vocab()));
-  backend_->copy_to_host(host.data(), logits, model_->n_vocab() * 4);
-
   if (argmax_out != nullptr) {
-    /* A separate device round trip for the token, which is what a caller that
-     * only wants the next id would do.  It costs four bytes against the four
-     * hundred kilobytes just transferred, and it keeps the logits path and the
-     * token path as two things a caller can choose between rather than one
-     * thing with a flag. */
+    /* The caller wants the token and not the distribution, so the vocabulary
+     * stays on the device.  This is the greedy fast path the header's
+     * `pocketllm_forward_argmax` exists for: `Backend::argmax` writes an int64
+     * on the device and eight bytes cross the bus, instead of the
+     * `n_vocab * 4` bytes the logits transfer below would cost.  The id is the
+     * same one `pocketllm_argmax` would pick over the host logits -- both are
+     * `Backend::argmax`, ties to the lowest index -- so the two paths cannot
+     * disagree, and it is returned as the empty vector's companion: the id is
+     * in `*argmax_out` and there are no logits to hand back. */
     kernel::DeviceBuffer index = backend_->allocate(8);
     backend_->argmax(logits, model_->n_vocab(), index);
     backend_->synchronize();
     backend_->copy_to_host(argmax_out, index, 8);
     backend_->release(index);
+    return {};
   }
+
+  /* The logits come back in one transfer.  Not because they are wanted on the
+   * host -- a decode wants one integer -- but because the ABI hands them to the
+   * caller, and a caller that does not want them asked for the argmax above. */
+  std::vector<float> host(static_cast<std::size_t>(model_->n_vocab()));
+  backend_->copy_to_host(host.data(), logits, model_->n_vocab() * 4);
   return host;
 }
 
