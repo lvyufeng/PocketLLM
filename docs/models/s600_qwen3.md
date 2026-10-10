@@ -96,16 +96,20 @@ not through the ABI backend of the same name. The `horizon` kind is what `--devi
 `balanced` pool, measured in one session on 2026-10-10.** Fixed prompt **"The capital of France is"**,
 greedy `generation_config.json`, canonical-prompt three decode runs per graph, one process per graph.
 Throughput and load time from the delegate's `last_performance()` (`xlm_model_performance_t`); memory
-held from the kernel's own ION accounting (`/sys/kernel/debug/ion/heaps/all_heap_info`), read while
-the graph is loaded. The memory column is what each model costs in the 10.00 GiB `ion_carveout`.
+held from the kernel's own ION accounting (`/sys/kernel/debug/ion/heaps/all_heap_info`), read **after
+the load completes and before the first decode** — the load-time peak, the same instant
+[the margin section](#the-8b-sits-comfortably-in-balanced-the-numbers) measures, so the two tables
+agree. (A decode adds ~152 MiB of KV/scratch on top; that is per-request work-in-flight, not what the
+model costs in the pool, and it is excluded here deliberately.) The memory column is what each model
+costs in the 10.00 GiB `ion_carveout`.
 
-| Size | `.hbm` | Load | Prefill | Decode | Memory held (carveout) | of pool |
+| Size | `.hbm` | Load | Prefill | Decode | Memory held at load (carveout) | of pool |
 |---|---|---|---|---|---|---|
-| Qwen3-0.6B (w8) | 1.02 GiB | 5.26 s | 6169–7111 t/s | **88.3 t/s** (88.09 / 88.73 / 88.28) | 3,154,706,432 B (2.94 GiB) | 29.4% |
-| Qwen3-1.7B (w4) | 1.70 GiB | 5.70 s | 5172–5818 t/s | **70.2 t/s** (70.18 / 70.13 / 70.16) | 3,893,624,832 B (3.63 GiB) | 36.3% |
-| Qwen3-4B (w4) | 3.10 GiB | 6.44 s | 2415–2573 t/s | **42.8 t/s** (42.77 / 42.72 / 42.78) | 6,845,366,272 B (6.38 GiB) | 63.8% |
-| Qwen3-8B (w4) | 5.31 GiB | 7.66 s | 1939–2040 t/s | **29.7 t/s** (29.65 / 29.66 / 29.70) | 9,576,382,464 B (8.92 GiB) | **89.2%** |
-| Qwen3-4B (w4), ours `cache_1024` | 3.00 GiB | 6.35 s | 4339–4571 t/s | **49.9 t/s** (49.99 / 49.96 / 49.86) | 4,413,521,920 B (4.11 GiB) | 41.1% |
+| Qwen3-0.6B (w8) | 1.02 GiB | 5.26 s | 6169–7111 t/s | **88.3 t/s** (88.09 / 88.73 / 88.28) | 2,995,585,024 B (2.79 GiB) | 27.9% |
+| Qwen3-1.7B (w4) | 1.70 GiB | 5.70 s | 5172–5818 t/s | **70.2 t/s** (70.18 / 70.13 / 70.16) | 3,734,503,424 B (3.48 GiB) | 34.8% |
+| Qwen3-4B (w4) | 3.10 GiB | 6.44 s | 2415–2573 t/s | **42.8 t/s** (42.77 / 42.72 / 42.78) | 6,686,113,792 B (6.23 GiB) | 62.3% |
+| Qwen3-8B (w4) | 5.31 GiB | 7.66 s | 1939–2040 t/s | **29.7 t/s** (29.65 / 29.66 / 29.70) | 9,417,129,984 B (8.77 GiB) | **87.7%** |
+| Qwen3-4B (w4), ours `cache_1024` | 3.00 GiB | 6.35 s | 4339–4571 t/s | **49.9 t/s** (49.99 / 49.96 / 49.86) | 4,254,269,440 B (3.96 GiB) | 39.6% |
 
 Decode falls with size — 88.3 → 70.2 → 42.8 → 29.7 t/s — and the memory column rises with it, which
 is the whole of the ladder's shape: the BPU's per-token cost and the pool's footprint both track the
@@ -128,10 +132,12 @@ under 0.8% at every size, so decode is stable rather than a lucky run.
 
 **Two rows deserve their own note.**
 
-*The 8B costs 89.2% of the pool.* That is the largest model this board runs, and it does not leave
-much: [the margin section](#the-8b-sits-comfortably-in-balanced-the-numbers) breaks the number down —
-about 6.5 GiB of the pool is available to a `.hbm` file once the load's fixed overhead is accounted
-for, which is an 8B–9B class model and not a 14B.
+*The 8B costs 87.7% of the pool at load.* That is the largest model this board runs, and it leaves
+**1,320,288,256 B (1.23 GiB) free — 12.3%** — the figure
+[the margin section](#the-8b-sits-comfortably-in-balanced-the-numbers) derives; the two tables are the
+same measurement at the same instant, and their numbers agree to the byte. Roughly 6.5 GiB of the pool
+is available to a `.hbm` file once the load's fixed overhead is accounted for, which is an 8B–9B class
+model and not a 14B.
 
 *A graph we compile ourselves is faster.* Our own `Qwen3-1.7B` build at `cache_1024` (1.66 GiB, md5
 `0b41e627f2227c029b14ed63928fd33f`) also loads and runs: decode **88 t/s** (88.84 / 87.90 / 87.59) and
