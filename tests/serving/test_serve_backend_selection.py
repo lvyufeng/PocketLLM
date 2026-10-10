@@ -42,13 +42,16 @@ def _args(device: str) -> EngineArgs:
 # -- the mapping, checkable on any host -------------------------------------
 
 
-@pytest.mark.parametrize("device", ["auto", "cpu", "cuda"])
+@pytest.mark.parametrize("device", ["auto", "cpu", "cuda", "ascend"])
 def test_the_c_engines_kinds_select_the_native_adapter(device: str) -> None:
-    """``auto``/``cpu``/``cuda`` are the C engine, exactly as ``run`` resolves them.
+    """``auto``/``cpu``/``cuda``/``ascend`` are the C engine, exactly as ``run`` resolves them.
 
     ``auto`` lands on the native adapter because :func:`~pocketllm.cli._run_device`
     resolves it to ``cpu`` for the same reason: it is the choice that cannot fail
-    on a host where CUDA was never built in.
+    on a host where CUDA was never built in.  ``ascend`` is the same *runtime*: the
+    C engine carries the ascend kernel backend, so the CLI names a runtime and the
+    backend underneath is the only difference -- the ascend adapter needs no
+    separate ``EngineBackend`` because it already drives the same ``NativeBackend``.
     """
     assert _serve_runtime(_args(device)) == _NATIVE
 
@@ -64,13 +67,14 @@ def test_the_delegate_is_selected_by_the_horizon_kind() -> None:
     assert _serve_runtime(_args("horizon")) == _DELEGATE
 
 
-@pytest.mark.parametrize("device", ["qnn", "mps", "ascend"])
+@pytest.mark.parametrize("device", ["qnn", "mps"])
 def test_a_kind_with_no_adapter_is_refused_by_name(device: str) -> None:
     """Every other registered kind is refused, and the refusal names what is served.
 
     These are Python-ABI backends with no ``EngineBackend`` adapter; the failure
     this guards is the silent one -- falling through to the C engine would accept
     ``--device qnn`` and run the model on the CPU, which the client cannot tell.
+    (``ascend`` used to be in this list; it is now ``native`` -- see the test above.)
     """
     with pytest.raises(ConfigurationError) as raised:
         _serve_runtime(_args(device))

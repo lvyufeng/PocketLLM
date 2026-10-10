@@ -266,6 +266,7 @@ def _run_device(engine_args: EngineArgs) -> str:
 _RUNTIMES: dict[str, str] = {
     "cpu": "native",
     "cuda": "native",
+    "ascend": "native",
     _DELEGATE_DEVICE: "delegate",
 }
 
@@ -273,7 +274,7 @@ _RUNTIMES: dict[str, str] = {
 def _dispatch_device(engine_args: EngineArgs, command: str) -> str:
     """The runtime ``command`` drives for these engine args: ``native`` or ``delegate``.
 
-    *Honest about the rest.*  ``qnn``, ``mps``, ``ascend`` and every other kind
+    *Honest about the rest.*  ``qnn``, ``mps`` and every other kind
     the registry knows are Python-ABI backends with no runtime a host entry point
     can drive at all -- ``run`` and ``serve`` cannot use them, and saying so by
     name is the point.  A silent fall-through to the C engine would accept
@@ -281,6 +282,13 @@ def _dispatch_device(engine_args: EngineArgs, command: str) -> str:
     about the wrong runtime), which is worse than a refusal because the caller
     cannot tell.  The extension seam is :data:`_RUNTIMES`: a new runtime names the
     kinds it serves and both commands follow.
+
+    ``ascend`` is ``native``: the C engine carries an ascend backend, so
+    ``--device ascend`` drives the same ctypes runtime as ``cpu``/``cuda`` -- the
+    kernel backend underneath is the only difference, and the CLI names a
+    *runtime*, not a kernel.  (It was left out of this table while the backend's
+    context was thread-bound and ``serve`` could not reach it from a worker
+    thread; see :func:`pocketllm.cli._cmd_serve`.)
 
     ``command`` is the word the refusal uses -- ``run`` or ``serve`` -- so the
     message names the command the user actually typed rather than a fixed one.

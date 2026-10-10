@@ -119,20 +119,20 @@ def test_a_missing_engine_is_reported_as_a_missing_engine() -> None:
 @needs_engine
 @needs_checkpoint
 def test_an_unknown_backend_names_what_the_build_provides() -> None:
-    """`--device` is a kind from the registry; the C core knows two of them.
+    """`--device` is a kind from the registry; the runtimes a host entry point drives are fewer.
 
-    The two vocabularies are not the same set -- the Python registry lists
-    `ascend`, `qnn` and `horizon`, which no C build implements -- so a device
-    the argument parser accepts can still be one the engine refuses.  The
-    refusal has to name what *is* there, or the user is left guessing which of
-    the parser's choices this particular build honours.
+    The two vocabularies are not the same set -- the Python registry lists `qnn`
+    and `mps` (and `ascend`/`horizon`, which *are* drivable) -- so a device the
+    argument parser accepts can still be one this command has no runtime for.
+    The refusal has to name what *is* there, or the user is left guessing which of
+    the parser's choices this command honours.
     """
     result = _run(
-        "--model", str(CHECKPOINT), "--prompt", "hi", "--max-tokens", "1", "--device", "ascend"
+        "--model", str(CHECKPOINT), "--prompt", "hi", "--max-tokens", "1", "--device", "qnn"
     )
     assert result.returncode != 0
     message = result.stdout + result.stderr
-    assert "ascend" in message and "cpu" in message, message
+    assert "qnn" in message and "cpu" in message, message
 
 
 @needs_engine
