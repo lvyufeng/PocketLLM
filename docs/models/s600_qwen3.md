@@ -320,6 +320,21 @@ show it, and the 1.7B's own short generations are fine (it answers all ten faith
 What is *not* established is the cause inside the compile: this is one measured artifact behaving badly,
 not a diagnosis of which pass in the build produced it.
 
+**Tested board-side, without a rebuild — the obvious triggers are refuted.** *Cache length and position*
+are not it: the shipped 1.7B (`cache_4096`) was driven to **2022 generated tokens** listing every integer
+1–400 completely and correctly with **no loop**, well past our 1024-token window, so a window of ~1024 is
+not a threshold past which this graph loops; and our 1.7B loops at *different* positions on different
+prompts (piece 143 on the essay, 107 on the list), so there is no fixed onset. *Thinking mode* is not it:
+with `enable_thinking` off our 1.7B loops anyway (`the Eiffel Tower, the Eiffel Tower …`, ×141). The
+repeated piece is ordinary text (`I`, ` the Eiffel Tower`), not a degenerate special id. There *is* an
+early numeric divergence — on the looping prompt our 1.7B and the shipped 1.7B agree on only **two
+pieces** (` thinking\n`) and diverge at the **third token** (ours reasons, the shipped emits `</think>`) —
+but that immediate divergence is a property of **every** rebuild, not of the loop: our **0.6B** diverges
+from its own shipped twin at the **fourth token** and stays coherent, and the same 1.7B pair still answers
+all ten faithfulness prompts identically. So the trigger is none of position, cache, template or token
+mapping; it is the graph's own generation on the 1.7B `w4` weights, and localizing it to a layer or a pass
+needs a rebuild this board cannot run.
+
 #### Answer faithfulness: 9/10 on the 0.6B and 10/10 on the larger graphs
 
 A different build of the same weights can be faster and still reach different answers, and the whole
