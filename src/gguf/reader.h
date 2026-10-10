@@ -11,6 +11,12 @@
  * into a heap buffer per session would double the resident set for no gain --
  * the tensors are read once, in place, by the kernels.
  *
+ * "Read once" is also what lets `release_mapping()` hand the mapping back when
+ * the caller is done with it, which the library's own entry points do after
+ * `Qwen3Model::load` has bound every tensor: on a board where the accelerator
+ * and the host share one LPDDR pool, keeping the file mapped costs the pool
+ * the whole checkpoint.  See `release_mapping()`.
+ *
  * The layout, in order, is what makes the reader a straight-line program:
  *
  *   "GGUF" | version u32 | tensor_count u64 | metadata_count u64
@@ -108,6 +114,25 @@ class GgufReader {
    * the check that turns a truncated download into a message instead of a
    * segfault during the first matmul. */
   const uint8_t *tensor_data(const std::string &name, uint64_t *nbytes) const;
+
+  /* Drop the file mapping once nothing will read the file again.
+   *
+   * The directory -- names, shapes, offsets and the metadata -- is parsed into
+   * this object's own storage at construction, so `size()`, `metadata()`,
+   * `tensors()` and `tensor()` keep working after the bytes are gone; only
+   * `tensor_data()` needs the mapping, and it throws a named error rather than
+   * returning a dangling pointer if it is called afterwards.
+   *
+   * This is what makes a checkpoint larger than the board's free host memory
+   * runnable: a caller that has bound every tensor into device memory (or its
+   * own buffers) no longer holds 4.7 GiB of reclaimable page-cache-backed
+   * mapping against `MemAvailable`, so the pages the single shared LPDDR pool
+   * reports as free are real.  A checkpoint the loader re-reads stays mapped --
+   * this is a decision the caller makes, not a policy this class applies. */
+  void release_mapping();
+
+  /* False once `release_mapping()` has run. */
+  bool mapping_held() const { return mapping_ != nullptr; }
 
  private:
   void parse();

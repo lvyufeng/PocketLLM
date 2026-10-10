@@ -457,6 +457,74 @@ this is where the ladder ends at `q4_k_m` fp16 planes — the packed-weight path
 [W4A16 section](#precision-two-different-errors-and-which-one-is-the-graphs) closed is what would
 move it, and it is not this change.
 
+### Where the 8B's host memory actually goes — and the one piece of it that was ours to give back
+
+That "~0.6 GB `MemAvailable` with swap touched" paragraph invited an investigation that assumed the
+4.7 GiB mmap'd checkpoint was resident and could be released. **Half of that was right and half was
+wrong, and the wrong half is why the peak did not move.**
+
+Measured on this board (23.7 GiB `MemTotal`, 22.9 GiB available at rest), the host memory during an
+8B run is **not** dominated by the mapping or by the process's own heap. The readings below are
+`/proc/<pid>` interiors taken *at the moment `MemAvailable` is lowest*, so this is the peak, not a
+quiet point in it:
+
+| what | how counted | at peak |
+|---|---|---|
+| `libpocketllm` stack + the Ascend runtime's own buffers, as one anonymous `aclrtMalloc` region | `[anon]` Rss in `smaps` | **~2.9 GiB** |
+| the storage/driver hugepage pool (`/sp_group_100001_nohuge`) | `sp_group` Rss + Swap in `smaps` | **~4.1 GiB** (plus ~2 GiB swapped) |
+| the checkpoint, `mmap`'d `MAP_PRIVATE` | the `gguf` mapping's `Rss` | **~4 kB** — fully evicted |
+| the process heap | `[heap]` Rss | **~33 MiB** |
+| the process's stated `VmRSS` | `/proc/<pid>/status` | **~7.6 GiB** |
+| `MemAvailable` | `/proc/meminfo` | **~0.58 GB** |
+
+Three things fall out of this and each one closed a door:
+
+- **The checkpoint mapping is not the problem at the peak.** `/proc/<pid>/smaps` reports a `Rss` of
+  **0** for the 4.7 GiB `gguf` mapping: the kernel had already evicted every unreferenced page of it,
+  because `MAP_PRIVATE` file pages are clean and first to go under pressure. Releasing the mapping
+  did **not** lower the peak and could not — the peak was already being reached without it.
+- **The process's own host memory is negligible.** ~33 MiB of heap and a handful of MiB of library
+  text. There is no large `std::vector` in the ascend path: every staging buffer (`cube_for`,
+  `dense_table_for`, `read_f32`, `to_f16`) is a local that dies before the next tensor, so none
+  accumulates. The "which host buffer can be shrunk" half of the question has no answer because there
+  is no such buffer.
+- **What `MemAvailable` sees is the device pool.** The 310B has no separate device LPDDR — the NPU
+  carves its allocations out of the same 23.7 GiB the host uses, which is why `MemAvailable` ≈
+  23.7 − (driver reserve) − (device allocations) − (host Rss). The device side, not the host side,
+  is what the number is reporting. The memtrace confirms the device peak: `aclrtMalloc` reaches
+  **21.7 GiB live**, of which 14.1 GiB is the layer+head cube planes, 2.3 GiB the f32 embedding
+  table, and the rest is the KV cache at a 256-row initial capacity, the context-length cos/sin
+  tables, and the arena. That is 92% of `MemTotal` before a single byte of swap is used, and the swap
+  is the direct consequence.
+
+**What was changed anyway, because it is correct in its own right.** `GgufReader` now exposes
+`release_mapping()`, and both engine entry points (`Qwen3Model::load` in `run.cpp` and
+`Session::open` in `session.cpp`) call it once every tensor has been bound into device memory — the
+tokenizer has already copied its vocabulary and merges, and nothing reads the file again. The
+directory (names, shapes, offsets, metadata) is parsed into the reader's own storage, so `size()`,
+`tensors()` and `tensor()` keep working; only `tensor_data()` needs the bytes, and it now throws a
+named error rather than returning a dangling pointer if it is called after the release. This frees
+the mapping the instant the build ends instead of holding it for the session's life.
+
+**What the change does and does not do, measured.** One clean A/B on the same binary, same prompt,
+same 8 steps:
+
+| | peak host RSS | peak swap | wall |
+|---|---|---|---|
+| before (mapping held for the session) | 8.68 GiB | ~3.47 GiB | 1139 s |
+| after (mapping released after the build) | 7.87 GiB | ~3.47 GiB | 1189 s |
+
+The peak RSS is ~0.8 GiB lower; the peak swap and the wall are unchanged. The wall difference is
+within the run-to-run spread this board has shown all along (~1100–1200 s for the same 8 tokens).
+**So the honest outcome is that the 8B is still swap-bound and its decode is still not a clean
+marginal — the mapping release is a real, small reduction in resident set, not a fix for the
+thrashing.** The 8B does not fit in the 310B's single shared pool at `q4_k_m` fp16 planes, and
+nothing that touches only the *host* side can make it: the thing that does not fit is 21.7 GiB of
+device allocation against a 23.7 GiB pool with a ~7 GiB driver carve-out. The ladder's exit for a
+checkpoint this size is the packed-weight path ([W4A16](#precision-two-different-errors-and-which-one-is-the-graphs)),
+which would cut the 14.1 GiB of fp16 planes to the ~4.4 GiB of packed weights — a change to what the
+*cube* consumes, not to what the host holds, and not this change.
+
 The honest statement of coverage is now four sizes: **0.6B, 4B and 8B token-identical, and 1.7B runs
 and fits with one documented near-tie** — the same fp16-plane precision limit this whole page is
 about, met at one prompt at 1.7B and not met at the other three, with no new op and no shape guard in
