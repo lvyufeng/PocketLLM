@@ -92,47 +92,102 @@ not through the ABI backend of the same name. The `horizon` kind is what `--devi
 
 ## Measured ladder
 
-Fixed prompt **"The capital of France is"**, greedy `generation_config.json`, through
-`pocketllm run --device horizon`. Throughput and load time from the delegate's `last_performance()`
-(`xlm_model_performance_t`); three runs per size.
+**This is the canonical ladder: all four shipped Qwen3 sizes plus our own compiled 4B, on the
+`balanced` pool, measured in one session on 2026-10-10.** Fixed prompt **"The capital of France is"**,
+greedy `generation_config.json`, canonical-prompt three decode runs per graph, one process per graph.
+Throughput and load time from the delegate's `last_performance()` (`xlm_model_performance_t`); memory
+held from the kernel's own ION accounting (`/sys/kernel/debug/ion/heaps/all_heap_info`), read while
+the graph is loaded. The memory column is what each model costs in the 10.00 GiB `ion_carveout`.
 
-| Size | Loads? | Load | Prefill | Decode | TTFT |
-|---|---|---|---|---|---|
-| Qwen3-0.6B (w8) | yes | 5.25–5.30 s | 6169 t/s | **87.0 t/s** (86.27 / 87.17 / 87.39) | not available |
-| Qwen3-1.7B (w4) | yes | 5.62–5.69 s | 5172 t/s | **69.4 t/s** (69.35 / 69.55 / 69.31) | not available |
-| Qwen3-4B (w4) | yes | 6.46–7.34 s | 2381–2415 t/s | **42.6 t/s** (42.59 / 42.44 / 42.72) | not available |
-| Qwen3-8B (w4) | yes | 7.66–7.70 s | 1932–1939 t/s | **29.6 t/s** (29.43 / 29.70 / 29.65) | not available |
-| Qwen3-4B (w4), ours `cache_1024` | yes | 6.32–6.38 s | 4339–4376 t/s | **50.0 t/s** (49.98 / 49.91 / 49.96) | not available |
+| Size | `.hbm` | Load | Prefill | Decode | Memory held (carveout) | of pool |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B (w8) | 1.02 GiB | 5.26 s | 6169–7111 t/s | **88.3 t/s** (88.09 / 88.73 / 88.28) | 3,154,706,432 B (2.94 GiB) | 29.4% |
+| Qwen3-1.7B (w4) | 1.70 GiB | 5.70 s | 5172–5818 t/s | **70.2 t/s** (70.18 / 70.13 / 70.16) | 3,893,624,832 B (3.63 GiB) | 36.3% |
+| Qwen3-4B (w4) | 3.10 GiB | 6.44 s | 2415–2573 t/s | **42.8 t/s** (42.77 / 42.72 / 42.78) | 6,845,366,272 B (6.38 GiB) | 63.8% |
+| Qwen3-8B (w4) | 5.31 GiB | 7.66 s | 1939–2040 t/s | **29.7 t/s** (29.65 / 29.66 / 29.70) | 9,576,382,464 B (8.92 GiB) | **89.2%** |
+| Qwen3-4B (w4), ours `cache_1024` | 3.00 GiB | 6.35 s | 4339–4571 t/s | **49.9 t/s** (49.99 / 49.96 / 49.86) | 4,413,521,920 B (4.11 GiB) | 41.1% |
 
-The 4B and 8B rows are new: measured 2026-10-10 **after the board was switched to `balanced` and
-rebooted**, in the same session and by the same method as the two rows above. Decode falls with size —
-87 → 69 → 42.6 → 29.6 t/s — which is the shape the earlier "1.7B is the ceiling" reading mistook for
-the end of the ladder. The three runs of each graph produced **byte-identical text**
-(sha256 `63ef9253ce67b4d7` for 4B, `e229830a3fb396a2` for 8B), so the numbers are a rate rather than a
-draw. The last row is our own compiled 4B, [below](#the-large-models-after-the-switch) — the recompile is *not*
-the path to 4B (the pool switch is), but once the pool fits it, it runs and is the fastest of the
-three 4B-class results here.
+Decode falls with size — 88.3 → 70.2 → 42.8 → 29.7 t/s — and the memory column rises with it, which
+is the whole of the ladder's shape: the BPU's per-token cost and the pool's footprint both track the
+parameter count. Every graph's three runs produced **byte-identical text**, so each number is a rate
+and not a draw.
 
-The two "no" rows are the **current `cpu_first` mode's 2.00 GiB carve-out** refusing a 3 GiB+ graph,
-not a limit on the model size — the S600 supports all four, and the switch that reaches 4B/8B is
-[the ceiling section](#the-4b-8b-ceiling-applied) below.
+**The switch did not regress 0.6B or 1.7B.** The board changed memory *mode*
+(`cpu_first` → `balanced`), and the two small graphs were re-measured against the numbers this page
+carried from before it: both produce **the same greedy output, byte for byte** (0.6B sha256
+`25a32998bfab7e7e`, 1.7B `6bcca969667a395a`, banner stripped and the `run` prompt echo removed before
+hashing, so the comparison is text against text). The decode figures moved slightly *upward* (0.6B
+87.0 → 88.3, 1.7B 69.4 → 70.2 t/s), which is run-to-run spread and a warmer machine rather than a
+mode effect — the pool is bigger, not different, and nothing about a graph's own allocation changed.
+That expectation is now a measurement instead of an assumption.
 
 **TTFT is not available on this SDK build.** The `ttft`, `tpot` and `end_to_end_cost` fields of
 `xlm_model_performance_t` come back `0.0`, so a time-to-first-token is not something this page can
-quote from the runtime; wall-clock load time above is quoted instead. Decode at 87 t/s (0.6B) and
-69 t/s (1.7B) is the load-bearing number: it is what a caller feels, and the spread across three runs
-is under 1.4% at 0.6B and under 0.4% at 1.7B, so it is stable rather than a lucky run.
+quote from the runtime; wall-clock load time above is quoted instead. The spread across three runs is
+under 0.8% at every size, so decode is stable rather than a lucky run.
 
-**A graph we compile ourselves is faster, and the ladder's 1.7B row is therefore a *shipped-graph*
-number, not a 1.7B number.** Our own `Qwen3-1.7B` build at `cache_1024` (1.66 GiB, md5
-`0b41e627f2227c029b14ed63928fd33f`) also loads and runs on this board: decode **88 t/s** (88.84 /
-87.90 / 87.59) and prefill 8982 t/s, against the shipped `cache_4096` graph's 69.4 t/s / 5172 t/s
-measured in the same session. It is the first artifact out of
-[the native compile chain](../architecture/s600_native_chain.md#the-first-build-result), it answers the
-same prompts with the same final answers, and its **reasoning text differs** from the shipped graph's —
-two build-time quantizations of one checkpoint, not two caches of one graph. Whether a smaller graph
-gets **4B** under the `cpu_first` ceiling is now answered — it does not, and the pool had to move
-instead; see [the large models after the switch](#the-large-models-after-the-switch).
+**Two rows deserve their own note.**
+
+*The 8B costs 89.2% of the pool.* That is the largest model this board runs, and it does not leave
+much: [the margin section](#the-8b-sits-comfortably-in-balanced-the-numbers) breaks the number down —
+about 6.5 GiB of the pool is available to a `.hbm` file once the load's fixed overhead is accounted
+for, which is an 8B–9B class model and not a 14B.
+
+*A graph we compile ourselves is faster.* Our own `Qwen3-1.7B` build at `cache_1024` (1.66 GiB, md5
+`0b41e627f2227c029b14ed63928fd33f`) also loads and runs: decode **88 t/s** (88.84 / 87.90 / 87.59) and
+prefill 8982 t/s, against the shipped `cache_4096` graph's ~70 t/s / ~5.2k t/s in the same session —
+which is why the 1.7B row above is a *shipped-graph* number and not a 1.7B number. It is the first
+artifact out of [the native compile chain](../architecture/s600_native_chain.md#the-first-build-result),
+it answers the same prompts with the same final answers, and its **reasoning text differs** from the
+shipped graph's — two build-time quantizations of one checkpoint, not two caches of one graph. Whether
+a smaller graph gets **4B** under the `cpu_first` ceiling is answered — it does not, and the pool had
+to move instead; see [the large models after the switch](#the-large-models-after-the-switch).
+
+### Running the ladder in one process does not work, and that is a finding
+
+Every number above was taken with **one process per graph**, and it has to be. Reusing one interpreter
+to walk the ladder in order — open 0.6B, close, open 1.7B, close, … — **cannot load the 8B**, and the
+reason is not what the disposition suggests.
+
+Measured: after a graph has been **loaded and decoded on** and then closed, `xlm_destroy` releases the
+`.hbm`'s own block but leaves a **residue in the carveout** — 1,059,782,656 B in 60 blocks after a
+0.6B or 1.7B, and 1,361,772,544 B in 76 blocks after a 4B or 8B (the residue does not grow from 0.6B
+to 1.7B, and grows in one step at the 4B). A graph that was only *opened and closed* with no decode
+leaves nothing — the residue needs an inference. The residue is stable: it is still there 20 s later,
+so it is not a release that has not happened yet.
+
+That residue is enough to fail an 8B, and the failure is **fragmentation, not capacity**:
+
+```text
+[Model] Can not open .../Qwen3-8B_..._w4_..._corenum_4_4.hbm    (makes it look like a bad path)
+  hbrt4_mem/src/unified.rs:156: Cannot malloc bpu memory with length 5703561320 bytes
+    { len: 5704908800 }
+  Fail to do ION_IOC_ALLOC(ret=Cannot allocate memory)!
+  -> HBRT4_STATUS_RESOURCE_EXHAUSTED
+```
+
+The `hbDNNInitializeFromFiles failed` line above it is a red herring the SDK prints when an open fails
+for a *missing* file too — the real cause is two lines further down. What the pool actually looks like
+after a 4B decode and close:
+
+| | value |
+|---|---|
+| carveout total | 10,737,418,240 B |
+| free (total) | **9,375,645,696 B** — *more* than the 5,704,908,800 B an 8B needs |
+| largest **contiguous** free run | **5,166,792,704 B** — *less* than an 8B needs |
+| other free runs | 4,048,945,152 B, 159,907,840 B |
+
+An 8B's `.hbm` is one contiguous allocation, and no single free run is big enough for it, so the load
+fails while 9.38 GB sits free. The control that makes this unambiguous: into that **same** fragmented
+pool, a 0.6B and then a 1.7B both **load fine** (they fit in the 5.17 GB run), and only the 8B fails.
+So it is the largest graph that the residue's fragmentation excludes, not capacity in general — and a
+fresh process, which starts from an empty pool, loads the 8B without complaint.
+
+This is why the ladder's method is a process per graph. It is the same method the pre-switch ladder
+used (`batch.sh` spawned `one.py` per run), so the two are comparable — but the reason is now known
+rather than incidental, and it is worth knowing: **a long-lived process that serves several models in
+turn accumulates pool residue, and a later large model can be refused by it.** A single-graph process
+— what `serve` and `run` actually are — is unaffected.
 
 ## The runtime knob space
 
@@ -528,7 +583,10 @@ France is"**, greedy `generation_config.json`, `pocketllm`'s `XlmEngine` with `b
 `HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6`, three runs per graph. Each graph was driven through the
 **SDK's own tool first** (`hrt_model_exec model_info`, step 1 of the load test) and then through
 **`pocketllm run --device horizon`** on the shipped `qwen3_4b_config.json` / `qwen3_8b_config.json`,
-which answers the prompt with `rc 0`.
+which answers the prompt with `rc 0`. (The numbers below are the first measurement of the large graphs
+and agree with [the canonical ladder](#measured-ladder) to within run-to-run spread; where they differ
+in the last digit, the ladder's row is the one to quote, because it was measured in one session beside
+the small models rather than in a session of its own.)
 
 **All three initialize.** The SDK's own `hrt_model_exec model_info` — the tool that refused them before
 — reports `Load model to DDR` for each, with no `Cannot malloc bpu memory` and no
