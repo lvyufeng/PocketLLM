@@ -398,6 +398,17 @@ The verdict is trajectory; what the board cannot yet split is `cache_len` versus
 sit behind the same rebuild, and both are precision). The rebuild above **is** the separating
 measurement: if the loops vanish, cache-length sensitivity; if they persist, provenance/calibration.
 
+**The compiled 0.6B and 4B do not reach it — the 1.7B crosses the threshold first.** The "only the 1.7B
+loops" line was originally drawn on short generations that ended cleanly, which the 1.7B's own trigger
+(sustained generation) never tests; driven to the cache cap on the same three prompts, the small graphs
+stay clean. The comparison is not marginal: across every small-model run the most-repeated 40-character
+window recurs **at most twice**, while the 1.7B repeats its attractor **8–18×**, and the small graphs
+*answer* — the 0.6B writes the list through 177 and the 4B through 59 (both truncated by the cap), while
+the 1.7B never writes the list at all. The 4B shows the mechanism approaching — a repetitive-reasoning
+stretch in its thinking block on two prompts, and it reaches the cap on two of three — but nothing
+fatal: the threshold sits beyond ~450–650 steps at `w4`, and the 1.7B is the first of our compiled
+graphs past it.
+
 #### A request whose prompt does not fit the cache was an abort, and is now refused
 
 The cap above is about *generation*: a prompt that fits still truncates its answer cleanly at the window.
