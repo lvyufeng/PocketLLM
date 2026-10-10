@@ -94,6 +94,7 @@ __all__ = [
     "VlaParams",
     "VlmParams",
     "XlmEngine",
+    "XlmOverCapError",
     "XlmUnavailable",
     "XlmModelType",
     "is_available",
@@ -171,6 +172,22 @@ class XlmInferenceError(RuntimeError):
     to notice it are the state the callback saw or the empty text.  This tree used
     to notice neither: a run whose graph never executed printed the prompt and an
     empty line, and exited 0.
+    """
+
+
+#: The failure :meth:`XlmEngine.infer` raises when a prompt would not fit the cache.
+class XlmOverCapError(XlmInferenceError):
+    """A prompt longer than the graph's cache, refused before any tensor is fed.
+
+    Past its cache window the delegate **aborts the process** -- a glibc
+    ``corrupted size vs. prev_size`` on the heap, ``SIGABRT``, not a truncation
+    and not an error status -- so on ``serve`` one over-long prompt takes the
+    server down for every later client.  Refusing up front turns that into an
+    ordinary error a caller sees (``run`` a one-line refusal, ``serve`` a 400).
+
+    It is a :class:`XlmInferenceError` so a caller that already catches the
+    delegate's failures keeps catching this one; the distinction is only for the
+    code that wants to react to the length specifically.
     """
 
 
@@ -518,7 +535,15 @@ class XlmEngine:
     library that took a lock would hide it from a caller who knows better.
     """
 
-    def __init__(self, lib: "CDLL", handle: ctypes.c_void_p, params: CommonParams) -> None:
+    def __init__(
+        self,
+        lib: "CDLL",
+        handle: ctypes.c_void_p,
+        params: CommonParams,
+        *,
+        count_tokens: "Callable[[str], int] | None" = None,
+        cache_tokens: int | None = None,
+    ) -> None:
         self._lib = lib
         self._handle = handle
         #: Held for the session's life so the pointers it carries stay valid.
@@ -527,6 +552,15 @@ class XlmEngine:
         #: no stack that points here.
         self._params = params
         self._closed = False
+        #: The over-cap guard's two halves, both optional and both the *host's* to
+        #: supply (this module is stdlib-only and cannot tokenize).  `count_tokens`
+        #: returns the prompt's effective length -- what the delegate's prefill sees,
+        #: chat wrapper included -- and `cache_tokens` is the graph's cache window.
+        #: Guarding needs both: with either ``None``, :meth:`infer` behaves exactly
+        #: as before rather than guessing a window, because a guard against the wrong
+        #: number is worse than none.
+        self._count_tokens = count_tokens
+        self._cache_tokens = cache_tokens
 
     @classmethod
     def open(
@@ -538,9 +572,18 @@ class XlmEngine:
         model_type: int = XlmModelType.QWEN3,
         context_size: int = 0,
         callback: "Callable[[Result, int], None] | None" = None,
+        count_tokens: "Callable[[str], int] | None" = None,
+        cache_tokens: int | None = None,
         lib: "CDLL | None" = None,
     ) -> "XlmEngine":
         """Open a delegate session.  Raises :class:`XlmUnavailable` on any refusal.
+
+        ``count_tokens`` and ``cache_tokens`` arm the over-cap guard (see
+        :meth:`infer`): a host-supplied prompt-length function and the graph's
+        cache window, both optional.  There is deliberately no default for
+        ``cache_tokens`` — the cache is the `.hbm`'s build shape and the host
+        reads it from there (the filename's ``cache<n>``) — because a guessed
+        window guards the wrong number, which is worse than not guarding.
 
         ``context_size`` of 0 keeps the config file's own value rather than
         forcing the header's default: the `.hbm` was compiled for a specific
@@ -576,7 +619,9 @@ class XlmEngine:
             status = loaded.xlm_init(ctypes.byref(param), ffi, ctypes.byref(handle))
         if status != 0 or not handle.value:
             raise XlmUnavailable(f"xlm_init refused the checkpoint (status {status})")
-        engine = cls(loaded, handle, param)
+        engine = cls(
+            loaded, handle, param, count_tokens=count_tokens, cache_tokens=cache_tokens
+        )
         # The trampoline must outlive the session: the delegate keeps the
         # function pointer and calls it on every decode, so a collected
         # `CFUNCTYPE` object is a jump into freed memory.
@@ -614,6 +659,21 @@ class XlmEngine:
         """
         if self._closed:
             raise XlmUnavailable("this XlmEngine has been closed")
+
+        # **Refuse a prompt that cannot fit before any tensor is fed.**  Past its
+        # cache window the delegate aborts the process (SIGABRT, glibc
+        # `corrupted size vs. prev_size`), so this is the one place a *host* can
+        # turn that into an error the caller sees.  It guards only when the host
+        # supplied both halves -- a length function and the graph's cache -- since
+        # a guard against a guessed window is the failure this exists to prevent.
+        if self._count_tokens is not None and self._cache_tokens is not None:
+            count = self._count_tokens(prompt)
+            if count > self._cache_tokens:
+                raise XlmOverCapError(
+                    f"the prompt is {count} tokens (chat template included) but this graph's "
+                    f"cache holds {self._cache_tokens}; the delegate aborts the process past its "
+                    "cache, so the request is refused before any tensor is fed (shorten the prompt)"
+                )
 
         state = self._state  # type: ignore[attr-defined]
         # Reset both per call: the trampoline accumulates into `chunks` and

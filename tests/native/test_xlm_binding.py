@@ -138,6 +138,67 @@ def test_model_type_qwen3_is_nine() -> None:
     assert xlm.STATE_END == 1
 
 
+# -- the over-cap seam, checkable on any host -------------------------------
+
+
+def _seam(count_tokens, cache_tokens):  # noqa: ANN001 - a tiny fixture-shaped helper
+    """An :class:`XlmEngine` with the two guard halves and nothing else.
+
+    ``__init__`` wants a live delegate handle, which is exactly what a host
+    without the board does not have; the guard reads only ``_closed``,
+    ``_count_tokens`` and ``_cache_tokens`` before it can fire, so constructing
+    past ``__init__`` is what lets the refusal be checked off-board.  A guard that
+    needs the board to test is a guard nobody tests.
+    """
+    engine = xlm.XlmEngine.__new__(xlm.XlmEngine)
+    engine._closed = False
+    engine._count_tokens = count_tokens
+    engine._cache_tokens = cache_tokens
+    return engine
+
+
+def test_an_over_cap_prompt_is_refused_before_any_tensor_is_fed() -> None:
+    """A count past the cache raises, naming both numbers, before the delegate runs.
+
+    The refusal exists because the alternative is not an exception: the delegate
+    aborts the process (SIGABRT, glibc heap corruption) once a prompt is past the
+    graph's cache.  So the assertion is not merely "it raised" — it is that the
+    message carries the prompt length *and* the cache window, because those two
+    numbers are what tell the caller how far to shorten.
+    """
+    engine = _seam(lambda _prompt: 1028, 1024)
+    with pytest.raises(xlm.XlmOverCapError) as raised:
+        engine.infer("a prompt the tokenizer counts past the window")
+
+    message = str(raised.value)
+    assert "1028" in message and "1024" in message
+
+
+def test_the_over_cap_error_is_an_inference_error() -> None:
+    """A caller that already catches ``XlmInferenceError`` keeps catching this.
+
+    The delegate's failures are already one class; a second, unrelated one would
+    slip past every existing ``except XlmInferenceError`` and surface as an
+    unhandled traceback.  So the new type is a *subclass*, not a sibling.
+    """
+    assert issubclass(xlm.XlmOverCapError, xlm.XlmInferenceError)
+
+
+def test_the_guard_is_inert_without_both_halves() -> None:
+    """One half alone does not arm the guard — it reaches the delegate instead.
+
+    A window with no length function (or a length function with no window) cannot
+    decide "over cap", and a guard against a guessed number is worse than none, so
+    the seam deliberately runs unguarded.  The proof that it did *not* fire: the
+    call gets all the way to the line that reads the delegate state, which a
+    seam without one raises on — anything past the guard is the point.
+    """
+    with pytest.raises(AttributeError):
+        _seam(lambda _prompt: 10_000, None).infer("past any cache, but no window to compare")
+    with pytest.raises(AttributeError):
+        _seam(None, 8).infer("a window, but nothing to count with")
+
+
 # -- the behaviour, needs the board -----------------------------------------
 
 
