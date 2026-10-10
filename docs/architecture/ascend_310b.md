@@ -965,17 +965,34 @@ f32 weight (`run_cube` → `build_cube_weight_from_f32`). It is the same class, 
 never reaches it: every decode GEMM is `gemm_quant`, whose plane is `cube_for`-cached. Left for a
 follow-up rather than fixed here.
 
-**What is *not* this class.** `attention` reads its whole KV window to the host on every call
-(`read_kv` of `context × width`), and that traffic is both material and context-scaling — measured,
-attention is **~5.5 ms/step at a ~30-token context and ~257 ms/step at ~600 tokens, a 47× scaling
-with context** on the 0.6B (the profile op counts, `--steps 1` against `--steps 11`). But the buffer
-is the **KV cache, which changes every decode step** — it is not a pure function of anything stable,
-so no cache can hold it. That cost is the attention kernel's host gather, a standing property of the
-backend's attention path already documented above, and it is not the rope pattern. Fixing it is a
-device-side attention kernel, a separate project.
+**What is *not* this class, and how its cost actually splits.** `attention` reads its whole KV window
+to the host on every call (`read_kv` of `context × width`), and that traffic is both material and
+context-scaling — measured on the 0.6B with matched `--steps 1` against `--steps 11` windows,
+attention is **~5.6 ms/step at a ~30-token context and ~240 ms/step at ~600 tokens, a 43× scaling
+with context**. But the buffer is the **KV cache, which changes every decode step** — not a pure
+function of anything stable, so no cache can hold it. That cost is the attention step's operand
+plumbing, and it is not the rope pattern.
+
+Scoping it for a fix, the cost is **not** transfer-dominated, which changes what the fix should be.
+Decomposing the ~240 ms/step: the host f32→f16 conversion of the q/k/v operands is **~177 ms (74%)**,
+the device↔host transfer of the window is **~46 ms (19%)**, and the op's own NPU work plus the host
+repack scatter is **~17 ms (7%)**. The A/B that proves the split is the existing
+`$POCKETLLM_ASCEND_KV_F16` lever, which halves the wire bytes — and the step gets *worse*
+(325 → 438 ms/step), because the narrow slab adds a `half_to_f32` sandwich on the read side while the
+transfer it saves is the minority term.
+
+So the fix is **not** a device-side attention kernel: that removes only the 19 % transfer term. It is
+to keep the K/V **projections** f16 on the device across `kv_append` → `attention`, so the operand
+boundary never leaves the host; that removes the 74 % conversion term, reuses the NPU kernel that
+already exists, and needs only the `attention`/`kv_append` contract to permit a device-resident f16
+K/V (an interface change, not an AscendC kernel). The ceiling is bounded by the end-to-end wall clock
+— ~307 ms/step short and ~620 ms/step at 600 tokens — so removing attention entirely at 600 tokens is
+**~620 → ~400 ms, a ~1.5× step**, the remainder being the context-independent logits read-back and
+sampling on this 3-core board.
 
 So the sweep found one more instance, fixed it, and confirmed the class is otherwise exhausted: the
-next material round-trip is attention, which is a different problem. `pocketllm-mscale` is unchanged.
+next material round-trip is attention — but as an operand-conversion boundary, not a transfer to
+hide behind a kernel. `pocketllm-mscale` is unchanged.
 
 ## Serving on the 310B: coming up, and the thread-bound context that had to be attached
 
