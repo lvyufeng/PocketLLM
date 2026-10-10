@@ -1185,6 +1185,28 @@ class AscendBackend final : public Backend {
     const bool as_f16 = from_env != nullptr && from_env[0] != '\0' && from_env[0] != '0';
     return as_f16 ? KVDtype::kF16 : KVDtype::kF32;
   }
+
+  /* ON: the graph hands `kv_append` an f16 projection so this backend never
+   * widens the cache back to f32 only to narrow it again inside `attention`.
+   *
+   * This backend is the one that pays the round trip -- it has no device f32->f16
+   * cast op, so the f32 cache the graph binds is read to the host, widened,
+   * repacked and re-narrowed on every `attention` call, and the measured cost at
+   * ~600 tokens is ~74% of the whole decode step's attention (see
+   * `docs/architecture/ascend_310b.md`).  With this ON, `kv_append` narrows the
+   * f32 projection *once* and the cache holds exactly the bytes `attention`'s own
+   * `to_f16` would have computed (`f32_to_f16` is round-to-nearest-even and the
+   * cache is stored f16), so the window is dropped into the op with no re-widen.
+   * The output is byte-identical; the identity gate checks that rather than this
+   * flag.
+   *
+   * `$POCKETLLM_ASCEND_KV_PROJ_F16=0` turns it back off, so the A/B is a flag and
+   * not a rebuild. */
+  bool prefers_kv_projection_in_cache_dtype() const override {
+    const char *from_env = std::getenv("POCKETLLM_ASCEND_KV_PROJ_F16");
+    return from_env == nullptr || from_env[0] == '\0' || from_env[0] != '0';
+  }
+
   void argmax(DeviceBuffer values, int64_t n, DeviceBuffer out) override {
     ensure_context();
     OpScope _op("argmax");
@@ -1593,33 +1615,59 @@ class AscendBackend final : public Backend {
     /* The graph's token-major cache holds the `context` visible rows packed
      * contiguously from position 0, so one streaming read of `context * width`
      * elements is the whole window -- in whichever width the graph bound. */
-    std::vector<float> k_rows(static_cast<std::size_t>(span));
-    std::vector<float> v_rows(static_cast<std::size_t>(span));
-    read_kv(k_cache, span, kv_dtype, &k_rows);
-    read_kv(v_cache, span, kv_dtype, &v_rows);
-
     std::vector<float> q_f(static_cast<std::size_t>(n_heads * d));
     copy_to_host(q_f.data(), q, n_heads * d * 4);
-
-    /* [position][head][d] -> [head][position][d] */
-    std::vector<float> k_planar(static_cast<std::size_t>(span));
-    std::vector<float> v_planar(static_cast<std::size_t>(span));
-    for (int64_t t = 0; t < context; ++t) {
-      for (int64_t h = 0; h < n_head_kv; ++h) {
-        const int64_t src = (t * n_head_kv + h) * d;
-        const int64_t dst = (h * context + t) * d;
-        std::memcpy(&k_planar[static_cast<std::size_t>(dst)], &k_rows[static_cast<std::size_t>(src)],
-                    static_cast<std::size_t>(d) * 4);
-        std::memcpy(&v_planar[static_cast<std::size_t>(dst)], &v_rows[static_cast<std::size_t>(src)],
-                    static_cast<std::size_t>(d) * 4);
-      }
-    }
-    /* fp32 scores with the query and the cache in fp16 is the combination the
-     * kernel is written for, so the cache is widened through fp32 above and the
-     * op narrows it back -- the double rounding is a fp16 value either way. */
     std::vector<uint16_t> q_h = to_f16(q_f.data(), n_heads * d);
-    std::vector<uint16_t> k_h = to_f16(k_planar.data(), span);
-    std::vector<uint16_t> v_h = to_f16(v_planar.data(), span);
+
+    /* The window is gathered head-by-head into the op's layout.  When the cache
+     * is already f16 the window is read *as* f16 and packed in f16 -- the exact
+     * bits the op is fed, with no widen-then-narrow -- because this backend has
+     * no device f32->f16 cast op and the round trip through f32 was the whole
+     * per-step cost (see `docs/architecture/ascend_310b.md`).  When the cache is
+     * f32 the window is read as floats, repacked, and narrowed on the host: the
+     * same float->fp16 value the f16 path stores, which is what makes the two
+     * paths byte-identical rather than merely close. */
+    std::vector<uint16_t> k_h(static_cast<std::size_t>(span));
+    std::vector<uint16_t> v_h(static_cast<std::size_t>(span));
+    if (kv_dtype == KVDtype::kF16) {
+      std::vector<uint16_t> k_rows(static_cast<std::size_t>(span));
+      std::vector<uint16_t> v_rows(static_cast<std::size_t>(span));
+      copy_to_host(k_rows.data(), k_cache, span * 2);
+      copy_to_host(v_rows.data(), v_cache, span * 2);
+      for (int64_t t = 0; t < context; ++t) {
+        for (int64_t h = 0; h < n_head_kv; ++h) {
+          const int64_t src = (t * n_head_kv + h) * d;
+          const int64_t dst = (h * context + t) * d;
+          std::memcpy(&k_h[static_cast<std::size_t>(dst)], &k_rows[static_cast<std::size_t>(src)],
+                      static_cast<std::size_t>(d) * 2);
+          std::memcpy(&v_h[static_cast<std::size_t>(dst)], &v_rows[static_cast<std::size_t>(src)],
+                      static_cast<std::size_t>(d) * 2);
+        }
+      }
+    } else {
+      std::vector<float> k_rows(static_cast<std::size_t>(span));
+      std::vector<float> v_rows(static_cast<std::size_t>(span));
+      read_kv(k_cache, span, kv_dtype, &k_rows);
+      read_kv(v_cache, span, kv_dtype, &v_rows);
+      /* [position][head][d] -> [head][position][d] */
+      std::vector<float> k_planar(static_cast<std::size_t>(span));
+      std::vector<float> v_planar(static_cast<std::size_t>(span));
+      for (int64_t t = 0; t < context; ++t) {
+        for (int64_t h = 0; h < n_head_kv; ++h) {
+          const int64_t src = (t * n_head_kv + h) * d;
+          const int64_t dst = (h * context + t) * d;
+          std::memcpy(&k_planar[static_cast<std::size_t>(dst)],
+                      &k_rows[static_cast<std::size_t>(src)], static_cast<std::size_t>(d) * 4);
+          std::memcpy(&v_planar[static_cast<std::size_t>(dst)],
+                      &v_rows[static_cast<std::size_t>(src)], static_cast<std::size_t>(d) * 4);
+        }
+      }
+      /* fp32 scores with the query and the cache in fp16 is the combination the
+       * kernel is written for, so the cache is widened through fp32 above and the
+       * op narrows it back -- the double rounding is a fp16 value either way. */
+      k_h = to_f16(k_planar.data(), span);
+      v_h = to_f16(v_planar.data(), span);
+    }
 
     DeviceBuffer dq = allocate(n_heads * d * 2);
     DeviceBuffer dk = allocate(span * 2);

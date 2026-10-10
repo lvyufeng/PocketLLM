@@ -344,6 +344,15 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
    * overrides it.  A backend that cannot consume an f16 cache overrides the
    * same call, which is what keeps this line from deciding for it. */
   model->kv_dtype_ = backend.preferred_kv_dtype();
+  /* A backend that has no device f32->f16 cast op pays that cast on the host.
+   * It can ask for the cache to be bound f16 so the cast happens once per token
+   * in `kv_append` instead of a whole-window widen-and-narrow inside every
+   * `attention` call.  f16 is the interface's own default and this only ever
+   * moves *toward* it, so the value stored is the same `f32_to_f16(projection)`
+   * the f32 path computes -- the cast's placement changes, not its result. */
+  if (backend.prefers_kv_projection_in_cache_dtype()) {
+    model->kv_dtype_ = kernel::KVDtype::kF16;
+  }
 
   /* The keys are namespaced by architecture, and the prefix comes from the file
    * rather than from a literal so that a checkpoint declaring `qwen3` cannot be

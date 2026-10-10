@@ -982,17 +982,69 @@ repack scatter is **~17 ms (7%)**. The A/B that proves the split is the existing
 transfer it saves is the minority term.
 
 So the fix is **not** a device-side attention kernel: that removes only the 19 % transfer term. It is
-to keep the K/V **projections** f16 on the device across `kv_append` → `attention`, so the operand
-boundary never leaves the host; that removes the 74 % conversion term, reuses the NPU kernel that
-already exists, and needs only the `attention`/`kv_append` contract to permit a device-resident f16
-K/V (an interface change, not an AscendC kernel). The ceiling is bounded by the end-to-end wall clock
-— ~307 ms/step short and ~620 ms/step at 600 tokens — so removing attention entirely at 600 tokens is
-**~620 → ~400 ms, a ~1.5× step**, the remainder being the context-independent logits read-back and
-sampling on this 3-core board.
+to keep the K/V **projections** f16 across `kv_append` → `attention`, so the operand boundary never
+round-trips through f32; that removes the 74 % conversion term and reuses the NPU kernel that already
+exists. **That fix is now implemented and measured.**
+
+It needed no new op and no change to what any kernel computes. The board has no device f32→f16 cast,
+but the f16 cache path already narrows the projection *once* per token in `kv_append` (an O(n·width)
+walk, ~0.1 ms at a decode), and `f32_to_f16` is round-to-nearest-even — so the f16 cache holds
+*exactly* the bytes `attention`'s own `to_f16` would have computed from the f32 window. Pointing the
+graph at the f16 cache therefore changes only *where* the cast happens, never its result, and
+`attention` reads the window and feeds the op with no widen-then-narrow. The switch is a new
+default-OFF capability on the interface (`prefers_kv_projection_in_cache_dtype()`, alongside
+`preferred_kv_dtype()`) so every other backend and the reference are untouched; the ascend backend
+overrides it and `$POCKETLLM_ASCEND_KV_PROJ_F16=0` turns it back off for the A/B.
+
+**Measured on the 0.6B at ~600 tokens, byte-identical before and after.** The window is `--steps 11`
+against `--steps 41` — the marginal over 30 steps, *after* the one-time weight load and plane build,
+which a `--steps 1`-vs-N window divides by N and so inflates (see the wall note below). f32 cache vs
+f16 projection:
+
+| | f32 cache | f16 projection | |
+|---|---:|---:|---|
+| `attention` op (profiled, marginal) | 235 ms | **31 ms** | **7.6×** |
+| `to_f16` (host convert) | 193 ms | **3 ms** | gone |
+| decode step (profiled marginal) | 321 ms | **116 ms** | **2.8×** |
+| decode step (wall marginal) | 615 ms | **309 ms** | **2.0×** |
+| short context (~30 tok, wall) | 102 ms | 102 ms | unchanged |
+
+The `to_f16` term — the widest single column, the host narrow of the whole window every call —
+collapses to near zero, and with it the widening that fed it; the `attention` op drops 7.6×. The wire
+traffic (`sdma_down`) *falls* too (the window is read as f16 rather than as f32), and the profiled step
+total drops 2.8×. At short context the step is **unchanged** (102 vs 102 ms/step over the same window):
+attention is a small share there, so a fix to it should do nothing, and it does nothing — which is the
+check that this is a scaling fix and not a constant-time win.
+
+**The wall clock: one honest number, and why an earlier draft stated a different one.** The
+long-context decode wall is **~615 ms/step (f32) → ~309 ms/step (f16), a 2.0× step**; the fix halves
+the ~600-token decode step and the win grows with context, since attention's share does. #638 reported
+~620 ms/step here from walls of 202.69 / 208.87 / 215.03 s at 1 / 11 / 21 steps — **+618 then +616,
+linear, correct** — and this re-measurement reproduces it at 615. The fix's first draft instead printed
+**1234** ms/step, from `(wall₁₁ − wall₁)/10`. That is the *same* window and the *same* one-time cost
+divided by 10 rather than 20: the two campaigns' `wall₁₁ − wall₁` were 12.34 s and 12.36 s — identical
+— so the page was never reporting two different walls, only one cost at two scales. Both windows are
+short enough to still contain the one-time build; 1234 is the artifact of the smaller divisor.
+**~615–620 ms/step is the honest long-context marginal**, and it is what this page now states.
+
+**Short context is the same windowing story, and there the fix changes nothing.** At ~30 tokens the
+step must not move, and it does not: 102 vs 102 ms/step over a matched 30-step window. #638's
+~307 ms/step came from a 10-step window (`(wall₂₁ − wall₁₁)/10`) and this page's earlier ~101 from a
+30-step one — the board's one-time cost seen through different divisors, not two decode rates. A
+short-context run here is barely longer than its own load: one session measured steps 1 / 11 / 21 at
+24.56 / 24.55 / 24.54 s and steps 31 / 41 at 27.62 / 27.61 s — flat, then one ~3.06 s step, then flat
+again — so *any* short run's "ms/step" is an artifact of where that step lands in the window. The
+short-context result is therefore stated only as **unchanged**, which is the claim that matters and is
+divisor-independent.
+
+**The gate is the whole requirement, and it holds: byte-identical on the 0.6B, 1.7B and 4B** (token
+ids and text), because the f16 cache stores the same rounding the f32 path applies. That is what makes
+this a cost removal rather than a numerics change; had a projection cast moved the rounding, the gate
+would have failed and the change would have been dropped, not retuned.
 
 So the sweep found one more instance, fixed it, and confirmed the class is otherwise exhausted: the
-next material round-trip is attention — but as an operand-conversion boundary, not a transfer to
-hide behind a kernel. `pocketllm-mscale` is unchanged.
+next material round-trip was attention — as an operand-conversion boundary, and the conversion is now
+gone. `pocketllm-mscale` is unchanged.
 
 ## Serving on the 310B: coming up, and the thread-bound context that had to be attached
 

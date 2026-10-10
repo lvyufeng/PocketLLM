@@ -189,6 +189,23 @@ class Backend {
    * `tests/native/llama_oracle.py`. */
   virtual KVDtype preferred_kv_dtype() const { return KVDtype::kF16; }
 
+  /* Whether this backend wants the K/V *projections* (`k_`, `v_`) stored in the
+   * cache's own width on the device, so a later `kv_append` -> `attention` never
+   * has to convert them on the host.
+   *
+   * OFF by default, and the default is the whole point: a backend for which the
+   * f32 activation -> f16 cache cast is a free device operation (the card) or a
+   * non-issue (the CPU, whose cache is host memory) keeps the existing path and
+   * the existing numerics untouched.  A backend that overrides this to `true`
+   * must produce a cache that `attention` reads back to *exactly* the values the
+   * f32 path's `to_f16` would have written -- it is a cost removal, not a
+   * precision change -- which is checked by the identity gate, not by this flag.
+   *
+   * The graph removes a cast in `kv_append`, never changes the cache's numerical
+   * contents, so `preferred_kv_dtype` is unaffected: the storage width and the
+   * projection width are separate questions and this answers only the second. */
+  virtual bool prefers_kv_projection_in_cache_dtype() const { return false; }
+
   /* The index of the largest of `n` values, written to device memory. Returns a
    * device address rather than an integer so the caller transfers four bytes
    * instead of the whole logit vector when it only wants the token. */
