@@ -379,6 +379,25 @@ result pins `cache_len 1024` as the cause; a **still-looping** one says the diff
 provenance — our build pipeline or our calibration — not the cache. (`cache_len 2048` is the cheaper first
 step; `w_bits 8, cache_len 1024` the `w4` control.)
 
+**The loop is a precision trajectory, not a graph defect.** Four measurements separate the two. One,
+the onset is **content-determined and position-independent**: in **absolute context position** it lands
+at 52, 165, 180 and 201 tokens on `France?`, the list, the essay and `Tell me about France.` — no
+clustering at 256/512/1024, so no cache boundary triggers it — and padding `France?` with a repeated
+filler moves the onset in **generated-step count** (piece 31 → 49 → 105) without holding *either* that
+count or the absolute position fixed; the onset follows the continuation, not an address. Two, the
+degeneration is **gradual, not sudden**: the fraction of never-before-seen 8-char shingles erodes over
+roughly **450 largely-coherent pieces** before it collapses, and revives (88% novel at piece 350 of
+`France?`) — a fixed wrong op cannot turn correct again. Three, the attractor **changes with the task**:
+on one prompt it is a verbatim trap (`. The population is 67 million.` ×103), on the others it is a
+self-referential template (`… Let me check the requirements again …`) — a defect would show the same
+failure on every prompt. Four, the strongest, is functional: on the **same** list prompt the shipped
+graph completes 1–400 while ours never writes the list at all, looping in planning prose — same weights,
+same tokenizer, same runtime, different cache.
+
+The verdict is trajectory; what the board cannot yet split is `cache_len` versus the calibration (both
+sit behind the same rebuild, and both are precision). The rebuild above **is** the separating
+measurement: if the loops vanish, cache-length sensitivity; if they persist, provenance/calibration.
+
 #### A request whose prompt does not fit the cache was an abort, and is now refused
 
 The cap above is about *generation*: a prompt that fits still truncates its answer cleanly at the window.
