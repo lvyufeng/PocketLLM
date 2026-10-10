@@ -1046,6 +1046,84 @@ So the sweep found one more instance, fixed it, and confirmed the class is other
 next material round-trip was attention — as an operand-conversion boundary, and the conversion is now
 gone. `pocketllm-mscale` is unchanged.
 
+## What the short-context decode step is — and where it is *not*
+
+The #643 fix left the ~30-token step unchanged at ~102 ms/step, which is the correct result: at short
+context attention is a small share, so a fix to attention should not move it. That leaves the
+**context-independent** part of the step to name — the per-step weight stream, the logits read-back,
+argmax/sampling, and launch. Profiling a short-context decode on the current build (`--steps 11`
+against `--steps 41`, the marginal over 30 steps, so the one-time plane build cancels the way the
+canonical table above does it):
+
+| stage | 0.6B ms/step | share | 1.7B ms/step | share |
+|---|---:|---:|---:|---:|
+| **`op_sync`** — the cube executing the 36-layer GEMMs | **66.7** | **77.4%** | **185.6** | **87.7%** |
+| `sdma_down` — *all* D2H, incl. the 607 KB logits read-back | 4.55 | 5.3% | 5.60 | 2.6% |
+| `to_f32` — fp16→f32 widen of op activations | 3.81 | 4.4% | 5.36 | 2.5% |
+| `to_f16` — f32→fp16 narrow of op activations | 3.39 | 3.9% | 5.24 | 2.5% |
+| `op_enqueue` — host cost of the op call | 3.20 | 3.7% | 3.79 | 1.8% |
+| `sdma_up` — H2D | 2.63 | 3.1% | 3.72 | 1.8% |
+| `ws_get` + `aclTensor` create/destroy | 1.88 | 2.2% | 2.22 | 1.0% |
+| **profiled total** | **86.2** | | **211.6** | |
+
+The per-op table says the same thing from the other side: `gemm_quant` is **77.7 ms/step of the 0.6B's
+86.2** and **200.7 of the 1.7B's 211.6** — 90% and 95% — and every other op is a millisecond or two.
+`attention` is 2.5 ms/step (2.9%), `rms_norm` 2.9 (3.3%), `rope_neox` 1.6, `kv_append` 0.5, `silu_mul`
+1.0. **The short-context step is the weight stream and essentially nothing else**, and that is not a
+surprise at 30 tokens — it is the same fact the batch section already established, that a decode step
+is one m=1 GEMV per weight tensor at ~19 GFLOP/s.
+
+**Is it at the roofline? Yes, by the same arithmetic as the m-sweep.** A 0.6B decode step is ~1.07
+GFLOP (28 layers × ~13.6 MFLOP + a 155.6 MFLOP head), so 66.7 ms is **~16 GFLOP/s**; the 1.7B step is
+~3.68 GFLOP over 185.6 ms, **~20 GFLOP/s**. The m-scale table's m = 1 row measured **19.0 GFLOP/s** on
+a synthetic GEMV. The three agree, from three different harnesses, so the short-context step is
+**weight-streaming-bound at the board's m = 1 GEMV rate** and there is **no host-side lever in it** —
+the same conclusion the 4B section reached, now for the small model at short context. The only lever
+that reaches a decode GEMM rate is a wider m (batch serving), which is the batch section's subject and
+not a change to this step.
+
+**Item 2 — the argmax read-back: the ABI advertises four bytes and the *device* does four bytes, but
+no caller reaches it, and on the C path reaching it would save nothing.** `backend.h` says `argmax`
+returns a device address "so the caller transfers four bytes instead of the whole logit vector when it
+only wants the token". The ascend backend honors that: `argmax` drives `aclnnArgMax` and reads back 8
+bytes. But the whole-vocab transfer does **not** come from the argmax path — it comes from
+`pocketllm_forward`, whose signature is `(session, tokens, n, float *logits, logits_cap)` and which
+**must** write the logits, because the ABI's contract is "return the vocabulary size — which is also
+the number of floats written". Measured, that transfer is not a cost:
+
+- **`aclrtMemcpy` D2H of 607,744 bytes (the 151,936-float vocab) moves at 8.7 GB/s = 0.070 ms**, and
+  8 bytes moves in 0.0018 ms — measured directly with a standalone ACL benchmark on this board. On the
+  C path the host then does a 0.080 ms memcpy and a **0.20 ms** `kernel::argmax` scan. **Total, the
+  entire logits read-back and greedy pick on the C path is ~0.28 ms of a ~102 ms step: 0.3%.** The
+  607 KB sits inside the profile's `sdma_down` (4.55 ms, and that column also carries every op's
+  read-back), so it is not even individually visible.
+- **On the Python path it is a different number, and this is the finding.** `native.py`'s `forward`
+  declares `out = (ctypes.c_float * vocab)()` and returns `[float(out[i]) for i in range(vocab)]` —
+  it **materializes the whole vocabulary as a 151,936-element Python list**, and `Engine.argmax` then
+  **repacks that list back into a ctypes array** to hand it to the C scan. Measured on the board:
+  the list build is **57 ms/step** and the repack is **72 ms/step** (the C scan itself is 0.20 ms).
+  End to end, `pocketllm run --device ascend` (which crosses this path) reads **308 ms/step where the
+  C binary reads 102** over the same `--steps 11`/`41` window — a **~205 ms/step** host-shell cost that
+  is almost entirely the Python list round-trip, larger than the C decode step it wraps.
+
+So the answer is split, and both halves are useful. On the **C path there is no lever**: the read-back
+is 0.3% and the step is at the GEMV roofline. On the **host shell there is a large one** — the Python
+bridge materializes the full vocab twice per step for a token that is one integer, when
+`Session::forward` already has an `argmax_out` that fills the id from the device in 8 bytes. The
+interface change is small and mirrors #643's shape: **plumb the device argmax through the entry
+points** — a `pocketllm_next_token(session, tokens, n)`-style ABI call (or an `argmax_out` parameter on
+`pocketllm_forward`), plus a `native.Engine.next_token` that returns an int instead of a list, so the
+greedy loop never asks for the vocabulary at all. It is a *host-shell* change, not a kernel one, and
+the GPU/CPU backends already implement `argmax`; the sampling path would still need the logits (the
+measured host sampler is 12.7 ms for `topk_sample` and 0.125 ms for `temperature`), so the win is
+greedy-only, which is the default and the documented fast path.
+
+**No behavior changed.** This section is measurement, not code: no op, no graph, no ABI moved, and the
+identity gates (#643's byte-identical 0.6B/1.7B/4B) stand because nothing was rebuilt. The D2H and
+sampler figures come from standalone benchmarks against the shipped `libpocketllm.so`; the per-stage
+and per-op tables come from `POCKETLLM_ASCEND_PROFILE=1` on the same binary the canonical section's
+numbers were taken from.
+
 ## Serving on the 310B: coming up, and the thread-bound context that had to be attached
 
 Everything above this point was measured through `pocketllm-run` (the C binary) or the `ctypes`
