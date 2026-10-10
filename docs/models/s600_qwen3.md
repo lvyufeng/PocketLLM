@@ -534,6 +534,29 @@ launch across several steps — not anything on the host, and not the weights, w
 cost. It is a *decode-only* win: prefill is compute-bound and pays little for the cache (its gain comes from the
 build, not the KV).
 
+**The lever, measured across sizes — the win is shallow and it is a small-model win.** Decode on the long
+list prompt, ours `cache_1024` vs the shipped `cache_4096`, same weights otherwise: the gain is **1.38×**
+on the 0.6B (121.5 vs 88.4 t/s), **1.27×** on the 1.7B (89.2 vs 70.2) and **1.17×** on the 4B (49.9 vs
+42.8) — falling with size because the weights are a fixed read the cache does not touch, so the KV is a
+large share of a small model's step and a small share of a large one's. `cache_512` would add only ~25%
+more decode over `1024` on the 0.6B and less elsewhere. (These pairs also differ in *calibration* — #634 —
+but calibration changes the scale values, not the tensor shapes, so the KV byte count and the *rate* are
+still a clean cache comparison.)
+
+**And it trades against context and against the loop threshold.** The usable window is `cache_len − 29`
+chat wrapper `− prompt`: `cache_1024` leaves **~940–975 tokens**, enough for the essay (~330 output + 37
+prompt) with ~630 to spare, while truncating a long *thinking* run (the 4B reached only 59 in its list
+because its thinking used ~800 of the 966 before the answer began). Shrinking below `1024` collides with
+#634/#636: the loop threshold sits beyond **~450–650 steps**, so `cache_512` (a ~425–460-token window)
+would *truncate a generation before the loop can appear* — faster and loop-proof for the 1.7B, but it caps
+an ordinary answer at ~450 tokens, which is not a fix for a precision-trajectory problem.
+
+**Recommendation for the next build round (not built — the queue is ours to sequence):** **`--cache_len
+1024` for the 0.6B and 1.7B** (already the sweet spot — fastest, tested; the 1.7B's next build should
+spend its budget on the loop, not the cache) and **`--cache_len 2048` for the 4B and 8B** (their thinking
+truncates at 1024 and decode is weight-bound, so doubling the window costs almost nothing). **Never build
+below `1024`** — the floor is the loop threshold plus the wrapper.
+
 #### Answer faithfulness: 9/10 on the 0.6B and 10/10 on the larger graphs
 
 A different build of the same weights can be faster and still reach different answers, and the whole
