@@ -331,9 +331,53 @@ early numeric divergence — on the looping prompt our 1.7B and the shipped 1.7B
 pieces** (` thinking\n`) and diverge at the **third token** (ours reasons, the shipped emits `</think>`) —
 but that immediate divergence is a property of **every** rebuild, not of the loop: our **0.6B** diverges
 from its own shipped twin at the **fourth token** and stays coherent, and the same 1.7B pair still answers
-all ten faithfulness prompts identically. So the trigger is none of position, cache, template or token
-mapping; it is the graph's own generation on the 1.7B `w4` weights, and localizing it to a layer or a pass
-needs a rebuild this board cannot run.
+all ten faithfulness prompts identically. So the trigger is none of position, template or token mapping; it
+is the graph's own generation on the 1.7B `w4` weights. The one parameter that *does* separate our graph
+from the shipped one — the cache size — is where the next subsection points the rebuild.
+
+#### The 1.7B loop: a 2-token reproducer, its onset, and the one build parameter that differs
+
+The loop localizes to a **minimal reproducer**, and the two graphs it contrasts differ in exactly one
+build parameter.
+
+**Minimal reproducer: the prompt `France?`.** Two tokens, greedy, on our compiled 1.7B (`cache_1024`,
+`w4`), it generates **1004 pieces / 4467 chars** to the cache cap with **no `</think>`, no answer and no
+EOS**. The repetition starts at generated **piece 31** (char 120, 2.7% in) and holds to the end (a 40-char
+window recurs 4× in the first half, 7× in the second); the recurring text is meta-commentary (`… a general
+answer. Let me think of the possible answers.`) with immediate word repeats (`fashion and fashion`), and it
+is **byte-identical across runs** (sha256 `f3f87ee4…`). It is not *any* prompt — generations that stop
+early stay clean (`Write` → 142 pieces ending `How can I assist you?`, `The capital of France is` →
+`**Paris**`) — so the trigger is a generation that runs **long**, not the prompt.
+
+**Divergence is early; the loop is late.** Our 1.7B and the shipped 1.7B first disagree at generated
+**piece 9** on `France?` and **piece 2** on the essay, but the loop starts at **piece 31** and **143** — a
+divergence→onset gap of **22** and **141** pieces. Across eleven prompts the onset lands anywhere from
+piece 31 to 810 (0.03–0.81 of the generation): not at the divergence, not at a fixed index, only after the
+generation has run long.
+
+**Not the content.** The integer-list prompt — a long, non-repeating enumeration the **shipped** 1.7B drives
+cleanly through 1–400 — **loops in ours anyway** (`…from 1 to 400…`, never finishing), while **short**
+enumerations (`1–100`, `1–200`) end on their last number. A non-repeating answer loops; a short one does not.
+
+**The commanded build parameters differ only in the cache.** Our 1.7B and the shipped 1.7B are both
+`Qwen3-1.7B_language_chunk_512_…_w4_nash-p_corenum_4_4` — same `w_bits` (4), `chunk`, `march`, `corenum`
+— and their command lines differ in **exactly one parameter: `cache_len` (1024 vs 4096)**. So the "cache
+length is not it" above narrows to: that tested *generation length* (2022 tokens on the shipped graph), not
+the *cache size*, and the shipped graph is `cache_4096` and simply never loops. `cache_len` is the leading
+suspect **because it is the only commanded difference**.
+
+**But the two artifacts differ in more than the command line.** `model_info` shows the **KV-cache**
+quantization scales are *not* the same on the two graphs (`layer_0_cache_key`: shipped `0.0120087`, ours
+`0.0120163`; 110 of 112 such tensors differ — [the variance is in the native chain
+page](../architecture/s600_native_chain.md#the-first-build-result)). A
+quantization scale is set by the **calibration activation range**, not by the tensor's length, so the
+shipped graph was **not** produced by an identical build with only the cache changed: the two are separate
+calibrations of the same weights, and which of `cache_len` and the calibration causes the loop is not yet
+separated. The decisive rebuild is still **ours at the vendor's own cache** — `cache_len 4096`, all else
+identical ([the command](../architecture/s600_native_chain.md#the-concrete-command-sequence)): a **clean**
+result pins `cache_len 1024` as the cause; a **still-looping** one says the difference is calibration or
+provenance — our build pipeline or our calibration — not the cache. (`cache_len 2048` is the cheaper first
+step; `w_bits 8, cache_len 1024` the `w4` control.)
 
 #### A request whose prompt does not fit the cache was an abort, and is now refused
 
