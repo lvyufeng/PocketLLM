@@ -208,6 +208,80 @@ the greedy branch, exactly the chaotic-decode effect the 1.7B section describes.
 footprint at a shorter maximum context, and it costs token-level identity with the vendor graph; which
 of those a caller wants is the choice, and it is the same choice the compiled 1.7B and 4B present.
 
+#### Long generation: the answer to "does 121 t/s hold, and what happens at the cache"
+
+Every number above uses the ~8-token canonical answer, which cannot show either property a served graph
+lives on: whether the text stays coherent over a long generation, and whether the decode rate holds as
+the context fills. Both graphs were measured on 2026-10-10 with a prompt inviting a long answer
+(`Write a detailed essay about the capital of France, at least 250 words.`), greedy, driven directly
+through **`pocketllm run --device horizon`**, three runs each.
+
+**The text is coherent to the end, at both sizes.** Ours produced an **881-token, 4200-character**
+essay — a six-paragraph structure (introduction → history → architecture → economy → government →
+conclusion) with no repetition loop, no mid-sentence break and the fact intact throughout. It even
+closes with its own self-check, `(Word count: 250)`. The shipped graph's essay (a shorter 791 tokens, on
+a different build) is coherent in exactly the same way. The excerpts:
+
+```text
+# ours, opening
+…  </think>
+**The Capital of France: Paris**  
+
+Paris, the capital of France, stands as the heart of Europe, a city that seamlessly blends history,
+culture, and modernity. …
+
+# ours, 881 tokens later
+… In conclusion, Paris is more than a city—it is the soul of France. Its history, culture, and economic
+vitality make it a defining location for the nation. As the capital, it continues to inspire and unite
+people across the world.  
+
+(Word count: 250)
+```
+
+**It is deterministic**, three runs byte-identical: ours sha256 `47abb370a7108cf6338e0b8f4ac070016271bfc50fb1074488b5b5b43dc5bab7`,
+the shipped graph's `e57999e2b4d0b954e322511841745fc4a417c560060256c1d09b9a35607126d3`.
+
+**The rate does not degrade with position — and this is the thing the 8-token prompt could not show.**
+Sampling the decode rate from per-token callback timestamps:
+
+| graph | tokens 1–20 | tokens 180–200 | last quarter | delegate's own `decode_tps` |
+|---|---|---|---|---|
+| ours `cache_1024` | 121.5 | 121.4 | 121.4 | 121.35 / 121.89 / 121.82 |
+| shipped `cache_4096` | 88.5 | 88.5 | 88.5 | 88.72 / 88.72 / 88.6 |
+
+Flat at both sizes, and the delegate's own per-run figure agrees with the callback measurement to
+within 0.5% — the 121.6 t/s of the ladder is a rate that holds for the whole generation, not a
+first-token artifact. The smaller cache does not make decode *cheaper with position*; it makes every
+step cheaper, uniformly.
+
+**What the shorter cache actually costs is reach, and it is a hard cap, not a quality cliff.** Asked to
+`Count from 1 to 400, one number per line, with no other text.`, ours counts correctly and coherently to
+**168 and then truncates mid-number at `1`** — 986 generated tokens, three runs byte-identical (sha256
+`17e717b690532b440232e43c66a14cf715eef84bd8fb05f589bd52dd477c20e3`). It is a **cutoff, not
+degeneration**: the numbers are clean right up to the stop, with no repetition or garbage before it. The
+exact limit is measurable: the tokenized prompt is **49 tokens** and the generation **986**, so
+prompt + generation = **1035**, against the compiled `cache_1024`. Lengthening the prompt to **184
+tokens** drops the generation to **851** — the same total, **1035**. So the graph caps chat at ~1035
+tokens (prompt + generated) and truncates anything longer, mid-token, exactly where the cache ends.
+
+**The shipped graph does the same thing at its own cap, 2 GiB further out.** A handful of prompts ended
+on their own before the shipped graph's ~4096-token context (`Count from 1 to 5000` stopped at EOS after
+2367 tokens, `1..500` complete). Pushed past it with `Count from 1 to 8000`, it also truncates
+mid-token — **4057 generated, ending `…939 9`** — at its own limit, sha256
+`0bf00626dafb062d8d84b0adaeb9c8f435550722d28255e7ca0e2124a9c528d7`. So both truncate; the shipped
+graph's reach is simply **about four times ours**.
+
+| graph | cache | measured reach (prompt + generated) | on hitting it |
+|---|---|---|---|
+| ours `cache_1024` | 1024 | **~1035 tokens**, mid-token | truncates; output clean to the stop |
+| shipped `cache_4096` | 4096 | **~4100 tokens**, mid-token | truncates; output clean to the stop |
+
+That is the honest trade the `cache_1024` build makes, stated plainly: **the same 1.38× decode, at a
+quarter of the context.** A caller whose prompt + answer stays under ~1000 tokens — every chat turn in
+these measurements, including an 881-token essay — gets the speed for free and never sees the cap; a
+caller that needs a 4k window does not. The cap is the graph, not the HTTP shell: it shows up the same
+way through `run` and through [`serve`](#serving-on-the-board).
+
 ### Running the ladder in one process does not work, and that is a finding
 
 Every number above was taken with **one process per graph**, and it has to be. Reusing one interpreter
