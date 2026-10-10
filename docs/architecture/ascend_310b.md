@@ -939,6 +939,44 @@ what stands.
 named rather than a measured B-way run. And `pocketllm-mscale` is unchanged, so no gate is at risk:
 the 0.6B/1.7B/4B identities are as documented above.
 
+### The round-trip class, swept: what else reads a stable buffer
+
+The rope table was not a one-off. It was one instance of a class worth naming exactly: **an op that
+reads a whole device buffer to the host and re-uploads it on every call, when the buffer is (a) a pure
+function of a stable, bound tensor and (b) larger than the slice the call uses.** Swept against that
+definition, every op in the ascend backend falls into one of three groups.
+
+**Stable buffers already cached** — the weight plane (`cube_for`), the embedding table
+(`dense_table_for`), the rope tables (`rope_tables_for`). Each reads only its activation per call.
+
+**The one stable buffer that was not** — `rms_norm` narrowed its gamma on the host on every call
+(`read_f32(weight, d)` + `to_f16` + `copy_to_device`), but the gamma is a bound f32 tensor the graph
+never rewrites: a pure function of a stable buffer, exactly the rope case. It is now cached the same
+way, keyed on the source handle and the element count (`narrow_weight_for`). The win is real but
+**small**: differencing `--steps 1` against `--steps 31` on the 0.6B, `rms_norm` fell from
+**3.55 ms/step to 2.95 ms/step** (two repeats: 3.567→3.023, 3.547→2.907), and the per-step `to_f16`
+call count fell from 563 to 450 (the ~28 layers × 2 norms × the gamma). That is **~0.6 ms of a ~95 ms
+decode step, under 1%** — well under the materiality threshold the rope fix cleared, because the
+gamma is `d = 1024` elements against the rope table's `rows × d/2`. It was taken anyway: same class,
+same contract, one op, and the 0.6B/1.7B/4B identity gate is byte-identical.
+
+**The one other stable read, not hot** — the dense `gemm` builds its weight plane per call from the
+f32 weight (`run_cube` → `build_cube_weight_from_f32`). It is the same class, and the graph's decode
+never reaches it: every decode GEMM is `gemm_quant`, whose plane is `cube_for`-cached. Left for a
+follow-up rather than fixed here.
+
+**What is *not* this class.** `attention` reads its whole KV window to the host on every call
+(`read_kv` of `context × width`), and that traffic is both material and context-scaling — measured,
+attention is **~5.5 ms/step at a ~30-token context and ~257 ms/step at ~600 tokens, a 47× scaling
+with context** on the 0.6B (the profile op counts, `--steps 1` against `--steps 11`). But the buffer
+is the **KV cache, which changes every decode step** — it is not a pure function of anything stable,
+so no cache can hold it. That cost is the attention kernel's host gather, a standing property of the
+backend's attention path already documented above, and it is not the rope pattern. Fixing it is a
+device-side attention kernel, a separate project.
+
+So the sweep found one more instance, fixed it, and confirmed the class is otherwise exhausted: the
+next material round-trip is attention, which is a different problem. `pocketllm-mscale` is unchanged.
+
 ## Serving on the 310B: coming up, and the thread-bound context that had to be attached
 
 Everything above this point was measured through `pocketllm-run` (the C binary) or the `ctypes`

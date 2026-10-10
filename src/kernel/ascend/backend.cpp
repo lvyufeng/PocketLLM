@@ -839,19 +839,20 @@ class AscendBackend final : public Backend {
      * weight arrive f32.  Narrow both, drive the op, widen the result back. */
     const int64_t elements = n_tokens * d;
     const std::vector<uint16_t> x_h = to_f16(read_f32(x, elements, ACL_FLOAT).data(), elements);
-    const std::vector<uint16_t> w_h = to_f16(read_f32(weight, d, ACL_FLOAT).data(), d);
+    /* The gamma is a bound weight, not an activation -- it is narrowed to fp16
+     * once and held on the device (see `narrow_weight_for`), so the only per-call
+     * host traffic left is the activation `x`. */
+    const DeviceBuffer dw = narrow_weight_for(weight, d);
     DeviceBuffer dx = allocate(elements * 2);
-    DeviceBuffer dw = allocate(d * 2);
     DeviceBuffer dout = allocate(elements * 2);
     copy_to_device(dx, x_h.data(), elements * 2);
-    copy_to_device(dw, w_h.data(), d * 2);
     run_rms_nd(dx, dw, dout, n_tokens, d, eps);
     std::vector<uint16_t> out_h(static_cast<std::size_t>(elements));
     copy_to_host(out_h.data(), dout, elements * 2);
     const std::vector<float> out_f = half_to_f32(out_h);
     copy_to_device(out, out_f.data(), elements * 4);
     release(dx);
-    release(dw);
+    /* `dw` is owned by `norm_cache_` and deliberately not released here. */
     release(dout);
   }
 
@@ -1926,6 +1927,36 @@ class AscendBackend final : public Backend {
     return inserted.first->second;
   }
 
+  /* The fp16 copy of a dense weight that is a pure function of its buffer -- the
+   * norm gammas.  `rms_norm` narrowed its gamma on the host (`read_f32` + `to_f16`
+   * + `copy_to_device`) on every call, but the gamma is bound once as f32 and
+   * never rewritten, so that round-trip was stable across calls and cacheable --
+   * the same class the cos/sin tables, the dequantized weights and the embedding
+   * table already are.  Keyed on the source handle and the element count, so a
+   * rebind or a reshape is a miss rather than a stale hit. */
+  DeviceBuffer narrow_weight_for(DeviceBuffer weight, int64_t elements) {
+    const std::string key =
+        "norm:" + std::to_string(weight.handle) + ":" + std::to_string(elements);
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      auto it = norm_cache_.find(key);
+      if (it != norm_cache_.end()) {
+        return it->second;
+      }
+    }
+    const std::vector<uint16_t> w_h = to_f16(read_f32(weight, elements, ACL_FLOAT).data(), elements);
+    DeviceBuffer device = allocate(elements * 2);
+    copy_to_device(device, w_h.data(), elements * 2);
+    /* Same emplace-and-release-the-loser contract as `cube_for`: two callers for
+     * the same key may both build, and the loser must not leak its copy. */
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto inserted = norm_cache_.emplace(key, device);
+    if (!inserted.second) {
+      release(device);
+    }
+    return inserted.first->second;
+  }
+
   aclrtStream stream_ = nullptr;
   aclrtContext context_ = nullptr;
   std::string soc_;
@@ -1934,6 +1965,7 @@ class AscendBackend final : public Backend {
   std::unordered_map<std::string, CubeWeight> cube_cache_;
   std::unordered_map<std::string, DeviceBuffer> table_cache_;
   std::unordered_map<std::string, std::pair<DeviceBuffer, DeviceBuffer>> rope_cache_;
+  std::unordered_map<std::string, DeviceBuffer> norm_cache_;
 };
 
 }  // namespace
