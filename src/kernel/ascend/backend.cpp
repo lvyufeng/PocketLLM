@@ -580,6 +580,7 @@ class AscendBackend final : public Backend {
     }
     acl_ok(aclInit(nullptr), "aclInit");
     acl_ok(aclrtSetDevice(0), "aclrtSetDevice(0)");
+    acl_ok(aclrtCreateContext(&context_, 0), "aclrtCreateContext");
     acl_ok(aclrtCreateStream(&stream_), "aclrtCreateStream");
     const char *const soc = aclrtGetSocName();
     soc_ = soc != nullptr ? soc : "unknown";
@@ -592,13 +593,51 @@ class AscendBackend final : public Backend {
     if (stream_ != nullptr) {
       aclrtDestroyStream(stream_);
     }
+    if (context_ != nullptr) {
+      aclrtDestroyContext(context_);
+    }
     aclrtResetDevice(0);
     aclFinalize();
   }
 
   const char *name() const override { return "ascend"; }
 
+  /* Attach this backend's ACL context to the calling thread.
+   *
+   * CANN's ACL context is per-thread (`acl_rt.h`): `aclrtSetDevice` implicitly
+   * creates a *default* context for whichever thread calls it, and a context
+   * created on one thread is not current on another.  This backend builds its
+   * context once, in the constructor, on the thread that opened it -- which for
+   * `pocketllm serve` is the process's main thread, while every request runs on
+   * a different `ThreadingHTTPServer` worker.  Without this, every op launched
+   * from a worker finds no current context, the launch fails, and `c_api.cpp`
+   * flattens it to `pocketllm_forward failed (-1)`.
+   *
+   * `aclrtSetCurrentContext` attaches the one context to the calling thread and
+   * is idempotent ("the last one prevails", per the header), so it is safe to
+   * call before every op; the thread_local below reduces that to once per
+   * thread, storing *which* context this thread bound so a thread that outlives
+   * one backend and meets another rebinds rather than skipping.
+   *
+   * Sharing one context and one stream across threads is exactly what CANN
+   * permits "if the user guarantees the execution order of tasks in the same
+   * stream under the same context in two threads" (`aclrtSetCurrentContext`
+   * restriction).  This backend synchronizes the stream at the end of every op
+   * and its callers serialize, so no two threads ever have work in flight in
+   * the stream at once -- which is also why no new stream is created per thread:
+   * a second stream on the same context would be a way to *overlap* work the
+   * session (one KV cache, one position) cannot support. */
+  void ensure_context() {
+    static thread_local aclrtContext bound = nullptr;
+    if (bound == context_) {
+      return;
+    }
+    acl_ok(aclrtSetCurrentContext(context_), "aclrtSetCurrentContext");
+    bound = context_;
+  }
+
   DeviceBuffer allocate(int64_t bytes) override {
+    ensure_context();
     if (bytes <= 0) {
       throw Error("ascend: cannot allocate " + std::to_string(bytes) + " bytes");
     }
@@ -612,12 +651,14 @@ class AscendBackend final : public Backend {
   }
 
   void release(DeviceBuffer buffer) override {
+    ensure_context();
     if (buffer.handle != 0) {
       aclrtFree(reinterpret_cast<void *>(buffer.handle));
     }
   }
 
   void copy_to_device(DeviceBuffer dst, const void *src, int64_t bytes) override {
+    ensure_context();
     StageClock _sc(2); /* sdma_up */
     acl_ok(aclrtMemcpy(reinterpret_cast<void *>(dst.handle), static_cast<std::size_t>(bytes), src,
                        static_cast<std::size_t>(bytes), ACL_MEMCPY_HOST_TO_DEVICE),
@@ -625,6 +666,7 @@ class AscendBackend final : public Backend {
   }
 
   void copy_to_host(void *dst, DeviceBuffer src, int64_t bytes) override {
+    ensure_context();
     StageClock _sc(3); /* sdma_down */
     acl_ok(aclrtMemcpy(dst, static_cast<std::size_t>(bytes),
                        reinterpret_cast<const void *>(src.handle), static_cast<std::size_t>(bytes),
@@ -633,6 +675,7 @@ class AscendBackend final : public Backend {
   }
 
   void copy_device_to_device(DeviceBuffer dst, DeviceBuffer src, int64_t bytes) override {
+    ensure_context();
     acl_ok(aclrtMemcpy(reinterpret_cast<void *>(dst.handle), static_cast<std::size_t>(bytes),
                        reinterpret_cast<const void *>(src.handle), static_cast<std::size_t>(bytes),
                        ACL_MEMCPY_DEVICE_TO_DEVICE),
@@ -644,6 +687,7 @@ class AscendBackend final : public Backend {
    * nothing else, so a host staging buffer is the honest implementation and the
    * one that cannot be wrong for a value the graph happens to pass. */
   void fill(DeviceBuffer dst, float value) override {
+    ensure_context();
     const int64_t count = dst.bytes / 4;
     std::vector<float> staged(static_cast<std::size_t>(count), value);
     acl_ok(aclrtMemcpy(reinterpret_cast<void *>(dst.handle),
@@ -655,6 +699,7 @@ class AscendBackend final : public Backend {
   void gemm_quant(DeviceBuffer x, DeviceBuffer blocks, DeviceBuffer bias, DeviceBuffer out,
                   int64_t m, int64_t n, int64_t k, int type_id, bool accumulate,
                   bool q6k_repacked = false) override {
+    ensure_context();
     OpScope _op("gemm_quant");
     /* The byte-expanded q6_K layout is a CUDA-only path; the ascend backend
      * decodes the GGUF blocks itself and never sets this. */
@@ -766,6 +811,7 @@ class AscendBackend final : public Backend {
 
   void rms_norm(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer out, int64_t n_tokens,
                 int64_t d, float eps) override {
+    ensure_context();
     OpScope _op("rms_norm");
     if (n_tokens <= 0 || d <= 0) {
       return;
@@ -811,6 +857,7 @@ class AscendBackend final : public Backend {
 
   void gemm(DeviceBuffer x, DeviceBuffer w, DeviceBuffer bias, DeviceBuffer out, int64_t m,
             int64_t n, int64_t k, bool accumulate) override {
+    ensure_context();
     OpScope _op("gemm");
     if (m <= 0 || n <= 0 || k <= 0) {
       return;
@@ -828,6 +875,7 @@ class AscendBackend final : public Backend {
   }
   void embedding(DeviceBuffer tokens, int64_t n_tokens, DeviceBuffer table, int64_t vocab,
                  int64_t d, DeviceBuffer out) override {
+    ensure_context();
     OpScope _op("embedding");
     std::vector<int32_t> ids(static_cast<std::size_t>(n_tokens));
     copy_to_host(ids.data(), tokens, n_tokens * 4);
@@ -836,6 +884,7 @@ class AscendBackend final : public Backend {
 
   void embedding_quant(DeviceBuffer tokens, int64_t n_tokens, DeviceBuffer blocks, int64_t vocab,
                        int64_t d, int type_id, DeviceBuffer out) override {
+    ensure_context();
     OpScope _op("embedding_quant");
     if (quant::block_bytes_of(type_id) == 0) {
       throw Error("ascend: embedding_quant has no decoder for GGML type id " +
@@ -862,6 +911,7 @@ class AscendBackend final : public Backend {
     gather_rows(ids, dtable, vocab, d, out);
   }
   void silu_mul(DeviceBuffer gate, DeviceBuffer up, DeviceBuffer out, int64_t n) override {
+    ensure_context();
     OpScope _op("silu_mul");
     if (n <= 0) {
       return;
@@ -928,6 +978,7 @@ class AscendBackend final : public Backend {
 
   void rope_neox(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d,
                  int64_t start_pos, DeviceBuffer cos_table, DeviceBuffer sin_table) override {
+    ensure_context();
     OpScope _op("rope_neox");
     /* `aclnnRopeCustom` walks a flat `[rows, d]` operand with a per-row INT32
      * index into the whole cos/sin table, so the token-major ``[token][head][d]``
@@ -1037,6 +1088,7 @@ class AscendBackend final : public Backend {
                  DeviceBuffer v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
                  int64_t q_offset, float scale, DeviceBuffer out, DeviceBuffer scores,
                  KVDtype kv_dtype) override {
+    ensure_context();
     OpScope _op("attention");
     (void)scores;  /* the op keeps its score row on the device, not in this buffer */
     if (first_key != 0) {
@@ -1092,6 +1144,7 @@ class AscendBackend final : public Backend {
 
   void kv_append(DeviceBuffer dst, DeviceBuffer src, int64_t n, int64_t n_head_kv, int64_t d,
                  int64_t elem) override {
+    ensure_context();
     OpScope _op("kv_append");
     if (n <= 0) {
       return;
@@ -1130,6 +1183,7 @@ class AscendBackend final : public Backend {
     return as_f16 ? KVDtype::kF16 : KVDtype::kF32;
   }
   void argmax(DeviceBuffer values, int64_t n, DeviceBuffer out) override {
+    ensure_context();
     OpScope _op("argmax");
     if (n <= 0) {
       throw Error("ascend: argmax needs a positive length, got " + std::to_string(n));
@@ -1166,6 +1220,7 @@ class AscendBackend final : public Backend {
   }
 
   void softmax(DeviceBuffer x, DeviceBuffer out, int64_t rows, int64_t cols) override {
+    ensure_context();
     OpScope _op("softmax");
     if (rows <= 0 || cols <= 0) {
       return;
@@ -1197,10 +1252,12 @@ class AscendBackend final : public Backend {
     aclDestroyTensor(to);
   }
   void logits_temperature(DeviceBuffer, DeviceBuffer, int64_t, float) override {
+    ensure_context();
     throw Error("ascend: logits_temperature not implemented yet");
   }
   void topk_sample(DeviceBuffer logits, int64_t vocab, float uniform, int64_t top_k, float top_p,
                    float min_p, DeviceBuffer order, DeviceBuffer out) override {
+    ensure_context();
     OpScope _op("topk_sample");
     (void)logits;
     (void)vocab;
@@ -1213,7 +1270,10 @@ class AscendBackend final : public Backend {
     throw Error("ascend: topk_sample not implemented yet");
   }
 
-  void synchronize() override { acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream"); }
+  void synchronize() override {
+    ensure_context();
+    acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
+  }
 
   std::string describe() const override {
     const char *const custom = std::getenv("ASCEND_CUSTOM_OPP_PATH");
@@ -1822,6 +1882,7 @@ class AscendBackend final : public Backend {
   }
 
   aclrtStream stream_ = nullptr;
+  aclrtContext context_ = nullptr;
   std::string soc_;
   std::mutex mutex_;
   std::unordered_map<std::string, PackedQ4K> cache_;

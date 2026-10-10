@@ -793,79 +793,60 @@ device itself does ~230 GFLOP/s fp16 at m ≥ 16. Nothing on this board is at th
 does not touch the backend, so no kernel or graph code moved and no identity gate was at risk; the
 0.6B/1.7B/4B gates are as documented above.
 
-## Serving on the 310B: `serve` does not come up, and the reason is a thread-bound context
+## Serving on the 310B: coming up, and the thread-bound context that had to be attached
 
 Everything above this point was measured through `pocketllm-run` (the C binary) or the `ctypes`
 bridge on the **opening thread**. The HTTP surface — `pocketllm serve` — had never been run on this
-board, and it does not work. A bounded smoke of the serving path (the production
-`NativeBackend` + `server.openai.serve`, 0.6B `q4_k_m`, no code changed) found three things stacked
-on top of each other.
+board, and it did not come up, for two stacked and independently fixable reasons. Both are fixed now,
+and the path is proven through the real server.
 
-**1. `pocketllm serve --device ascend` refuses at the parser.** The CLI's runtime dispatch table
-(`_RUNTIMES` in `python/pocketllm/cli.py`) maps `cpu`/`cuda` → the C engine and `horizon` → the S600
-delegate; `ascend` is not in it, so:
+**The two gaps.** (1) The CLI's runtime dispatch table (`_RUNTIMES` in `python/pocketllm/cli.py`)
+mapped `cpu`/`cuda` → the C engine and `horizon` → the S600 delegate, with no `ascend` entry, so
+`pocketllm serve --device ascend` refused at the parser. That was a table omission, not a backend gap
+— `pocketllm-run --device ascend` already drove the whole forward and answered `Paris`. (2) Even with
+the CLI bypassed, every request 500'd with the opaque `pocketllm_forward failed (-1)`, because the ACL
+context is **thread-bound**: `AscendBackend`'s constructor called `aclrtSetDevice(0)` and
+`aclrtCreateStream`, which bind the current context and stream to the **calling thread**, and
+`forward` never re-bound one on any other. `serve` is a `ThreadingHTTPServer` — one thread per
+request — and the adapter opens the engine on the main thread, so the handler thread had no current
+context and every op launch failed. The `cpu` backend has no such problem (forward from any thread is
+fine), which is why it went unnoticed: the C binary is single-threaded and read the engine on the
+thread that built it.
 
-```
-`pocketllm serve` cannot start: `serve` has no runtime for --device 'ascend';
-it runs cpu, cuda, horizon (and `auto`, which is cpu)
-```
+**The fix, and why this shape.** `_RUNTIMES` gains `"ascend": "native"` — the C engine carries the
+ascend backend, so `--device ascend` drives the same ctypes runtime as `cpu`/`cuda`; the CLI names a
+*runtime*, not a kernel. In the backend, the constructor now creates an explicit context
+(`aclrtCreateContext`) and `ensure_context()` — a `thread_local` guard — attaches it with
+`aclrtSetCurrentContext` before each device op. CANN's rule is exactly why: `acl_rt.h` says
+`aclrtSetDevice` "implicitly create[s] the default context … for the calling thread", so a context is
+per-thread and must be re-attached on each new one; `aclrtSetCurrentContext` is idempotent ("the last
+one prevails"), so the guard reduces it to once per thread while still rebinding a thread that meets a
+second backend. Sharing one context and one *stream* across threads is what CANN permits "if the user
+guarantees the execution order of tasks in the same stream" — which this backend does: every op
+synchronizes the stream before returning and its callers serialize, so no two threads ever have work
+in flight at once. That is also why no per-thread stream is created: a second stream would be a way to
+*overlap* work the session (one KV cache, one position) cannot support.
 
-This is a table omission, not a backend gap: the C core **does** drive ascend — the C binary
-`pocketllm-run --device ascend` runs the whole forward and answers `Paris` — and constructing
-`NativeBackend(EngineArgs(model=…, device="ascend"), "ascend")` directly opens the session and
-reports `Qwen3-0.6B-Q4_K_M.gguf on ascend`, `supports_batch = False`.
+**The proof, through the real HTTP server** (0.6B `q4_k_m`, `pocketllm serve --device ascend`):
 
-**2. Bypassing the CLI, every request 500s — because the ACL context is bound to the opening
-thread.** Driving that adapter through the real HTTP server and asking one `/v1/completions`:
-
-| | response | text |
-|---|---|---|
-| one request, `--device ascend` | **500** `{"error":{"message":"pocketllm_forward failed (-1)","type":"server_error"}}` | — |
-| the same, `--device cpu` (control) | 200, `finish_reason: length`, 6.63 s | `" Paris. The capital"` |
-
-`pocketllm_forward failed (-1)` is the whole message: `src/c_api.cpp`'s `pocketllm_forward` catches
-every `std::exception` and returns `-1`, so the C++ reason never reaches the HTTP body. The reason is
-thread affinity. `AscendBackend`'s constructor calls `aclrtSetDevice(0)` and `aclrtCreateStream`
-(`src/kernel/ascend/backend.cpp`), which bind the current ACL context and stream to the **calling
-thread**; `forward` never re-binds one. Isolated directly on the bridge, one engine:
-
-| call | result |
+| | result |
 |---|---|
-| `forward` on the thread that opened the engine | **OK**, argmax `12095` (`Paris`) |
-| `forward` on a different thread | `EngineUnavailable('pocketllm_forward failed (-1)')` |
+| `pocketllm serve --device ascend` starts | **yes** — `/ready` → 200, banner `Qwen3-0.6B-Q4_K_M.gguf on ascend` |
+| one `/v1/completions` | **200**, `finish_reason: length`, 19.5 s — ` Paris. The capital` |
+| **four concurrent, distinct prompts** | **4/4 correct, all 200**, wall 5.9 s — `Paris` / `Tokyo` / `4\n$$` / `the first president of` |
 
-`serve` is a `ThreadingHTTPServer` — one thread per request — and the adapter opens the engine on the
-main thread, so the worker thread that runs the handler has no current context and every op launch
-fails. **The `cpu` backend has no such problem** (forward from any thread is fine), which is exactly
-why this went unnoticed: the C binary is single-threaded and reads the engine on the thread that
-built it.
+The concurrent row is the point: each of the four returned its **own** correct text, none garbled —
+the worker-thread path now works, where before every one of them 500'd. The **0.6B gate is
+unchanged**: `pocketllm-run --device ascend --prompt "The capital of France is" --steps 8` still
+prints `[12095 Paris 13. 576 The 6722 capital 315 of 9625 France 374 is 1083 also]`, bit-identical to
+`--device cpu` — the change is in the op entry points, so that identity is the check that it is
+transparent.
 
-**3. The over-cap path is a 500, not a clean refusal.** A prompt longer than the checkpoint's window
-(40960 for this GGUF) comes back as the same **500** `pocketllm_forward failed (-1)`, in 0.2 s —
-`Qwen3Model::forward` throws *before* any GEMM ("the sequence would reach position …, past the
-checkpoint's context length"), the C API flattens it to `-1`, and `NativeBackend` re-raises it as
-`EngineUnavailable`, which `_error_status` maps to 500. A client gets neither `finish_reason: length`
-nor a 4xx naming the limit; it gets an opaque server error. (The window is the checkpoint's, not the
-request's: `SamplingParams.token_budget` returns an explicit `max_tokens` **unchanged**, so a client
-asking for more tokens than the window holds is not clamped either — it walks the loop to the edge
-and hits the same `-1`.)
-
-**What this means for the concurrency hazard the native path was guarded against.** The concern that
-motivated `supports_batch = False` — `ThreadingHTTPServer` fanning requests onto one C session that
-holds one KV cache and one position, returning **wrong text with a 200** — **is not what happens
-here**, and not because the lock saves it: on this board the path fails *loudly* (500) before it can
-return anything, on the thread-affinity cause above. The lock is not what is protecting concurrency;
-the failure is upstream of it. The control run confirms both the harness and the lock: on `cpu`,
-four concurrent requests with **distinct** prompts each came back **200 with the correct, distinct
-text** (`Paris` / `Tokyo` / `4` / `the first president of`), 4/4 — so the serialization the adapter
-declares is real and works, and it is only the ascend backend underneath that cannot be reached from
-a worker thread.
-
-**Nothing was changed.** No kernel or graph code moved and the 0.6B/1.7B/4B gates are untouched; this
-is a measurement note. A fix has two parts, neither taken here: an `ascend` entry in `_RUNTIMES`, and
-binding the ACL context to the calling thread in `AscendBackend::forward` (or pinning the session to
-one executor thread) — CANN's context is per-thread, and the backend currently binds it only at
-construction.
+**Not folded in.** The over-cap path is still a plain **500** (`pocketllm_forward failed (-1)`, in
+0.2 s) rather than a clean `finish_reason: length`: `Qwen3Model::forward` throws before any GEMM when
+the sequence would pass the checkpoint's 40960 window, and `c_api.cpp` flattens it to `-1`. That is
+distinct from the #622 over-cap *crash* (which was the S600/horizon delegate) and is left as a
+follow-up, so this change stays "serve comes up and is correct on ascend".
 
 ## Current state — the canonical numbers after the series
 
