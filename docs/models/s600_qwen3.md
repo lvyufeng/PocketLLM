@@ -282,6 +282,46 @@ these measurements, including an 881-token essay — gets the speed for free and
 caller that needs a 4k window does not. The cap is the graph, not the HTTP shell: it shows up the same
 way through `run` and through [`serve`](#serving-on-the-board).
 
+#### Answer faithfulness: the compiled graph reaches 9 of the shipped graph's 10 answers
+
+A different build of the same weights can be faster and still reach different answers, and the whole
+point of the compiled graph is that it is *useful*, not just fast. So ours and the shipped 0.6B were
+put through a battery of **ten prompts with a single checkable short answer**, greedy, the final answer
+extracted from each (everything after the reasoning block). Both sides are `w8`, so this is the
+width-and-scheme-matched pair and the cleanest signal of the set.
+
+| prompt | ours `cache_1024` | shipped `cache_4096` | final answer matches? |
+|---|---|---|---|
+| `The capital of France is` | **Paris** | **Paris** | yes |
+| `2 + 2 =` | **4** | **4** | yes |
+| `The largest planet in the solar system is` | **Jupiter** | **Jupiter** | yes |
+| `The chemical symbol for gold is` | **Au** | **Au** | yes |
+| `How many continents are there?` | **14** | **7** | **no** |
+| `The first month of the year is` | **January** | **January** | yes |
+| `The capital of Japan is` | **Tokyo** | **Tokyo** | yes |
+| `The boiling point of water in Celsius at sea level is` | **100 °C** | **100 °C** | yes |
+| `The largest ocean on Earth is` | **Pacific Ocean** | **Pacific Ocean** | yes |
+| `The chemical symbol for water is` | **H₂O** | **H₂O** | yes |
+
+**9 / 10 final answers are identical**, and on those nine both graphs give the same correct fact —
+whether the answer is one word or the shipped graph adds an elaboration sentence ours omits.
+
+**The tenth is the finding, and it is a wrong answer, not a reworded one.** Asked
+`How many continents are there?`, the shipped graph answers **7** (correct) and ours answers **14**,
+with a fluent, confident elaboration ("These include regions such as Africa, Asia, Europe, North
+America, South America, Oceania, and others. The continents are divided into 14 distinct landmasses, with
+no overlap between them."). It is deterministic — three runs of each graph, byte-identical within a
+graph — so it is a property of the compiled artifact, not a flaky draw.
+
+This is a **stronger** statement than the reasoning-block divergence recorded above, and it is the one
+that matters for the fleet's accuracy bar. There, the two builds *phrased* the same fact differently;
+here, on one prompt in ten, the compiled build reaches a **different final answer**, and the wrong one.
+The cause is the same — the `cache_len` change and the compiler's own graph, not a quantizer width,
+since both sides are `w8` — with a worse outcome on this prompt. The honest read is that a 0.6B model is
+weak to begin with, and a different build of a weak model can flip a fact: the compiled graph's 1.38×
+decode is real, and so is this failure mode. A caller who needs answer fidelity on a fact-sensitive task
+should measure the specific prompts they care about, not assume the two builds agree.
+
 ### Running the ladder in one process does not work, and that is a finding
 
 Every number above was taken with **one process per graph**, and it has to be. Reusing one interpreter
