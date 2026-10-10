@@ -31,6 +31,23 @@ class Error : public std::runtime_error {
   explicit Error(const std::string &what) : std::runtime_error(what) {}
 };
 
+/* A request the *caller* can fix: the sequence is longer than the checkpoint's
+ * context window.  Distinct from :class:`Error` so the ABI can report it with
+ * its own return code and the host can answer with a client error instead of
+ * treating it like any other failure -- a prompt past the window is a bad
+ * request, not a broken engine.  The message carries the position and the
+ * limit, which is the whole point of naming it. */
+class ContextLengthError : public Error {
+ public:
+  explicit ContextLengthError(const std::string &what) : Error(what) {}
+};
+
+/* The negative return `pocketllm_forward` uses for :class:`ContextLengthError`,
+ * so a host can tell "the prompt is too long" from "the engine failed" without
+ * parsing a message string.  Chosen below the generic `-1`/`-2` failures and
+ * documented in `pocketllm.h`. */
+constexpr int kErrContextLength = -3;
+
 /* Copy `message` into a caller-owned buffer, NUL-terminated and truncated
  * rather than overflowing.  A NULL buffer or a zero capacity is a no-op: the
  * header lets a caller that wants only the return value pass neither. */

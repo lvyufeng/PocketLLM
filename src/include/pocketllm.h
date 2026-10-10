@@ -22,6 +22,11 @@
  *   - Buffers are caller-allocated.  `_cap` is the caller's capacity in
  *     elements; a call that needs more than `_cap` fails rather than
  *     overflowing.
+ *   - Negative returns are not all alike.  `-1` is a generic failure and `-2`
+ *     an unbound model; `POCKETLLM_ERR_CONTEXT_LENGTH` (`-3`) is a
+ *     specifically *recoverable* one -- the request ran past the checkpoint's
+ *     context window -- and no other failure uses that value, so a host can
+ *     tell a bad request from a broken engine without reading the message.
  */
 
 #ifndef POCKETLLM_H
@@ -29,6 +34,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+/* The return `pocketllm_forward` gives when the tokens would run past the
+ * checkpoint's context window.  It is the one negative value a caller may
+ * usefully act on: the request is too long, not malformed, and a shorter one
+ * will succeed.  `pocketllm_forward` takes no error buffer, so this code is how
+ * a caller tells that case apart; the limit itself is the checkpoint's context
+ * length, a property of the model rather than of a given call. */
+#define POCKETLLM_ERR_CONTEXT_LENGTH (-3)
 
 /* The library is built with hidden visibility, so a function that is not
  * marked here is not in the symbol table at all -- which is the point: the ABI

@@ -53,7 +53,7 @@ from pocketllm.api import (
     Usage,
 )
 from pocketllm.choices import RequestState
-from pocketllm.native import Engine, EngineUnavailable, is_available
+from pocketllm.native import ContextLengthExceeded, Engine, EngineUnavailable, is_available
 from pocketllm.protocol.contract import CHAT, FieldRefusal, ServedFields, audit
 from pocketllm.protocol.templating import split_reasoning
 
@@ -374,6 +374,17 @@ class NativeBackend:
                 ),
                 metadata=metadata,
             )
+        except ContextLengthExceeded as exc:
+            # The engine refused the sequence as past the checkpoint's window
+            # (its own `POCKETLLM_ERR_CONTEXT_LENGTH`, not a generic failure).
+            # That is a bad *request*, so it leaves this layer as a
+            # `ConfigurationError` -- a 400 -- rather than a 500, and the message
+            # names the limit.  The token count and the window are both known
+            # here, so the client is told what to shrink to.
+            raise ConfigurationError(
+                f"the prompt is {len(prompt_tokens)} tokens, past this model's "
+                f"context window of {self._context_length}"
+            ) from exc
         finally:
             self._lock.release()
             self._leave_queue()

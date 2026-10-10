@@ -649,8 +649,9 @@ kernel::DeviceBuffer Qwen3Model::forward(const int32_t *tokens, int64_t n, int64
                 std::to_string(cache_length_) + " positions");
   }
   if (start_pos + n > capacity_) {
-    throw Error("the sequence would reach position " + std::to_string(start_pos + n) +
-                ", past the checkpoint's context length of " + std::to_string(capacity_));
+    throw ContextLengthError("the sequence would reach position " + std::to_string(start_pos + n) +
+                             ", past the checkpoint's context length of " +
+                             std::to_string(capacity_));
   }
 
   ensure_capacity(n, start_pos + n);
