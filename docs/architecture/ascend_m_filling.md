@@ -6,7 +6,10 @@ GEMV in it presents an **m = 1** activation, the cube's M dimension sits idle, a
 do **~108 GFLOP/s at m = 8** and **~230 GFLOP/s at m ≥ 16**. Launch count and sync placement were
 measured and moved nothing; the device is fine; the *shape* is the limit. That leaves exactly one
 lever — **put more tokens on the cube at once** — and it has exactly two forms. This page decides
-between them. It is a scoping document: it changes no code, and its recommendation is **do neither**.
+between them. It is a scoping document: it changes no code, and its recommendation is **do neither**
+— *on cost and constraint, not payoff*. [The bound is now measured](#the-bound-measured-and-it-is-not-the-3-the-model-above-derived):
+batch serving buys **3.7× per-sequence at k=4 and 6.6× at k=8**, well past the level the opening
+model suggested.
 
 The gap, in one sentence: **a decode step is one token, so it is 36 layers plus a head of m=1 GEMMs,
 and there is no way to widen m within one request's one token** — the tokens have to come from
@@ -48,11 +51,142 @@ Say **`< 3×` at B=8, `< 4×` at B=32**, not 5.7×. And that ceiling assumes eve
 holds a per-token constant and only the GEMM band moves — the most favorable reading. A measured 4B
 step of 0.587 s/token would land near **0.20 s/token** if the whole GEMM band took the m=8 rate.
 
+**That model is superseded below.** [The measured bound](#the-bound-measured-and-it-is-not-the-3-the-model-above-derived)
+drives the same question through `pocketllm-mscale` on the 4B's five real drive shapes and the decode
+profile's per-step split, and it lands at **3.7× at k=4 and 6.6× at k=8** — larger than this model's
+`< 3×` at 8, because the model used a single fixed shape for the m-rate and the whole-step 14.5% for
+the floor. Read this section as the derivation the measurement later corrected, not as the number.
+
 One correction worth recording, because it is tempting and wrong: **the chunked read-back does not
 divide by B.** `run_cube_weight` walks N in 8192-column chunks and reads back a partial sum per
 chunk (`sdma_down`, 2.2%), and a larger m means `m × 8192` floats per chunk instead of `1 × 8192` —
 so those bytes grow with B even as the per-token share of them falls. The read-back stops being a
 bottleneck (0.4×/token at B=8) without disappearing from the step.
+
+## The bound, measured — and it is not the `< 3×` the model above derived
+
+The ceiling above was **asserted from a model**, and the page said so: the fraction of the step that
+scales with m was a derived `0.85–0.9`, the m-rate curve was `m=1 → 19 GFLOP/s` while a decode step
+actually runs at **~17 GFLOP/s** (the m-scale table's own m=8 at a *fixed* shape is not the *weighted*
+rate over the 4B's five real drive shapes), and the per-op floor was assumed to scale with m. Each of
+those is worth more than a factor of one, and together they move the answer. Re-measured on the board,
+the honest end-to-end bound at **k=4 is 3.7× and at k=8 is 6.6×** — well above the `< 3×`-at-8 the
+model gave — and the per-token rate *rises with m when weighted correctly*, which is the direction the
+fixed-shape table obscured.
+
+### The weighted GEMM curve — the 4B's real shapes, not a proxy
+
+The m-scale table uses **one fixed (n, k) per row**. A 4B decode step drives **five** distinct shapes,
+and the m-rate is not uniform across them: the wide-`n` shapes (the head at `n = 151936`, the ffn at
+`n = 9728`) reach ~100–106 GFLOP/s at m=8 while the square `q/k/v/o` shape (`n = k = 2560`) only
+reaches ~108 by m=16. So the right measurement is the *sum over the step's drives* at each m, from
+`pocketllm-mscale` on exactly the shapes `qwen3.cpp` runs:
+
+| drive (the 4B's own) | per layer | m=1 | m=2 | m=4 | m=8 | m=16 | m=32 |
+|---|---|---|---|---|---|---|---|
+| `q/k/v/o`, n=k=2560 | ×4 | 0.692 | 0.729 | 0.812 | 0.966 | 1.244 | 1.949 |
+| `ffn_gate`/`up`, n=9728, k=2560 | ×2 | 3.246 | 3.324 | 3.521 | 3.884 | 4.602 | 6.829 |
+| `ffn_down`, n=2560, k=9728 | ×1 | 2.344 | 2.415 | 2.614 | 2.938 | 3.688 | 6.120 |
+| `output` head, n=151936 | ×1 | 52.845 | 51.839 | 54.000 | 58.797 | 68.206 | 99.871 |
+| **step total (ms, all 36 layers + head)** | | **470.6** | **483.1** | **518.5** | **583.3** | **711.5** | **1092.5** |
+
+The per-call figures are `pocketllm-mscale --n … --k … --rep 20`; the step total applies the call
+counts (36×4 + 36×2 + 36×1 + 1). Two facts fall out and both matter:
+
+- **The measured m=1 total, 470.6 ms, is the cube's own share of `op_sync`** — against the step's
+  ~8.04 GFLOP its rate is **17.1 GFLOP/s**, the decode profile's ~17 GFLOP/s, which ties the synthetic
+  harness to the real step. `op_sync` measured 452.8 ms, so the cube's GEMMs *are* essentially all of
+  it; the ~18 ms of mesh is `AttentionStepCustom` **and** `rope_neox` (a cube drive too — it fell
+  outside `gemm_quant`'s op scope, so it is in the gap, not in the cube total).
+- **`r(k) = GEMM(k)/GEMM(1)` is `1.027` at k=2, `1.102` at k=4, `1.240` at k=8.** The GEMM time is
+  *nearly flat* from m=1 to m=4 and only 24% higher at m=8 — so the per-*token* GEMM cost divides
+  almost exactly by k, which is the whole lever, and it is larger than the fixed-shape model implied.
+
+### The split at 4B, measured
+
+The page's split above is `op_sync` 85.5% vs the rest 14.5%. That is right but it is a *whole-step*
+average; what the bound needs is the same split **per decode step**, and the per-op dump gives it. The
+`--steps 1` and `--steps 8` runs differ by exactly seven decode steps (they share the one-time prologue
+and the 5-token prefill, as the [4B profile](ascend_310b.md#where-a-4b-decode-step-actually-goes-and-why-nothing-was-changed)
+establishes), so the difference over seven **is** a decode step:
+
+| stage | per decode step | share | scales with m? |
+|---|---|---|---|
+| **the cube** (the weighted GEMM table above, m=1) | **470 ms** | **88.2%** | **yes — the lever** |
+| `to_f16` + `to_f32` (per-op activation convert) | **~42 ms** | 7.9% (14.5% of the activation half) | no |
+| `rope_neox` + `attention` + `rms_norm` + `silu_mul` (the mesh) | **~18 ms** | 3.4% (11.5%) | no |
+| `sdma_up` / `sdma_down` / `op_enqueue` / glue | **~3–10 ms** | ~2% | no (the transfer is tiny here) |
+
+**The cube's GEMMs are 88% of a 4B decode step; the non-GEMM floor is ~77 ms.** That is a *stronger*
+case than the 85.5/14.5 the page modelled, because the ~85% `op_sync` figure conflated the cube with
+the attention/rope mesh. The one caution this split carries: the `to_f16`/`sdma` figures are
+*activation-side*, and a real batch's larger activations convert and transfer proportionally more, so
+a full m-fold growth of that band would roughly triple it per step — but the measurement above bounds
+how much of the step it can ever be, and at m=1 it is under 8%.
+
+### The bound — k ∈ {2, 4, 8}
+
+`T(k) = 470.6 · r(k) + 77.2` ms per step for **all k sequences together**; the per-sequence wall is
+that over k. `r(k)` is the table above.
+
+| k | GEMM(k) ms | non-GEMM ms | **aggregate step** (all k) | **per-sequence step** | **per-seq speed-up** | aggregate tok/s |
+|---|---|---|---|---|---|---|
+| **1** | 470.6 | 77.2 | 548 ms | **548 ms/token** | 1.00× | 1.8 |
+| **2** | 483.1 | 77.2 | 560 ms | **280 ms/token** | **1.96×** | 3.6 |
+| **4** | 518.5 | 77.2 | 596 ms | **149 ms/token** | **3.68×** | 6.7 |
+| **8** | 583.3 | 77.2 | 661 ms | **83 ms/token** | **6.64×** | 12.1 |
+| 16 | 711.5 | 77.2 | 789 ms | 49 ms/token | 11.2× | 20.3 |
+| 32 | 1092.5 | 77.2 | 1170 ms | 37 ms/token | 15.0× | 27.4 |
+
+Three caveats, and none is small enough to ignore. **The "per-seq speed-up" column is amortized
+throughput, not latency:** it is the per-sequence wall when k sequences decode on the board at once,
+so the *aggregate* work per token falls — a **single** request on an otherwise idle board still pays
+the whole `T(k)` step (548 ms at m=1, 596 ms at m=4), and it is a *batched* caller who sees the win.
+That is the shape the 310B serves in, but it is the one reading of the table to get wrong. First, **m=1 here is 548 ms where the page's
+canonical decode is 587 ms** — the 39 ms gap is real (a `--steps 8/32` marginal is measured deeper
+into the sequence, where attention's window is longer) and it means these are ratios, anchored to the
+profile's own numbers, not a promise about the canonical marginal. Second, **the ~14.5% floor is
+modelled as fixed**, which is the *conservative* direction: the k-fold growth of `to_f16`/`sdma` sits
+*inside* that floor and at m=1 is under 8% of the step. Third, KV residency: `per_layer` at 4096
+positions is 2 MiB/layer, so 36 layers is **72 MiB per sequence** — at k=4 that is 288 MiB added to
+the 4B's **~8.2 GiB** residency, i.e. ~3.5%, which the ~16.7 GB usable pool absorbs.
+
+### The decision — the bound justifies batch serving, and the page's "do neither" must move
+
+**There is a k where per-sequence decode is meaningfully faster — in amortized throughput, not in a
+single request's latency — well past the 1.3× bar:** k=2 gives
+1.96×, k=4 gives 3.68× and k=8 gives 6.64× per-sequence. The page's own derived model said `< 3×` at
+B=8; the measured bound is **~6.6× at B=8**, and at **k=4 it is already 3.7×** — the same number the
+model put at B=8. The model was wrong in the *useful* direction because it under-credited two things:
+the GEMM's *weighted* rate rises more with m than a single fixed shape showed, and the 4B step's
+per-op floor is a smaller fraction of the step than the `op_sync`-based 14.5% suggested. So the honest
+reading is the opposite of the page's summary: **(a)'s payoff is not "short of 2×" observational, it is
+3.7× at four sequences and 6.6× at eight.**
+
+That does **not** reverse the page's *recommendation*, and the distinction is the point of this
+section. The payoff was never the reason to say neither — the page said so itself
+("the decision not to do it is purely about cost and constraint, not payoff"). What the measurement
+changes is the *weight* on the trade: the page priced a ~2.9×-at-B=8 feature and got a lean against
+it; the real feature is ~6.6× at B=8, which changes the calculus for anyone with a real multi-request
+workload. So the honest conclusion is:
+
+- **The bound justifies batch serving** — decide for it if a multi-request serving workload is the
+  goal, because 3.7×/6.6× on a single card is a feature, not a rounding error.
+- **The cost is unchanged and still the deciding factor** — a new batched ragged-window `ascend310b`
+  attention kernel in the adjacent tree, the KV-slab rewrite, batch `Session`/`native`/adapter APIs
+  and a scheduler, all to preserve the `supports_batch=False` correctness contract whose violation is
+  silently wrong text (measured 0/6). None of that gets cheaper because the payoff is bigger.
+- **The minimal sketch** (a design, not an implementation) is the page's own PR list, and it stays
+  right: (1) the batched ragged `AttentionStepCustom` for `ascend310b` — the gating item and the only
+  board-side one; (2) `qwen3.cpp`'s KV slab to `[layer][sequence][position][kv_width]`; (3) `Session`
+  + `native.py` N positions and a batch `forward`, B=1 preserved so the gate is unchanged; (4)
+  `native_backend.py`'s scheduler with `supports_batch` flipped true only when real per-sequence
+  isolation replaces the lock. Its size is the page's own estimate: **two repositories, four PRs, and
+  a new 310B kernel** — the same feature, now with a measured 6.6× to justify it.
+
+The one-sentence verdict: **the lever is worth 3.7× at four sequences and 6.6× at eight — measured, not
+modelled — so if 310B serving throughput becomes a real goal, build (a); nothing about the cost
+changed, only the size of the prize.**
 
 ## Option (a) — batch serving
 
@@ -97,7 +231,9 @@ already takes a batch dimension. This is the one part of the stack that is *not*
 
 ### What it buys, and what it breaks
 
-It buys the bound above: **≈ 2.9× at B=8, ~3.8× at B=32**, and it is *architecturally* the right
+It buys the bound above: **3.7× per-sequence at k=4 and 6.6× at k=8** (measured; see
+[the measured bound](#the-bound-measured-and-it-is-not-the-3-the-model-above-derived)), and it is
+*architecturally* the right
 lever — it provably fills m, which is the measured constraint. The decision not to do it is purely
 about cost and constraint, not payoff.
 
@@ -181,15 +317,20 @@ would take a real acceptance-rate measurement to raise it.
 
 ## The recommendation — neither, and here is the reasoning
 
-**Do neither. The 310B's ~18 GFLOP/s is a real shape limit, and neither lever clears it cheaply
-enough to be the next thing this tree does.**
+**Do neither *as the next thing this tree does* — and note that the measurement above made the case
+for (a) stronger, not weaker.** The recommendation stands on *cost and constraint*, which the
+measurement did not touch; its payoff is now 3.7×/6.6× rather than the modelled `< 3×`, so the page
+is choosing against a *larger* prize than it first priced. That is the honest state: not "the lever is
+weak" but "the lever is strong and the price is a new board-side kernel plus a correctness-critical
+rewrite, for a board that serves one request at a time today".
 
 - **Batch serving is the right lever and the wrong cost.** It *provably* fills the dimension the
   measurement identified — nothing else in this tree can — but it needs a **new `ascend310b` custom
   attention kernel** (ragged per-sequence windows; today's `AttentionStepCustom` is `q_len==1`), a
   **slab-layout rewrite of the KV cache** from per-session to per-sequence, batch APIs in `Session`,
   `native.py` and the serving adapter, and a scheduler — spread over two repositories, and against a
-  memory pool the 8B already fills. Its payoff (~2.9× at B=8) is real but it is **serving throughput
+  memory pool the 8B already fills. Its payoff (measured **3.7× at k=4, 6.6× at k=8**) is real but it
+  is **serving throughput
   for a single-card board that currently serves one request at a time**, and the contract it must
   preserve (`supports_batch = False`, protect-the-lock) is the one whose absence has already produced
   silently wrong text measured 0/6. That is a large, correctness-critical feature for a board whose
