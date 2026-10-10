@@ -815,6 +815,105 @@ device itself does ~230 GFLOP/s fp16 at m ≥ 16. Nothing on this board is at th
 does not touch the backend, so no kernel or graph code moved and no identity gate was at risk; the
 0.6B/1.7B/4B gates are as documented above.
 
+## How much a batch would actually buy, and what blocks it
+
+The section above answered "is batching the lever?" with the m-sweep. This one decomposes that sweep
+into a fixed and a marginal part, reads the runtime for what a batched decode would have to change,
+puts an honest multiplier on B = 4 and B = 8, and records **a measured single-request inefficiency
+that is worth more than the batch path** and needs none of it.
+
+**The m-sweep, re-measured (`pocketllm-mscale --device ascend --n 2560 --k 2560 --rep 50`).** The
+rates reproduce the section above to a few percent; what is new is the time, not just the rate:
+
+| m | ms per call | GFLOP/s | slower than m = 1 | B rows in one call vs B sequential m = 1 |
+|---|---|---|---|---|
+| 1 | 0.694 | 18.9 | 1.00× | 1.00× |
+| 2 | 0.735 | 35.7 | 1.06× | **1.89×** |
+| 4 | 0.824 | 63.6 | 1.19× | **3.37×** |
+| 8 | 0.976 | 107.5 | 1.41× | **5.69×** |
+| 16 | 1.268 | 165.5 | 1.83× | **8.76×** |
+| 32 | 1.922 | 218.2 | 2.77× | **11.55×** |
+
+**The op is a fixed cost plus a small per-row cost: `ms(m) ≈ 0.657 + 0.0393·m`.** At m = 1 that fixed
+part is **95% of the call**, which is the m-sweep's own proof that the m=1 decode GEMM is paying for
+the *tile*, not for the row: a width-m GEMM costs almost the same as a width-1 one until m fills the
+cube. The rate is flat in n (same m gives the same rate at n = 2560, 9728 and 151936), so this is the
+M dimension of the array sitting idle, nothing else.
+
+**What actually blocks a batch — from the code, not from the flag.** `supports_batch = False` is a
+*conclusion*; these are its causes. A B-row decode step needs, in order of how large the change is:
+
+1. **A KV cache per sequence.** `Qwen3Model` holds one `k_cache_`/`v_cache_`, sized `[layer][position]
+   [kv_head][head_dim]` (`qwen3.h`), and `Session` advances one `position_` by `cache_length_`
+   (`session.cpp`). A batch of B independent sequences needs B such caches (or one cache with a B-wide
+   position axis), plus a per-sequence position vector and per-sequence `cache_length_` — because the
+   sequences in a batch are at *different* positions, which is the same fact that makes attention
+   non-uniform. This is the largest piece: it changes the cache layout, `forward`'s write offsets,
+   and the `Session` contract in one go.
+2. **A batched attention.** `attention` (`backend.cpp`) is driven **one query at a time** —
+   `for (t = 0; t < q_len; ++t) run_attention(...)` — because `AttentionStepCustom` scores one query
+   against its own causal window and the loop is where the causal structure lives. A batch of B rows
+   at B different positions is B such steps with B different windows; the op is already a
+   one-query-against-a-window kernel, so batching it means either B drives per layer (no kernel
+   change, no amortization of the window read) or a new multi-query path in the op.
+3. **A batched prefill/decode seam.** `forward` sizes its scratch to `n` and its cache to `end_pos`,
+   and the head is projected at literal `m = 1` (`x_last` is one row). Batched decode is `m = B`, so
+   every downstream shape and the head's row selection move with it.
+4. **The serving seam.** `native_backend.py` serializes behind one lock and declares
+   `supports_batch = False` precisely because the C `Session` has one cache and one position; a batch
+   path means the adapter collecting B requests into one `pocketllm_forward`, which the header has no
+   entry point for.
+
+None of these is a kernel change; the cube, the norms and the rope are shape-agnostic already (the
+m-sweep *is* the proof). The change is the **runtime's state model** — one cache and one position
+becoming B — which is why "batch serving" is a project and not a flag flip.
+
+**The honest ceiling.** The batchable half of a decode step is the weight-reading (the GEMMs); the
+other half — attention, the KV traffic, the per-op host round-trips — does **not** shrink when the
+batch grows and in fact grows with B. Writing `G` for the GEMM share of the m = 1 step and `R_m` for
+the sweep's rate ratio, the speedup is `1 / (G/R_m + (1 − G))`:
+
+| G (GEMM share of the m=1 step) | source | B = 4 | B = 8 |
+|---|---|---|---|
+| 0.855 | 4B profile, `op_sync` = 85.5% | **2.5×** | **3.4×** |
+| 0.68 | 0.6B profile, this run | **1.9×** | **2.3×** |
+| 1.00 | the pure-GEMM ideal | 3.4× | 5.7× |
+
+The 4B number is the more favorable one — a bigger model is more GEMM-bound — and the assumption is
+stated: **the non-GEMM half is held constant**, which is optimistic, because attention and the KV
+reads scale with B and are themselves host round-trips here. So the expected end-to-end factor is
+**~2× at B = 4 and ~2.5–3× at B = 8, not the 3.4×/5.7× the pure GEMM suggests**, and the honest
+reading is that the number this measurement supports is a *ceiling*, not a projection. It is still a
+real lever — nothing else on this board moves the decode rate by 2× — but it is a runtime project,
+and the single-request win below is cheaper and already measured.
+
+**The single-request win — and it is bigger than the batch's first step.** While reading the ops for
+the blocker list, `rope_neox` (`backend.cpp`) showed up as a round-trip: it reads the **entire**
+cos/sin table to the host and re-uploads it on **every call**, when the op only indexes the
+`n_tokens · n_heads` rows the batch actually uses. The table is `position_capacity` rows (256
+initially, doubling), so at short context it is 128 KB read + 64 KB re-uploaded *per call*, 56 calls
+per decode step — and the read is of rows the batch never touches.
+
+The A/B is the check that this is the table and not the token count: the same one-token batch, at a
+short vs a ~300-token context, so the table is 256 vs 512 rows —
+
+| rope table | rows | rope cost per decode step | per call |
+|---|---|---|---|
+| short context | 256 | 24.1 ms | 430 µs |
+| ~300-token context | 512 | **49.3 ms** | **880 µs** |
+
+**The per-call cost doubles exactly when the table doubles, at a fixed one-token batch** — so the
+cost is the whole-table round-trip, and it *worsens as the context grows*. At 256 rows that is
+**24.3 ms of a ~140 ms 0.6B decode step: 17%**, before the table has grown at all. Reading only the
+rows the op indexes — the fix the code already implies, since `row_t` names exactly those rows —
+would remove most of it, and unlike the batch path it is **one op**, does not touch the session, and
+gets *more* valuable the longer the context. That is the first thing to try, and it is bounded.
+
+**What this does not do.** No batch path was built — this is measurement and reading, and the ceiling
+above is a model with its assumption named rather than a measured B-way run. The rope round-trip was
+measured, not fixed. And `pocketllm-mscale` is unchanged, so no gate is at risk: the 0.6B/1.7B/4B
+identities are as documented above.
+
 ## Serving on the 310B: coming up, and the thread-bound context that had to be attached
 
 Everything above this point was measured through `pocketllm-run` (the C binary) or the `ctypes`
