@@ -748,6 +748,8 @@ block trades blocks for warps and does not help decode: 16 / 64 / 128 columns pe
 shape has; what would move it is a different kernel *shape* — persistent blocks, or sharing the weight
 pass across columns — not a different layout.
 
+### The horizontal reduce, and why the lane pairing is load-bearing
+
 `dot_Rrows_q8k` ends each row with one horizontal reduce, and the tree it builds has to be the one
 `dot_row_q8k` builds or the two kernels stop agreeing. That tree pairs *across* the two 128-bit
 halves — `((l0 + l4) + (l1 + l5)) + ((l2 + l6) + (l3 + l7))` — so the halves are added first
