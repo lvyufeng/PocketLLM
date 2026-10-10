@@ -282,6 +282,44 @@ these measurements, including an 881-token essay — gets the speed for free and
 caller that needs a 4k window does not. The cap is the graph, not the HTTP shell: it shows up the same
 way through `run` and through [`serve`](#serving-on-the-board).
 
+**The reach is uniform across our compiled graphs — and one of them does not copy the 0.6B's clean long
+generation.** Our 1.7B and 4B are `cache_1024` builds too, so the same ~1035-token cap should hold.
+Measured the same way (greedy, per-token callback timestamps, `pocketllm run --device horizon` and the
+harness), it does: the counting prompt that reaches **986 generated** on the 0.6B reaches the same
+**986** on the 4B, and the padded 184-token prompt drops both to **851** — the same total, **1035**,
+twice. The 1.7B's short-prompt count stops on its own earlier (it abbreviates to `1 2 3 … 400` instead
+of listing), but its padded count reaches the same **851 + 184 = 1035**, so all three share one cap.
+The cap is the graph shape, and it is the same shape for all three.
+
+| graph | cache | reach (prompt+generated) | rate, tokens 1–20 → last quarter | long-essay text |
+|---|---|---|---|---|
+| ours 0.6B | 1024 | ~1035 | 121.5 → 121.4 | coherent (881 tok, ends on its own) |
+| ours 1.7B | 1024 | ~1035 | 89.1 → 89.0 | **repetition loop** |
+| ours 4B | 1024 | ~1035 | 49.9 → 49.9 | coherent, clean truncation |
+
+**The 4B is the clean mirror.** Its essay runs coherently and — unlike the 0.6B's, which ends on its own
+at 881 tokens — reaches the cap and **truncates mid-sentence**, the same clean cutoff the 0.6B's counting
+prompt shows, with no repetition before it. Three runs byte-identical (sha256 `0189cacc…`), rate flat at
+49.9 t/s from the first token to the last.
+
+**The 1.7B is where it breaks: a repetition loop in the reasoning block.** On the same essay prompt, our
+compiled 1.7B never closes its ` thinking` block. Its reasoning degenerates into a verbatim loop
+(`… the 12th-century Notre-Dame de la Porte is a different building. The 13th-century Sainte-Trinité is
+a different building. …`), the loop consumes the rest of the generation — the last ~60% of the text —
+and the cache cap truncates it **mid-loop** at 988 generated tokens. There is no `</think>`, no answer
+and no EOS: a caller sees the raw, looping reasoning. It is deterministic (three runs identical, sha256
+`bdc40f49…`) and reproduces on a second, unrelated topic (`… The 19th century, the 19th century. …`,
+sha256 `268c4ac1…`) and through `pocketllm run --device horizon` as well as the harness. The rate stays
+flat *through* the loop (89.1 → 89.0 t/s), so this is the model's own output, not a throughput limit.
+
+**It is our compiled 1.7B, not the 1.7B.** The shipped 1.7B — same weights, `cache_4096` — on the same
+essay prompt emits an empty reasoning block and a **coherent essay** that ends on its own conclusion at
+405 tokens, no loop, 70.2 t/s flat (sha256 `972dfe4b…`). So the loop is a property of **our compiled
+1.7B graph**, not of the 1.7B weights and not of long generations in general — our 0.6B and 4B do not
+show it, and the 1.7B's own short generations are fine (it answers all ten faithfulness prompts below).
+What is *not* established is the cause inside the compile: this is one measured artifact behaving badly,
+not a diagnosis of which pass in the build produced it.
+
 #### Answer faithfulness: 9/10 on the 0.6B and 10/10 on the larger graphs
 
 A different build of the same weights can be faster and still reach different answers, and the whole
