@@ -127,6 +127,15 @@ int main(int argc, char **argv) {
      * that the same binary can run either path without a rebuild. */
     auto backend = pocketllm::kernel::make_backend(device);
     auto model = pocketllm::Qwen3Model::load(checkpoint, *backend);
+    /* Both the tokenizer and the model have copied what they need out of the
+     * file -- the tokenizer its vocabulary and merges at construction, the model
+     * every tensor's bytes into device memory here -- so the mapping is dead
+     * weight from this line on.  Handing it back matters most on a board where
+     * the accelerator and the host share one LPDDR pool and a large checkpoint
+     * would otherwise keep the pool's pages tied up as reclaimable cache; on a
+     * discrete-GPU host it is a no-op the kernel would have reclaimed anyway.
+     * Nothing below this reads `checkpoint` again. */
+    checkpoint.release_mapping();
 
     std::vector<int32_t> tokens =
         have_literal ? literal_tokens : tokenizer.encode(prompt, /*add_special=*/false,

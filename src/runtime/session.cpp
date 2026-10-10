@@ -56,6 +56,14 @@ std::unique_ptr<Session> Session::open(const std::string &gguf_path, const std::
   if (checkpoint->get_string("general.architecture", "") == "qwen3") {
     device_backend = kernel::make_backend(device);
     model = Qwen3Model::load(*checkpoint, *device_backend);
+    /* The model has copied every tensor it needs into the backend's memory, and
+     * the tokenizer its vocabulary and merges, so nothing reads the file again.
+     * Release the mapping here rather than at session teardown: `MemAvailable`
+     * is what the caller watches, and it is measured while the session is open,
+     * not after it closes.  A checkpoint of an architecture this build cannot
+     * run stays mapped, because binding never happened and `tensor_data` may
+     * still be the only thing keeping the loaded bytes alive. */
+    checkpoint->release_mapping();
   }
 
   return std::unique_ptr<Session>(new Session(gguf_path, device, std::move(device_backend),

@@ -370,10 +370,26 @@ const uint8_t *GgufReader::tensor_data(const std::string &name, uint64_t *nbytes
   if (info->absolute_offset + info->nbytes > size_) {
     throw Error("GGUF: tensor '" + name + "' runs past the end of the file (truncated?)");
   }
+  /* The directory outlives the mapping, so this is the one place a released
+   * mapping can be reached -- and it has to be a named error rather than a
+   * dangling pointer: the caller asked for bytes that were deliberately handed
+   * back, which is a different mistake from a truncated file. */
+  if (mapping_ == nullptr) {
+    throw Error("GGUF: tensor '" + name +
+                "' was requested after the checkpoint mapping was released");
+  }
   if (nbytes != nullptr) {
     *nbytes = info->nbytes;
   }
   return mapping_ + info->absolute_offset;
+}
+
+void GgufReader::release_mapping() {
+  if (mapping_ == nullptr) {
+    return;
+  }
+  ::munmap(const_cast<uint8_t *>(mapping_), size_);
+  mapping_ = nullptr;
 }
 
 }  // namespace pocketllm
