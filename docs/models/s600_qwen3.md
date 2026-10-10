@@ -92,8 +92,9 @@ not through the ABI backend of the same name. The `horizon` kind is what `--devi
 
 ## Measured ladder
 
-**This is the canonical ladder: all four shipped Qwen3 sizes plus our own compiled 4B, on the
-`balanced` pool, measured in one session on 2026-10-10.** Fixed prompt **"The capital of France is"**,
+**This is the canonical ladder: all four shipped Qwen3 sizes plus our own compiled 0.6B and 4B, on the
+`balanced` pool, measured in one session on 2026-10-10 (the compiled 0.6B was added the same day, once
+its build landed).** Fixed prompt **"The capital of France is"**,
 greedy `generation_config.json`, canonical-prompt three decode runs per graph, one process per graph.
 Throughput and load time from the delegate's `last_performance()` (`xlm_model_performance_t`); memory
 held from the kernel's own ION accounting (`/sys/kernel/debug/ion/heaps/all_heap_info`), read **after
@@ -109,12 +110,14 @@ costs in the 10.00 GiB `ion_carveout`.
 | Qwen3-1.7B (w4) | 1.70 GiB | 5.70 s | 5172–5818 t/s | **70.2 t/s** (70.18 / 70.13 / 70.16) | 3,734,503,424 B (3.48 GiB) | 34.8% |
 | Qwen3-4B (w4) | 3.10 GiB | 6.44 s | 2415–2573 t/s | **42.8 t/s** (42.77 / 42.72 / 42.78) | 6,686,113,792 B (6.23 GiB) | 62.3% |
 | Qwen3-8B (w4) | 5.31 GiB | 7.66 s | 1939–2040 t/s | **29.7 t/s** (29.65 / 29.66 / 29.70) | 9,417,129,984 B (8.77 GiB) | **87.7%** |
+| Qwen3-0.6B (w8), ours `cache_1024` | 0.98 GiB | 5.31 s | 11636–13128 t/s | **121.6 t/s** (122.18 / 121.72 / 120.82) | 1,702,756,352 B (1.59 GiB) | 15.9% |
 | Qwen3-4B (w4), ours `cache_1024` | 3.00 GiB | 6.35 s | 4339–4571 t/s | **49.9 t/s** (49.99 / 49.96 / 49.86) | 4,254,269,440 B (3.96 GiB) | 39.6% |
 
-Decode falls with size — 88.3 → 70.2 → 42.8 → 29.7 t/s — and the memory column rises with it, which
-is the whole of the ladder's shape: the BPU's per-token cost and the pool's footprint both track the
-parameter count. Every graph's three runs produced **byte-identical text**, so each number is a rate
-and not a draw.
+Decode falls with size — 88.3 → 70.2 → 42.8 → 29.7 t/s on the shipped graphs — and the memory column
+rises with it, which is the whole of the ladder's shape: the BPU's per-token cost and the pool's
+footprint both track the parameter count. Our own `cache_1024` builds sit *above* their shipped twins
+on both axes (faster, and smaller in the pool), which is the subject of the last note below. Every
+graph's three runs produced **byte-identical text**, so each number is a rate and not a draw.
 
 **The switch did not regress 0.6B or 1.7B.** The board changed memory *mode*
 (`cpu_first` → `balanced`), and the two small graphs were re-measured against the numbers this page
@@ -130,7 +133,7 @@ That expectation is now a measurement instead of an assumption.
 quote from the runtime; wall-clock load time above is quoted instead. The spread across three runs is
 under 0.8% at every size, so decode is stable rather than a lucky run.
 
-**Two rows deserve their own note.**
+**A few rows deserve their own note.**
 
 *The 8B costs 87.7% of the pool at load.* That is the largest model this board runs, and it leaves
 **1,320,288,256 B (1.23 GiB) free — 12.3%** — the figure
@@ -145,9 +148,65 @@ prefill 8982 t/s, against the shipped `cache_4096` graph's ~70 t/s / ~5.2k t/s i
 which is why the 1.7B row above is a *shipped-graph* number and not a 1.7B number. It is the first
 artifact out of [the native compile chain](../architecture/s600_native_chain.md#the-first-build-result),
 it answers the same prompts with the same final answers, and its **reasoning text differs** from the
-shipped graph's — two build-time quantizations of one checkpoint, not two caches of one graph. Whether
-a smaller graph gets **4B** under the `cpu_first` ceiling is answered — it does not, and the pool had
-to move instead; see [the large models after the switch](#the-large-models-after-the-switch).
+shipped graph's — two build-time quantizations of one checkpoint, not two caches of one graph. Our
+`Qwen3-0.6B` and `Qwen3-4B` at the same `cache_1024` do likewise, each with a row in the ladder above;
+the smallest size carries the biggest decode edge of the three and has
+[a section of its own](#our-compiled-06b-vs-the-shipped-06b). Whether a smaller graph gets **4B** under
+the `cpu_first` ceiling is answered — it does not, and the pool had to move instead; see
+[the large models after the switch](#the-large-models-after-the-switch).
+
+### Our compiled 0.6B vs the shipped 0.6B
+
+The recompile was extended to the size that matters most for latency, and it is the cleanest result of
+the set. Our own `Qwen3-0.6B` at `cache_1024` — built with the same recipe as the 1.7B and 4B
+(`--model_name qwen3 --march nash-p --w_bits 8 --chunk_size 512 --cache_len 1024 --prefill_core_num 4
+--decode_core_num 4`) — is **1,052,244,472 B (0.98 GiB)**, md5 `0d9d7e87e4f658eced34f04e17f17b2d`,
+sha256 prefix `75ae275557571145`. Measured against the shipped `cache_4096` graph 2026-10-10 with
+[the same harness](../architecture/s600_native_chain.md#the-first-build-result) every compiled row here
+uses — same prompt, greedy tokenizer directory, `bpu_core [0,1,2,3]`, three runs per side, one process
+per side:
+
+| | shipped `cache_4096` (w8) | ours `cache_1024` (w8) | ratio |
+|---|---|---|---|
+| file | 1,096,189,432 B (1.02 GiB) | 1,052,244,472 B (0.98 GiB) | 0.96× |
+| load | 5.29 s | 5.31 s | — |
+| prefill | 6169–7111 t/s | **11636–13128 t/s** | **~1.8×** |
+| decode | 88.09 / 88.53 / 88.28 t/s | **122.18 / 121.72 / 120.82 t/s** | **1.38×** |
+| memory held at load | 2,995,585,024 B (27.9%) | **1,702,756,352 B (15.9%)** | 0.57× |
+| greedy output sha256 | `25a32998bfab7e7e…` | `59d31f4401d710e5…` | differ |
+
+**It loads and runs** — the 0.98 GiB artifact is well inside the pool, no `RESOURCE_EXHAUSTED` — and
+the answer is coherent and correct:
+
+```text
+# shipped 0.6B, cache_4096
+…  </think>
+The capital of France is **Paris**. It serves as the political, cultural, and economic center of the country.
+
+# ours 0.6B, cache_1024
+…  </think>
+The capital of France is **Paris**.
+```
+
+**1.38× decode and ~1.8× prefill — the largest decode edge of any graph we have built.** Against the
+shipped twin's 88.3 t/s, ours decodes at 121.6 t/s, and prefill nearly doubles. That is the `cache_1024`
+move paying off most where the graph is smallest: the KV cache is attention work, and at 0.6B it is a
+larger share of an already-short per-token step, so halving it buys more here than the 1.17× it bought
+at the 4B or the ~1.27× at the 1.7B. The smaller context is the trade — 1024 tokens of maximum context
+against the shipped graph's 4096 — and it is also why the file is 4% smaller and the pool footprint is
+**1.20 GiB lighter** (1.59 GiB against 2.79 GiB), the same three-way shrink the 4B shows.
+
+**It is not token-identical to the shipped graph, and — unlike the 1.7B and 4B pairs — the two are the
+same width and scheme.** Both sides are `w8`, symmetric per-output-channel int8, so unlike the 1.7B
+(w4, scheme mismatched against its oracle) or the mixed cases, there is no quantizer difference to
+point at here. The divergence is nonetheless real and starts in the **reasoning block**: shipped opens
+"I know France's capital is Paris…" and closes with an added sentence after the answer; ours opens "I
+need to make sure I provide the correct information…" and stops at **Paris**. Both converge on the
+right answer, so the honest statement is that the `cache_1024` build is a **different graph, not a
+faster copy** — the shorter context and the compiler's own graph change the early logits enough to flip
+the greedy branch, exactly the chaotic-decode effect the 1.7B section describes. It buys speed and pool
+footprint at a shorter maximum context, and it costs token-level identity with the vendor graph; which
+of those a caller wants is the choice, and it is the same choice the compiled 1.7B and 4B present.
 
 ### Running the ladder in one process does not work, and that is a finding
 
