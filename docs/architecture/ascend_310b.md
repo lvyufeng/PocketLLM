@@ -412,9 +412,11 @@ its "3.6 GiB peak RSS" row above does **not** count, because the RSS is not wher
 Read the 1.7B row's "peak RSS" as host RSS and this table as what the device is actually holding.
 These device figures are computed from the checkpoints' element counts, not sampled: `npu-smi`
 returns nothing once the process holds the device, so they are the sizes the allocator is asked for.
-`npu-smi info` reports the pool as **23.73 GB**, with **~7.0 GB in use at idle and no process
-running** (the driver/firmware carve-out), leaving ~16.7 GB for the plane; the 4B's 8.2 GiB sits
-comfortably inside it.
+`npu-smi info` reports the pool as **23673 MB**, with **5814 MB (5.8 GiB) in use at idle and no
+process running** (the driver/firmware carve-out), leaving **~17.4 GiB** for a model; the 4B's 8.2 GiB
+sits comfortably inside it. (The 8B's planes and table are 16.42 GiB and its measured device peak is
+21.7 GiB — see [the 8B subsection](#why-the-8b-is-at-the-edge-the-fp16-plane-not-the-24-gib) — which
+is why the 8B, and not the 4B, is the size the pool cannot hold.)
 
 **Timings — this is a coverage result, not a speed one.** Decode is the marginal between `--steps 8`
 and `--steps 32`, paired in one session: (234.88 − 220.80) / 24 = **0.587 s/token** (1.7 t/s), 1.5×
@@ -434,9 +436,11 @@ plane, not the layer count: 6.06 / 2.41 = 2.51× the 1.7B plane, 212 / 91.5 ≈ 
 host build that is a host walk over every block, not a signal.)
 
 **And the next size up runs too — this is where the board stops being comfortable.** An 8192-wide
-`Qwen3-8B-Q4_K_M` needs **11.81 GiB** of layer plane, a **1.16 GiB** head plane on its distinct
-`output.weight`, and a **2.32 GiB** f32 embedding table — **~15.3 GiB device** — against the ~16.7 GB
-the pool leaves after the driver's 7 GB carve-out, and 4.7 GiB of mmap'd checkpoint on the host.
+`Qwen3-8B-Q4_K_M` needs a **12.94 GiB** layer plane, a **1.16 GiB** head plane on its distinct
+`output.weight`, and a **2.32 GiB** f32 embedding table — **16.4 GiB of planes and table**, and the
+**~21.7 GiB** measured device peak once the arena is counted (both derived below) — against the
+~17.4 GiB the pool leaves after the ~5.8 GiB the driver holds at idle, and 4.7 GiB of mmap'd
+checkpoint on the host.
 Measured, it **completes** and, on the same prompt, is **token-identical to CPU** at 8 steps:
 
 ```
@@ -529,6 +533,76 @@ The honest statement of coverage is now four sizes: **0.6B, 4B and 8B token-iden
 and fits with one documented near-tie** — the same fp16-plane precision limit this whole page is
 about, met at one prompt at 1.7B and not met at the other three, with no new op and no shape guard in
 the way at any of them.
+
+### Why the 8B is at the edge: the fp16 plane, not the 24 GiB
+
+The section above answers "where did the memory go" from the host side. The question it invites —
+*why is an 8B model at the edge on a board with ~24 GiB of unified memory?* — has a different answer,
+and it is the pool's size and the cube's operand width, not the 8B's own footprint in bytes.
+
+**The pool is ~17 GiB, not 24.** The 310B has no separate device LPDDR: the NPU allocates out of the
+same memory the host uses (`enable_ascend_share_pool` in `/proc/cmdline`), and the driver/firmware
+carve-out is charged *before* any model is loaded. Read at idle, with no model bound, on this board:
+
+| reading | value | source |
+|---|---|---|
+| board total (host-visible) | 23.1 GiB (`24241728 kB`) | `/proc/meminfo` `MemTotal` |
+| `npu-smi` total | 23673 MB | `npu-smi info` |
+| **`npu-smi` charged at idle** | **5814 MB** | `npu-smi info`, no process running |
+| **pool left for a model** | **~17.4 GiB** (23673 − 5814) | the two above |
+
+So the number to reason about is ~17 GiB, and a comfortable 8B has to fit inside it — the ~5.7 GiB
+idle charge is gone before the first weight is read.
+
+**The 8B's device footprint is the measured 21.7 GiB, and two thirds of it is the fp16 *expansion* of
+a 5.0 GB packed file.** Parsed from the checkpoint's own tensor table (`Qwen3-8B-Q4_K_M.gguf`,
+5,027,784,512 B, 36 layers, hidden 4096, a *distinct* `output.weight` — Qwen3-8B does not tie the
+head):
+
+| what | packed on disk | on device | factor |
+|---|---|---|---|
+| 36 layers' quantized weights (`q4_k`/`q6_k`) | 4.160 GB | **13.892 GB (12.94 GiB)** fp16 | **3.34×** |
+| `output.weight` head (`q6_k`, not tied) | 0.511 GB | 1.245 GB (1.16 GiB) fp16 | 2.44× |
+| — *planes alone* | *4.671 GB* | ***14.10 GiB*** *(the page's measured "14.1")* | *3.02×* |
+| `token_embd.weight` → f32 embedding table | 0.350 GB | 2.489 GB **(2.32 GiB)** f32 | 7.11× |
+| *planes + table* | *5.021 GB* | ***16.42 GiB*** | *3.51×* |
+| arena / workspace (measured: 21.7 − 16.42) | — | **~5.28 GiB** | — |
+| **measured device peak** (`aclrtMalloc`, the section above) | — | **21.7 GiB** | — |
+
+**The two numbers on this page are the same number, split.** Planes + table is **16.42 GiB**, and the
+paragraph above records the **21.7 GiB** measured `aclrtMalloc` peak; the **~5.28 GiB** between them is
+the arena and workspace, which the computed table does not itemize and the memtrace does. So the 8B's
+settled footprint is the *measured* **21.7 GiB**, not the computed 16.4 — and either figure is already
+over the ~17.4 GiB pool, which is the point: the planes alone (14.10 GiB) are **~81% of the pool**, and
+a decode that must also hold the arena cannot fit it.
+
+The expansion is not an implementation detail, it is `MatmulCubeCustom`'s contract: the cube is
+`half × half → half`, so a packed `q4_k`/`q6_k` block cannot be fed to it — the graph decodes each
+weight to fp16 once (`cube_for`, cached) and the plane it keeps is the fp16 one.
+
+**Why it is swap-bound rather than OOM-killed.** The pool *is* host DRAM, and there is a 24 GiB
+swapfile (`/mnt/data/swapfile`, on `nvme0n1p1`) with `vm.swappiness = 60`. An allocation that does not
+fit in the pool does not fail — it succeeds from the host's point of view and pages churn to NVMe,
+which is the 500 s clean run versus the ~1197 s one: the wall is the paging, not the decode. (Swap at
+rest, with no model, is already ~0.9 GiB used of 24 GiB.)
+
+**The only lever is the plane, and the measured middle is untried.** Shrinking host-side buffers moves
+nothing (the prior section: the heap is ~33 MiB and every staging buffer is a local). The W4A16 packed
+path would cut the 14.1 GiB of fp16 planes to ~4.4 GiB — but it *requantizes* `q4_K → int4` at
+~1.2e-1 relative error ([#590](#precision-two-different-errors-and-which-one-is-the-graphs)), which
+fails the page's 1e-3 bar and produces incoherent text; that is measured, not speculative. A faithful
+int8 plane (~3.8 GiB, `q4_K` decoded exactly and stored as int8 rather than fp16) would need a new
+cube op or a new dtype the op accepts, and it is the one middle rung nobody has built. Until then the
+8B's home on this board is a ~17 GiB pool that its fp16 planes fill, and its decode is a swap
+measurement rather than a rate — which is why the canonical table above carries no 8B *throughput*
+number, only its gate result.
+
+*Verified on the board, read-only, for this section: the idle `npu-smi` charge, `/proc/meminfo`,
+`/proc/cmdline`, the swap device and swappiness, and the full GGUF tensor table (whose per-tensor
+element counts give the 12.94 GiB layer plane, the 1.16 GiB head, and the 2.32 GiB f32 table). The
+**21.7 GiB** `aclrtMalloc` peak is the **prior** measurement recorded in the section above — it was
+not re-taken here, and no 8B run was made, because a run thrashes swap for 500–1200 s; the ~5.28 GiB
+arena row is that measured peak minus the computed planes+table, not an independent measurement.*
 
 ## Where a 4B decode step actually goes — and why nothing was changed
 
@@ -766,8 +840,9 @@ actually opens in.
 
 **The 8B has no clean decode marginal on this board, and that is a memory fact, not a decode one.**
 At 8 steps it completes in **486.5 s** and is token-identical to CPU (the gate above). But its
-**~15.3 GiB** device footprint against the pool's ~16.7 GiB usable, plus a 4.7 GiB mmap'd checkpoint
-on a 23.7 GiB host, pushes `MemAvailable` to ~0.6 GB and the process into swap: measured, the same
+**~21.7 GiB** measured device peak (16.42 GiB of planes and table) against the pool's ~17.4 GiB
+usable, plus a 4.7 GiB mmap'd checkpoint on a 23.7 GiB host, pushes `MemAvailable` to ~0.6 GB and the
+process into swap: measured, the same
 `--steps 8` run takes **486.5 s** on a quiet board (nearly all plane build) and its `--steps 32` leg
 has been timed at **2402 s**, with an intermediate `--steps 1`/`8` pair at 634 s / ~16 min. The
 marginal between two such walls is dominated by how much the kernel paged out, not by decode, and it
