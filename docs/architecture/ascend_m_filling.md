@@ -138,7 +138,11 @@ that over k. `r(k)` is the table above.
 | 16 | 711.5 | 77.2 | 789 ms | 49 ms/token | 11.2× | 20.3 |
 | 32 | 1092.5 | 77.2 | 1170 ms | 37 ms/token | 15.0× | 27.4 |
 
-Two caveats, and neither is small enough to ignore. First, **m=1 here is 548 ms where the page's
+Three caveats, and none is small enough to ignore. **The "per-seq speed-up" column is amortized
+throughput, not latency:** it is the per-sequence wall when k sequences decode on the board at once,
+so the *aggregate* work per token falls — a **single** request on an otherwise idle board still pays
+the whole `T(k)` step (548 ms at m=1, 596 ms at m=4), and it is a *batched* caller who sees the win.
+That is the shape the 310B serves in, but it is the one reading of the table to get wrong. First, **m=1 here is 548 ms where the page's
 canonical decode is 587 ms** — the 39 ms gap is real (a `--steps 8/32` marginal is measured deeper
 into the sequence, where attention's window is longer) and it means these are ratios, anchored to the
 profile's own numbers, not a promise about the canonical marginal. Second, **the ~14.5% floor is
@@ -149,7 +153,8 @@ the 4B's **~8.2 GiB** residency, i.e. ~3.5%, which the ~16.7 GB usable pool abso
 
 ### The decision — the bound justifies batch serving, and the page's "do neither" must move
 
-**There is a k where per-sequence decode is meaningfully faster, well past the 1.3× bar:** k=2 gives
+**There is a k where per-sequence decode is meaningfully faster — in amortized throughput, not in a
+single request's latency — well past the 1.3× bar:** k=2 gives
 1.96×, k=4 gives 3.68× and k=8 gives 6.64× per-sequence. The page's own derived model said `< 3×` at
 B=8; the measured bound is **~6.6× at B=8**, and at **k=4 it is already 3.7×** — the same number the
 model put at B=8. The model was wrong in the *useful* direction because it under-credited two things:
