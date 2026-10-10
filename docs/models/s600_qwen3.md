@@ -398,6 +398,68 @@ result, with no `corrupted size`/`SIGABRT` in the log. So the guard turns the cr
 without the serialization turning one over-cap request into a server-wide failure — the interaction the guard
 was most likely to get wrong.
 
+#### Where the compiled 0.6B's 1.38× actually comes from: the BPU is the whole step
+
+The 121.6 t/s above is an end-to-end rate; the question the next lever needs is *where that time goes*. The
+delegate reports a `Performance` struct but **zeroes its own token counts and `end_to_end_cost` on this SDK
+build** — only `prefill_tps`/`decode_tps` are live — so the split comes from the delegate's rates plus the
+SDK's own per-node profiler (`hrt_model_exec perf`, which needs our `HB_DNN_USER_DEFINED_L2M_SIZES=6:6:6:6`).
+
+**Load is the same either way.** `xlm_init`→ready is **5.22–5.33 s** for ours and **5.28 s** for the shipped
+0.6B; the cache size does not move it.
+
+**Prefill and decode, ours vs the shipped twin** (same weights `w8`, `chunk_512`, `corenum_4_4`; only the
+cache differs):
+
+| | cache | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| ours | `1024` | **11 636–13 128** | **121.3** |
+| shipped | `4096` | **6 169–7 014** | **88.2** |
+
+Both halves gain — prefill **1.77–1.89×**, decode **1.38×** — so the win is not decode-only.
+
+**The decode step, decomposed** (`hrt_model_exec perf`, ms; `decode_tps` disagrees with the host because the
+profiler runs the raw graph without the delegate's in-place KV handling):
+
+| stage | ours `cache_1024` | shipped `cache_4096` | ratio |
+|---|---|---|---|
+| Stage2 BPU-core compute | **6.93** | **9.97** | 1.44× |
+| Stage1 launch / sync | 0.53 | 0.53 | 1.00× |
+| CPU nodes (GatherND + reshape) | 0.013 | 0.014 | 1.08× |
+| **total** | **7.46** | **10.51** | **1.41×** |
+
+**It is BPU-compute-bound and spends nothing on the host.** ~93% of the step is BPU-core compute, ~7% is op
+launch, ~0.2% is CPU; the host's own per-step cost is **immeasurable** — bracketing `infer`'s callback, the
+host-observed step median matches `1/decode_tps` to within noise (host share ≈ −0.7%), so there is no
+host-side overhead beyond the BPU. **The CPU nodes are identical across both graphs**, so the entire 1.38× is
+BPU compute.
+
+**The KV size explains all of it, and the fitted slope — not the ratio — is what pins the mechanism.** The
+graph holds KV for a *fixed* cache even in a one-token step, and for GQA-8 attention that is linear in the
+cache: `0.6B · 28 layers · 2 · 8 · 128 · 2 B ≈ 0.115 MB` per token. The BPU-core time fits it exactly:
+
+```
+9.970 ms (cache_4096) − 6.927 ms (cache_1024) = 3.043 ms over 3072 tokens
+                                             = 0.991 µs/token
+0.115 MB/token ÷ 0.991 µs = 116 GB/s effective
+```
+
+That is a textbook **LPDDR5 effective bandwidth — and it is the whole step's rate, not a KV-only one.** Reading
+the same way at both caches, the step is weights (~700 MB at `w8`, a fixed read present in both graphs) plus KV
+(`0.115 MB` per cached token, read in full even for a one-token step): `700 + 117 MB` over 6.93 ms at
+`cache_1024`, `700 + 470 MB` over 9.97 ms at `cache_4096` — **~116 GB/s either way**. (The single weight size
+that makes the two rates equal is **≈688 MB**, which is the `w8` footprint of 0.6B params plus scales — the
+one-parameter fit reproduces the model's own weight size, which is the check that it is the right model.) So
+the 3.04 ms is simply the **352 MB of extra KV** the larger cache reads, at the same bandwidth, and it rules
+out the alternatives:
+quadratic attention is ≪0.01% of a step at ≤1035 tokens (one query against a linear key axis), and a fixed
+per-step overhead would show in launch — which is identical at 0.53 ms in both graphs. The step is **pure DRAM
+streaming, and the cache sets how many KV bytes it streams**; the ~0.53 ms of launch on top is the only part
+not streaming. So the levers left are **a smaller cache for decode** (fewer bytes) and a **batch** to amortize
+launch across several steps — not anything on the host, and not the weights, which are already `w8` and a fixed
+cost. It is a *decode-only* win: prefill is compute-bound and pays little for the cache (its gain comes from the
+build, not the KV).
+
 #### Answer faithfulness: 9/10 on the 0.6B and 10/10 on the larger graphs
 
 A different build of the same weights can be faster and still reach different answers, and the whole
