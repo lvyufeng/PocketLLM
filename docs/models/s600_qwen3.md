@@ -282,7 +282,7 @@ these measurements, including an 881-token essay — gets the speed for free and
 caller that needs a 4k window does not. The cap is the graph, not the HTTP shell: it shows up the same
 way through `run` and through [`serve`](#serving-on-the-board).
 
-#### Answer faithfulness: the compiled graph reaches 9 of the shipped graph's 10 answers
+#### Answer faithfulness: 9/10 on the 0.6B and 10/10 on the larger graphs
 
 A different build of the same weights can be faster and still reach different answers, and the whole
 point of the compiled graph is that it is *useful*, not just fast. So ours and the shipped 0.6B were
@@ -321,6 +321,70 @@ since both sides are `w8` — with a worse outcome on this prompt. The honest re
 weak to begin with, and a different build of a weak model can flip a fact: the compiled graph's 1.38×
 decode is real, and so is this failure mode. A caller who needs answer fidelity on a fact-sensitive task
 should measure the specific prompts they care about, not assume the two builds agree.
+
+**The same battery on the 1.7B and 4B.** Both of our larger compiled graphs are `cache_1024` builds
+too — the 1.7B from the #595 native chain (md5 `0b41e627…`) and the 4B, 3.00 GiB — and each was run
+through the identical ten prompts against its **shipped `w4` twin**, so each pair is width- and
+scheme-matched exactly as the 0.6B pair was. The comparison is on the **answer fact** — the single
+checkable short answer the prompt asks for — not on the whole sentence: the larger models elaborate,
+and an exact-sentence match counts a bare "**4**" against "2 + 2 = **4**" as a miss when both reach
+the same answer. Every row below reaches the one correct fact; the two builds differ only in how much
+they say around it.
+
+| prompt | ours `cache_1024` | shipped `cache_4096` | final answer matches? |
+|---|---|---|---|
+| `The capital of France is` | **Paris** | **Paris** | yes |
+| `2 + 2 =` | **4** | **4** | yes |
+| `The largest planet in the solar system is` | **Jupiter** | **Jupiter** | yes |
+| `The chemical symbol for gold is` | **Au** | **Au** | yes |
+| `How many continents are there?` | **7** | **seven** | yes |
+| `The first month of the year is` | **January** | **January** | yes |
+| `The capital of Japan is` | **Tokyo** | **Tokyo** | yes |
+| `The boiling point of water in Celsius at sea level is` | **100 °C** | **100 °C** | yes |
+| `The largest ocean on Earth is` | **Pacific Ocean** | **Pacific Ocean** | yes |
+| `The chemical symbol for water is` | **H₂O** | **H₂O** | yes |
+
+**10 / 10 on the 1.7B.** The only differences are surface: ours is usually the terser of the two
+(shipped answers `How many continents` as "**seven continents**… " followed by the list, ours as
+"**7 continents**…" followed by the same list), and on `The first month of the year is` ours emits a
+stray leading `</think>` token before the answer — cosmetic, the answer that follows is `January`.
+No prompt reaches a different fact.
+
+| prompt | ours `cache_1024` | shipped `cache_4096` | final answer matches? |
+|---|---|---|---|
+| `The capital of France is` | **Paris** | **Paris** | yes |
+| `2 + 2 =` | **4** | **4** | yes |
+| `The largest planet in the solar system is` | **Jupiter** | **Jupiter** | yes |
+| `The chemical symbol for gold is` | **Au** | **Au** | yes |
+| `How many continents are there?` | **seven** | **seven** | yes |
+| `The first month of the year is` | **January** | **January** | yes |
+| `The capital of Japan is` | **Tokyo** | **Tokyo** | yes |
+| `The boiling point of water in Celsius at sea level is` | **100 °C** | **100 °C** | yes |
+| `The largest ocean on Earth is` | **Pacific Ocean** | **Pacific Ocean** | yes |
+| `The chemical symbol for water is` | **H₂O** | **H₂O** | yes |
+
+**10 / 10 on the 4B**, on the same terms — every difference is phrasing (ours spells `100 °C` out as
+"100 degrees Celsius (°C)"; both write the 4B's answers at length), and no prompt lands on a
+different fact.
+
+**The synthesis, over the three compiled graphs.** On this battery the wrong-final-answer failure is
+the **0.6B's alone**: 9/10, with the one flip (`How many continents` → **14**) that reaches a
+different *and incorrect* answer; the 1.7B and the 4B each reproduce their shipped twin's final
+answer on all ten. That is the shape a small-model artifact would have, and it is consistent with
+capacity rather than the build: if the `cache_len` change and the compiler were flipping facts on
+their own, the 1.7B and 4B — which are also `cache_1024` builds — would flip them too, and on these
+prompts they do not. So the honest read is that the compiled graphs preserve the shipped graph's
+answers on ten easy recall prompts, and the one failure we hold is on the weakest model, where a
+different build of a model that is already shaky on a fact can tip it.
+
+**What this does and does not establish.** It does establish that the compiled 1.7B and 4B match
+their shipped twins on these ten single-fact prompts, and that the 0.6B's wrong-answer flip is not
+reproduced at 1.7B or 4B. It does **not** establish general answer fidelity for the larger builds:
+ten prompts is a probe, not a benchmark, and every one of them is short-fact recall (nothing harder
+than `2 + 2` in the way of reasoning or multi-step math), so a divergence that needs a longer chain
+to surface would not show up here. The row that matters for a deployment decision is the 0.6B's, and
+the rule it implies stands for all three: measure the specific prompts a task depends on rather than
+assuming a rebuild is faithful.
 
 ### Running the ladder in one process does not work, and that is a finding
 
