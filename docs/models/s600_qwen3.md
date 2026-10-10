@@ -162,15 +162,41 @@ where the shipped leaves 1.23. It decodes **33.2 t/s** and prefills ~3.06k t/s a
 29.7 / ~2.0k, three byte-identical runs, and holds that rate start-to-end with **no swapping**
 (`MemAvailable` flat at 42.6 GiB through a cap-length generation — the earlier 8B memory ceiling was the
 cache, not the weights). It answers the canonical prompt `Paris` with the usual early reasoning
-divergence. **One caveat is real: a single deterministic corrupted token, at no fixed place.** Driving enumerations,
-ours writes 1…55 cleanly on `1..400`, emits `.bunifuFlatButton` for the 56th number and resumes 57… —
-reproducible across runs (sha256 `79b0efae…`), and the shipped graph does not make it. It is **not**
-position- or item-indexed: on `1..100` the same graph slips at the **37th** number with the same token,
-and writes both 37 and 56 correctly in a `1..50` run — so it is a **state-dependent numerical near-tie
+divergence. **One caveat is real: a reproducible corrupted-token failure on the dominant path, plus a rarer divergence
+that never answers.** Driving enumerations, the dominant `1..400` run writes 1…55 cleanly, emits
+`.bunifuFlatButton` for the 56th number and resumes 57… — reproducible (sha256 `79b0efae…` in 6 of 8 runs; the other 2 diverge mid-thinking
+and never answer), and the shipped graph does not make it — though neither the slip index nor the garbage
+token is fixed: the token is `个人` at `1..50` and `.bunifuFlatButton` at `1..200`/`1..400`, and the index is
+the **37th** number at `1..50` but the 56th at `1..400`. It is **not** position- or item-indexed either —
+under one fixed prompt, `1..50` slips at 37 with `个人` while `1..100` runs **clean** (all three runs), so the
+near-tie does not sit at a fixed token position; and the garbage token is **prompt-dependent** too, not only
+length-dependent (`1..100` is clean under the long prompt above, yet under the shorter `List every integer
+from 1 to 100, one per line.` the same graph slips at 37 with `.bunifuFlatButton`). Both facts point the same
+way: it is a **state-dependent numerical near-tie
 resolved wrongly** (a digit's logit and a garbage token's within a hair), the same *root* as the 1.7B loop
 but a sharper expression: one token, no repetition build-up, and it resumes. `cache_1024 w8` is the build
-that isolates it (width is the natural lever for a numerical flip); it is the thing to fix before this
+that targets it (width is the natural lever for a numerical near-tie), but the ~25% run-to-run variance and
+the prompt-varying token make it a **bet, not a guarantee** — the intermittent path points at the decode
+side too, so a single clean `w8` run would not prove the slip gone. It is the thing to fix before this
 graph is trusted.
+
+The raw per-length run is the evidence for "state-dependent, not index-fixed":
+
+| prompt | run(s) | result | sha256 | garbage token |
+|---|---|---|---|---|
+| `1..50` | 3/3 identical | slip at the **37th** number | `c2f028c98846…` | `个人` |
+| `1..100` | 3/3 identical | **clean** | `8405f496009c…` | — |
+| `1..200` | 1, 2 of 3 | TIMEOUT (delegate hung) | — | — |
+| `1..200` | 3 of 3 | slip at the **37th** number | `d678e3cf09ac…` | `.bunifuFlatButton` |
+| `1..400` | 2, 3, 4, 5, 6, 8 of 8 | slip at the **56th** number | `79b0efae9a08…` | `.bunifuFlatButton` |
+| `1..400` | 1, 7 of 8 | no answer (diverged mid-` thinking`, never closed it) | `a1105a5c86aa…`, `ba1257518e1d…` | — |
+| `1..100` short prompt | 1 | slip at the **37th** number | `f95507349243…` | `.bunifuFlatButton` |
+
+Prompt, unless the row says otherwise: `List every integer from 1 to N, one per line, in order. Do not
+abbreviate, do not use an ellipsis, and do not add any other text.` The last row uses the shorter
+`List every integer from 1 to 100, one per line.` It is the one case where a single length is **clean** under
+one prompt and slips under another. Each run is its own process, greedy, and the sha256 is over the full
+generated text.
 
 ### Our compiled 0.6B vs the shipped 0.6B
 
