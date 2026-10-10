@@ -155,6 +155,19 @@ the smallest size carries the biggest decode edge of the three and has
 the `cpu_first` ceiling is answered — it does not, and the pool had to move instead; see
 [the large models after the switch](#the-large-models-after-the-switch).
 
+**The 8B compiles too, and it is the lighter and faster of the pair.** Our own `Qwen3-8B` build at
+`cache_1024` (5.61 GB, md5 `84a312d26361d21b0d8daf398a48651b`) loads in **7.87 s** and costs the pool
+**6.52 GiB (65.2%)** — 2.25 GiB below the shipped `cache_4096` 8B's 8.77 GiB, leaving **3.48 GiB free**
+where the shipped leaves 1.23. It decodes **33.2 t/s** and prefills ~3.06k t/s against the shipped's
+29.7 / ~2.0k, three byte-identical runs, and holds that rate start-to-end with **no swapping**
+(`MemAvailable` flat at 42.6 GiB through a cap-length generation — the earlier 8B memory ceiling was the
+cache, not the weights). It answers the canonical prompt `Paris` with the usual early reasoning
+divergence. **One caveat is real and new: a single deterministic corrupted token.** Driving the
+integer-list prompt to the cap, ours writes 1…55 cleanly, emits `.bunifuFlatButton` for the 56th number,
+then resumes 57… — a `w4` precision slip, reproducible across runs (sha256 `79b0efae…`), that the shipped
+graph does not make. It is content-local (one token in the enumeration, not a loop — max 40-char
+recurrence 2×), but it is the thing to fix before this graph is trusted.
+
 ### Our compiled 0.6B vs the shipped 0.6B
 
 The recompile was extended to the size that matters most for latency, and it is the cleanest result of
