@@ -335,6 +335,44 @@ all ten faithfulness prompts identically. So the trigger is none of position, ca
 mapping; it is the graph's own generation on the 1.7B `w4` weights, and localizing it to a layer or a pass
 needs a rebuild this board cannot run.
 
+#### A request whose prompt does not fit the cache aborts the process
+
+The cap above is about *generation*: a prompt that fits still truncates its answer cleanly at the window.
+The other half — what a request does when its **prompt** does not fit — is worse than a truncation, and a
+deployer will meet it the first time it forgets a length check.
+
+**A prompt longer than the cache kills the process with `SIGABRT` (glibc `corrupted size vs. prev_size`).**
+It is not an error status and not a clean truncation: the delegate walks past its KV and the allocator
+aborts. Measured on the compiled **0.6B** (`cache_1024`), greedy, one prompt per process, effective
+prompt = prompt + the same 29-token chat wrapper #616 counted:
+
+| effective prompt | 1001 | 1021 | **1041** |
+|---|---|---|---|
+| result | OK, 152 chars | OK, 50 chars | **abort, rc 134** |
+
+The whole window is usable — 1021 still answers — and **one token past 1024 aborts**, on content that is
+just filler text followed by a question. It is the length, not the topic: a `What is the capital of
+France?` tail on the same preamble (effective 1037) aborts identically.
+
+**It is the SDK's failure, not our build's — at whatever cache the graph was built with.** The **shipped**
+0.6B (`cache_4096`) on the same prompt family answers at effective **4090** and aborts at **4130**. Our
+compiled graphs each crash at their own `cache_1024`; the shipped builds would crash at `cache_4096`. The
+compiled cache does not *add* the failure, it moves the cliff 4× closer.
+
+**On `serve` the crash is the request and every request after it.** An over-cap completion gets **no HTTP
+response at all** — the connection closes after ~2.6 s (curl `HTTP 000`, size 0) — and the server is gone:
+the next request is `connection refused` with nothing listening. `/v1/chat/completions` does the same. So a
+single over-long prompt **takes the server down for every subsequent client** — silent in the sense that
+the first caller sees a dropped connection rather than a 200, but fatal for the process.
+
+**What is clean.** Inside the window the cap is honest: `finish_reason: "length"`, HTTP 200, text coherent
+up to where it stops, and the KV is not left dirty — a canonical `The capital of France is` issued *after*
+an over-cap one in the same process still returns `Paris`. Two smaller quirks sit beside it and are not
+corruption: `max_tokens` is not applied on this path (a request for `max_tokens: 3` returns the full
+answer, because the delegate owns its own stop), and a generation consumed entirely by an unterminated
+reasoning block surfaces as **empty content at 200** once the chat splitter strips it. Neither is the
+prompt-does-not-fit case, which is a crash.
+
 #### Answer faithfulness: 9/10 on the 0.6B and 10/10 on the larger graphs
 
 A different build of the same weights can be faster and still reach different answers, and the whole
