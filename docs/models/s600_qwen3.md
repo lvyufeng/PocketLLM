@@ -1033,6 +1033,34 @@ for the same reason recorded above (the delegate reports no stop signal). Wall t
 4.5 s at the 4B's 42.6 t/s and 5.1 s at the 8B's 29.6 t/s, which is the *same* generation the ladder
 measures — nothing about the HTTP shell changes what the graph does.
 
+### Our compiled 0.6B over `serve`
+
+Our own graphs had only ever been run directly, never through the serving path, and "the compiled
+graphs are faster" is only useful if they deploy the way the vendor's do. So our `cache_1024`
+`Qwen3-0.6B` was served on 2026-10-10 exactly as the shipped graphs are — `pocketllm serve --device
+horizon --model /tmp/ours/ours_06b_cache1024_w8.json`, the same two environment variables, a config
+naming our `.hbm` and the greedy tokenizer directory:
+
+| Endpoint | Status | Body |
+|---|---|---|
+| `GET /v1/models` | **200** | `{"object":"list","data":[{"id":"ours_06b_cache1024_w8.json",…}]}` |
+| `POST /v1/completions` | **200** | `"text":"\n\nThe capital of France is **Paris**."` |
+| `POST /v1/chat/completions` | **200** | `content` = the answer; `reasoning_content` = the thinking block |
+| `POST /v1/chat/completions` (`temperature: 0.9`) | **400** | refused by field name, same `unsupported_feature` message |
+
+**It starts and answers through the same path as the vendor graphs, with no config field, no missing
+tensor and no env the shipped path sets that this one does not** — the integration proof the compiled
+graphs needed. Both endpoints return `200` with coherent text (`The capital of France is **Paris**.`);
+the `finish_reason` is `length`, the `usage` object is present-and-zero, and the reasoning block lands
+in `message.reasoning_content` with `message.content` the answer alone — every one of the #608
+behaviours, unchanged. No body carries an SDK-monitor token: the loader banner is on the server's stderr
+(the same `[UCP]`/`mod_mgr`/`BPU_MONITOR` chatter the shipped 0.6B produces), not in a reply. The one
+thing worth noting is that it is **fast**: the whole request is 0.58 s on `/v1/completions` (0.99 s on
+`/v1/chat/completions`, whose answer carries the longer reasoning block), against the shipped 4B's 4.46
+and 8B's 5.14 — the 121.6 t/s decode of
+[the compiled-0.6B section](#our-compiled-06b-vs-the-shipped-06b) showing through the HTTP shell, which
+changes nothing about what the graph does.
+
 ### The 8B sits comfortably in `balanced` — the numbers
 
 The question the mode switch leaves open is how much room a large model actually has, because it
