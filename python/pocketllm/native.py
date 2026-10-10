@@ -57,6 +57,28 @@ class EngineUnavailable(RuntimeError):
     """The native library is not built, or cannot be loaded on this host."""
 
 
+class ContextLengthExceeded(EngineUnavailable):
+    """The request ran past the checkpoint's context window.
+
+    A subclass of :class:`EngineUnavailable` so every existing ``except
+    EngineUnavailable`` still catches it -- the failure is one a backend user
+    already handles -- but a caller that can act on it catches this narrower
+    type first and answers with a client error instead of a 500.  It is raised
+    from the ABI's own return code (``pocketllm_forward`` returns
+    ``POCKETLLM_ERR_CONTEXT_LENGTH``, not the generic ``-1``), so the engine's
+    authority on the limit is what decides it, not a host-side guess.  The
+    message names the position the sequence would reach; the window number is
+    added by the caller, which reads it from the same GGUF key the engine does.
+    """
+
+
+#: The negative return ``pocketllm_forward`` gives for an over-cap sequence, mirroring
+#: ``POCKETLLM_ERR_CONTEXT_LENGTH`` in ``src/include/pocketllm.h``. Duplicated as a
+#: literal rather than read from the header -- reading it would mean this module parses C
+#: -- and the ABI conformance test is what catches a drift between the two.
+_ERR_CONTEXT_LENGTH = -3
+
+
 def _repository_root() -> pathlib.Path:
     """The checkout root, from this file's location.
 
@@ -311,6 +333,14 @@ class Engine:
         arr = (ctypes.c_int32 * n)(*tokens)
         out = (ctypes.c_float * vocab)()
         written = self._lib.pocketllm_forward(self._handle, arr, n, out, vocab)
+        if written == _ERR_CONTEXT_LENGTH:
+            # The engine's own verdict, not a guess: the request runs past the
+            # checkpoint's window.  Raised as the narrow type so a serving layer
+            # can answer with a client error; the limit is named by the caller,
+            # which reads it from the same GGUF key the engine does.
+            raise ContextLengthExceeded(
+                f"a sequence of {n} tokens would run past the checkpoint's context window"
+            )
         if written < 0:
             raise EngineUnavailable(f"pocketllm_forward failed ({written})")
         return [float(out[i]) for i in range(written)]

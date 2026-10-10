@@ -864,11 +864,21 @@ prints `[12095 Paris 13. 576 The 6722 capital 315 of 9625 France 374 is 1083 als
 `--device cpu` — the change is in the op entry points, so that identity is the check that it is
 transparent.
 
-**Not folded in.** The over-cap path is still a plain **500** (`pocketllm_forward failed (-1)`, in
-0.2 s) rather than a clean `finish_reason: length`: `Qwen3Model::forward` throws before any GEMM when
-the sequence would pass the checkpoint's 40960 window, and `c_api.cpp` flattens it to `-1`. That is
-distinct from the #622 over-cap *crash* (which was the S600/horizon delegate) and is left as a
-follow-up, so this change stays "serve comes up and is correct on ascend".
+**The over-cap path, since fixed to a 400.** At the time of the serving fix an over-cap prompt was
+still a plain **500** (`pocketllm_forward failed (-1)`, 0.2 s) rather than a client error:
+`Qwen3Model::forward` throws before any GEMM when the sequence would pass the checkpoint's 40960
+window, and `c_api.cpp` flattened every `std::exception` to `-1`. That is distinct from the #622
+over-cap *crash* (which was the S600/horizon delegate), and it is now its own fix. The engine's
+verdict is made distinguishable across the ABI instead of being guessed at on the host: the
+context-length case throws `ContextLengthError` and `pocketllm_forward` returns
+`POCKETLLM_ERR_CONTEXT_LENGTH` (`-3`) for it, ahead of the generic `-1`. `native.py`'s
+`ContextLengthExceeded` is raised from that code, and `native_backend.py` maps it to
+`ConfigurationError`, which `_error_status` renders as **400 `invalid_request_error`** naming the
+limit: `{"error":{"message":"the prompt is 50000 tokens, past this model's context window of
+40960","type":"invalid_request_error"}}`. A return code was chosen over a host pre-flight check
+because the C engine's `capacity_` is the authority on the window — the host's `_context_length`
+falls back to a hardcoded 4096 when the GGUF lacks the key — and because the same code catches a
+decode that walks past the window one token at a time, which a prompt-length check cannot see.
 
 ## Current state — the canonical numbers after the series
 

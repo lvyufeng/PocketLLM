@@ -154,6 +154,14 @@ int pocketllm_forward(pocketllm_session *session, const int32_t *tokens, int n, 
     const std::vector<float> values = self->forward(tokens, n, nullptr);
     std::memcpy(logits, values.data(), static_cast<std::size_t>(vocab) * sizeof(float));
     return static_cast<int>(vocab);
+  } catch (const pocketllm::ContextLengthError &e) {
+    /* A *recoverable* refusal, with its own return code: the request is too
+     * long for the checkpoint's window, which is the caller's to fix, not the
+     * engine's failure.  Reported before the generic catch so it does not
+     * flatten into `-1` -- the whole reason the type exists.  `pocketllm_forward`
+     * has no `err` buffer, so the code is the entire signal: a host that wants to
+     * name the limit reads it from the same GGUF key the engine does. */
+    return pocketllm::kErrContextLength;
   } catch (const std::exception &) {
     return -1;
   }
