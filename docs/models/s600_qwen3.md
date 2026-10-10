@@ -335,7 +335,7 @@ all ten faithfulness prompts identically. So the trigger is none of position, ca
 mapping; it is the graph's own generation on the 1.7B `w4` weights, and localizing it to a layer or a pass
 needs a rebuild this board cannot run.
 
-#### A request whose prompt does not fit the cache aborts the process
+#### A request whose prompt does not fit the cache was an abort, and is now refused
 
 The cap above is about *generation*: a prompt that fits still truncates its answer cleanly at the window.
 The other half — what a request does when its **prompt** does not fit — is worse than a truncation, and a
@@ -374,6 +374,19 @@ corruption: `max_tokens` is not applied on this path (a request for `max_tokens:
 answer, because the delegate owns its own stop), and a generation consumed entirely by an unterminated
 reasoning block surfaces as **empty content at 200** once the chat splitter strips it. Neither is the
 prompt-does-not-fit case, which is a crash.
+
+**The crash is now refused on the host, at both entry points, before any tensor is fed.** The cache is the
+graph's compiled window and the delegate cannot count a prompt, so the guard is a *host* one: `XlmEngine`
+takes an injected `count_tokens: Callable[[str], int]` and the `.hbm`'s own `cache<n>` build shape, and
+refuses in `infer` when the effective count is past the window — `pocketllm.xlm` stays stdlib-only, since a
+`Callable` is stdlib and the tokenizer is not. The host supplies the real counter from the SDK's own
+`configs/Qwen3_config/tokenizer.json` (via the optional `tokenizers` package) plus the measured 29-token chat
+wrapper; the window is read from the `.hbm` name (`cache_1024`, `cache_4096`). `run` now exits **rc 1** with a
+message naming both numbers, and `serve` answers **HTTP 400 `invalid_request_error`** — the server stays up and
+the next valid request is still served. When either half cannot be read (no `tokenizer.json`, a `.hbm` without
+a `cache<n>` shape) the guard is **disarmed and the serving path warns once at startup**, rather than running
+silently unguarded. The 0.6B `The capital of France is` regression is unchanged: in-window prompts still
+answer `Paris`.
 
 #### Answer faithfulness: 9/10 on the 0.6B and 10/10 on the larger graphs
 

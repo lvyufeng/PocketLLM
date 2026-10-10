@@ -211,6 +211,81 @@ def test_the_module_imports_without_the_delegate() -> None:
     assert hasattr(xlm_backend, "XlmBackend")
 
 
+# -- the over-cap guard's host half, checkable on any host ------------------
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("Qwen3-0.6B_language_chunk_512_cache_1024_w8_nash-p_corenum_4_4.hbm", 1024),
+        ("Qwen3-0.6B_language_chunk_512_cache_4096_w8_nash-p_corenum_4_4.hbm", 4096),
+        ("ours_06b_cache1024_w8.hbm", 1024),  # the shape is spelled without the underscore too
+        ("a_graph_with_no_build_shape.hbm", None),  # nothing to read -> the guard stays off
+        ("something_cache_0.hbm", None),  # zero is not a window
+    ],
+)
+def test_the_cache_window_is_read_from_the_hbm_shape(name: str, expected: int | None) -> None:
+    """The window comes from the compiled name, and a name without one reads as "no guard".
+
+    The SDK exposes the cache nowhere else — no ``xlm.h`` call reports it and
+    ``context_size`` does not move it — so the build shape in the filename is the
+    only honest source.  The ``None`` cases matter as much as the numbers: a shape
+    that cannot be read must *disarm* the guard, never default to a guess, because
+    guarding against the wrong window is the failure the guard exists to prevent.
+    """
+    assert xlm_backend._hbm_cache_tokens(name) == expected
+
+
+def test_a_missing_tokenizer_yields_no_counter(tmp_path: pathlib.Path) -> None:
+    """No ``tokenizer.json`` means no counter, so the caller can warn rather than run blind.
+
+    The guard is a pair, and half a pair guards nothing.  Returning ``None`` here
+    is what lets :class:`XlmBackend` raise its loud startup warning instead of
+    arming a guard against an unknown length.
+    """
+    assert xlm_backend._build_token_counter(tmp_path / "absent.json") is None
+
+
+def test_the_counter_counts_ids_plus_the_chat_wrapper() -> None:
+    """The count is the tokenizer's ids **plus** the wrapper the delegate prepends.
+
+    The guard must compare against what the delegate's *prefill* sees, not what the
+    raw tokenizer returns: the chat scaffold is ~29 tokens the caller never typed.
+    An empty prompt is the clean read of the constant — the ids are zero, so the
+    count is the wrapper alone.
+    """
+    pytest.importorskip("tokenizers")
+    tokenizer_file = _SDK / "configs/Qwen3_config/tokenizer.json"
+    if not tokenizer_file.is_file():
+        pytest.skip("the SDK tokenizer.json is not on this host")
+
+    counter = xlm_backend._build_token_counter(tokenizer_file)
+    assert counter is not None
+    assert counter("") == xlm_backend._OVER_CAP_WRAPPER_TOKENS
+    # Same text, same count — the counter is a function of the prompt alone.
+    assert counter("The capital of France is") == counter("The capital of France is")
+
+
+def test_the_over_cap_error_becomes_a_client_facing_request_error() -> None:
+    """The seam's stdlib exception is translated to the API's ``ConfigurationError``.
+
+    ``xlm.py`` is stdlib-only and cannot inherit the package's error, so its
+    :class:`~pocketllm.xlm.XlmOverCapError` would otherwise reach
+    :func:`~pocketllm.server.openai._error_status` as a bare ``RuntimeError`` and
+    be answered **500 server_error** — the server blamed for a prompt the caller
+    can shorten.  ``ConfigurationError`` is what that function maps to **400
+    invalid_request_error**, so this asserts the type it reads.  Every other
+    exception must pass through untouched.
+    """
+    from pocketllm.xlm import XlmOverCapError
+
+    translated = xlm_backend._as_request_error(XlmOverCapError("too long"))
+    assert isinstance(translated, ConfigurationError)
+
+    unrelated = ValueError("something else")
+    assert xlm_backend._as_request_error(unrelated) is unrelated
+
+
 # -- the behaviour, needs the board -----------------------------------------
 
 

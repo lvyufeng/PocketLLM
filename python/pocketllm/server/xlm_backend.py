@@ -68,6 +68,7 @@ import pathlib
 import queue
 import threading
 import time
+import warnings
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
@@ -87,7 +88,13 @@ from pocketllm.api import (
 from pocketllm.choices import RequestState
 from pocketllm.protocol.contract import CHAT, FieldRefusal, ServedFields, audit
 from pocketllm.protocol.templating import split_reasoning
-from pocketllm.xlm import XlmEngine, XlmModelType, XlmUnavailable, is_available
+from pocketllm.xlm import (
+    XlmEngine,
+    XlmModelType,
+    XlmOverCapError,
+    XlmUnavailable,
+    is_available,
+)
 
 __all__ = ["XlmBackend"]
 
@@ -132,12 +139,22 @@ class XlmBackend:
                 "serve. Install the D-Robotics LLM SDK under ~/llm_sdk/, or point "
                 "POCKETLLM_XLM_LIB at an existing libxlm.so."
             )
+        # The over-cap guard's two halves, built here (the host) so `pocketllm.xlm`
+        # stays stdlib-only: a token counter over the SDK's own tokenizer, and the
+        # graph's cache from the `.hbm` name.  Both are optional -- `None` on either
+        # disarms the guard, and the warning below says so rather than guard silently.
+        self._count_tokens = _build_token_counter(
+            self._model.tokenizer_dir / "tokenizer.json"
+        )
+        self._cache_tokens = _hbm_cache_tokens(self._model.hbm)
         try:
             self._engine = XlmEngine.open(
                 model_path=str(self._model.hbm),
                 tokenizer_dir=str(self._model.tokenizer_dir),
                 config_path=str(self._model.config),
                 model_type=self._model.model_type,
+                count_tokens=self._count_tokens,
+                cache_tokens=self._cache_tokens,
                 lib=lib,
             )
         except (XlmUnavailable, OSError) as exc:
@@ -146,6 +163,21 @@ class XlmBackend:
             ) from exc
 
         self._context_length = _context_length(self._model.config)
+        # **A guard with no counter must be loud, not silent.**  Past its cache the
+        # delegate aborts the process -- and on `serve` that is every later client --
+        # so a session that cannot build a counter runs unguarded, which is the state
+        # this fix exists to end.  Say so once, at construction, rather than let an
+        # over-cap request discover it by taking the server down.
+        if self._count_tokens is None or self._cache_tokens is None:
+            which = "the tokenizer" if self._count_tokens is None else "the .hbm's cache size"
+            warnings.warn(
+                f"the S600 over-cap guard is INACTIVE ({which} could not be read): a prompt "
+                "past the graph's cache window will not be refused and the delegate will abort "
+                "the process. Provide the SDK tokenizer.json (or a counter) and a cache-bearing "
+                ".hbm name to arm the guard.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -290,7 +322,7 @@ class XlmBackend:
                 tokens = self._prompt(request)
                 chunks.put(("done", self._engine.infer(tokens, on_chunk=sink)))
             except Exception as exc:  # noqa: BLE001 - re-raised in the consumer
-                chunks.put(("error", exc))
+                chunks.put(("error", _as_request_error(exc)))
 
         try:
             if self._state.is_cancelled(request.request_id):
@@ -357,7 +389,10 @@ class XlmBackend:
                 raise ConfigurationError(f"request {request.request_id} was cancelled")
             prompt = self._prompt(request)
             started = time.perf_counter()
-            text = self._engine.infer(prompt)
+            try:
+                text = self._engine.infer(prompt)
+            except Exception as exc:  # noqa: BLE001 - translated, not swallowed
+                raise _as_request_error(exc) from exc
             completed = time.perf_counter()
             performance = self._engine.last_performance
 
@@ -545,6 +580,84 @@ def _context_length(config: pathlib.Path) -> int:
         if isinstance(spec.get(key), int):
             return int(spec[key])
     return 0
+
+
+#: Tokens the Qwen3 chat scaffold adds around a prompt before the delegate prefills it
+#: (``<|im_start|>user`` / ``<|im_end|>`` / ``<|im_start|>assistant`` / `` thinking``).
+#: **Measured on this board, not derived**: a prompt the tokenizer counts as ``n`` ids
+#: prefill-fills as ``n + 29``.  It is a wrapper constant, not a per-prompt count, so
+#: the guard adds it to every count rather than reconstructing the template.
+_OVER_CAP_WRAPPER_TOKENS = 29
+
+
+def _hbm_cache_tokens(hbm: pathlib.Path | str) -> int | None:
+    """The graph's cache window, read from the ``.hbm`` name's ``cache<n>`` build shape.
+
+    The cache is a property of how the graph was **compiled** and the SDK exposes it
+    nowhere else: no ``xlm.h`` call reports it, no demo config carries it, and
+    ``context_size`` at ``xlm_init`` neither changes it nor stops the past-cache abort.
+    The build shape carries it in the filename (``…_cache_4096_…``, ``…_cache1024_…``).
+    Returns ``None`` when the name does not carry one — the guard is then skipped rather
+    than run against a guess.
+    """
+    import re
+
+    match = re.search(r"cache_?(\d+)", pathlib.Path(hbm).name)
+    if match is None or int(match.group(1)) <= 0:
+        return None
+    return int(match.group(1))
+
+
+#: The SDK ``tokenizer.json``, decoded once per process (the Rust `Tokenizer` is not
+#: cheap to build and the file does not change under a running server).
+_TOKENIZER: Any = None
+
+
+def _build_token_counter(
+    tokenizer_file: pathlib.Path, wrapper: int = _OVER_CAP_WRAPPER_TOKENS
+) -> "Callable[[str], int] | None":
+    """A ``str -> int`` prompt-length counter over the SDK's ``tokenizer.json``, or ``None``.
+
+    The count is what the delegate's prefill sees: the tokenizer's own ids **plus** the
+    chat scaffold (``wrapper``).  Reading the SDK's ``token.json`` needs the ``tokenizers``
+    (HuggingFace, Rust) package — an *optional host* dependency, imported lazily and only
+    here — so when it is absent (a CPU-only install, a phone) this returns ``None`` and the
+    caller warns loudly rather than running unguarded.  A missing tokenizer file is the
+    same ``None``, for the same reason.
+    """
+    global _TOKENIZER
+    if _TOKENIZER is None:
+        if not tokenizer_file.is_file():
+            return None
+        try:
+            from tokenizers import Tokenizer  # noqa: PLC0415 - optional host dependency
+        except ImportError:
+            return None
+        _TOKENIZER = Tokenizer.from_file(str(tokenizer_file))
+
+    def count(prompt: str) -> int:
+        return len(_TOKENIZER.encode(prompt).ids) + wrapper
+
+    return count
+
+
+def _as_request_error(exc: BaseException) -> BaseException:
+    """Translate the delegate seam's over-cap refusal into the API's request error.
+
+    :class:`~pocketllm.xlm.XlmOverCapError` is raised in ``xlm.py``, which is
+    stdlib-only and so cannot inherit :class:`~pocketllm.api.ConfigurationError`.
+    Left as-is it would reach :func:`pocketllm.server.openai._error_status` as a
+    bare ``RuntimeError`` and be answered **500 server_error** — wrong, because the
+    prompt, not the server, is at fault.  Not-guarding is the crash; guarding
+    *wrongly* would tell the caller the server broke on a request it can fix by
+    shortening.  So the translation lives here, in the host layer, at the one seam
+    the two exception taxonomies meet.
+
+    Every other exception passes through untouched.
+    """
+    if isinstance(exc, XlmOverCapError):
+        return ConfigurationError(str(exc))
+    return exc
 
 
 def _refuse_unsupported_sampling(body: Mapping[str, Any], note: str) -> FieldRefusal | None:

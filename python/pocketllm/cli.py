@@ -533,6 +533,8 @@ def _run_delegate(namespace: argparse.Namespace, engine_args: EngineArgs) -> int
     disagree about which values are refused.
     """
     from .server.xlm_backend import (
+        _build_token_counter,
+        _hbm_cache_tokens,
         _refuse_unsupported_sampling,
         _resolve_model,
     )
@@ -597,6 +599,11 @@ def _run_delegate(namespace: argparse.Namespace, engine_args: EngineArgs) -> int
             tokenizer_dir=str(model.tokenizer_dir),
             config_path=str(model.config),
             model_type=model.model_type,
+            # Arm the same over-cap guard `serve` arms, from the same host helpers:
+            # without it `run` aborts (SIGABRT) on a prompt past the cache instead of
+            # refusing it.  Either half being `None` disarms the guard.
+            count_tokens=_build_token_counter(model.tokenizer_dir / "tokenizer.json"),
+            cache_tokens=_hbm_cache_tokens(model.hbm),
         )
     except (XlmUnavailable, OSError) as exc:
         raise SystemExit(f"`pocketllm run` failed: {exc}") from exc
