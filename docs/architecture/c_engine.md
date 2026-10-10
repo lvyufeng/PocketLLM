@@ -687,6 +687,67 @@ older measurement's q4_K share that has since grown). **The top cost is no longe
 a 66 t/s token; the aligned read cut it from 3.24 ms. That kernel, and not this one, is where the next
 lever is.
 
+### The q4_K weights were already vectorized; the scale header was not
+
+The `q6_K` fix above invites an analogy — expand the layout, read wider — and the analogy is **wrong**
+for `q4_K`. Its weights were already read as vectors: a `q4_K` block is 144 bytes (`= 9 * 16`), so every
+32-byte nibble run starts 16-byte aligned and the kernel has loaded each run as two `uint4` since
+#580. Counting the SASS load widths confirms it — the q4_K branch issues **8 `LDG.128`** for its
+weights, and the `long_scoreboard` stall that dominates the kernel (**2.4–3.3 of ~6 cycles per
+instruction**, with `lg_throttle` at zero) is not the weights at all. It is the **block header**: `d`,
+`dmin` and the twelve packed scale bytes, which `get_scale_min_k4`/`as_byte` reach as ~24 scattered
+1-byte `LDG.E.U8`s — four per group, eight groups — against the eight vector loads for the 256 weights
+that dominate the bytes.
+
+The fix is the same shape applied where it actually applies: the header is `block[0..15]`, one aligned
+`uint4`, and decoding its four little-endian words in registers removes the scalar loads without
+moving a value. `d` and `dmin` are recovered with the file's own little-endian half reconstruction and
+`get_scale_min_k4` is transcribed against the register bytes, so each `total +=` stays in the same
+order and the output is **bit-identical** — the same gate, not a tolerance.
+
+**This is a prefill lever, not a decode one**, and the counters say why. On the decode shape
+(`m == 1`, one warp per scheduler, ~9% occupancy) the kernel is latency-bound: a single narrow header
+load is hidden behind the serial `total +=` chain, so the change moves `tg128` only ~4%. Prefill has
+the warp count to run ahead, and there the scalar header sets the *issue* ceiling. At the prefill shape
+the pure-`q4_K` projection (`grid.x = 192`, `grid.y = 512`, 98 304 blocks) on this card:
+
+| | before | after |
+|---|---:|---:|
+| duration | 16.10 ms | **8.32 ms** |
+| issue active | 20.5% | **39.8%** |
+| DRAM throughput | 30.0% | **42.6%** |
+| occupancy | 49.8% | 49.8% |
+
+The instruction count is unchanged (1.198 B → 1.196 B) and the occupancy is identical — the whole
+difference is that the same work now issues **twice as fast**, which is what a scalar-load front end
+and an already-vector weight read leave on the table.
+
+**Measured** (`Qwen3-1.7B-Q4_K_M.gguf`, `cuda`, three interleaved A/B rounds against the same binary at
+`origin/main`, idle host):
+
+| | before | after | ratio |
+|---|---:|---:|---:|
+| `pp512` t/s (median of 3) | 294.7 | 424.5 | **1.44** |
+| `tg128` t/s (median of 3) | 66.36 | 68.86 | **1.04** |
+
+The three `pp512` rounds were 298.7/294.7/292.4 before and 426.8/424.5/421.7 after; `tg128`
+66.98/66.36/66.29 versus 69.27/68.73/68.86 — no overlap. The gate holds: greedily decoded ids
+identical for **300 steps** on `"The capital of France is"` and **200** on `"Once upon a time"` and
+`"def fibonacci(n):"`, before versus after. The suite is **1107 passed / 148 skipped**.
+
+**Is there a further q4_K lever?** The honest answer from the profile is no, not a layout one. `q4_K`
+decode is now **latency-bound at ~9% occupancy with one active warp per scheduler and 84% of cycles
+with no eligible warp** — the block count is fixed by `n / 32` (a 2048-wide projection is 64 blocks on
+a 68-SM card) and the block size by the shape, so the kernel cannot hide its own memory latency no
+matter how the bytes are packed. The weights are already `LDG.128`; there is nothing left to widen.
+The remaining `q4_K` cost is **memory behaviour** — achieved DRAM at the decode shape is ~16% of the
+card's ~616 GB/s peak, and the kernel has neither the bytes nor the warps to go higher. Widening the
+block trades blocks for warps and does not help decode: 16 / 64 / 128 columns per block measure
+`tg128` **60.6 / 63.7 / 63.4** against 32's **69.6** (`pp512` 306 / 381 / **445** against 436 — only
+128 is better there, and it pays 6 t/s on decode). The block count `n / 32` is the decode optimum this
+shape has; what would move it is a different kernel *shape* — persistent blocks, or sharing the weight
+pass across columns — not a different layout.
+
 ### The horizontal reduce, and why the lane pairing is load-bearing
 
 `dot_Rrows_q8k` ends each row with one horizontal reduce, and the tree it builds has to be the one

@@ -230,14 +230,37 @@ __device__ void quant_block_accumulate(int type_id, const uint8_t *block, const 
     return;
   }
   if (type_id == quant::kGgmlQ4K) {
-    const float d = quant::as_half(block, 0);
-    const float dmin = quant::as_half(block, 2);
-    const uint8_t *scales = block + 4;
+    /* The 16-byte header -- `d`, `dmin` and the twelve packed scale bytes -- is
+     * read as **one** aligned `uint4`. It sits at `block[0..15]` and a Q4_K
+     * block is 144 bytes (`= 9 * 16`), so it is aligned for every block of every
+     * column. `get_scale_min_k4` reaches those twelve bytes as ~24 scattered
+     * `as_byte` loads (four per group, eight groups), each its own `LDG.E.U8`.
+     * At the decode shape that is hidden (one narrow load per ~9 cycles of
+     * serial dependency), but at the prefill shape the block already has the
+     * warp count to run ahead, and the scalar header is what holds issue at
+     * **20.5%** while the weights are already `LDG.128`: reading the header as a
+     * vector takes that launch from 16.1 ms to 8.3 ms at the raised issue. The
+     * bytes are recovered from the four little-endian words exactly as `as_byte`
+     * would, and each `total +=` stays in the same order, so the value is
+     * unchanged bit for bit. */
+    const uint4 hdr = *reinterpret_cast<const uint4 *>(block);
+    const unsigned hw[4] = {hdr.x, hdr.y, hdr.z, hdr.w};
+    const auto hb = [&](int o) { return static_cast<int>((hw[o >> 2] >> ((o & 3) * 8)) & 0xFFu); };
+    const float d = half_to_float(static_cast<uint16_t>(hb(0) | (hb(1) << 8)));
+    const float dmin = half_to_float(static_cast<uint16_t>(hb(2) | (hb(3) << 8)));
     int col = 0;
     for (int g = 0; g < 8; ++g) {
       int scale = 0;
       int minimum = 0;
-      quant::get_scale_min_k4(scales, g, &scale, &minimum);
+      /* `get_scale_min_k4` against the bytes of `hw` instead of global memory:
+       * the twelve scale bytes are `hb(4) .. hb(15)`. */
+      if (g < 4) {
+        scale = hb(4 + g) & 63;
+        minimum = hb(4 + g + 4) & 63;
+      } else {
+        scale = (hb(4 + g + 4) & 0x0F) | ((hb(4 + g - 4) >> 6) << 4);
+        minimum = (hb(4 + g + 4) >> 4) | ((hb(4 + g) >> 6) << 4);
+      }
       const float sd = d * static_cast<float>(scale);
       const float md = dmin * static_cast<float>(minimum);
       /* The eight 32-weight groups map onto four 32-byte runs of packed
