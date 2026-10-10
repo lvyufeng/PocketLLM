@@ -1013,20 +1013,22 @@ class AscendBackend final : public Backend {
     }
 
     const std::vector<float> x_f = read_f32(x, rows * d, ACL_FLOAT);
-    const std::vector<float> c_f = read_f32(cos_table, table_rows * (d / 2), ACL_FLOAT);
-    const std::vector<float> s_f = read_f32(sin_table, table_rows * (d / 2), ACL_FLOAT);
     const std::vector<uint16_t> x_h = to_f16(x_f.data(), rows * d);
-    const std::vector<uint16_t> c_h = to_f16(c_f.data(), table_rows * (d / 2));
-    const std::vector<uint16_t> s_h = to_f16(s_f.data(), table_rows * (d / 2));
+
+    /* The cos/sin tables are the whole-table round-trip this call used to pay
+     * on every decode step; they are narrowed to fp16 once and cached on the
+     * device (see `rope_tables_for`).  Both tables are the same shape, so one
+     * lookup covers them, and the key includes the row count so a grown table is
+     * a miss rather than a stale hit. */
+    const std::pair<DeviceBuffer, DeviceBuffer> tables =
+        rope_tables_for(cos_table, sin_table, table_rows, d / 2);
+    const DeviceBuffer dc = tables.first;
+    const DeviceBuffer ds = tables.second;
 
     DeviceBuffer dx = allocate(rows * d * 2);
-    DeviceBuffer dc = allocate(table_rows * (d / 2) * 2);
-    DeviceBuffer ds = allocate(table_rows * (d / 2) * 2);
     DeviceBuffer dr = allocate(rows * 4);
     DeviceBuffer dout = allocate(rows * d * 2);
     copy_to_device(dx, x_h.data(), rows * d * 2);
-    copy_to_device(dc, c_h.data(), table_rows * (d / 2) * 2);
-    copy_to_device(ds, s_h.data(), table_rows * (d / 2) * 2);
     copy_to_device(dr, row_t.data(), rows * 4);
 
     aclTensor *tx = make_tensor({rows, d}, ACL_FLOAT16, reinterpret_cast<void *>(dx.handle));
@@ -1067,9 +1069,9 @@ class AscendBackend final : public Backend {
     aclDestroyTensor(ts);
     aclDestroyTensor(tr);
     aclDestroyTensor(to);
+    /* `dc`/`ds` are the cached fp16 tables -- owned by `rope_cache_`, not by
+     * this call, so they are deliberately not released here. */
     release(dx);
-    release(dc);
-    release(ds);
     release(dr);
     release(dout);
   }
@@ -1881,6 +1883,49 @@ class AscendBackend final : public Backend {
     return inserted.first->second;
   }
 
+  /* The cos/sin tables narrowed to fp16 once and held on the device, keyed on
+   * the source buffers' handles and their shape -- the same shape of cache as
+   * `cube_for`.  The op wants fp16 `[rows, half]` operands while the graph holds
+   * the tables as f32, and converting them per call meant reading the *whole*
+   * table to the host on every `rope_neox`: at 256 rows that is ~11x the
+   * activation the call actually rotates, and it doubled with the table (24.1
+   * ms/decode step at 256 rows, 49.3 at 512, at a fixed one-token batch -- the
+   * doubling is what named it a round-trip rather than real work).  The tables
+   * are a pure function of their buffer: the model builds them once and only
+   * reallocates on a grow, which changes `rows` and so the key, so the fp16 copy
+   * is safe to hold for the process on the same contract `cube_for` relies on. */
+  std::pair<DeviceBuffer, DeviceBuffer> rope_tables_for(DeviceBuffer cos_table,
+                                                        DeviceBuffer sin_table, int64_t rows,
+                                                        int64_t half) {
+    const std::string key = "rope:" + std::to_string(cos_table.handle) + ":" +
+                            std::to_string(sin_table.handle) + ":" + std::to_string(rows) + ":" +
+                            std::to_string(half);
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      auto it = rope_cache_.find(key);
+      if (it != rope_cache_.end()) {
+        return it->second;
+      }
+    }
+    const std::vector<float> c_f = read_f32(cos_table, rows * half, ACL_FLOAT);
+    const std::vector<float> s_f = read_f32(sin_table, rows * half, ACL_FLOAT);
+    const std::vector<uint16_t> c_h = to_f16(c_f.data(), rows * half);
+    const std::vector<uint16_t> s_h = to_f16(s_f.data(), rows * half);
+    DeviceBuffer dc = allocate(rows * half * 2);
+    DeviceBuffer ds = allocate(rows * half * 2);
+    copy_to_device(dc, c_h.data(), rows * half * 2);
+    copy_to_device(ds, s_h.data(), rows * half * 2);
+    /* Same emplace-and-release-the-loser contract as `cube_for`: two callers for
+     * the same key may both reach here, and the loser must not leak its copy. */
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto inserted = rope_cache_.emplace(key, std::make_pair(dc, ds));
+    if (!inserted.second) {
+      release(dc);
+      release(ds);
+    }
+    return inserted.first->second;
+  }
+
   aclrtStream stream_ = nullptr;
   aclrtContext context_ = nullptr;
   std::string soc_;
@@ -1888,6 +1933,7 @@ class AscendBackend final : public Backend {
   std::unordered_map<std::string, PackedQ4K> cache_;
   std::unordered_map<std::string, CubeWeight> cube_cache_;
   std::unordered_map<std::string, DeviceBuffer> table_cache_;
+  std::unordered_map<std::string, std::pair<DeviceBuffer, DeviceBuffer>> rope_cache_;
 };
 
 }  // namespace

@@ -904,15 +904,40 @@ short vs a ~300-token context, so the table is 256 vs 512 rows —
 
 **The per-call cost doubles exactly when the table doubles, at a fixed one-token batch** — so the
 cost is the whole-table round-trip, and it *worsens as the context grows*. At 256 rows that is
-**24.3 ms of a ~140 ms 0.6B decode step: 17%**, before the table has grown at all. Reading only the
-rows the op indexes — the fix the code already implies, since `row_t` names exactly those rows —
-would remove most of it, and unlike the batch path it is **one op**, does not touch the session, and
-gets *more* valuable the longer the context. That is the first thing to try, and it is bounded.
+**~25 ms of a 0.6B decode step: over a fifth of it**, before the table has grown at all.
 
-**What this does not do.** No batch path was built — this is measurement and reading, and the ceiling
-above is a model with its assumption named rather than a measured B-way run. The rope round-trip was
-measured, not fixed. And `pocketllm-mscale` is unchanged, so no gate is at risk: the 0.6B/1.7B/4B
-identities are as documented above.
+**The fix, and its measured win.** The tables are a pure function of their buffer — the model builds
+them once and only reallocates on a grow — so the correct fix is not to read fewer rows but to stop
+re-converting at all: the fp16 tables are now built once and **cached on the device**, keyed on the
+source buffers' handles and shape, exactly the contract `cube_for` already relies on for the weight
+plane (`rope_tables_for` in `backend.cpp`). The key includes the row count, so a grown table is a
+miss and re-converts rather than returning a stale hit; the cached buffers are owned by the cache,
+not by the call, so the op no longer releases them. A/B on the board, the same two table sizes, the
+profiled binary built both ways and diffed:
+
+| rope table | rows | rope before | rope after | decode step before → after |
+|---|---|---|---|---|
+| short context | 256 | 25.3 ms/step (21.7%) | **1.5 ms/step (1.6%)** | 116.8 → 93.2 ms |
+| ~300-token context | 512 | 48.4 ms/step (19.4%) | **1.3 ms/step (0.6%)** | 249.3 → 218.3 ms |
+
+**The round-trip is gone and the doubling with it** — rope is now flat in the table size (1.5 vs 1.3
+ms, noise), where it used to double. The cost was *all* round-trip: the op's own work is ~1.4 ms.
+That is a **~24 ms/decode step cut at 256 rows and ~47 ms at 512** — a ~12–20% step reduction on the
+0.6B, from one bounded change to one op, with no session or graph change.
+
+**The gate: byte-identical, which is the whole requirement.** This is a pure cost removal, so the
+tokens must not move. Built both ways and diffed: the 0.6B canonical prompt is byte-identical before
+and after, ids and text (`[12095 13 576 6722 315 9625 374 1083 …]` for 16 steps), and the 1.7B is
+too (`[12095 13 576 6722 315 279 3639 4180]`) — 1.7B is the one near-tie this page already carries,
+so its gate is pre-change-against-post-change, not against cpu. The 4B is identical as well. The
+conformance suite also carries rope cases that compare the kernels against the reference on the
+tables the graph builds; they need the tool at the repo-root `build/` path, which this board's
+out-of-tree `src/build` does not provide, so on this host they skip and the identity diffs above are
+what stands.
+
+**What this does not do.** No batch path was built — the ceiling above is a model with its assumption
+named rather than a measured B-way run. And `pocketllm-mscale` is unchanged, so no gate is at risk:
+the 0.6B/1.7B/4B identities are as documented above.
 
 ## Serving on the 310B: coming up, and the thread-bound context that had to be attached
 
