@@ -551,6 +551,18 @@ launch across several steps — not anything on the host, and not the weights, w
 cost. It is a *decode-only* win: prefill is compute-bound and pays little for the cache (its gain comes from the
 build, not the KV).
 
+**Prefill, decomposed the same way, is at the roofline — and has no lever.** The complement of the decode
+story is the prefill step, and it is the opposite shape. Profiled at the node level, the compiled prefill is
+**94–97% BPU-core** (ours 0.6B: 33.25 of 35.40 ms; ours 1.7B: 46.17 of 49.10), with an almost constant
+**~1 ms of launch** (two BPU segments) and ~1–2 ms of CPU nodes. The **1.7–1.9×** edge over the shipped
+prefill is **entirely Stage2**: the launch and CPU ratios across the pair are 1.00–1.02, so our build does
+about **half the BPU compute** for the same prompt — less work, not fewer launches. It is also **not** near
+the memory roofline: 33.25 ms for the ~688 MB of `w8` weights is **~21 GB/s**, ~5.6× below the decode step's
+116. So prefill is **BPU-arithmetic-bound, at its ceiling**, and its rate is **flat** with prompt length
+(13 128 t/s from 69 to 909 tokens on ours 0.6B — no quadratic-attention falloff, so the cost is linear, a
+constant per-token matmul). The lever decode has (a smaller cache) does not exist here: launch is 1–3% and
+halving it moves nothing, and the only way under the BPU ceiling is less arithmetic. **No prefill lever.**
+
 **The lever, measured across sizes — the win is shallow and it is a small-model win.** Decode on the long
 list prompt, ours `cache_1024` vs the shipped `cache_4096`, same weights otherwise: the gain is **1.38×**
 on the 0.6B (121.5 vs 88.4 t/s), **1.27×** on the 1.7B (89.2 vs 70.2) and **1.17×** on the 4B (49.9 vs
