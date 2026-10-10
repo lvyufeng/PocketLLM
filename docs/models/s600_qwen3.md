@@ -388,6 +388,16 @@ a `cache<n>` shape) the guard is **disarmed and the serving path warns once at s
 silently unguarded. The 0.6B `The capital of France is` regression is unchanged: in-window prompts still
 answer `Paris`.
 
+**The refusal holds under `serve` concurrency — the case the one-request-at-a-time design exists for.** Six
+distinct prompts fired at once all returned 200 with their own correct answers (6/6), the same serialization
+the lock already guaranteed. Then four valid distinct prompts and two over-cap ones fired **together**: every
+valid request came back **200** with its own text (4/4, no garbling from the 400s interleaving), both over-cap
+requests came back **400 `invalid_request_error`** naming `1024` (2/2 — not a 500, not a dropped connection),
+and the server was **still up** afterward, serving the next valid request correctly. Repeated four times, same
+result, with no `corrupted size`/`SIGABRT` in the log. So the guard turns the crash into a *per-request* error
+without the serialization turning one over-cap request into a server-wide failure — the interaction the guard
+was most likely to get wrong.
+
 #### Answer faithfulness: 9/10 on the 0.6B and 10/10 on the larger graphs
 
 A different build of the same weights can be faster and still reach different answers, and the whole
