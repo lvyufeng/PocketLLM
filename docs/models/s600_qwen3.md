@@ -1603,10 +1603,13 @@ distribution rather than a min/max/median:
 | 0.6B (w8 vs oracle `q4_k_m`) | **0 / 50** | 4 / 8 / **18** / 26 / 59 | **1 / 50** |
 | 1.7B (w4 vs oracle `Qwen3-1.7B-Q4_K_M`) | **0 / 50** | 2 / 7 / **11** / 17 / 38 | **9 / 50** |
 
-(The 1.7B row is the **shipped `cache_4096`** graph. The cache was then swept with the pipeline held
+(Both rows are the **shipped `cache_4096`** graphs. The cache was then swept with the pipeline held
 fixed — our own `1024`/`2048`/`4096` builds — and it turns out **not** to move agreement; the pipeline
 does. That row sits in [its own subsection](#a-cache-row-on-the-accuracy-table-the-cache-is-not-what-moves-agreement)
-below, because it changes how the 1.7B row above should be read: it is the vendor's graph.)
+below, because it changes how the 1.7B row above should be read: it is the vendor's graph. The same
+paired comparison at **0.6B and 8B** — the two other sizes with both a shipped and an ours-built graph —
+shows the gap is real at every size but shaped differently, in
+[the subsection after it](#the-provenance-gap-holds-at-the-other-sizes-and-it-is-not-uniform).)
 
 The distribution is itself the finding, and it **changes the headline on the 1.7B row.** Ten prompts
 said "most divergences are near-ties, but not all"; fifty say that is true of the **0.6B** — 39 of 50
@@ -1616,12 +1619,12 @@ splits sit under one logit, and only one (`multi_02`, the EN→FR translation) r
 found (row 05, 14.06) was therefore not an outlier to explain away; it was a visible point on a tail
 the ten-prompt draw was too small to show the shape of.
 
-The corpus, both captures and both scored tables live in `~/scratch/ref/harness/` on the board
-(`artifacts/0.6B-w8.{s600,agreement}.json`, `artifacts/1.7B-w4.{s600,agreement}.json`), as do the four
-cache-sweep captures of the 1.7B (`artifacts/1.7B-w4-{ours-c1024,c2048,ours-c4096}.{s600,agreement}.json`,
-the shipped `1.7B-w4` being the fourth), and the whole
-measurement is now **one command** — see [the harness](#the-harness-one-command) below, which is what
-makes the vendor's `w4` 0.6B a single invocation when it lands. The single-prompt artifacts remain at
+The corpus and every capture live in `~/scratch/ref/harness/` on the board: the two shipped rows
+(`artifacts/0.6B-w8.*`, `artifacts/1.7B-w4.*`), the four cache-sweep captures of the 1.7B
+(`artifacts/1.7B-w4-{ours-c1024,c2048,ours-c4096}.*`), and the four provenance-pair captures
+(`artifacts/0.6B-{ours,shipped}-w8.*`, `artifacts/8B-{ours,shipped}-w4.*`). The whole measurement is now
+**one command** — see [the harness](#the-harness-one-command) below, which is what makes the vendor's
+`w4` 0.6B a single invocation when it lands. The single-prompt artifacts remain at
 `~/scratch/ref/parity/s600_parity.json`.
 
 ### The distribution, by category
@@ -1691,6 +1694,61 @@ govern how closely the next token matches the oracle. And the accuracy row the p
 was the vendor's graph, which is why it read as the better one — not because `4096` is more accurate, but
 because that graph was not built by us. The self-built graph carries a quieter, second cost beside the
 loop: on this corpus it is the *less* oracle-like of the two, at every cache.
+
+### The provenance gap holds at the other sizes, and it is not uniform
+
+A single size cannot say whether "our build agrees less" is a compile-pipeline fact or a 1.7B one. The
+same paired comparison was run at the two other sizes where **both** a shipped and an ours-built graph
+exist on the board, each pair at a **matched width** so the pipeline is the only axis (the cache differs,
+`1024` vs `4096`, but the 1.7B sweep above shows the cache does not move agreement):
+
+| size | ours (build) | shipped (build) | ours prefix min/p25/med/p75/max | ours hist | ours ≥5 | ship prefix | ship hist | ship ≥5 |
+|---|---|---|---|---|---|---|---|---|
+| 0.6B `w8` | ours `c1024` | shipped `c4096` | 2 / 7 / **13** / 23 / 64 | 6 / 13 / 12 / 12 / 3 / 4 | **0** | 4 / 8 / **18** / 26 / 59 | 3 / 15 / 12 / 11 / 5 / 4 | 1 |
+| 1.7B `w4` | ours `c1024` | shipped `c4096` | 0 / 2 / **6** / 13 / 21 | 20 / 17 / 10 / 3 / 0 / 0 | **23** | 2 / 7 / **11** / 17 / 38 | 10 / 12 / 17 / 8 / 3 / 0 | 9 |
+| 8B `w4` | ours `c1024` | shipped `c4096` | 2 / 7 / **11** / 20 / 61 | 5 / 14 / 15 / 8 / 3 / 1 | 2 | 4 / 14 / **23** / 33 / 88 | 2 / 5 / 15 / 12 / 8 / 8 | 2 |
+
+**The gap holds at every size — our build is the less oracle-like one in all three pairs — but its
+magnitude and its shape are not the same.** Paired per prompt (ours minus shipped on the *same* prompt,
+so a shared easy prompt cannot flatter either side):
+
+| size | prompts | ours shorter | equal | ours longer | median Δ | Δ range |
+|---|---|---|---|---|---|---|
+| 0.6B `w8` | 50 | 15 | **24** | 11 | **0** | −38 … +35 |
+| 1.7B `w4` | 50 | **30** | 12 | 8 | **−2** | −36 … +12 |
+| 8B `w4` | 46 | **32** | 8 | 6 | **−8** | −69 … +36 |
+
+- **0.6B is the weakest case, and it nearly reverses on individual prompts** — the paired difference is
+  a coin-flip (24 of 50 identical to the token, only 15 shorter to 11 longer, median Δ exactly 0). The
+  distribution is only modestly worse for us: median 13 against 18, and **zero** wide-margin splits
+  against the shipped graph's single 7.91 (`multi_02`). So at the smallest size "our build is less
+  oracle-like" is *true on the aggregate and near-invisible on any one prompt*.
+- **8B is the widest median gap and the most lopsided**: 32 of 46 prompts shorter, median Δ **−8**
+  (11 against 23), with the shipped graph reaching a **88**-token shared prefix that ours never approaches
+  (max 61). But — unlike the 1.7B — the **wide-margin split count is equal** (2 and 2); the 8B's
+  disagreement is a *systematic step earlier*, not a different distribution of confidence.
+- **1.7B is the outlier in the tail, not the mechanism**: its median gap (−2) is smaller than the 8B's,
+  but it carries **23** wide-margin splits against the shipped graph's **9** — two and a half times the
+  rate. That is the 1.7B's signature from the row above, and it is the one place ours does not merely
+  drift earlier but *disagrees more confidently*.
+
+So the answer to the question is **neither "1.7B-only" nor "uniform"**: our build is the less oracle-like
+graph at all three sizes (a **systematic** compile-pipeline effect), while the *shape* of the deficit is
+size-specific — a coin-flip at 0.6B, a step-margin drift at 8B, a widened tail at 1.7B. The honest
+statement is that provenance is a real, every-size axis on this table, weakest where the model is
+smallest.
+
+**The 8B's corrupted token is present in the capture and invisible in the agreement data.** The
+`bunifuFlatButton` glitch — a single Qwen vocabulary token, id `95234`, that substitutes for a *digit*
+(`1.5` → `1.bunifuFlatButton`, `75%` → `75.bunifuFlatButton`, `age > 18` → `age > .bunifuFlatButton`) —
+appears **12 times across the 8B-ours capture** (the arithmetic, code, instruction and long-form rows);
+it appears **zero** times in the shipped 8B's 50 prompts and zero times at 0.6B and 1.7B. It is the exact
+signature the enumeration survey localized (`#24`/`#37`/`#56` in the `1..N` lists), now seen on a
+different prompt family. **It does not show up in the agreement table** because in all twelve rows the
+glitch token sits **after** the first divergence — 130 to 924 tokens after it, e.g. `code_05` diverges at
+token 4 but slips at 603 — so it never *causes* the split the harness scores. It is a downstream artifact
+of our 8B having already left the oracle's trajectory, which is why a divergence-only comparison misses
+it: the corruption is real, it is ours, and it lives past the point the table stops looking.
 
 ### The width confound, and why only one pair can remove it
 
