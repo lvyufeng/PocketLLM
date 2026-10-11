@@ -1698,8 +1698,8 @@ the ten-prompt draw was too small to show the shape of.
 
 The corpus and every capture live in `~/scratch/ref/harness/` on the board: the two shipped rows
 (`artifacts/0.6B-w8.*`, `artifacts/1.7B-w4.*`), the four cache-sweep captures of the 1.7B
-(`artifacts/1.7B-w4-{ours-c1024,c2048,ours-c4096}.*`), and the six provenance-pair captures
-(`artifacts/0.6B-{ours,shipped}-w8.*`, `artifacts/4B-{ours-c1024,shipped-c4096}.*`,
+(`artifacts/1.7B-w4-{ours-c1024,c2048,ours-c4096}.*`), and the seven provenance-pair captures
+(`artifacts/0.6B-{ours,shipped}-w8.*`, `artifacts/0.6B-w4.*`, `artifacts/4B-{ours-c1024,shipped-c4096}.*`,
 `artifacts/8B-{ours,shipped}-w4.*`). The whole measurement is now
 **one command** — see [the harness](#the-harness-one-command) below, which is what makes the vendor's
 `w4` 0.6B a single invocation when it lands. The single-prompt artifacts remain at
@@ -1783,17 +1783,21 @@ exist on the board, each pair at a **matched width** so the pipeline is the only
 | size | ours (build) | shipped (build) | ours prefix min/p25/med/p75/max | ours hist | ours ≥5 | ship prefix | ship hist | ship ≥5 |
 |---|---|---|---|---|---|---|---|---|
 | 0.6B `w8` | ours `c1024` | shipped `c4096` | 2 / 7 / **13** / 23 / 64 | 6 / 13 / 12 / 12 / 3 / 4 | **0** | 4 / 8 / **18** / 26 / 59 | 3 / 15 / 12 / 11 / 5 / 4 | 1 |
+| 0.6B `w4` | ours `c1024` | — (no vendor `w4`) | 0 / 0 / **4** / 6 / 22 | 32 / 10 / 4 / 4 / 0 / 0 | **14** | — | — | — |
 | 1.7B `w4` | ours `c1024` | shipped `c4096` | 0 / 2 / **6** / 13 / 21 | 20 / 17 / 10 / 3 / 0 / 0 | **23** | 2 / 7 / **11** / 17 / 38 | 10 / 12 / 17 / 8 / 3 / 0 | 9 |
 | **4B `w4`** | ours `c1024` | shipped `c4096` | 2 / 6 / **8** / 16 / 35 | 8 / 21 / 15 / 4 / 2 / 0 | **16** | 4 / 11 / **18** / 24 / 42 | 3 / 6 / 19 / 15 / 5 / 2 | 2 |
 | 8B `w4` | ours `c1024` | shipped `c4096` | 2 / 7 / **11** / 20 / 61 | 5 / 14 / 15 / 8 / 3 / 1 | 2 | 4 / 14 / **23** / 33 / 88 | 2 / 5 / 15 / 12 / 8 / 8 | 2 |
 
-**The gap holds at every size — our build is the less oracle-like one in all four pairs — but its
-magnitude and its shape are not the same.** Paired per prompt (ours minus shipped on the *same* prompt,
-so a shared easy prompt cannot flatter either side):
+**The gap holds at every size — our build is the less oracle-like one in all four vendor pairs — but its
+magnitude and its shape are not the same.** The table carries a **fifth row**, the `0.6B w4` our-own
+build, which has no vendor counterpart to pair against (the SDK publishes no `w4` 0.6B); its own
+comparisons are within 0.6B and are read below. Paired per prompt (ours minus shipped on the *same*
+prompt, so a shared easy prompt cannot flatter either side):
 
 | size | prompts | ours shorter | equal | ours longer | median Δ | Δ range |
 |---|---|---|---|---|---|---|
 | 0.6B `w8` | 50 | 15 | **24** | 11 | **0** | −38 … +35 |
+| 0.6B `w4` | 50 | **46** | 2 | 2 | **−12** | −59 … +8 |
 | 1.7B `w4` | 50 | **30** | 12 | 8 | **−2** | −36 … +12 |
 | **4B `w4`** | 50 | **33** | 8 | 9 | **−4.5** | −38 … +27 |
 | 8B `w4` | 46 | **32** | 8 | 6 | **−8** | −69 … +36 |
@@ -1803,6 +1807,18 @@ so a shared easy prompt cannot flatter either side):
   distribution is only modestly worse for us: median 13 against 18, and **zero** wide-margin splits
   against the shipped graph's single 7.91 (`multi_02`). So at the smallest size "our build is less
   oracle-like" is *true on the aggregate and near-invisible on any one prompt*.
+- **A second 0.6B row, and it is the widest deficit on the table**: our own `w4` 0.6B build, matched in
+  *width* to the `q4_k_m` oracle where the `w8` row above was not, agrees **less** than our `w8` does,
+  not more — the opposite of what "match the oracle's width" predicts. Its median prefix is **4** (against
+  the `w8` row's 13 and the shipped graph's 18), **32 of 50** prompts share under five tokens, and it
+  carries **14** wide-margin splits against the `w8` row's **0** — a new, heavy tail on a row that had
+  none. Paired within 0.6B it is the shorter side on **41 of 50** prompts against our `w8` (median Δ
+  **−9**) and **46 of 50** against the shipped graph (median Δ **−12**). It is a distinct shape from the
+  other four — not a coin-flip, a step-margin drift, or a widened tail on a drifted median, but a
+  **near-collapse**: the whole distribution slides toward zero *and* grows a wide-margin tail. Whether
+  this is a `w4` effect, a scheme effect (the same `leap_llm` int4 the 1.7B and 4B use), or something
+  about this particular build is **not established**; the plain fact on the table is that our-w4 agrees
+  less with the `q4_k_m` oracle than our own w8 does.
 - **8B is the widest median gap and the most lopsided**: 32 of 46 prompts shorter, median Δ **−8**
   (11 against 23), with the shipped graph reaching a **88**-token shared prefix that ours never approaches
   (max 61). But — unlike the 1.7B — the **wide-margin split count is equal** (2 and 2); the 8B's
@@ -1822,9 +1838,21 @@ so a shared easy prompt cannot flatter either side):
 
 So the answer to the question is **neither "1.7B-only" nor "uniform"**: our build is the less oracle-like
 graph at all four sizes (a **systematic** compile-pipeline effect), while the *shape* of the deficit is
-size-specific — a coin-flip at 0.6B, a step-margin drift at 8B, and a widened tail at 1.7B and 4B. The
-honest statement is that provenance is a real, every-size axis on this table, weakest where the model is
-smallest.
+size-specific — a coin-flip at 0.6B `w8`, a step-margin drift at 8B, a widened tail at 1.7B and 4B, and
+a fourth shape on the new `0.6B w4` row: a near-collapse toward zero shared prefix carrying its own
+wide-margin tail. The honest statement is that provenance is a real, every-size axis on this table,
+weakest where the model is smallest.
+
+**And a narrower precision did not buy agreement here — it cost it, which is an OPEN question, not a
+conclusion.** The `0.6B w4` row was built to test whether matching the oracle's width narrows the gap;
+it does the opposite, and by a wide margin (our-w4 agrees less than our own `w8`, at every summary
+statistic). The tempting inference — "so agreement with a quantized oracle is not monotonic in *our*
+precision" — is **not claimed here**, because the `q4_k_m` oracle is itself a quantization and the two
+sides read different numeric scales; a `w4` build can be *further* from a 4-bit k-quant oracle than a
+`w8` build is, if the `w8` build's finer weights happen to land closer to the k-quant's coarser grid on
+this corpus. Which of those it is cannot be separated against a quantized oracle at all: the
+disambiguating measurement is a **near-lossless (`f16`) oracle**, and it has not been run. Until it is,
+the plain fact stands and the mechanism does not.
 
 **The 4B closes the table, and the row it closes is the one that still cannot be paired the decisive
 way.** The 4B is the last size with a shipped-and-ours pair, so the provenance gap now rests on **all
@@ -1888,6 +1916,14 @@ the only path that would produce a `w4` 0.6B or a `w8` 1.7B `.hbm` is the same
 on x86-64, not fetched. Until then the honest reading is: **the 0.6B row mixes width and scheme; the
 1.7B row isolates scheme; and the wide-margin divergences we have measured — all nine of them, and
 the ten-prompt batch's row 05 — are on the row that isolates it.**
+
+**A `w4` 0.6B now exists — but it is ours, not the vendor's, so it does not close the confound.** The
+row added above (`artifacts/0.6B-w4.*`, md5 `935c299b9a3efa66318ce5b522793ebd`) is our own `leap_llm`
+`w4` build of the same checkpoint, matched to the oracle in width. It is therefore the same-width
+pair the paragraph above says the vendor does not publish — but pairing the *pipeline* this way does
+not remove the *scheme* confound, because `leap_llm`'s per-channel affine int4 is still not
+`q4_k_m`'s super-block k-quant. The width axis is now measured and it does not help (see the
+`0.6B w4` bullet above); the scheme axis is untouched by this build and still open.
 
 **Near-ties dominate the 0.6B row; they do not dominate the 1.7B.** The fifty-prompt gap
 distribution says so directly: at 0.6B, **39 of 50** splits sit under one logit and only `multi_02`
