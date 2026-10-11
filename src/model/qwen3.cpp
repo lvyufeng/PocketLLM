@@ -877,4 +877,42 @@ void Qwen3Model::ensure_kv(int64_t positions, int64_t n_seq) {
   kv_slots_ = n_seq;
 }
 
+void Qwen3Model::reserve(int64_t positions, int64_t slots) {
+  if (positions <= 0 || slots <= 0) {
+    throw Error("reserve needs a positive position window and slot count");
+  }
+  if (positions > capacity_) {
+    throw ContextLengthError("reserve asked for " + std::to_string(positions) +
+                             " positions, past the checkpoint's context length of " +
+                             std::to_string(capacity_));
+  }
+  /* The same power-of-two row count `ensure_kv` grows to, so a later forward at
+   * a position the reservation already covers takes the early return and never
+   * reaches the release-without-copy path. */
+  int64_t grown = std::max<int64_t>(cache_capacity_, kInitialPositions);
+  while (grown < positions) {
+    grown = std::min<int64_t>(grown * 2, capacity_);
+  }
+  /* Already big enough in both directions: keep the live slabs rather than
+   * freeing a batch that is mid-flight. */
+  if (k_cache_.handle != 0 && grown <= cache_capacity_ && slots <= kv_slots_) {
+    return;
+  }
+  const int64_t elem = kernel::kv_dtype_size(kv_dtype_);
+  const std::size_t per_layer =
+      static_cast<std::size_t>(grown) * static_cast<std::size_t>(n_head_kv_ * head_dim_);
+  if (k_cache_.handle != 0) {
+    backend_->release(k_cache_);
+    backend_->release(v_cache_);
+  }
+  k_cache_ = backend_->allocate(static_cast<int64_t>(per_layer) * n_layer_ * slots * elem);
+  v_cache_ = backend_->allocate(static_cast<int64_t>(per_layer) * n_layer_ * slots * elem);
+  cache_capacity_ = grown;
+  kv_slots_ = slots;
+  /* The rotary table is indexed by absolute position and has no per-slot axis,
+   * so the same window bounds it; grow it here so the first forward of the
+   * group (at up to `positions - 1`) cannot reach the table's own grow path. */
+  grow_rope_table(positions);
+}
+
 }  // namespace pocketllm

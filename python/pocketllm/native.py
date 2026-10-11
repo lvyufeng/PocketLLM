@@ -185,6 +185,9 @@ def _bind(lib: "CDLL") -> None:
         ctypes.POINTER(ctypes.c_int32),
     ]
 
+    lib.pocketllm_reserve.restype = ctypes.c_int
+    lib.pocketllm_reserve.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64]
+
     lib.pocketllm_argmax.restype = ctypes.c_int
     lib.pocketllm_argmax.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_int]
 
@@ -430,6 +433,25 @@ class Engine:
     def reset(self) -> None:
         if self._lib.pocketllm_reset(self._handle) < 0:
             raise EngineUnavailable("pocketllm_reset failed")
+
+    def reserve(self, positions: int, slots: int) -> None:
+        """Pre-size the KV cache to `slots` sequence slots of `positions` rows.
+
+        The batched forward cannot let the cache grow once more than one
+        sequence is live -- the engine's grow path releases and reallocates the
+        slabs without copying, which would wipe the other slots -- so a
+        scheduler reserves the window once, before admitting a group, and keeps
+        every sequence's position inside it.  Idempotent; `positions` past the
+        checkpoint's context raises :class:`ContextLengthExceeded`.
+        """
+        rc = self._lib.pocketllm_reserve(self._handle, positions, slots)
+        if rc == _ERR_CONTEXT_LENGTH:
+            raise ContextLengthExceeded(
+                f"reserve asked for {positions} positions, past the model's context window"
+            )
+        if rc < 0:
+            raise EngineUnavailable(f"pocketllm_reserve failed ({rc})")
+
 
     @staticmethod
     def argmax(logits: list[float]) -> int:

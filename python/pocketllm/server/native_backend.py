@@ -5,13 +5,16 @@
 tested, and :mod:`pocketllm.native` already drives the engine token by token, but the
 object between them did not exist.  This is that object.
 
-**One request at a time, and the lock is not an inconvenience.**  The server is a
-``ThreadingHTTPServer`` -- one thread per request -- while a C ``Session`` holds one
-``position_`` and one KV cache with no locking anywhere in ``src/`` or ``native.py``.
-Two threads sharing one session do not crash; they interleave one request's tokens into
-another's context and return a 200 with the wrong text, which is the worst failure a
-server can have and the reason :attr:`capabilities` declares ``supports_batch = False``
-rather than leaving the handler free to fan out against a promise nothing can keep.
+**The engine is driven by one thread, and that is what makes concurrency safe.**
+The server is a ``ThreadingHTTPServer`` -- one thread per request -- while a C
+``Session`` holds one KV cache and one set of per-sequence lengths with no locking
+anywhere in ``src/`` or ``native.py``.  Two threads sharing one session do not crash;
+they interleave one request's tokens into another's context and return a 200 with the
+wrong text.  So exactly one thread drives the engine: the scheduler below.  Requests
+from every handler thread are handed to it as jobs, and it runs them in groups, each
+request in its own KV slot -- the *sequence axis* Stage 1 put on the slab.  That
+structural isolation is what :attr:`capabilities` reports as ``supports_batch`` (at a
+width above one); it is not a promise the handler could be free to break.
 
 The class lives under ``server/`` rather than ``backends/`` because of what it imports,
 and the import table in ``tests/test_package_boundaries.py`` is what settles it:
@@ -31,10 +34,13 @@ from __future__ import annotations
 
 import os
 import pathlib
+import queue
 import random
 import threading
 import time
+from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from pocketllm.api import (
@@ -82,8 +88,90 @@ _SERVES = ServedFields(
 )
 
 
+# -- the batch scheduler ----------------------------------------------------
+#
+# One request at a time was the whole concurrency story: a single C `Session`
+# holds one KV cache and one set of per-sequence lengths, and two threads
+# sharing it interleave one request's tokens into another's context and return
+# a 200 with the wrong text.  Stage 1 gave the engine a *sequence axis* on the
+# KV slab, so one forward can carry several sequences; this turns that into
+# serving.
+#
+# The model is **grouped and static**.  A scheduler thread forms a group of up
+# to `max_batch_size` requests, admits them together, and runs the whole group
+# to completion: each step is one `next_tokens` call whose result is fanned
+# back to the live members.  A member that finishes early keeps its slot -- fed
+# a dummy token, its output ignored -- until the slowest member finishes,
+# because the engine addresses a sequence by its position in the call and there
+# is no way to close a hole.  New requests wait for the next group.
+#
+# The one hard rule: **the KV slabs are reserved once and never grow**.  The
+# engine's grow path releases and reallocates the slabs without copying, so a
+# sequence crossing a capacity boundary would wipe every other slot's history
+# and return fluent-wrong text with no error.  `_run_group` reserves the window
+# before admitting, and every member stops at the window with
+# `finish_reason="length"` rather than let a forward grow past it.
+
+
+#: How long the scheduler waits for a partial group to fill before running it
+#: anyway.  Small enough not to be felt on a single request, large enough that
+#: requests already in flight land in the same group.  A full group skips it.
+_BATCH_WAIT = 0.02
+
+#: What a finished member is fed to keep its slot alive while the group runs
+#: on.  The id reaches a slot whose output is discarded, so its value does not
+#: matter; what matters is that every slot contributes one token per step.
+_FINISHED_TOKEN = 0
+
+
+@dataclass(slots=True)
+class _Job:
+    """One request in the scheduler, and the channel its events come back on.
+
+    A structural record -- the stepping lives on the backend, which owns the
+    engine, the eos id and the decoder.  A job is either collected
+    (``stream=False``): its terminal `GenerationResult` is put on `events`; or
+    streamed: `TokenEvent`s are put on `events` as they are produced and a
+    terminal ``None`` closes the stream.  A failure is put on `events` in place
+    of the result and raised by whoever drains it.
+    """
+
+    request: GenerationRequest
+    stream: bool
+    events: queue.Queue = field(default_factory=queue.Queue)
+
+    # -- per-request decode state, advanced by the group loop ---------------
+    prompt_tokens: list[int] = field(default_factory=list)
+    budget: int = 0
+    emitted_ids: list[int] = field(default_factory=list)
+    text: str = ""
+    finish_reason: str = "length"
+    completion_tokens: int = 0
+    started: float = 0.0
+    first_at: float | None = None
+    decode_started: float = 0.0
+    splitter: "_ReasoningSplitter | None" = None
+    done: bool = False
+    failure: BaseException | None = None
+    #: The slot this job holds for the life of its group, and the one token
+    #: that slot contributes to the next `next_tokens` call.
+    slot: int = 0
+    next_token: int = _FINISHED_TOKEN
+
+    @property
+    def greedy(self) -> bool:
+        return self.request.sampling_params.greedy
+
+
+def _as_request_error(exc: BaseException) -> BaseException:
+    """The engine's context-length refusal is a bad request (400), not a 500."""
+    if isinstance(exc, ContextLengthExceeded):
+        return ConfigurationError(str(exc))
+    return exc
+
+
 class NativeBackend:
-    """One C session behind the serving contract, serialized by a lock.
+    """One C session behind the serving contract, driven by a batch scheduler.
 
     Constructed with :class:`~pocketllm.api.EngineArgs` and an already-resolved device
     backend name, because the two vocabularies differ: ``--device`` is a *kind* the
@@ -98,13 +186,9 @@ class NativeBackend:
         self._path = _checkpoint_file(args.checkpoint_dir)
         self._lib = lib
         self._state = RequestState()
-        #: Guards the session *and* the decode loop.  A plain `Lock` and not a `RLock`: nothing
-        #: inside the critical section re-enters, and an `RLock` would hide it if something did.
-        self._lock = threading.Lock()
-        #: Guards the two fields below, and is deliberately *not* `self._lock`: the queue depth is
-        #: read by `metrics` from the HTTP thread while a generation holds the session lock, so a
-        #: metrics scrape would block for as long as the generation runs.  Two locks, because they
-        #: protect two unrelated things.
+        #: Guards the queue depth.  It is not held across a generation -- the
+        #: scheduler owns the engine for the whole of a group -- so a `metrics`
+        #: scrape from an HTTP thread never waits on a decode.
         self._queue_lock = threading.Lock()
         #: How many requests are waiting for the engine, the one number that is genuinely the
         #: engine's rather than a request's -- see `metrics`.
@@ -127,14 +211,38 @@ class NativeBackend:
         self._template = _chat_template(self._path)
         self._encoder = _build_encoder(self._template)
 
+        # -- the batch scheduler -------------------------------------------
+        # One thread owns the engine.  At width 1 it runs groups of one through
+        # the unchanged single-sequence loop; above that it runs the batched
+        # decode.  Either way the engine is touched by one thread only, and that
+        # isolation is what `supports_batch` now reports.
+        self._max_batch = max(1, int(args.max_batch_size))
+        self._window = int(args.batch_kv_window)
+        self._cv = threading.Condition()
+        self._pending: deque[_Job] = deque()
+        self._stopping = False
+        #: The widths the scheduler has run, so a caller can prove the batched
+        #: path was reached rather than a serialization that only looks batched.
+        self._group_sizes: list[int] = []
+        #: The widths the *batched decode* actually ran at, appended only inside
+        #: `_run_group`.  `_group_sizes` records how many requests were
+        #: co-submitted -- a group of two that ran `_run_serial` twice is still
+        #: width two there -- so a gate must assert on this, not on that.
+        self._batched_widths: list[int] = []
+        self._scheduler = threading.Thread(
+            target=self._scheduler_loop, daemon=True, name="pocketllm-scheduler"
+        )
+        self._scheduler.start()
+
     # -- lifecycle ----------------------------------------------------------
 
     @property
     def capabilities(self) -> BackendCapabilities:
         """What this path actually has, with the two ``False``s load-bearing.
 
-        ``supports_batch`` is false because one session cannot be shared; read the module
-        docstring for what going the other way would cost.  ``supports_cancellation`` is
+        ``supports_batch`` is true at a width above one because the scheduler gives each
+        request its own KV slot on one thread -- the isolation is real, not a promise -- and
+        false at width one, where there is no batch to run.  ``supports_cancellation`` is
         false because a forward cannot be interrupted.  Reporting either as true would let
         the handler's fan-out or its cancellation endpoint act on a capability that is not
         there.
@@ -144,7 +252,7 @@ class NativeBackend:
             models=(os.path.basename(self._path),),
             model_formats=("gguf",),
             devices=(self._device,),
-            supports_batch=False,
+            supports_batch=self._max_batch > 1,
             supports_streaming=True,
             supports_cancellation=False,
             supports_logprobs=False,
@@ -177,20 +285,40 @@ class NativeBackend:
         """The queue depth, which is the engine's own and not a request's.
 
         The request path already reports its own counters to the server; what the HTTP layer
-        cannot see is how many callers are waiting behind the lock, and under serialization
-        that is the number an operator needs.  Nothing else is added here -- an absent series
-        is honest, and an invented one is not.
+        cannot see is how many callers are waiting for the scheduler, and how wide the groups
+        it forms actually are.  A `last_group_size` above one is the scheduler's own proof that
+        the batched path ran rather than a serialization that only looks batched.  Nothing else
+        is added here -- an absent series is honest, and an invented one is not.
         """
         with self._queue_lock:
-            return {"pocketllm_waiting_requests": float(self._queued)}
+            return {
+                "pocketllm_waiting_requests": float(self._queued),
+                "pocketllm_max_batch_size": float(self._max_batch),
+                "pocketllm_last_group_size": float(self._group_sizes[-1] if self._group_sizes else 0),
+            }
 
     def close(self) -> None:
-        with self._lock:
+        # Stop the scheduler and wait for it: it is mid-group on the engine, and
+        # closing the engine under it would be a use-after-free.  Only after it
+        # has returned is nothing else touching the session.
+        with self._cv:
             if self._closed:
                 return
             self._closed = True
-            self._state.close()
-            self._engine.close()
+            self._stopping = True
+            self._cv.notify_all()
+        self._scheduler.join(timeout=60)
+        self._state.close()
+        # The engine is freed only if the thread actually exited.  A group still
+        # mid-forward after the timeout would be freed under: `pocketllm_close`
+        # deletes the session (and its KV slab) with no sync.  Refuse rather than
+        # corrupt -- an abort at shutdown is recoverable, a use-after-free is not.
+        if self._scheduler.is_alive():
+            raise BackendUnavailableError(
+                "the scheduler thread did not stop within 60s; refusing to close the "
+                "engine under a live forward (that would be a use-after-free)"
+            )
+        self._engine.close()
 
     # -- the field audit ----------------------------------------------------
 
@@ -217,188 +345,321 @@ class NativeBackend:
     # -- generation ---------------------------------------------------------
 
     def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
-        """One run per request, in the order given, each holding the lock for its whole life.
+        """One result per request, in the order given.
 
-        The order is the contract: the server pairs results with the choices it dispatched, so
-        a request answered out of order would be attached to the wrong choice.
+        The order is the contract: the server pairs results with the choices it
+        dispatched, so a request answered out of order would be attached to the
+        wrong choice.  Every request is submitted before any is collected, so
+        they land in the same group and share a weight pass.
         """
-        return [self._run(request) for request in requests]
+        jobs = [self._submit(request, stream=False) for request in requests]
+        return [self._collect(job) for job in jobs]
 
     def stream(self, request: GenerationRequest) -> Iterator[TokenEvent]:
-        """One run, yielded as it decodes.
+        """One request's events, yielded as they decode.
 
-        The lock is held across the whole generator, not per token: between two ``forward``
-        calls the session's position is one token further on, and releasing it there would let
-        a second request write into the same KV cache.  The cost is that a slow client holds
-        the engine, which is the same serialization the non-streaming path pays.
+        The scheduler owns the engine, so this submits the request and drains
+        the job's channel; the per-token decode, the eos/stop checks and the
+        timing split all happen in the group loop -- the same code the collected
+        path runs -- so streaming and collecting cannot drift.
         """
+        job = self._submit(request, stream=True)
+        while True:
+            event = job.events.get()
+            if event is None:
+                break
+            if isinstance(event, BaseException):
+                raise event
+            yield event
+
+    def _submit(self, request: GenerationRequest, *, stream: bool) -> "_Job":
+        """Enqueue the request.  Tokenizing happens later, on the scheduler thread.
+
+        Nothing engine-backed runs here: one thread -- the scheduler -- is the
+        only user of the session, which is what replaces the old lock and what
+        makes ``supports_batch`` true against a real isolation rather than a
+        promise.
+        """
+        if self._closed:
+            raise BackendUnavailableError("the backend is closed")
+        job = _Job(request=request, stream=stream)
         self._state.begin(request.request_id)
         self._enter_queue()
-        self._lock.acquire()
-        try:
-            if self._state.is_cancelled(request.request_id):
-                raise RequestCancelledError(f"request {request.request_id} was cancelled")
-            self._engine.reset()
-            prompt_tokens = self._prompt_tokens(request)
-            started = time.perf_counter()
-            budget = request.sampling_params.token_budget(
-                max(1, self._context_length - len(prompt_tokens))
-            )
-            # The prefill is the first pass over the prompt and it yields the
-            # first token; `_advance` is the one place that decides whether
-            # that costs the whole vocabulary (sampling) or four bytes
-            # (greedy).  It is before `decode_started` so the timing split is
-            # the one this method always reported.
-            token = self._advance(prompt_tokens, request.sampling_params, len(prompt_tokens))
-            first_at: float | None = None
-            decode_started = time.perf_counter()
+        with self._cv:
+            if self._closed:
+                self._state.clear(request.request_id)
+                self._leave_queue()
+                raise BackendUnavailableError("the backend is closed")
+            self._pending.append(job)
+            self._cv.notify()
+        return job
 
-            # The decoded text is carried whole and diffed, rather than assembled from
-            # per-token decodes.  A BPE split lands mid-character on any script whose glyphs
-            # are more than one token wide -- `decode([id])` on a partial UTF-8 sequence emits
-            # a replacement character that the next token cannot undo, so '한국어' arrives as
-            # '한국어 �' and never repairs.  Decoding the grown list and stripping a
-            # trailing replacement is correct because a partial sequence can only ever sit at
-            # the end: everything before it is complete, and the next token completes it.
-            emitted_ids: list[int] = []
-            splitter = _ReasoningSplitter(_thinking_mode(request))
-            finish_reason = "length"
-            completion_tokens = 0
+    def _collect(self, job: "_Job") -> GenerationResult:
+        result = job.events.get()
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
-            for _ in range(budget):
-                emitted_ids.append(token)
-                completion_tokens += 1
-                # Before the decode, not after: the end-of-text token decodes to its literal
-                # spelling -- Qwen3's is `<|im_end|>` -- and yielding first would put that in the
-                # response text.  The collected path breaks here too, so the two agree.
-                if token == self._eos:
-                    finish_reason = "stop"
+    # -- the scheduler thread -----------------------------------------------
+
+    def _scheduler_loop(self) -> None:
+        """Form a group, run it, repeat -- until `close` sets `_stopping`.
+
+        The thread is the only user of the engine, so the isolation the old lock
+        bought is now structural: one thread, one call at a time, and each
+        request written into its own KV slot.
+        """
+        while True:
+            with self._cv:
+                while not self._pending and not self._stopping:
+                    self._cv.wait()
+                if self._stopping and not self._pending:
+                    return
+                jobs = self._take_group_locked()
+            self._group_sizes.append(len(jobs))
+            for job in jobs:
+                try:
+                    self._start_job(job)
+                except BaseException as exc:  # noqa: BLE001 - reported to the job
+                    job.failure = _as_request_error(exc)
+            live = [job for job in jobs if job.failure is None]
+            batched = self._max_batch > 1 and len(live) > 1 and all(job.greedy for job in live)
+            try:
+                if batched:
+                    # One group failure is every member's: the engine state is
+                    # shared, so a mid-group raise means the batch is lost.
+                    try:
+                        self._run_group(live)
+                    except BaseException as exc:  # noqa: BLE001
+                        for job in live:
+                            if not job.done:
+                                job.failure = _as_request_error(exc)
+                else:
+                    # Width 1, and sampling (which the greedy batched ABI cannot
+                    # serve), go one at a time through the original loop.
+                    for job in live:
+                        try:
+                            self._run_serial(job)
+                        except BaseException as exc:  # noqa: BLE001
+                            job.failure = _as_request_error(exc)
+            finally:
+                for job in jobs:
+                    self._finish_job(job)
+
+    def _take_group_locked(self) -> list["_Job"]:
+        """Form one group under `self._cv`.
+
+        A partial group waits a short grace for in-flight requests to arrive, so
+        a burst lands in one group; a full group, or `close`, skips the wait.
+        """
+        take = min(self._max_batch, len(self._pending))
+        group = [self._pending.popleft() for _ in range(take)]
+        if len(group) < self._max_batch and not self._stopping:
+            deadline = time.perf_counter() + _BATCH_WAIT
+            while len(group) < self._max_batch and not self._stopping:
+                while self._pending and len(group) < self._max_batch:
+                    group.append(self._pending.popleft())
+                if len(group) >= self._max_batch:
                     break
-                # See `_decoded_text` for why the whole list is decoded rather than one id.
-                text = self._decoded_text(emitted_ids)
-                reasoning, content = splitter.feed(text)
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                self._cv.wait(remaining)
+        for slot, job in enumerate(group):
+            job.slot = slot
+        return group
 
-                if first_at is None:
-                    first_at = time.perf_counter()
-                if reasoning or content:
-                    yield TokenEvent(
-                        request_id=request.request_id,
+    def _start_job(self, job: "_Job") -> None:
+        """Tokenize and time the request -- on the scheduler thread, so the
+        engine's tokenizer is touched by one thread only."""
+        if self._state.is_cancelled(job.request.request_id):
+            raise RequestCancelledError(f"request {job.request.request_id} was cancelled")
+        job.prompt_tokens = self._prompt_tokens(job.request)
+        job.budget = job.request.sampling_params.token_budget(
+            max(1, self._context_length - len(job.prompt_tokens))
+        )
+        job.splitter = _ReasoningSplitter(_thinking_mode(job.request))
+        job.started = time.perf_counter()
+
+    def _run_serial(self, job: "_Job") -> None:
+        """The single-sequence loop, unchanged -- width 1 and sampling.
+
+        This is the loop the backend has always run: one `reset`, one `_advance`
+        per token, the greedy fast path or the sampler behind it.  Keeping it
+        verbatim is what makes a single request's streamed output byte-identical
+        to the pre-scheduler backend.
+        """
+        params = job.request.sampling_params
+        self._engine.reset()
+        if len(job.prompt_tokens) >= self._context_length:
+            # The single-sequence path's own refusal, kept identical to the
+            # pre-scheduler `_run`: an over-length prompt is a bad request (400),
+            # and the message names the prompt length and the window.  Letting the
+            # engine's generic ContextLengthError surface instead would be a
+            # behavior regression on the B=1 path, which must not move.
+            raise ConfigurationError(
+                f"the prompt is {len(job.prompt_tokens)} tokens, past this model's "
+                f"context window of {self._context_length}"
+            )
+        token = self._advance(job.prompt_tokens, params, len(job.prompt_tokens))
+        job.decode_started = time.perf_counter()
+        while True:
+            if not self._advance_job(job, token):
+                return
+            token = self._advance([token], params, len(job.prompt_tokens) + job.completion_tokens)
+
+    def _run_group(self, jobs: list["_Job"]) -> None:
+        """Prefill the group ragged, then one `next_tokens` per decode step.
+
+        `jobs` is slot-ordered and every job is live and greedy.  The KV slabs
+        are reserved once, to the window, before the first forward -- after that
+        they never grow, which is what makes a mid-batch wipe impossible.
+        """
+        self._engine.reset()
+        self._engine.reserve(self._window, self._max_batch)
+        self._batched_widths.append(len(jobs))
+        # The group's window is ONE number, and a padded finished slot keeps
+        # advancing on it just like a live one (the engine has no way to close a
+        # hole), so a bound on a job's own generation does not bound its slot's
+        # position.  Bound the whole group instead: `cap` is the longest prompt,
+        # every slot stops `self._window - cap` steps past its own prompt, and no
+        # slot's final position (`len(prompt_tokens) + steps <= cap + (window - cap)`)
+        # can reach the reservation.  Without this a short job finished early and
+        # padded while a long one ran would walk its slot past `cache_capacity_`
+        # and `ensure_kv` would reallocate the slab without copying, wiping the
+        # long job's live KV -- fluent-wrong text with no error.
+        cap = 0
+        for job in jobs:
+            if len(job.prompt_tokens) + 1 > self._window:
+                raise ConfigurationError(
+                    f"the prompt is {len(job.prompt_tokens)} tokens, past the batch KV "
+                    f"window of {self._window}; raise batch_kv_window or lower max_batch_size"
+                )
+            cap = max(cap, len(job.prompt_tokens))
+        group_steps = self._window - cap
+        assert group_steps >= 1, "the reservation always leaves at least one step"
+        for job in jobs:
+            job.budget = max(1, min(job.budget, group_steps))
+        first_tokens = self._engine.next_tokens([job.prompt_tokens for job in jobs])
+        prefill_done = time.perf_counter()
+        for job in jobs:
+            job.decode_started = prefill_done
+        for job, token in zip(jobs, first_tokens):
+            self._advance_job(job, int(token))
+        steps = 0
+        while any(not job.done for job in jobs):
+            assert steps < group_steps, (
+                f"the group ran {steps} steps, past its own bound of {group_steps}; "
+                "a padded slot would have grown the slab")
+            batch = [[job.next_token] if not job.done else [_FINISHED_TOKEN] for job in jobs]
+            ids = self._engine.next_tokens(batch)
+            steps += 1
+            for job, token_id in zip(jobs, ids):
+                if not job.done:
+                    self._advance_job(job, int(token_id))
+
+    def _advance_job(self, job: "_Job", token: int) -> bool:
+        """Fold one decoded token into a job.  Returns False when the job ends.
+
+        The per-request body of the loop, shared by `_run_serial` and
+        `_run_group` so the two cannot drift.  `job.next_token` is queued for the
+        next batched step; a job that ends is fed `_FINISHED_TOKEN` until the
+        group does.
+        """
+        if self._stopping:
+            # `close` is waiting to join us; stop at a token boundary rather than
+            # run the group out, so shutdown cannot outlast the join and leave the
+            # engine freed under a live call.  In `_advance_job` and not in the
+            # two loops, so the serial path (width 1 and sampling) is covered too.
+            raise BackendUnavailableError("the backend is closing")
+        job.emitted_ids.append(token)
+        job.completion_tokens += 1
+        job.next_token = token
+        if token == self._eos:
+            job.finish_reason = "stop"
+            job.done = True
+            return False
+        text = self._decoded_text(job.emitted_ids)
+        job.text = text
+        if job.stream:
+            assert job.splitter is not None
+            reasoning, content = job.splitter.feed(text)
+            if job.first_at is None:
+                job.first_at = time.perf_counter()
+            if reasoning or content:
+                job.events.put(
+                    TokenEvent(
+                        request_id=job.request.request_id,
                         token_id=token,
                         text=content,
                         metadata={"reasoning_content": reasoning} if reasoning else {},
                     )
-
-                if _stop_match(text, request.sampling_params.stop) is not None:
-                    # The stop sequence was matched against a text whose content half has already
-                    # been sent, which is the one place a stream is not byte-exact with the
-                    # collected answer: a client sees the sequence it asked to stop at.  Holding
-                    # the tokens back until the sequence is known to be absent would mean a
-                    # lookahead of its length, and `_run` -- which has the whole text -- trims
-                    # instead.  The difference is documented rather than hidden.
-                    finish_reason = "stop"
-                    break
-                token = self._advance(
-                    [token],
-                    request.sampling_params,
-                    len(prompt_tokens) + completion_tokens,
                 )
+        if _stop_match(text, job.request.sampling_params.stop) is not None:
+            job.finish_reason = "stop"
+            job.done = True
+            return False
+        if job.completion_tokens >= job.budget:
+            job.finish_reason = "length"
+            job.done = True
+            return False
+        return True
 
-            ended = time.perf_counter()
-            usage = Usage(
-                prompt_tokens=len(prompt_tokens),
-                completion_tokens=completion_tokens,
-            )
-            yield TokenEvent(
-                request_id=request.request_id,
-                finish_reason=finish_reason,
-                usage=usage,
-                metadata={
-                    "timings": TimingMetrics(
-                        prefill_seconds=(first_at or started) - started,
-                        decode_seconds=ended - decode_started,
-                        total_seconds=ended - started,
-                        ttft_seconds=(first_at or started) - started,
-                    ).as_dict()
-                },
-            )
-        finally:
-            self._lock.release()
-            self._leave_queue()
-            self._state.clear(request.request_id)
-
-    def _run(self, request: GenerationRequest) -> GenerationResult:
-        """The whole generation, collected.  The non-streaming twin of :meth:`stream`."""
-        self._state.begin(request.request_id)
-        self._enter_queue()
-        self._lock.acquire()
-        try:
-            if self._state.is_cancelled(request.request_id):
-                raise RequestCancelledError(f"request {request.request_id} was cancelled")
-            self._engine.reset()
-            prompt_tokens = self._prompt_tokens(request)
-            started = time.perf_counter()
-            budget = request.sampling_params.token_budget(
-                max(1, self._context_length - len(prompt_tokens))
-            )
-            # The prefill yields the first token; see `_advance` for the routing.
-            token = self._advance(prompt_tokens, request.sampling_params, len(prompt_tokens))
-            prefill_done = time.perf_counter()
-
-            emitted_ids: list[int] = []
-            text = ""
-            finish_reason = "length"
-            for _ in range(budget):
-                emitted_ids.append(token)
-                if token == self._eos:
-                    finish_reason = "stop"
-                    break
-                text = self._decoded_text(emitted_ids)
-                if _stop_match(text, request.sampling_params.stop) is not None:
-                    finish_reason = "stop"
-                    break
-                token = self._advance(
-                    [token],
-                    request.sampling_params,
-                    len(prompt_tokens) + len(emitted_ids),
+    def _finish_job(self, job: "_Job") -> None:
+        """Deliver the terminal event (or the failure), once, and free the slot."""
+        ended = time.perf_counter()
+        if job.failure is not None:
+            job.events.put(job.failure)
+        elif job.stream:
+            job.events.put(
+                TokenEvent(
+                    request_id=job.request.request_id,
+                    finish_reason=job.finish_reason,
+                    usage=Usage(
+                        prompt_tokens=len(job.prompt_tokens),
+                        completion_tokens=job.completion_tokens,
+                    ),
+                    metadata={
+                        "timings": TimingMetrics(
+                            prefill_seconds=(job.first_at or job.started) - job.started,
+                            decode_seconds=ended - job.decode_started,
+                            total_seconds=ended - job.started,
+                            ttft_seconds=(job.first_at or job.started) - job.started,
+                        ).as_dict()
+                    },
                 )
-
-            completed = time.perf_counter()
-            text = _trim_stop(text, request.sampling_params.stop)
-            # The same split the streaming path applies, computed once over the finished text,
-            # so the two answers agree about where the reasoning ends.  `_ReasoningSplitter`
-            # exists for the streaming case; here the whole text is in hand.
-            reasoning, content = split_reasoning(text, _thinking_mode(request))
+            )
+            job.events.put(None)
+        else:
+            text = _trim_stop(job.text, job.request.sampling_params.stop)
+            reasoning, content = split_reasoning(text, _thinking_mode(job.request))
             metadata: dict[str, Any] = {}
             if reasoning:
                 metadata["reasoning_content"] = reasoning
-            return GenerationResult(
-                request_id=request.request_id,
-                token_ids=[t for t in emitted_ids if t != self._eos],
-                text=content,
-                finish_reason=finish_reason,
-                usage=Usage(prompt_tokens=len(prompt_tokens), completion_tokens=len(emitted_ids)),
-                timings=TimingMetrics(
-                    prefill_seconds=prefill_done - started,
-                    decode_seconds=completed - prefill_done,
-                    total_seconds=completed - started,
-                ),
-                metadata=metadata,
+            job.events.put(
+                GenerationResult(
+                    request_id=job.request.request_id,
+                    token_ids=[t for t in job.emitted_ids if t != self._eos],
+                    text=content,
+                    finish_reason=job.finish_reason,
+                    usage=Usage(
+                        prompt_tokens=len(job.prompt_tokens),
+                        completion_tokens=job.completion_tokens,
+                    ),
+                    timings=TimingMetrics(
+                        # The collected path has no first emitted token to time
+                        # from, so the prefill boundary is the end of the
+                        # prefill forward -- which is what the pre-scheduler
+                        # `_run` reported.
+                        prefill_seconds=job.decode_started - job.started,
+                        decode_seconds=ended - job.decode_started,
+                        total_seconds=ended - job.started,
+                    ),
+                    metadata=metadata,
+                )
             )
-        except ContextLengthExceeded as exc:
-            # The engine refused the sequence as past the checkpoint's window
-            # (its own `POCKETLLM_ERR_CONTEXT_LENGTH`, not a generic failure).
-            # That is a bad *request*, so it leaves this layer as a
-            # `ConfigurationError` -- a 400 -- rather than a 500, and the message
-            # names the limit.  The token count and the window are both known
-            # here, so the client is told what to shrink to.
-            raise ConfigurationError(
-                f"the prompt is {len(prompt_tokens)} tokens, past this model's "
-                f"context window of {self._context_length}"
-            ) from exc
-        finally:
-            self._lock.release()
-            self._leave_queue()
-            self._state.clear(request.request_id)
+        self._state.clear(job.request.request_id)
+        self._leave_queue()
 
     # -- helpers ------------------------------------------------------------
 

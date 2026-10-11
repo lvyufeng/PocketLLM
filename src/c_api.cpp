@@ -215,6 +215,24 @@ int pocketllm_forward_batch(pocketllm_session *session, const int32_t *tokens,
   }
 }
 
+int pocketllm_reserve(pocketllm_session *session, int64_t positions, int64_t slots) {
+  if (session == nullptr || positions <= 0 || slots <= 0) {
+    return -1;
+  }
+  try {
+    pocketllm::Session *self = as_session(session);
+    if (self->model() == nullptr) {
+      return -2;
+    }
+    self->reserve(positions, slots);
+    return 0;
+  } catch (const pocketllm::ContextLengthError &e) {
+    return pocketllm::kErrContextLength;
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+
 int pocketllm_reset(pocketllm_session *session) {
   if (session == nullptr) {
     return -1;

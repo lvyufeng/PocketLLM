@@ -1,0 +1,32 @@
+{
+  "entry": "serve/native-b1",
+  "note": "Recorded from the module before the Stage 2 scheduler replaced its per-request `_run` loop, on the python3.10 interpreter the package needs, greedy.  G1: a width-1 streamed request must still produce exactly this.",
+  "recorded_from": {
+    "rev": "ac36842",
+    "module": "python/pocketllm/server/native_backend.py",
+    "sha256": "f3e9acd1d6b9cb23074ca30ac75112fd8c032f773f96f17ea9e3a727d424ddb8"
+  },
+  "checkpoint": {
+    "name": "Qwen3-0.6B-Q4_K_M.gguf",
+    "sha256": "ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a"
+  },
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Reply with the single line: golden fixture."
+      }
+    ],
+    "max_tokens": 8,
+    "temperature": 0.0
+  },
+  "expected": {
+    "token_ids": [
+      97235,
+      12507
+    ],
+    "text": "golden fixture",
+    "finish_reason": "stop",
+    "prompt_tokens": 21
+  }
+}
