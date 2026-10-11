@@ -209,7 +209,8 @@ and 8B at `cache_4096` — three runs each, one process per run, the same greedy
 ellipsis), or **hang** (the lost wake-up of the section below, caught by the 25-second stall detector).
 The point of the survey is to ask whether the corrupted-token signature is an 8B property or a
 `cache_1024` property; the 8B's own `cache_4096` build is still compiling, so the shipped 8B at
-`cache_4096` stands in for it.
+`cache_4096` stands in for it — it no longer has to; the decisive cell is measured
+[below](#the-decisive-cell-our-8b-at-the-vendors-cache-still-corrupts).
 
 | graph | cache | `1..200` | `1..400` | outcome class |
 |---|---|---|---|---|
@@ -218,11 +219,14 @@ The point of the survey is to ask whether the corrupted-token signature is an 8B
 | ours 1.7B (w4) | 4096 | **clean** | **clean** | lists fully, 1..200 and 1..400 |
 | ours 4B (w4) | 1024 | **slip at #24** (`2一`) | **slip at #24** (`2一`) | corrupts |
 | ours 8B (w4) | 1024 | **slip at #37** (`.bunifuFlatButton`); 1 of 3 hung | **slip at #56** (`.bunifuFlatButton`); 1 of 3 self-stopped at 22 | corrupts, and hangs |
+| ours 8B (w4) | 4096 | **slip, 3 of 3** (runs 1 & 3 identical: a repeated 22…24 block *and* `1.bunifuFlatButton` at #105; run 2 `2.bunifuFlatButton` at #25) | **slip at #45** (`4.bunifuFlatButton`), 3 of 3 identical | corrupts, deterministically — and earlier |
 | shipped 1.7B (w4) | 4096 | clean | clean | — |
 | shipped 8B (w4) | 4096 | clean | clean | — |
 
 All three runs per cell unless the cell says otherwise; every cell that completed was byte-identical
-across its runs, so each is a mode, not a draw.
+across its runs, so each is a mode, not a draw. Our 8B at `cache_4096` keeps that rule: its `1..400`
+runs are identical three of three, and its `1..200` runs slip three of three (two identical, the third
+a different index) — the larger cache moved the position, not the fact.
 
 **The corruption is a `cache_1024` property, and it is not an 8B one.** Two of the four `cache_1024`
 graphs corrupt the list — the 8B, as before, and the **4B**, which does it for the first time here: at
@@ -248,6 +252,79 @@ that are running clean are neither ours nor the corrupting sizes, and the one ge
 (our 8B at `cache_4096`) is the one still compiling.** What it does settle is narrower and worth stating
 plainly: the corruption is not peculiar to the 8B — the 4B makes it too — and it is absent wherever the
 cache is large.
+
+#### The decisive cell: our 8B at the vendor's cache still corrupts
+
+The cell the survey could not reach — **our own** 8B graph at `cache_4096`, the exact compile that
+produced the `cache_1024` corruption, rebuilt at the cache the shipped graph uses — has since landed
+(`Qwen3-8B_language_chunk_512_cache_4096_w4_nash-p_corenum_4_4.hbm`, 5.71 GB, md5
+`004e3470f61a84ed1640483628d24ea7`). It is the clean separation of **cache** from **build**: same
+width, same model, same source recipe, the cache the only variable against our own `cache_1024` graph,
+and the build the only variable against the shipped `cache_4096` graph. The same enumeration battery
+was run on it, three runs a cell, one process a run, classified the same way:
+
+| prompt | runs | result | glitch token |
+|---|---|---|---|
+| `1..200` long prompt | 1, 3 of 3 | slip — an exact `22,23,24` block repeated **inside** the list and `1.bunifuFlatButton` at the 105th number; the list then **completes to 200** | `.bunifuFlatButton` (id 95234) |
+| `1..200` long prompt | 2 of 3 | slip at the **25th** number (`2.bunifuFlatButton`) | `.bunifuFlatButton` |
+| `1..400` long prompt | 3 of 3 identical | slip at the **45th** number (`4.bunifuFlatButton`); completes to 400 | `.bunifuFlatButton` |
+| `1..100` short prompt | 3 of 3 identical | **clean** | — |
+
+**The answer is unambiguous: the corrupted token is not a `cache_1024` artefact.** Our 8B at
+`cache_4096` corrupts **six of six** long-format runs — every one emits the same `bunifuFlatButton`
+glitch (`4.bunifuFlatButton` for the 45th number, `2.bunifuFlatButton` for the 25th, `1.bunifuFlatButton`
+for the 105th) — and the `1..400` cell is **byte-identical three of three**, the same determinism the
+`cache_1024` graph shows. The cache did not remove the corruption; it moved its position. So the lever
+the 1.7B loop answered to is *not* the lever for this slip, and the cause is the **build**, not the cache.
+
+Two things sharpen the "moved, not removed" reading, and both cut against the cache:
+
+- **The slip moved *earlier*, not later.** `1..200` slips at the 37th number at `cache_1024`, the 25th
+  at `cache_4096`; `1..400` slips at the 56th at `cache_1024`, the **45th** at `cache_4096` — a
+  *shorter* shared prefix on the enumeration that prompted the whole investigation (the `1..400` shared
+  prefix is 45 against 56). A larger cache that made things worse is not a cache that fixed anything.
+- **The failure mode is state-driven, not cache-driven.** `1..400` slips deterministically at 45 while
+  `1..100` is clean at `cache_4096` — the same "length and prompt move the near-tie, the index is not
+  fixed" structure documented at `cache_1024`, reproduced at the larger cache. What survives the cache
+  change is the near-tie itself.
+
+**At the larger cache our build also corrupts *differently* — and it corrupts more.** At `cache_1024`
+the glitch aborts the run: the sequence stalls at 37 (or 56) and the generation degenerates into a
+repeated `6` for a few hundred characters before it ends. At `cache_4096` the glitch is a **local point
+substitution** — one number replaced, the model recovers, and the list **finishes** (`1..200` reaches
+200; `1..400` reaches 400). That is the same one-token near-tie, now recovered from instead of fatal.
+But the deeper cache also raised the count: the `1..400` shared prefix against the oracle is **45** at
+`cache_4096` against **56** at `cache_1024` — the larger cache cost this graph eleven tokens of
+oracle agreement on the one prompt the corruption first named.
+
+##### Cache versus build on the accuracy table
+
+Running `parity.py` on the graph (`--label 8B-ours-c4096`) drops our 8B at the vendor's cache into the
+provenance table, and it separates the two axes for the 8B exactly as the 1.7B sweep did:
+
+| graph | cache | shared prefix min/p25/med/p75/max | ≥5-logit splits | n |
+|---|---|---|---|---|
+| our 8B `w4` | 1024 | 2 / 7 / **11** / 20 / 61 | 2 | 46 |
+| **our 8B `w4`** | **4096** | 2 / 9 / **13** / 20 / 61 | **4** | **48** |
+| shipped 8B `w4` | 4096 | 4 / 14 / **23** / 33 / 88 | 2 | 50 |
+
+The row moves our 8B's median **up** two tokens (11 → 13), confirming the cache is not the accuracy
+lever — but the **≥5-logit splits double, 2 → 4**, matching the enumeration: the deeper cache made this
+build *worse* on the exact axis that separates build from cache. Paired per prompt, against the shipped
+graph at the **same cache** our build is the shorter-prefix side on **31 of 48** prompts (9 equal, 8
+longer, median Δ **−7.5**, range −69…+38); the `88`-token shared prefix the shipped graph reaches is
+still one ours never approaches (max 61 at both caches). Same build, cache `1024 → 4096`: **30 of 44
+identical** to the token, median Δ **0** — the cache changes the cache, not the build.
+
+#### The corrupted token is the build, not the cache
+
+The survey above guessed the corruption was "a `cache_1024` property" on the strength of the 1.7B loop.
+The decisive cell falsifies that guess for the 8B: the corruption survives the vendor cache because it
+was never the cache that produced it. Restated with the compile chain in view: our 8B's `w4` graph is a
+different quantization of the same weights than the vendor's, and that difference — not the cache — is
+what puts a digit's logit and `bunifuFlatButton`'s within a hair. The 1.7B loop was a genuine cache
+effect; the 8B slip is not one, and the two must not be read as the same failure. It is the build axis
+the provenance table measures, showing up as a single token in the text.
 
 **The answer to the enumeration question for the 1.7B is yes.** The `cache_4096` rebuild that cured the
 1.7B's runaway loop also lists all of `1..200` and `1..400` without corruption; the enumeration stays
@@ -1749,6 +1826,12 @@ glitch token sits **after** the first divergence — 130 to 924 tokens after it,
 token 4 but slips at 603 — so it never *causes* the split the harness scores. It is a downstream artifact
 of our 8B having already left the oracle's trajectory, which is why a divergence-only comparison misses
 it: the corruption is real, it is ours, and it lives past the point the table stops looking.
+
+**The 8B's own `cache_4096` build now joins this table** and confirms the two axes are separate: run on
+the same corpus, our 8B at the vendor's cache has the *same* wide 8B-style deficit (median Δ **−7.5**
+against the shipped graph at the same cache; median Δ **0** against our own `cache_1024` graph), so the
+cache is not an accuracy lever for the 8B either. The full row and the enumeration that came with it are
+[in the survey below](#cache-versus-build-on-the-accuracy-table).
 
 ### The width confound, and why only one pair can remove it
 
