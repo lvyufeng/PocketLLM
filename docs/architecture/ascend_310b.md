@@ -1148,6 +1148,27 @@ sampler figures come from standalone benchmarks against the shipped `libpocketll
 and per-op tables come from `POCKETLLM_ASCEND_PROFILE=1` on the same binary the canonical section's
 numbers were taken from.
 
+**Validated on the serving path (#646).** The fast path is not only the CLI's: `serve`'s greedy
+loop reaches the same `_advance`, so it was measured through the real HTTP surface on this board
+(`pocketllm serve --device ascend`, 0.6B `q4_k_m`, one greedy `/v1/completions`, 16 tokens).
+Before and after were the **same binary** with only `native_backend.py` swapped between the
+pre-#646 loop and `_advance` — the change is pure Python, so the C engine is held fixed.
+
+| metric | before (pre-#646 loop) | after (`_advance`) | note |
+|---|---|---|---|
+| greedy request, total | **4430 ms** | **2304 ms** | Δ 2126 ms = **132.9 ms/step** over 16 tokens |
+| TTFT (streamed) | **334.8 ms** | **210.4 ms** | Δ 124.4 ms |
+| sampling request (T=0.7) | 7076 ms | 7242 ms | unchanged (noise), still 200 |
+
+The per-step saving, **132.9 ms**, is the CLI's ~130 ms — the same `_advance`, reached over HTTP.
+The response **bodies are byte-identical** before and after (greedy and sampling; only `created`
+differs, as it does between any two requests), and the served greedy text is *exactly* the
+engine-level greedy output the identity gate produced — tokens `[12095, 13, 576, … 9625,
+13]`, decoded ` Paris. The capital of France is also the capital of the Republic of France.` —
+so the fast path is transparent on the surface a client sees, not just under it. The sampling
+path is unchanged because it still calls `forward`: same binary, same answer, no saving, as
+expected.
+
 ## Serving on the 310B: coming up, and the thread-bound context that had to be attached
 
 Everything above this point was measured through `pocketllm-run` (the C binary) or the `ctypes`
