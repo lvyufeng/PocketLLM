@@ -1352,6 +1352,49 @@ not from a flag: the delegate builds its sampler from that file when the model i
 So a deterministic deployment ships a greedy `generation_config.json` beside the tokenizer. That is a
 file the caller edits, which is why `--seed` is refused rather than honoured — see below.
 
+### The intermittent hang: a lost wake-up inside the delegate's decode path
+
+**One run in ten never returns.** It is not a BPU fault and not our graph — the process is alive,
+sleeping, holding the model, and the board is idle. **A long generation occasionally deadlocks inside
+the vendor's `libxlm.so`, and the process must be killed** (there is no timeout and no cancellation in
+the delegate's `infer`). Measured on the enumeration prompt `List every integer from 1 to 200 …`,
+greedy, one process per run, `bpu_core [0,1,2,3]`, a 25-second no-token stall as the hang detector:
+
+| graph | runs | hangs | rate |
+|---|---|---|---|
+| our compiled 8B (`cache_1024` w4) | 60 | **6** | 1 in 10 |
+| shipped 8B (`cache_4096` w4) | 20 | **1** | 1 in 20 |
+| our compiled 1.7B (`cache_1024` w4) | 20 | 0 | — |
+| our compiled 8B, `The capital of France is` (short) | 15 | 0 | — |
+
+The two 8B graphs are the same weights recompiled by us and shipped by the vendor, and **both hang**,
+so this is a property of the delegate, not of our build (the 1.7B's 0-of-20 is too few to distinguish
+1-in-20 from never). The short-prompt batch is clean, which is the expected shape — a hang needs a long
+decode. **It is not at a fixed step:** the four captures died after 90, 107, 538 and ~317 generated
+pieces, i.e. anywhere in the generation.
+
+**What the process looks like while hung** (captured live, before the kill, with `gdb` and `/proc`):
+
+- `State: S (sleeping)`, `wchan=futex_wait_queue` — **not** a `D`-state I/O wait, and not spinning
+  (CPU idle). The BPU core-utilization `ratio` for all four cores is **0**: the accelerator is idle.
+- 35 threads, all parked in futex waits. The main thread's stack is
+  `python3 → ctypes → xlm_infer → XlmImpl::XlmInfer → XlmImpl::XlmInferInner → std::thread::join`
+  — the delegate spawned an internal worker for the decode and is now **joining it forever**.
+- That worker's stack is `XlmImpl::XlmInferInnerThread → XlmInferDecode → LlmModel::DoDecode →
+  DoBatchDecodeImpl → DnnModelInfer → std::__atomic_futex_unsigned_base::_M_futex_wait_until` with a
+  **null timeout** (`__val=2147483648`, the sign bit set — the classic `std::atomic::wait` encoding).
+- **No syscall is in flight on any thread** (`strace` attaches and shows every thread already blocked in
+  `futex(...)`). So it is not blocked in a work-loop — it is parked on a condition that is never
+  signalled. That is a **lost wake-up / missed notification** between the delegate's decode worker and
+  whatever the BPU/DNN completion path is supposed to signal.
+
+So the failure is a **delegate-internal condition-variable deadlock in the DNN inference path**, reached
+roughly once per ten long decodes, that leaves the process unschedulable-to-completion with the hardware
+idle. Everything above is reproducible from the board; the fix is inside the vendor's `.so` (its BPU
+completion signalling), which this tree does not own. **The mitigation a caller can apply today is a
+generation timeout** — the delegate offers none (`supports_cancellation` is false for the same reason),
+so a wrapper that gives up and restarts the process is the only defence until the vendor fixes it.
+
 ## Accuracy against the 2080ti oracle
 
 The project's accuracy target is agreement with the 2080ti C-engine oracle. This path is **text-in /
