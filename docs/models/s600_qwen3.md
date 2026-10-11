@@ -1700,9 +1700,10 @@ The corpus and every capture live in `~/scratch/ref/harness/` on the board: the 
 (`artifacts/0.6B-w8.*`, `artifacts/1.7B-w4.*`), the four cache-sweep captures of the 1.7B
 (`artifacts/1.7B-w4-{ours-c1024,c2048,ours-c4096}.*`), and the seven provenance-pair captures
 (`artifacts/0.6B-{ours,shipped}-w8.*`, `artifacts/0.6B-w4.*`, `artifacts/4B-{ours-c1024,shipped-c4096}.*`,
-`artifacts/8B-{ours,shipped}-w4.*`). The `f16`-oracle re-scoring of the 0.6B captures (and its
-`q4_k_m`-vs-`f16` floor) lives beside them as `0.6B-{ours,shipped}-w8-f16`, `0.6B-w4-f16` and
-`q4_k_m-vs-f16` — the same registry, scored against a second oracle. The whole measurement is now
+`artifacts/8B-{ours,shipped}-w4.*`). The `f16`-oracle re-scoring lives beside them as
+`0.6B-{ours,shipped}-w8-f16`, `0.6B-w4-f16` and `q4_k_m-vs-f16` (0.6B), and
+`{1.7B,4B,8B}-{ours,shipped}-w4-f16` with `{1.7B,4B,8B}-q4km-vs-f16` (the whole-table run) — the same
+registry, scored against a second oracle. The whole measurement is now
 **one command** — see [the harness](#the-harness-one-command) below, which is what makes the vendor's
 `w4` 0.6B a single invocation when it lands. The single-prompt artifacts remain at
 `~/scratch/ref/parity/s600_parity.json`.
@@ -1854,15 +1855,24 @@ because that oracle is itself a quantization and the two sides read different nu
 
 #### The `f16` oracle: the gap is real against truth, and a floor separates w8 from w4
 
-The same 50-prompt captures were re-scored against a **near-lossless `f16`** checkpoint
-(`qwen3-0.6b-f16.gguf`, 1,509,347,584 B, `general.file_type = 1` — genuinely F16, 198 f16 + 113 f32
-tensors and no quant tensors), so `f16` stands in for truth and a `q4_k_m`-oracle row can be read
-against it. The captures are oracle-independent — they hold the prompts' token ids and the board's
-continuation ids — so this re-scores the existing `0.6B-{ours,shipped}-w8` and `0.6B-w4` captures
-without re-running the board; the `q4_k_m`-vs-`f16` floor is a direct C-engine-vs-C-engine pass on the
-same prompt ids:
+The same 50-prompt captures were re-scored against a **near-lossless `f16`** checkpoint, so `f16`
+stands in for truth and a `q4_k_m`-oracle row can be read against it. The 0.6B `f16`
+(`qwen3-0.6b-f16.gguf`, 1,509,347,584 B) already existed; for the three larger sizes there was none on
+the host, so genuine `f16` GGUFs were **built** from the checkpoints' own HF safetensors
+(`convert_hf_to_gguf.py --outtype f16`): `qwen3-1.7b-f16.gguf` (4,069,679,360 B), `qwen3-4b-f16.gguf`
+(8,051,285,280 B) and `qwen3-8b-f16.gguf` (16,388,044,128 B). Each is `general.file_type = 1` with no
+quant tensors (1.7B 198 f16 + 113 f32; 4B 253 + 145; 8B 254 + 145) — genuinely F16, not a re-labelled
+quant. The captures are oracle-independent — they hold the prompts' token ids and the board's
+continuation ids — so this re-scores the existing captures without re-running the board; each size's
+`q4_k_m`-vs-`f16` floor is a direct C-engine-vs-C-engine pass on the same prompt ids. **"≥5-logit
+splits" counts prompts whose first divergence had a top-2 logit margin of at least 5 logits on the
+truth (`f16`) side** — the same "wide-margin split" the tables above use. It is a *margin* count, not
+a shared-prefix count, so it does **not** agree with the histogram's 5+ bucket and must not be read as
+one.
 
-| graph | vs `f16` (truth) min/p25/med/p75/max | hist (0–4/5–9/10–19/20–29/30–39/40+) | ≥5 splits | Σ prefix |
+**0.6B:**
+
+| graph | vs `f16` (truth) min/p25/med/p75/max | hist (0–4/5–9/10–19/20–29/30–39/40+) | ≥5-logit splits | Σ prefix |
 |---|---|---|---|---|
 | shipped `w8` | 4 / 10 / **20** / 36 / 133 | 1 / 10 / 13 / 7 / 9 / 10 | 1 | **1327** |
 | ours `w8` | 2 / 8 / **16** / 28 / 70 | 3 / 11 / 14 / 12 / 6 / 4 | 0 | **973** |
@@ -1890,6 +1900,61 @@ them:
 The consequence is a rule for reading this whole section: **the `q4_k_m`-vs-`f16` floor (~20 median
 shared tokens) is the yardstick, and any `q4_k_m`-oracle row must be read against it.** A row at the
 floor is measuring the oracle's quantization error, not ours; a row below it is a genuine deficit.
+
+#### The whole table, truth-anchored at every size
+
+The same re-scoring was carried out at the three larger sizes, so the provenance table is now read
+against truth everywhere rather than at the 0.6B alone. Each is the same shape: the shipped graph,
+our graph (both `w4` here, the width the larger checkpoints ship at) and the size's own
+`q4_k_m`-vs-`f16` floor, over the same 50-prompt corpus.
+
+**1.7B** (`n = 50`):
+
+| graph | vs `f16` (truth) min/p25/med/p75/max | hist (0–4/5–9/10–19/20–29/30–39/40+) | ≥5-logit splits | Σ prefix |
+|---|---|---|---|---|
+| shipped `w4` | 2 / 8 / **14** / 19 / 38 | 6 / 11 / 21 / 10 / 2 / 0 | 6 | **724** |
+| ours `w4` | 0 / 2 / **6** / 12 / 21 | 17 / 18 / 12 / 3 / 0 / 0 | **23** | **394** |
+| **`q4_k_m` vs `f16` (the floor)** | 2 / 9 / **19** / 26 / 79 | 7 / 8 / 11 / 18 / 3 / 3 | 3 | **956** |
+
+**4B** (`n = 50`):
+
+| graph | vs `f16` (truth) min/p25/med/p75/max | hist (0–4/5–9/10–19/20–29/30–39/40+) | ≥5-logit splits | Σ prefix |
+|---|---|---|---|---|
+| shipped `w4` | 4 / 11 / **19** / 23 / 53 | 2 / 7 / 17 / 16 / 3 / 5 | 2 | **990** |
+| ours `w4` | 2 / 6 / **8** / 17 / 32 | 9 / 21 / 15 / 4 / 1 / 0 | 12 | **536** |
+| **`q4_k_m` vs `f16` (the floor)** | 4 / 17 / **25** / 47 / 96 | 1 / 4 / 12 / 12 / 7 / 14 | 2 | **1552** |
+
+**8B** (`n = 46` — the four prompts that stalled on the board, `fact_07`, `long_04`, `long_05`,
+`ambi_01`, carry no board continuation and are excluded here exactly as in the `q4_k_m` 8B row above):
+
+| graph | vs `f16` (truth) min/p25/med/p75/max | hist (0–4/5–9/10–19/20–29/30–39/40+) | ≥5-logit splits | Σ prefix |
+|---|---|---|---|---|
+| shipped `w4` | 4 / 16 / **21** / 33 / 67 | 1 / 3 / 18 / 14 / 9 / 5 | 2 | **1196** |
+| ours `w4` | 2 / 7 / **12** / 20 / 71 | 6 / 11 / 17 / 6 / 5 / 1 | 4 | **729** |
+| **`q4_k_m` vs `f16` (the floor)** | 4 / 19 / **34** / 53 / 119 | 1 / 4 / 9 / 6 / 12 / 18 | 0 | **1901** |
+
+Three readings hold across all four sizes:
+
+- **The gap holds against truth everywhere.** Shipped beats ours on total shared prefix against `f16`
+  at every size — Σ **1327** vs **973** (0.6B), **724** vs **394** (1.7B), **990** vs **536** (4B),
+  **1196** vs **729** (8B) — a gap of 354/330/454/467 tokens. The provenance finding is not an artefact
+  of comparing against a quantized oracle; it is the same against near-lossless weights.
+- **The floor grows with the model, and at the larger sizes it overtakes *both* graphs.** The
+  `q4_k_m`-vs-`f16` floor is Σ **995** (0.6B), **956** (1.7B), **1552** (4B), **1901** (8B): a GGML
+  k-quant is a near-truth reference only for the smallest checkpoint. Read as a ratio to the floor,
+  shipped/floor is **1.33 / 0.76 / 0.64 / 0.63** and ours/floor is **0.98 / 0.41 / 0.35 / 0.38** — so
+  from 1.7B up **both the shipped graph and ours sit below the floor**, and "below the floor" is *not*
+  a property of our build alone. This is the strongest form of the 0.6B point: the `q4_k_m` reference
+  is good only where the model is small, and above it every graph on this table — the vendor's
+  included — is closer to truth than the oracle is.
+- **The 1.7B's wide-margin tail survives against truth.** Its `q4_k_m` row carried **23** ≥5-logit
+  splits, the worst on the table; re-scored against `f16` it carries **23** again — the same count —
+  while the size's own floor carries only **3** and the shipped graph **6**. The tail is therefore a
+  real property of our 1.7B build, not the oracle's error: at this size ours does not merely drift
+  earlier, it disagrees more confidently than either the reference quant or the shipped graph, and
+  truth agrees. The 4B's 12 splits and the 8B's 4 are likewise above their floors' 2 and 0. The 0.6B
+  stays the exception in direction: there our `w4`'s 15 splits are the *only* thing above the floor,
+  on a graph otherwise pinned to the floor itself, while the `w8` row sits at it.
 
 **The 4B closes the table, and the row it closes is the one that still cannot be paired the decisive
 way.** The 4B is the last size with a shipped-and-ours pair, so the provenance gap now rests on **all
