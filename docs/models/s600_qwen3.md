@@ -1698,8 +1698,9 @@ the ten-prompt draw was too small to show the shape of.
 
 The corpus and every capture live in `~/scratch/ref/harness/` on the board: the two shipped rows
 (`artifacts/0.6B-w8.*`, `artifacts/1.7B-w4.*`), the four cache-sweep captures of the 1.7B
-(`artifacts/1.7B-w4-{ours-c1024,c2048,ours-c4096}.*`), and the four provenance-pair captures
-(`artifacts/0.6B-{ours,shipped}-w8.*`, `artifacts/8B-{ours,shipped}-w4.*`). The whole measurement is now
+(`artifacts/1.7B-w4-{ours-c1024,c2048,ours-c4096}.*`), and the six provenance-pair captures
+(`artifacts/0.6B-{ours,shipped}-w8.*`, `artifacts/4B-{ours-c1024,shipped-c4096}.*`,
+`artifacts/8B-{ours,shipped}-w4.*`). The whole measurement is now
 **one command** — see [the harness](#the-harness-one-command) below, which is what makes the vendor's
 `w4` 0.6B a single invocation when it lands. The single-prompt artifacts remain at
 `~/scratch/ref/parity/s600_parity.json`.
@@ -1775,7 +1776,7 @@ loop: on this corpus it is the *less* oracle-like of the two, at every cache.
 ### The provenance gap holds at the other sizes, and it is not uniform
 
 A single size cannot say whether "our build agrees less" is a compile-pipeline fact or a 1.7B one. The
-same paired comparison was run at the two other sizes where **both** a shipped and an ours-built graph
+same paired comparison was run at the three other sizes where **both** a shipped and an ours-built graph
 exist on the board, each pair at a **matched width** so the pipeline is the only axis (the cache differs,
 `1024` vs `4096`, but the 1.7B sweep above shows the cache does not move agreement):
 
@@ -1783,9 +1784,10 @@ exist on the board, each pair at a **matched width** so the pipeline is the only
 |---|---|---|---|---|---|---|---|---|
 | 0.6B `w8` | ours `c1024` | shipped `c4096` | 2 / 7 / **13** / 23 / 64 | 6 / 13 / 12 / 12 / 3 / 4 | **0** | 4 / 8 / **18** / 26 / 59 | 3 / 15 / 12 / 11 / 5 / 4 | 1 |
 | 1.7B `w4` | ours `c1024` | shipped `c4096` | 0 / 2 / **6** / 13 / 21 | 20 / 17 / 10 / 3 / 0 / 0 | **23** | 2 / 7 / **11** / 17 / 38 | 10 / 12 / 17 / 8 / 3 / 0 | 9 |
+| **4B `w4`** | ours `c1024` | shipped `c4096` | 2 / 6 / **8** / 16 / 35 | 8 / 21 / 15 / 4 / 2 / 0 | **16** | 4 / 11 / **18** / 24 / 42 | 3 / 6 / 19 / 15 / 5 / 2 | 2 |
 | 8B `w4` | ours `c1024` | shipped `c4096` | 2 / 7 / **11** / 20 / 61 | 5 / 14 / 15 / 8 / 3 / 1 | 2 | 4 / 14 / **23** / 33 / 88 | 2 / 5 / 15 / 12 / 8 / 8 | 2 |
 
-**The gap holds at every size — our build is the less oracle-like one in all three pairs — but its
+**The gap holds at every size — our build is the less oracle-like one in all four pairs — but its
 magnitude and its shape are not the same.** Paired per prompt (ours minus shipped on the *same* prompt,
 so a shared easy prompt cannot flatter either side):
 
@@ -1793,6 +1795,7 @@ so a shared easy prompt cannot flatter either side):
 |---|---|---|---|---|---|---|
 | 0.6B `w8` | 50 | 15 | **24** | 11 | **0** | −38 … +35 |
 | 1.7B `w4` | 50 | **30** | 12 | 8 | **−2** | −36 … +12 |
+| **4B `w4`** | 50 | **33** | 8 | 9 | **−4.5** | −38 … +27 |
 | 8B `w4` | 46 | **32** | 8 | 6 | **−8** | −69 … +36 |
 
 - **0.6B is the weakest case, and it nearly reverses on individual prompts** — the paired difference is
@@ -1804,16 +1807,35 @@ so a shared easy prompt cannot flatter either side):
   (11 against 23), with the shipped graph reaching a **88**-token shared prefix that ours never approaches
   (max 61). But — unlike the 1.7B — the **wide-margin split count is equal** (2 and 2); the 8B's
   disagreement is a *systematic step earlier*, not a different distribution of confidence.
+- **4B is the middle case, and the first one that is both wide and drifted**: 33 of 50 prompts shorter
+  at a moderate median Δ **−4.5** (8 against 18, so the median itself is only a four-token step), but
+  the tail is heavy — **16** wide-margin splits against the shipped graph's **2**, eight times the rate
+  and the largest *asymmetry* of the four pairs. The wide splits are not one model's noise: the shipped
+  graph keeps `code_01`'s 9.69 exactly and adds a single 9.90 (`code_04`), while ours spreads 16 splits
+  from 5.47 to 14.25 across code, instruction, factual, multilingual and long-form — every category but
+  the two smallest. So the 4B sits between the two extremes: like the 1.7B it *widens the tail*, and
+  unlike the 8B its drift is not merely a uniform step earlier.
 - **1.7B is the outlier in the tail, not the mechanism**: its median gap (−2) is smaller than the 8B's,
   but it carries **23** wide-margin splits against the shipped graph's **9** — two and a half times the
   rate. That is the 1.7B's signature from the row above, and it is the one place ours does not merely
   drift earlier but *disagrees more confidently*.
 
 So the answer to the question is **neither "1.7B-only" nor "uniform"**: our build is the less oracle-like
-graph at all three sizes (a **systematic** compile-pipeline effect), while the *shape* of the deficit is
-size-specific — a coin-flip at 0.6B, a step-margin drift at 8B, a widened tail at 1.7B. The honest
-statement is that provenance is a real, every-size axis on this table, weakest where the model is
+graph at all four sizes (a **systematic** compile-pipeline effect), while the *shape* of the deficit is
+size-specific — a coin-flip at 0.6B, a step-margin drift at 8B, and a widened tail at 1.7B and 4B. The
+honest statement is that provenance is a real, every-size axis on this table, weakest where the model is
 smallest.
+
+**The 4B closes the table, and the row it closes is the one that still cannot be paired the decisive
+way.** The 4B is the last size with a shipped-and-ours pair, so the provenance gap now rests on **all
+four** sizes rather than three — but it is paired the *same* way as the others, ours at `cache_1024`
+against the vendor's `cache_4096`, so the cache is a second axis in the row exactly as it is in the 0.6B,
+1.7B and 8B rows. Separating cache from build at 4B the way the 8B's own `cache_4096` cell separates it
+would need **our** 4B rebuilt at `cache_4096`, and **no such build exists** — unlike the 8B, where our
+own `cache_4096` graph was available to run. So the "the slip is the build, not the cache" result above
+is an **8B-only** fact on this page; at 4B the honest reading is the weaker one, that our build is the
+less oracle-like graph and the cache is not controlled out. Whether the 4B's 16-split tail would survive
+a cache-matched own build is **not measured, and not claimed**.
 
 **The 8B's corrupted token is present in the capture and invisible in the agreement data.** The
 `bunifuFlatButton` glitch — a single Qwen vocabulary token, id `95234`, that substitutes for a *digit*
