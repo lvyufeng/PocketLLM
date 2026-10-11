@@ -15,6 +15,7 @@ forces. The pages here are the design record, in the order the layers depend on 
 | [Serving from the C engine](serving.md) | The design for `pocketllm serve`: the adapter the HTTP surface is missing, and the concurrency it must admit it does not have |
 | [Filling m on the 310B](ascend_m_filling.md) | The scoping answer to the shape limit: batch serving vs speculative decoding, their real wins, what each breaks, and why neither is next |
 | [The S600 native compile chain](s600_native_chain.md) | The scoping answer to "how would a 4B `.hbm` be built": the SDK's compiler, where it runs, and whether 4B is reachable |
+| [Batch serving on the 310B](batch_serving.md) | What a batch would concretely change, the honest per-sequence ceiling at m=2/4/16, and whether the custom attention kernel is really the gate |
 
 ## The three words
 
