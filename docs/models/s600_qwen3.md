@@ -439,7 +439,10 @@ same tokenizer, same runtime, different cache.
 
 The verdict is trajectory; what the board cannot yet split is `cache_len` versus the calibration (both
 sit behind the same rebuild, and both are precision). The rebuild above **is** the separating
-measurement: if the loops vanish, cache-length sensitivity; if they persist, provenance/calibration.
+measurement: if the loops vanish, cache-length sensitivity; if they persist, provenance/calibration. **It
+has now been run** — our 1.7B at `cache_len 4096` — and the runaway loop does not appear at the larger
+cache; [the next subsection](#the-rebuilt-17b-at-the-vendors-cache-the-runaway-loop-is-the-cache) has the
+table and the verdict.
 
 **The compiled 0.6B and 4B do not reach it — the 1.7B crosses the threshold first.** The "only the 1.7B
 loops" line was originally drawn on short generations that ended cleanly, which the 1.7B's own trigger
@@ -451,6 +454,49 @@ the 1.7B never writes the list at all. The 4B shows the mechanism approaching �
 stretch in its thinking block on two prompts, and it reaches the cap on two of three — but nothing
 fatal: the threshold sits beyond ~450–650 steps at `w4`, and the 1.7B is the first of our compiled
 graphs past it.
+
+#### The rebuilt 1.7B at the vendor's cache: the runaway loop is the cache
+
+#634's decisive build — **our** 1.7B at `cache_len 4096`, the same pipeline and the same `w4`, `chunk 512`,
+`march` and `corenum`, with only the cache changed — has been built (`Qwen3-1.7B_language_chunk_512_cache_4096_w4_nash-p_corenum_4_4.hbm`,
+1.83 GB, md5 `af63d83d…`, on the 2080ti with `--device cpu`) and driven the same way as the pair it joins:
+the `1..400` list and the `France?` reproducer, greedy, three runs, one graph per process, `bpu_core [0,1,2,3]`.
+
+| 1.7B, `_w4` | decode t/s | prefill t/s | load | carveout after load | peak (long generation) | free |
+|---|---|---|---|---|---|---|
+| ours `cache_1024` | **89.1** | 8 828–9 846 | 5.62 s | 2.27 GiB (22.7%) | 2.42 GiB (24.2%) | 7.58 GiB |
+| ours `cache_4096` (new) | **70.2** | 5 172–5 818 | 5.78 s | 3.48 GiB (34.8%) | 3.63 GiB (36.3%) | 6.37 GiB |
+| shipped `cache_4096` | **70.1** | 5 172–5 818 | 5.70 s | 3.48 GiB (34.8%) | 3.63 GiB (36.3%) | 6.37 GiB |
+
+**The runaway loop does not appear at 4096.** The same pipeline that runs away at `cache_1024` terminates
+with a complete answer at `cache_4096`:
+
+| prompt | ours `cache_1024` | ours `cache_4096` (new) | shipped `cache_4096` |
+|---|---|---|---|
+| `France?` | 1004 pieces / 4467 chars, **no `</think>`**, 40-char window recurs **11×** | 229 pieces / 989 chars, closes the block, recurs **2×** | 407 pieces / 1986 chars, closes, recurs 2× |
+| `1..400` list | 3605 chars, **no `</think>` and no list** (recurs 8×) | 3876 chars, **closes and writes 1…400** (recurs 4×) | 4276 chars, closes and writes 1…400 (recurs 1×) |
+
+The new build's `France?` ends on its own at 229 pieces against the `cache_1024` graph's 1004, and its list
+run writes all of 1–400 where `cache_1024` never closes the block and writes none of it. Since the cache is
+the only commanded change, `cache_len 1024` is a **cause**, not a bystander. It is not *identical* to the
+shipped graph: at 4096 our plan block still echoes its own task line (**4×** on the list, against the
+shipped graph's 1×), a residue of the repetitive trajectory #634 localized — but the block now **closes**
+and the answer follows, which at `cache_1024` it never did.
+
+**The new build lands exactly on the `cache_4096` rate, and the #637 lever model holds.** Decode is
+**70.2 t/s**, the shipped graph's **70.1** to within a run; prefill is 5 172–5 818, also the shipped
+graph's. The price is the **1.27×** smaller-cache gain #637 measured (89.1 → 70.2 t/s, 11.2 → 14.2 µs/step)
+and **1.21 GiB** of extra carveout (2.27 → 3.48 GiB, 22.7% → 34.8% of the 10 GiB pool), leaving 6.37 GiB
+free. The lever is real for the 1.7B (27%), smaller than the 0.6B's 38% — #630's fixed per-step KV cost is
+a smaller share of a heavier model — so 4096 buys the 1.7B **no rate**, only reach and coherence.
+
+**Verdict on #637.** #637 set `cache_len 1024` for 0.6B/1.7B and `2048` for 4B/8B on *rate* grounds, and
+deferred the 1.7B loop to a calibration or `w8` rebuild. The **rate model is confirmed** — the new 4096
+build reproduces the shipped 70 t/s and the 1.27× is exactly #637's number. But the 1.7B part of the
+recommendation is **revised**: the cache is not a pure rate knob, it is the difference between looping and
+answering, so the 1.7B wants the 4096 the clean shipped graph uses (`2048` is the cheaper step, untested).
+The 4B/8B `2048` call stands and is reinforced — a window too small to close a long thinking block is what
+breaks the 1.7B, and those sizes run their thinking longer still.
 
 #### A request whose prompt does not fit the cache was an abort, and is now refused
 
