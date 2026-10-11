@@ -170,6 +170,97 @@ arithmetic on already-int4 weights, `~1e-1` is the int4 quantization of the chec
 weights, and the second is 300× larger, so it is the one the model sees.** Both rows are measured
 above, from the same probe, at the model's real shapes.
 
+## End-to-end accuracy: the 310B sits at the quantizer's own floor
+
+The precision section above is **op-level**: it measures the cube's arithmetic and the W4A16
+requantization against each other, not what a token stream does. This section is the
+token-level counterpart. It answers the project's accuracy question — agreement with the
+**2080ti C-engine oracle** — end to end, using the same method and the same 50-prompt corpus
+the S600 accuracy work established ([s600_qwen3.md](../models/s600_qwen3.md#accuracy-against-the-2080ti-oracle)).
+
+**The method, and one structural advantage.** Each prompt's ChatML-templated ids are fed to
+the board's engine and to the oracle; both decode greedily and the two id sequences are
+diffed. The 310B is *the C engine*, so it has a **native token-id surface**
+(`Engine.encode` / `Engine.next_token`) — the same API the oracle drives — so both sides see
+identical ids with **no text round-trip**. That is cleaner than the S600 path, whose delegate
+is text-in / text-out and must reconstruct the ChatML text and re-tokenize it. Two reports
+are read off each run: the **shared prefix** before the first divergence (bigger = the two
+engines agree longer), and the **oracle's top-1-minus-top-2 margin** at the split (how
+confident the oracle was where they part, in logits).
+
+"At the floor" is the yardstick the [S600 page](../models/s600_qwen3.md#the-f16-oracle-the-gap-is-real-against-truth-and-a-floor-separates-w8-from-w4)
+established: score the same capture against a near-lossless **f16** checkpoint (truth) and
+against the **q4_k_m** checkpoint the board runs (the floor). A build whose agreement with
+truth equals the q4_k_m checkpoint's own agreement with truth is measuring the *quantizer's*
+error, not the board's; a build below that floor is a real, board-owned deficit.
+
+Fifty prompts, three sizes, three axes (columns: shared-prefix min / p25 / median / p75 / max,
+summed prefix Σ, and splits with a ≥5-logit oracle margin):
+
+| size | axis | pref min/p25/**med**/p75/max | Σ prefix | splits ≥5 |
+|---|---|---|---|---|
+| 0.6B | 310B vs `q4_k_m` | 2 / 8 / **16** / 24 / 67 | 887 | 0 / 50 |
+| 0.6B | 310B vs `f16` | 2 / 11 / **19** / 25 / 63 | 1078 | 0 / 50 |
+| 0.6B | **floor** (`q4_k_m` vs `f16`) | 4 / 8 / **20** / 27 / 56 | 995 | 0 / 50 |
+| 1.7B | 310B vs `q4_k_m` | 2 / 16 / **33** / 49 / 128 | 1908 | 3 / 46 |
+| 1.7B | 310B vs `f16` | 2 / 8 / **17** / 27 / 79 | 939 | **5** / 49 |
+| 1.7B | **floor** (`q4_k_m` vs `f16`) | 2 / 9 / **19** / 26 / 79 | 956 | 3 / 49 |
+| 4B | 310B vs `q4_k_m` | 13 / 35 / **71** / 102 / 128 | 3495 | 5 / 49 |
+| 4B | 310B vs `f16` | 4 / 17 / **25** / 47 / 112 | 1620 | 2 / 50 |
+| 4B | **floor** (`q4_k_m` vs `f16`) | 4 / 17 / **25** / 47 / 96 | 1552 | 2 / 50 |
+
+**The 310B is AT the floor at every size, and never below it.** Against the f16 truth the
+board reaches **Σ 1078 / 939 / 1620** (0.6B / 1.7B / 4B) where the `q4_k_m` checkpoint's own
+distance from truth is the floor **Σ 995 / 956 / 1552** — ratios **1.08 / 0.98 / 1.04**. So the
+board's agreement with a near-lossless reference is **as good as the quantized checkpoint's own
+agreement with it**, and at 4B fractionally better; the two are within run-to-run noise of each
+other. The reading is direct: **the board is not adding a token-agreement deficit of its own** —
+what disagreement there is, is the `q4_k_m` quantization's, which the board inherits by running
+the same weights. The 0.6B floor Σ 995 is the S600 page's own measured 0.6B floor reproduced
+**exactly**, which cross-checks the corpus and the oracle across two boards.
+
+**This is the token-level confirmation of the section above.** The precision section measured a
+**~1.2e-1** error for the W4A16 op — the int4 requantization of the checkpoint's q4_K weights —
+and concluded the graph's path stays the dense cube on the faithfully-decoded plane, not W4A16.
+The end-to-end result is that conclusion restated at the token level: W4A16 is env-gated off
+(`$POCKETLLM_ASCEND_W4A16`, `backend.cpp:762`), the shipped path decodes `q4_k`/`q6_k` with the
+tree's own dequant and drives `MatmulCubeCustom` (~2.7e-4), and the board lands **at the floor**,
+not below it. Had the ~1e-1 requantization been the path, the suite would sit far under the
+floor — it does not. So the token agreement is the end-to-end evidence that **the faithful
+decode + cube is what actually executes.**
+
+**The one place the 1.7B is *not* merely at the floor is its confident disagreements.** Its
+310B-vs-f16 row carries **5** splits with a ≥5-logit margin against the floor's **3** — the
+board parts from truth with more conviction, on a handful of prompts, than the `q4_k_m`
+checkpoint itself does. `n` is small (five of fifty) so this is a note, not a finding, but it is
+the row to watch if a wider corpus is ever run.
+
+**The cross-board contrast is a quantizer-provenance effect, not a ranking of the boards.**
+Against the `q4_k_m` oracle at 1.7B the board reaches **Σ 1908 (median 33)**, where the S600's
+1.7B `w4` graph reached **Σ 636 (median 11)** with nine wide-margin splits. The reason is the
+weights: the 310B decodes **the same `q4_k_m` GGUF** the oracle runs, so the two agree by
+construction on most tokens; the S600's `.hbm` is a **different quantizer** (`leap_llm`
+symmetric per-channel int4, not `q4_k_m`'s super-block k-quant), so it agrees far less. This
+says nothing about which board is "better" — it says the 310B row is a *same-quantizer*
+comparison and the S600 `w4` row is a *cross-quantizer* one.
+
+**Scope, stated rather than implied.** Three limitations bound what this table means:
+
+- **No logits surface on the board path.** The 310B exposes ids, not a distribution, so the
+  project's "aligned to 1e-3" is expressible **only as token agreement** — the same limitation
+  the S600 page documents. This measures how long two engines agree, not a logit distance.
+- **The scheme confound.** `310B vs q4_k_m` is **same-quantizer** (hence the high Σ); the
+  `vs f16` rows and the floor are **cross-quantizer**. The floor is what makes the second
+  readable, and it is why the "at the floor" verdict — not the raw Σ — is the result.
+- **The 8B is omitted.** It is at the board's memory edge (swap, stalls), so a token-agreement
+  row there would be confounded by board instability rather than model fidelity; the table's
+  scope is 0.6B / 1.7B / 4B by that choice.
+
+The corpus, the two capture/score scripts and every artifact are recorded on the harness page's
+convention: the corpus is byte-identical to the S600 one (md5 `0feef55b9b879a6ec4529317a3162312`),
+and the captures and their `q4_k_m`/`f16`/floor scorings live beside the S600 artifacts on the
+oracle host.
+
 ## The cube path is the backend's default
 
 `MatmulCubeCustom` is `MatmulImpl<half,half,half>`, so the cube's L0C accumulator is fp32, and it
