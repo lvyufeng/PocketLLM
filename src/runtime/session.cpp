@@ -106,6 +106,41 @@ std::vector<float> Session::forward(const int32_t *tokens, int64_t n, int64_t *a
   return host;
 }
 
+void Session::forward_batch(const int32_t *tokens, const int64_t *n_per_seq, int64_t n_seq,
+                            int32_t *out_tokens) {
+  if (model_ == nullptr) {
+    throw Error("this checkpoint is architecture '" +
+                checkpoint_->get_string("general.architecture", "?") +
+                "', which this build has no graph for; only 'qwen3' runs");
+  }
+  if (out_tokens == nullptr || n_seq <= 0) {
+    throw Error("forward_batch needs an output and at least one sequence");
+  }
+  /* One pass over all the sequences' tokens; the model keeps one cached length
+   * per sequence and writes one logit row per sequence.  The greedy id is read
+   * from each row's device argmax, the same four-byte path `forward` uses when
+   * asked for a token -- the vocabulary never comes to the host. */
+  const kernel::DeviceBuffer logits = model_->forward_batch(tokens, n_per_seq, n_seq);
+  const int64_t vocab = model_->n_vocab();
+  kernel::DeviceBuffer index = backend_->allocate(8 * n_seq);
+  for (int64_t s = 0; s < n_seq; ++s) {
+    const kernel::DeviceBuffer row{logits.handle + static_cast<uintptr_t>(s * vocab * 4),
+                                   vocab * 4};
+    const kernel::DeviceBuffer slot{index.handle + static_cast<uintptr_t>(s * 8), 8};
+    backend_->argmax(row, vocab, slot);
+  }
+  backend_->synchronize();
+  std::vector<int64_t> ids(static_cast<std::size_t>(n_seq));
+  backend_->copy_to_host(ids.data(), index, n_seq * 8);
+  backend_->release(index);
+  for (int64_t s = 0; s < n_seq; ++s) {
+    out_tokens[s] = static_cast<int32_t>(ids[static_cast<std::size_t>(s)]);
+  }
+  /* `position_` tracks sequence 0, which is the single-sequence reader's
+   * notion of "where the cache is"; the model holds every sequence's length. */
+  position_ = model_->cache_length();
+}
+
 void Session::reset() {
   position_ = 0;
   if (model_ != nullptr) {
