@@ -125,6 +125,28 @@ POCKETLLM_API int pocketllm_decode(const pocketllm_session *session, const int32
 POCKETLLM_API int pocketllm_forward(pocketllm_session *session, const int32_t *tokens, int n, float *logits,
                                     int logits_cap);
 
+/* The greedy fast path: run `tokens` and write only the index of the largest
+ * logit into `out_token`.
+ *
+ * This is `pocketllm_forward` with the vocabulary left on the device.  The
+ * device computes the argmax (`Backend::argmax`) and four bytes cross the bus,
+ * so a caller that wants one token never materializes 151936 floats -- which is
+ * the whole cost of a decode step on a host whose logits surface is a Python
+ * list rather than a ctypes buffer.  The token it returns is the *same* one
+ * `pocketllm_argmax` would pick over the logits `pocketllm_forward` would have
+ * written: both are `Backend::argmax`, and ties resolve to the lowest index
+ * there, so the two paths cannot disagree.
+ *
+ * `out_token` is written only on success.  Returns 0 on success, a negative
+ * value on failure -- `kErrContextLength` for a prompt past the checkpoint's
+ * window, the same recoverable code `pocketllm_forward` returns.
+ *
+ * This is an addition, not a replacement: `pocketllm_forward` is unchanged and
+ * stays the call a sampler needs, because temperature/top-k/top-p want the
+ * distribution and not just its argmax. */
+POCKETLLM_API int pocketllm_forward_argmax(pocketllm_session *session, const int32_t *tokens, int n,
+                                           int32_t *out_token);
+
 /* Drop the KV cache and the position counter.  The next `pocketllm_forward`
  * starts a fresh sequence.  Returns 0 on success, negative on failure. */
 POCKETLLM_API int pocketllm_reset(pocketllm_session *session);

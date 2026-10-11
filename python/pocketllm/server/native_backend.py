@@ -241,11 +241,16 @@ class NativeBackend:
             self._engine.reset()
             prompt_tokens = self._prompt_tokens(request)
             started = time.perf_counter()
-            logits = self._engine.forward(prompt_tokens)
-            first_at: float | None = None
             budget = request.sampling_params.token_budget(
                 max(1, self._context_length - len(prompt_tokens))
             )
+            # The prefill is the first pass over the prompt and it yields the
+            # first token; `_advance` is the one place that decides whether
+            # that costs the whole vocabulary (sampling) or four bytes
+            # (greedy).  It is before `decode_started` so the timing split is
+            # the one this method always reported.
+            token = self._advance(prompt_tokens, request.sampling_params, len(prompt_tokens))
+            first_at: float | None = None
             decode_started = time.perf_counter()
 
             # The decoded text is carried whole and diffed, rather than assembled from
@@ -261,7 +266,6 @@ class NativeBackend:
             completion_tokens = 0
 
             for _ in range(budget):
-                token = self._draw(logits, request.sampling_params, len(prompt_tokens) + completion_tokens)
                 emitted_ids.append(token)
                 completion_tokens += 1
                 # Before the decode, not after: the end-of-text token decodes to its literal
@@ -293,7 +297,11 @@ class NativeBackend:
                     # instead.  The difference is documented rather than hidden.
                     finish_reason = "stop"
                     break
-                logits = self._engine.forward([token])
+                token = self._advance(
+                    [token],
+                    request.sampling_params,
+                    len(prompt_tokens) + completion_tokens,
+                )
 
             ended = time.perf_counter()
             usage = Usage(
@@ -329,19 +337,17 @@ class NativeBackend:
             self._engine.reset()
             prompt_tokens = self._prompt_tokens(request)
             started = time.perf_counter()
-            logits = self._engine.forward(prompt_tokens)
-            prefill_done = time.perf_counter()
             budget = request.sampling_params.token_budget(
                 max(1, self._context_length - len(prompt_tokens))
             )
+            # The prefill yields the first token; see `_advance` for the routing.
+            token = self._advance(prompt_tokens, request.sampling_params, len(prompt_tokens))
+            prefill_done = time.perf_counter()
 
             emitted_ids: list[int] = []
             text = ""
             finish_reason = "length"
             for _ in range(budget):
-                token = self._draw(
-                    logits, request.sampling_params, len(prompt_tokens) + len(emitted_ids)
-                )
                 emitted_ids.append(token)
                 if token == self._eos:
                     finish_reason = "stop"
@@ -350,7 +356,11 @@ class NativeBackend:
                 if _stop_match(text, request.sampling_params.stop) is not None:
                     finish_reason = "stop"
                     break
-                logits = self._engine.forward([token])
+                token = self._advance(
+                    [token],
+                    request.sampling_params,
+                    len(prompt_tokens) + len(emitted_ids),
+                )
 
             completed = time.perf_counter()
             text = _trim_stop(text, request.sampling_params.stop)
@@ -449,6 +459,26 @@ class NativeBackend:
                 _thinking_mode(request) == "thinking",
             )
         return request.prompt or ""
+
+    def _advance(self, last: list[int], params: SamplingParams, position: int) -> int:
+        """The next token from ``last``, greedy or sampled.
+
+        Greedy takes the ABI's argmax fast path (``Engine.next_token``) and never
+        materializes the vocabulary -- on this board the whole-vocabulary round
+        trip is the largest host-side cost of a decode step, so the greedy
+        default must not pay it.  Sampling needs the distribution, so the
+        sampling branch is the only caller of :meth:`_draw`.  Both loops (stream
+        and run) drive this one method, so the two cannot drift and there is one
+        place to read the routing.
+
+        ``last`` is always a token list -- the prompt on the first call, a
+        one-element list after -- because that is what both engine calls take,
+        and a one-token list costs nothing against the vocabulary it replaces.
+        ``position`` is the draw position, consulted only when sampling.
+        """
+        if params.greedy:
+            return self._engine.next_token(last)
+        return self._draw(self._engine.forward(last), params, position)
 
     def _draw(self, logits: list[float], params: SamplingParams, position: int) -> int:
         """One token, greedy or sampled, from the host's generator.

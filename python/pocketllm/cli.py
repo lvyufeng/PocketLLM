@@ -473,20 +473,39 @@ def _run_native(namespace: argparse.Namespace, engine_args: EngineArgs) -> int:
                 print("the prompt tokenized to nothing", file=sys.stderr)
                 return 1
 
-            # The prompt is one batch: every token in it attends to the ones
-            # before it, which is what makes a prefill one pass instead of n.
-            logits = engine.forward(tokens)
+            # Greedy needs the token and not the distribution, so it takes the
+            # ABI's argmax fast path (`next_token`) and never materializes the
+            # vocabulary -- the whole-vocabulary round trip is the largest
+            # host-side cost on this board.  Anything above a temperature of
+            # zero samples, which needs the logits, so it keeps `forward`.
+            if sampling.greedy:
+                token = engine.next_token(tokens)
+            else:
+                logits = engine.forward(tokens)
+                token = Engine.sample(
+                    Engine.temperature(logits, sampling.temperature),
+                    draws.random(),
+                    top_k=sampling.top_k or 0,
+                    top_p=sampling.top_p if sampling.top_p is not None else 1.0,
+                    min_p=sampling.min_p if sampling.min_p is not None else 0.0,
+                )
             print(namespace.prompt, end="", flush=True)
 
             for _ in range(namespace.max_tokens):
+                piece = engine.decode([token])
+                print(piece, end="", flush=True)
+                # One token per call, from the position the session is holding.
+                # A local counter here would be a second copy of a fact the
+                # engine already owns, and the two could disagree.
                 if sampling.greedy:
-                    token = Engine.argmax(logits)
+                    token = engine.next_token([token])
                 else:
                     # The transform is a separate call from the sample so the
                     # logits stay the model's own -- a caller that later wants
                     # logprobs wants the unscaled ones -- and the sampler is
                     # handed a uniform draw from this loop's generator and no
                     # other source of randomness.
+                    logits = engine.forward([token])
                     token = Engine.sample(
                         Engine.temperature(logits, sampling.temperature),
                         draws.random(),
@@ -494,12 +513,6 @@ def _run_native(namespace: argparse.Namespace, engine_args: EngineArgs) -> int:
                         top_p=sampling.top_p if sampling.top_p is not None else 1.0,
                         min_p=sampling.min_p if sampling.min_p is not None else 0.0,
                     )
-                piece = engine.decode([token])
-                print(piece, end="", flush=True)
-                # One token per call, from the position the session is holding.
-                # A local counter here would be a second copy of a fact the
-                # engine already owns, and the two could disagree.
-                logits = engine.forward([token])
             print()
             return 0
     except EngineUnavailable as exc:
