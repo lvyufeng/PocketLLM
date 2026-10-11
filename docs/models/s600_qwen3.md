@@ -1780,6 +1780,72 @@ only in how the answer is presented. `XlmEngine.infer` returns the delegate's ra
 `split_reasoning` presentation the [streaming](#serving-on-the-board) path uses, not a second
 generation.
 
+## Recovering from the delegate's hang: `--generation-timeout`
+
+`XlmEngine.infer` is **one blocking `ctypes` call** — `xlm_infer` returns nothing until the
+whole answer is decoded — and the delegate offers no timeout and no way to stop it once it
+has started (`supports_cancellation` is false for exactly that reason). A process that takes
+the lost-wake-up hang described above is therefore in a call that never returns, and **no
+timeout on the call site can reach it**: the call site is inside the call. The only place a
+watchdog can live is *outside the process*.
+
+Three shapes were considered, and two of them do not work:
+
+- **A watchdog thread in the same process cannot interrupt a blocked `ctypes` call.** Python
+  delivers an exception into a thread only at a bytecode boundary, and a thread parked in a
+  C call never reaches one; `xlm_infer` reads no cancellation flag either. The thread detects
+  the hang and recovers nothing — the process is still stuck.
+- **A thread running `infer` with a join-timeout recovers the caller but leaks the
+  accelerator.** The host can abandon the join and carry on, but the abandoned thread is
+  still inside `xlm_infer`, holding the delegate's one session and its BPU context. The
+  session cannot be `xlm_destroy`-ed while a call is in flight, so that BPU context is held
+  for the life of the process. That is not a mitigated failure; it is a leaked BPU.
+- **A subprocess per generation is the only shape that can be forcibly torn down**, and the
+  forced teardown is the whole recovery: a hung child holds the BPU only through its live
+  context, and `SIGKILL` takes that with it. Measured: after the gate below killed a hung 8B
+  run, the **next** run on the same `bpu_core` list produced a full answer. That is the fact
+  the design rests on — killing the process *is* the recovery, not a metaphor for one.
+
+`--generation-timeout SECONDS` selects it, and it is **off by default**, so an ordinary `run`
+is byte-for-byte what it was. With it set, `run` execs `pocketllm run` in a child with the
+same flags (the child is the one that opens the delegate) and watches that child's stdout: as
+long as decoded pieces keep arriving the child is making progress; when the stream goes
+**silent for the window** the child's **process group** is killed with `SIGKILL` — the group,
+because the hung decode worker is a thread of the child and a bare kill of the top pid would
+leave it holding the BPU. Detection is the same 25 s no-token stall #650 used; the flag's
+value is that window. To make the stream watchable the inner process writes each piece to a
+saved duplicate of the real stdout as the delegate produces it, because `infer` runs the call
+inside `quiet_delegate_stdout`, which points fd 1 at stderr for the duration.
+
+The output contract is preserved exactly. The inner process echoes the prompt *before* the
+decode and writes the pieces as they come, then only a terminating newline — so the child's
+stdout is `prompt + pieces + "\n"`, character-for-character the in-process `prompt + text +
+"\n"`. Verified on the 0.6B: `pocketllm run … --generation-timeout 25` and the plain run
+produce **byte-identical stdout** (`cmp` clean), same exit code, and the delegate's own banner
+still lands on stderr. The stderr of the child goes to a file, never a pipe drained at the
+end — the delegate's fd-2 banner can exceed a pipe buffer, and an unread pipe would block the
+child on a stderr write and be killed as a stall it did not cause.
+
+**Gate (board, 8B `cache_1024`, the `1..200` enumeration, 40 runs under
+`--generation-timeout 25`):** 38 runs clean, **2 hangs detected and killed** — run 32 after
+40 s (276 bytes of partial output) and run 37 after 55 s (2219 bytes) — both exiting **124**
+with the vendor-cause message on stderr and the partial text on stdout, and **0 leftover
+processes** across every run. The happy path is unchanged: 38 runs produced the full answer in
+~41 s, byte-identical to the unwatched command, and no clean run was falsely killed. The
+mechanism itself is pinned hardware-free in `tests/native/test_watchdog.py` (a stand-in child
+that stalls is detected and killed promptly; a healthy child is untouched; the parent is
+reusable after a kill), because the real hang is a ~1-in-10 race CI has no board to reproduce.
+
+**It is a mitigation, not a repair.** The deadlock is inside the vendor `libxlm.so` and is
+still there; a hung generation is *lost* — its partial text is all the caller gets and the
+request must be re-run — and the vendor fix is the only thing that removes it. What the
+watchdog buys is that the loss is one request instead of the whole process. It is a `run`
+flag, not a `serve` flag: the serving adapter serializes behind a lock it must hold for the
+request's life, so a deadlock there wedges the whole server, and recovering *that* needs a
+process boundary around the session (and a way for HTTP clients to learn the request died)
+that this change deliberately does not build. On `serve` today the only recovery from a hang
+is restarting the server, and that is stated rather than papered over.
+
 ## What is not on this path
 
 - **No Python backend implements the delegate.** `--device horizon` selects the `xlm` serving adapter,
