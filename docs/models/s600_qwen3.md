@@ -198,6 +198,68 @@ abbreviate, do not use an ellipsis, and do not add any other text.` The last row
 one prompt and slips under another. Each run is its own process, greedy, and the sha256 is over the full
 generated text.
 
+#### Where the corrupted-token slip lives: a survey across sizes and both cache lengths
+
+The `1..200` and `1..400` enumerations were then driven through **every graph on the board** — our
+compiled 0.6B / 1.7B / 4B / 8B at `cache_1024`, our rebuilt 1.7B at `cache_4096`, and the shipped 1.7B
+and 8B at `cache_4096` — three runs each, one process per run, the same greedy prompt and
+`bpu_core [0,1,2,3]`, classified from the streamed output as **clean** (the whole `1..N` listed),
+**slip** (a wrong token inside the list, which then continues), **self-stop** (EOS before reaching `N`),
+**truncate** (cut at the cache cap, clean to the last emitted token), **abbreviate** (the model chose an
+ellipsis), or **hang** (the lost wake-up of the section below, caught by the 25-second stall detector).
+The point of the survey is to ask whether the corrupted-token signature is an 8B property or a
+`cache_1024` property; the 8B's own `cache_4096` build is still compiling, so the shipped 8B at
+`cache_4096` stands in for it.
+
+| graph | cache | `1..200` | `1..400` | outcome class |
+|---|---|---|---|---|
+| ours 0.6B (w8) | 1024 | truncate, clean to 152 | truncate, clean to 177 | the ~1035-token cap, no corruption |
+| ours 1.7B (w4) | 1024 | abbreviates (`… 200`) | abbreviates, then cut mid-` thinking` at the cap | no corruption |
+| ours 1.7B (w4) | 4096 | **clean** | **clean** | lists fully, 1..200 and 1..400 |
+| ours 4B (w4) | 1024 | **slip at #24** (`2一`) | **slip at #24** (`2一`) | corrupts |
+| ours 8B (w4) | 1024 | **slip at #37** (`.bunifuFlatButton`); 1 of 3 hung | **slip at #56** (`.bunifuFlatButton`); 1 of 3 self-stopped at 22 | corrupts, and hangs |
+| shipped 1.7B (w4) | 4096 | clean | clean | — |
+| shipped 8B (w4) | 4096 | clean | clean | — |
+
+All three runs per cell unless the cell says otherwise; every cell that completed was byte-identical
+across its runs, so each is a mode, not a draw.
+
+**The corruption is a `cache_1024` property, and it is not an 8B one.** Two of the four `cache_1024`
+graphs corrupt the list — the 8B, as before, and the **4B**, which does it for the first time here: at
+both `1..200` and `1..400` it writes 1…23 cleanly and then `2一` for the 24th number before resuming at
+23/24, deterministically (3 of 3 identical, sha256 `bb7df4fb3543…` at `1..200`). The 8B keeps its 37th-
+and 56th-number `.bunifuFlatButton` slips; of its six runs one was the lost-wake-up hang
+and one self-stopped after 22 numbers behind a long reasoning block, so its cells rest on two
+observations, not three. Against that, the 0.6B and the 1.7B at the same `cache_1024` do **not** corrupt:
+the 0.6B reaches its ~1035-token cap and truncates mid-number (already documented above), and the 1.7B
+abbreviates the list outright (`1 2 3 … 200`) rather than corrupting within it. So the corrupted-token
+signature tracks neither size nor the `w4` width alone — the 1.7B is `w4` too and does not show it.
+
+**At the larger cache the corruption is gone — on every graph that has one.** Our rebuilt 1.7B at
+`cache_4096` lists `1..200` and `1..400` **completely and cleanly**, three runs identical in each — the
+same graph that abbreviates and then runs away at `cache_1024`. The shipped 1.7B and the shipped 8B, both
+`cache_4096`, are clean at both lengths as well; the shipped 8B in particular is the sum-of-one extra
+observation that the 8B, at `our build`'s width and the vendor's cache, does not corrupt. This is the
+second data point for the cache as the lever the 1.7B loop was already shown to be, and the reason the
+8B's own `cache_4096` build is the right next test: if it comes back clean on these enumerations, the
+slip is a `cache_1024` artefact like the loop; if it slips, the lever is width or the build, and the
+cache is not the whole story. **The survey cannot settle that on its own — the two `cache_4096` graphs
+that are running clean are neither ours nor the corrupting sizes, and the one genuinely decisive cell
+(our 8B at `cache_4096`) is the one still compiling.** What it does settle is narrower and worth stating
+plainly: the corruption is not peculiar to the 8B — the 4B makes it too — and it is absent wherever the
+cache is large.
+
+**The answer to the enumeration question for the 1.7B is yes.** The `cache_4096` rebuild that cured the
+1.7B's runaway loop also lists all of `1..200` and `1..400` without corruption; the enumeration stays
+clean at the larger cache, so the loop and the slip do not trade places when the cache grows.
+
+One determinism caveat the survey turned up, since it bears on how much weight a `3 of 3` carries: the
+**8B's reasoning block is not strictly byte-deterministic.** Of four completed shipped-8B `1..200` runs,
+three were identical and one diverged deep inside ` thinking` (char 4270 of the generation) before
+recovering to the same correct list — a same-prompt, same-graph, greedy divergence at the token level,
+the kind the smaller graphs did not show here. It did not change a single answer in the table above, but
+it is a second axis on which the 8B is the most fragile graph in the set, alongside the slip and the hang.
+
 ### Our compiled 0.6B vs the shipped 0.6B
 
 The recompile was extended to the size that matters most for latency, and it is the cleanest result of
