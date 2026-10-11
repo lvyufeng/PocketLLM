@@ -1700,7 +1700,9 @@ The corpus and every capture live in `~/scratch/ref/harness/` on the board: the 
 (`artifacts/0.6B-w8.*`, `artifacts/1.7B-w4.*`), the four cache-sweep captures of the 1.7B
 (`artifacts/1.7B-w4-{ours-c1024,c2048,ours-c4096}.*`), and the seven provenance-pair captures
 (`artifacts/0.6B-{ours,shipped}-w8.*`, `artifacts/0.6B-w4.*`, `artifacts/4B-{ours-c1024,shipped-c4096}.*`,
-`artifacts/8B-{ours,shipped}-w4.*`). The whole measurement is now
+`artifacts/8B-{ours,shipped}-w4.*`). The `f16`-oracle re-scoring of the 0.6B captures (and its
+`q4_k_m`-vs-`f16` floor) lives beside them as `0.6B-{ours,shipped}-w8-f16`, `0.6B-w4-f16` and
+`q4_k_m-vs-f16` — the same registry, scored against a second oracle. The whole measurement is now
 **one command** — see [the harness](#the-harness-one-command) below, which is what makes the vendor's
 `w4` 0.6B a single invocation when it lands. The single-prompt artifacts remain at
 `~/scratch/ref/parity/s600_parity.json`.
@@ -1843,16 +1845,51 @@ a fourth shape on the new `0.6B w4` row: a near-collapse toward zero shared pref
 wide-margin tail. The honest statement is that provenance is a real, every-size axis on this table,
 weakest where the model is smallest.
 
-**And a narrower precision did not buy agreement here — it cost it, which is an OPEN question, not a
-conclusion.** The `0.6B w4` row was built to test whether matching the oracle's width narrows the gap;
-it does the opposite, and by a wide margin (our-w4 agrees less than our own `w8`, at every summary
-statistic). The tempting inference — "so agreement with a quantized oracle is not monotonic in *our*
-precision" — is **not claimed here**, because the `q4_k_m` oracle is itself a quantization and the two
-sides read different numeric scales; a `w4` build can be *further* from a 4-bit k-quant oracle than a
-`w8` build is, if the `w8` build's finer weights happen to land closer to the k-quant's coarser grid on
-this corpus. Which of those it is cannot be separated against a quantized oracle at all: the
-disambiguating measurement is a **near-lossless (`f16`) oracle**, and it has not been run. Until it is,
-the plain fact stands and the mechanism does not.
+**And a narrower precision did not buy agreement here — it cost it. This was an OPEN question; the
+`f16` oracle has now been run and it is answered below.** The `0.6B w4` row was built to test whether
+matching the oracle's width narrows the gap; it does the opposite, and by a wide margin (our-w4 agrees
+less than our own `w8`, at every summary statistic). The tempting inference — "so agreement with a
+quantized oracle is not monotonic in *our* precision" — cannot be settled against a `q4_k_m` oracle,
+because that oracle is itself a quantization and the two sides read different numeric scales.
+
+#### The `f16` oracle: the gap is real against truth, and a floor separates w8 from w4
+
+The same 50-prompt captures were re-scored against a **near-lossless `f16`** checkpoint
+(`qwen3-0.6b-f16.gguf`, 1,509,347,584 B, `general.file_type = 1` — genuinely F16, 198 f16 + 113 f32
+tensors and no quant tensors), so `f16` stands in for truth and a `q4_k_m`-oracle row can be read
+against it. The captures are oracle-independent — they hold the prompts' token ids and the board's
+continuation ids — so this re-scores the existing `0.6B-{ours,shipped}-w8` and `0.6B-w4` captures
+without re-running the board; the `q4_k_m`-vs-`f16` floor is a direct C-engine-vs-C-engine pass on the
+same prompt ids:
+
+| graph | vs `f16` (truth) min/p25/med/p75/max | hist (0–4/5–9/10–19/20–29/30–39/40+) | ≥5 splits | Σ prefix |
+|---|---|---|---|---|
+| shipped `w8` | 4 / 10 / **20** / 36 / 133 | 1 / 10 / 13 / 7 / 9 / 10 | 1 | **1327** |
+| ours `w8` | 2 / 8 / **16** / 28 / 70 | 3 / 11 / 14 / 12 / 6 / 4 | 0 | **973** |
+| **`q4_k_m` vs `f16` (the floor)** | 4 / 8 / **20** / 27 / 56 | 4 / 10 / 9 / 19 / 5 / 3 | 0 | **995** |
+| ours `w4` | 0 / 0 / **4** / 6 / 22 | 33 / 11 / 2 / 4 / 0 / 0 | 15 | **240** |
+
+Two readings fall out, and the first one **truth-anchors** the provenance rows rather than retracting
+them:
+
+- **The gap holds against truth.** Shipped `w8` reaches a **1327** total shared prefix against `f16`
+  where ours reaches **973**; the shipped graph is the closer-to-truth one, exactly as the `q4_k_m`
+  table said. What the `f16` run corrects is the *reading*, not the finding: the **`q4_k_m` oracle sits
+  ~20 shared tokens from truth itself** (the floor row: median 20, Σ 995) — a GGML k-quant is not a
+  near-truth reference — so the `q4_k_m` table **flattened our `w8`**, pinning it at the oracle's own
+  error (ours-w8 Σ 973 ≈ floor Σ 995). Against truth our `w8` is closer to the oracle than the
+  `q4_k_m` table could show; the `q4_k_m`-measured gap understates how far apart ours and shipped
+  actually are.
+- **The w4/w8 asymmetry is the load-bearing fact.** Our `w8` sits **at the floor** — its
+  `q4_k_m`-oracle "gap" is largely the oracle's own error, not our build's. Our `w4` sits **well below**
+  the floor (Σ **240** against the floor's **995**): it is *further from truth than the GGML 4-bit
+  k-quant itself is*, a real and severe deficit, not an artefact of the quantized reference. So
+  "our build is less oracle-like" is **precision-dependent**: true and severe for our `w4`, mostly the
+  oracle for our `w8`.
+
+The consequence is a rule for reading this whole section: **the `q4_k_m`-vs-`f16` floor (~20 median
+shared tokens) is the yardstick, and any `q4_k_m`-oracle row must be read against it.** A row at the
+floor is measuring the oracle's quantization error, not ours; a row below it is a genuine deficit.
 
 **The 4B closes the table, and the row it closes is the one that still cannot be paired the decisive
 way.** The 4B is the last size with a shipped-and-ours pair, so the provenance gap now rests on **all
