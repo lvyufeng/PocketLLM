@@ -195,6 +195,7 @@
 #include <aclnn/acl_meta.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -259,19 +260,32 @@ double now_ms() {
  * outside a slot is not attributed; the op-scope total is printed per op so that
  * remainder is visible as the gap. */
 constexpr int kNumStages = 10;
+/* A stage name per slot, shared by the global dump and the per-op matrix so the
+ * two cannot disagree about slot ordering. */
+const char *const kStageNames[kNumStages] = {
+    "to_f16",    "to_f32",         "sdma_up",   "sdma_down", "tensor_create",
+    "tensor_destroy", "ws_get",    "ws_alloc",  "op_enqueue", "op_sync"};
 struct StageStats {
   double ms[kNumStages] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   long calls[kNumStages] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   std::unordered_map<std::string, std::pair<double, long>> ops;
+  /* Per-op, per-stage milliseconds.  The global stage totals answer "how much
+   * conversion is there" but not "which op's conversion", and the second is the
+   * question a boundary change needs -- so every op scope records its own stage
+   * deltas here.  Keyed by the op name, the same key `ops` uses. */
+  std::unordered_map<std::string, std::array<double, kNumStages>> op_stage;
 
   void add(int i, double dt) {
     ms[i] += dt;
     calls[i] += 1;
   }
-  void totals_in(const std::string &op, const double before[kNumStages]) {
+  void totals_in(const char *op, const double before[kNumStages]) {
     double t = 0;
+    auto &row = op_stage[op];
     for (int i = 0; i < kNumStages; ++i) {
-      t += ms[i] - before[i];
+      const double d = ms[i] - before[i];
+      t += d;
+      row[static_cast<std::size_t>(i)] += d;
     }
     auto &p = ops[op];
     p.first += t;
@@ -281,16 +295,13 @@ struct StageStats {
     if (!profile_on()) {
       return;
     }
-    static const char *const names[kNumStages] = {
-        "to_f16",    "to_f32",         "sdma_up",   "sdma_down", "tensor_create",
-        "tensor_destroy", "ws_get",    "ws_alloc",  "op_enqueue", "op_sync"};
     double total = 0;
     for (int i = 0; i < kNumStages; ++i) {
       total += ms[i];
     }
     std::printf("\n[pocketllm ascend profile] per-stage, summed over the process\n");
     for (int i = 0; i < kNumStages; ++i) {
-      std::printf("  %-15s %10.1f ms  %6.1f%%  %8ld calls\n", names[i], ms[i],
+      std::printf("  %-15s %10.1f ms  %6.1f%%  %8ld calls\n", kStageNames[i], ms[i],
                   total > 0 ? 100.0 * ms[i] / total : 0.0, calls[i]);
     }
     std::printf("  %-15s %10.1f ms\n", "TOTAL", total);
@@ -299,6 +310,29 @@ struct StageStats {
       std::printf("  %-16s %10.1f ms  %8ld calls  %8.3f ms/call\n", kv.first.c_str(), kv.second.first,
                   kv.second.second,
                   kv.second.second ? kv.second.first / static_cast<double>(kv.second.second) : 0.0);
+    }
+    /* The op x stage matrix: one row per op, one column per stage, plus the
+     * op's own-scope total and a "other" column for the part of its wall the
+     * stage clocks do not name (the host glue around the ops: the memcpy repack
+     * `attention` does per call, the aclnn/tensor setup, the loops that feed a
+     * launch).  This is the table the boundary question is read off: how much of
+     * each op's wall is conversion, how much transfer, how much its own kernel. */
+    std::printf("\n[pocketllm ascend profile] by op x stage (ms)\n  %-14s", "op");
+    for (int i = 0; i < kNumStages; ++i) {
+      std::printf("%12s", kStageNames[i]);
+    }
+    std::printf("%12s%12s\n", "op_total", "other");
+    for (const auto &kv : ops) {
+      const auto it = op_stage.find(kv.first.c_str());
+      const bool have = it != op_stage.end();
+      double named = 0;
+      std::printf("  %-14s", kv.first.c_str());
+      for (int i = 0; i < kNumStages; ++i) {
+        const double v = have ? it->second[static_cast<std::size_t>(i)] : 0.0;
+        named += v;
+        std::printf("%12.1f", v);
+      }
+      std::printf("%12.1f%12.1f\n", kv.second.first, kv.second.first - named);
     }
   }
 };
@@ -785,6 +819,7 @@ class AscendBackend final : public Backend {
     }
     aclnn_ok(aclnnMatmulW4a16Custom(workspace, ws_size, executor, stream_),
              "aclnnMatmulW4a16Custom");
+    StageClock _c(9); /* op_sync */
     acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
 
     /* The op emits fp16; the graph's `out` is f32.  Widen on the host. */
@@ -959,6 +994,7 @@ class AscendBackend final : public Backend {
              "aclrtMalloc workspace");
     }
     aclnn_ok(aclnnSiluMulCustom(workspace, ws_size, executor, stream_), "aclnnSiluMulCustom");
+    StageClock _c(9); /* op_sync */
     acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
 
     /* The op emits fp16; the graph's `out` is f32. */
@@ -1053,6 +1089,7 @@ class AscendBackend final : public Backend {
              "aclrtMalloc workspace");
     }
     aclnn_ok(aclnnRopeCustom(workspace, ws_size, executor, stream_), "aclnnRopeCustom");
+    StageClock _c(9); /* op_sync */
     acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
 
     std::vector<uint16_t> out_h(static_cast<std::size_t>(rows * d));
@@ -1233,6 +1270,7 @@ class AscendBackend final : public Backend {
              "aclrtMalloc workspace");
     }
     aclnn_ok(aclnnArgMax(workspace, ws_size, executor, stream_), "aclnnArgMax");
+    StageClock _c(9); /* op_sync */
     acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
     copy_to_host(&best, dout, 8);
     copy_to_device(out, &best, 8);
@@ -1269,6 +1307,7 @@ class AscendBackend final : public Backend {
              "aclrtMalloc workspace");
     }
     aclnn_ok(aclnnSoftmax(workspace, ws_size, executor, stream_), "aclnnSoftmax");
+    StageClock _c(9); /* op_sync */
     acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
     if (workspace != nullptr) {
       aclrtFree(workspace);
@@ -1297,6 +1336,7 @@ class AscendBackend final : public Backend {
 
   void synchronize() override {
     ensure_context();
+    StageClock _c(9); /* op_sync */
     acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
   }
 
@@ -1356,6 +1396,7 @@ class AscendBackend final : public Backend {
              "aclrtMalloc workspace");
     }
     aclnn_ok(aclnnRmsNormNdCustom(workspace, ws_size, executor, stream_), "aclnnRmsNormNdCustom");
+    StageClock _c(9); /* op_sync */
     acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
     if (workspace != nullptr) {
       aclrtFree(workspace);
@@ -1705,6 +1746,7 @@ class AscendBackend final : public Backend {
     }
     aclnn_ok(aclnnAttentionStepCustom(workspace, ws_size, executor, stream_),
              "aclnnAttentionStepCustom");
+    StageClock _c(9); /* op_sync */
     acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
 
     std::vector<uint16_t> out_h(static_cast<std::size_t>(n_heads * d));
@@ -1775,6 +1817,7 @@ class AscendBackend final : public Backend {
              "aclrtMalloc workspace");
     }
     aclnn_ok(aclnnEmbedding(workspace, ws_size, executor, stream_), "aclnnEmbedding");
+    StageClock _c(9); /* op_sync */
     acl_ok(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
 
     std::vector<float> rows(static_cast<std::size_t>(n * d));

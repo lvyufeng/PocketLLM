@@ -692,6 +692,32 @@ gates hold as documented above: **0.6B identical, 1.7B the one near-tie, 4B iden
 deliverable is the split above — the measured answer that the transfers are a ninth of the step, so
 the change the page named is not worth making, and the profile names a different bottleneck instead.
 
+### The per-op stage matrix (the profiler's second table)
+
+The per-stage table above answers "how much conversion is there in a step" but not **"which op's
+conversion"** — and the second is the question a boundary change asks. The clock now records each
+op scope's *own* stage deltas, and the profile prints a second table at exit:
+
+```
+[pocketllm ascend profile] by op x stage (ms)
+  op                  to_f16      to_f32     sdma_up   sdma_down  tensor_create ... op_sync   op_total     other
+  attention             ...          ...         ...         ...            ...        ...        ...        ...
+  gemm_quant            ...          ...         ...         ...            ...        ...        ...        ...
+```
+
+One row per op, one column per stage, plus the op's own-scope `op_total` and an **`other`** column —
+the part of that op's wall the stage clocks do not name, which is the host glue around the op (the
+`attention` memcpy repack, the `aclTensor`/`GetWorkspaceSize` setup, the loops that feed a launch).
+It is the raw material for the split in
+[the batched-decode bound page](ascend_310b_batch_decode_bound.md#5-what-the-term-actually-is-split):
+that page reads the residual it used to leave at 56% off this table.
+
+It is the same `POCKETLLM_ASCEND_PROFILE` gate as the per-stage table: with the flag unset no timer
+is armed and no clock is read, and it was landed under the same byte-identical gate. Instrumenting
+the last nine `aclrtSynchronizeStream` call sites (the per-stage table's `op_sync` column had only
+`gemm_quant`'s two) is what makes the matrix honest — before it, six ops reported a zero kernel and
+their host wall was over-counted into `other`.
+
 ## The 343 launches are not the cost — correcting the profile above
 
 The section above ends on a reading that the next two experiments falsify. It said the 452.8 ms of

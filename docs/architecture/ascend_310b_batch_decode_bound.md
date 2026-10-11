@@ -106,30 +106,51 @@ The 1.7B confirms the shape, with the GEMM's share larger and the attention's sm
 ms/sequence): `gemm_quant` **46.1 (45%)**, `attention` **5.2 (5%)**, `rms_norm` 3.2, `rope_neox` 1.5,
 `silu_mul` 1.4, `kv_append` 0.5.
 
-## 5. What the term actually is
+## 5. What the term actually is, split
 
-Three interior costs, all of which scale with the batch row count, none of which a batched *attention* kernel
-touches:
+The profiler was extended to record a **per-op × per-stage matrix**
+(see [ascend_310b.md](ascend_310b.md#the-per-op-stage-matrix-the-profilers-second-table)),
+so the residual this section used to leave unattributed is now split. Two views, both measured on the same
+0.6B board runs.
 
-1. **The m = B GEMM (30% of the 0.6B slope, 45% of the 1.7B's).** This is the cube doing *its job*: at B=1 a
-   step reads the full weight for one row, and at B=4 the same weight pass serves four rows, which is the
-   whole reason aggregate throughput rises (1.4 → 8.2 t/s over B=1…16, the Stage-2 result). But an m = B GEMM
-   is not free of B: the cube's own ms curve is `0.657 + 0.0393·m` ([ascend_m_filling.md](ascend_m_filling.md)),
-   so its wall still grows with m, and that growth is a per-sequence term. The kernel cannot remove it — the
-   GEMM is the work.
-2. **Host f32↔f16 conversion and transfer of the m = B activations.** `to_f16` and `to_f32` slope at 3.6 and
-   3.7 ms/sequence, and `sdma_up`/`sdma_down` at 5.1 and 4.3 — a combined ~17 ms/sequence of the 85.5, and it
-   is inside the "host glue" row because it is booked per-op. It scales **linearly with B** (to_f16: 3.6 → 14.3
-   ms/step from B=1 to B=4) because every op still brings its activation to the host, converts, and sends it
-   back (`ascend_310b.md`'s "activation-side transfers"). This is the largest single *removable* term, and it
-   is a backend change, not an attention kernel.
-3. **The m = B rows through the row-wise ops** (`rms_norm`, `silu_mul`, `rope_neox`): ~4.6 ms/sequence
-   together, again linear in m.
+**The step** (B=8, plen 53, 829.9 ms/step) splits:
 
-The 56% "host glue" row is the honest residual: it is the per-op host work that is not one of the four named
-stage slots — the memcpy repack `attention` does per call, the aclnn/tensor setup around each op, and the host
-loops that feed them. It is stated as a residual rather than attributed further because the clock does not
-split it, and it does not change the verdict: **none of it is op-launch count.**
+| component | ms/step | share |
+|---|---|---|
+| kernel — `op_sync`, the NPU running the op | 585.0 | 70.5% |
+| `sdma_up`/`sdma_down` — the host transfers | 86.1 | 10.4% |
+| `to_f16`/`to_f32` — the host f32↔f16 convert | 58.4 | 7.1% |
+| `op_enqueue` — the host cost of the op call | 6.0 | 0.7% |
+| unattributed — per-op `aclTensor` setup, `GetWorkspaceSize`, the loops that feed a launch | 90.4 | 10.9% |
+
+**The per-sequence slope** (the term itself, 85.4 ms/sequence at B=1→4) splits:
+
+| component | ms/sequence | share |
+|---|---|---|
+| kernel | 66.4 | 77.7% |
+| `sdma` transfers | 11.4 | 13.3% |
+| conversion | 7.3 | 8.5% |
+| enqueue | 0.4 | 0.5% |
+
+Ranked per-op host work on the slope: **`attention` 8.8, `gemm_quant` 5.1, `rms_norm` 2.2, `rope_neox` 1.6,
+`silu_mul` 0.8, `kv_append` 0.5** ms/sequence. Two readings:
+
+- **The slope is 78% kernel work** — the batch's own arithmetic (the m = B GEMM and the m = B rows through
+  the row-wise ops). The kernel cannot remove it; the GEMM's own curve is `0.657 + 0.0393·m`
+  ([ascend_m_filling.md](ascend_m_filling.md)), so it grows with m by construction.
+- **The largest *removable* host term is `attention`'s, and it is a device transpose, not a round-trip.**
+  Its host cost is **context-growing** — 63.9 ms/step at a 53-token context, **155.7 ms/step at 253** — while
+  the GEMM's is flat. That is the layout bridge in the file header: `attention` gathers the whole KV window
+  `[0, context)` to the host, repacks it token-major → head-major, and sends it back, once per (sequence,
+  layer) per step. The #632/#643 pattern ("keep an activation in its own width across a boundary") **does not
+  apply**: #643's `prefers_kv_projection_in_cache_dtype` already removed the re-widen, and what is left is a
+  transpose, which no width flag removes. The `gemm_quant` conversion (5.1 ms/sequence) is the other
+  candidate, and it needs an on-device f32↔f16 cast the board does not ship.
+
+So the "host glue" this page used to leave as a 56% residual is, measured, **a device transpose plus per-op
+`aclNN` setup — not a boundary round-trip, and not op-launch count.** No *attention* kernel touches it: the
+transpose is a host memory walk, and a fused attention op that reads the cache in place would remove it — but
+that is Stage 3, which does not otherwise earn its cost.
 
 ## 6. The consequence: Stage 3 does not earn its cost, and the batched assembly removes ≤8%
 
