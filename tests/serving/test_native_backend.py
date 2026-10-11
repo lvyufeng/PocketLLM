@@ -22,6 +22,7 @@ that gives each request its own KV slot, so the isolation is structural rather t
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import threading
 import time
@@ -33,12 +34,34 @@ from pocketllm.api import ConfigurationError, EngineArgs
 from pocketllm.protocol import build_chat_request, build_completion_request
 from pocketllm.protocol.contract import COMPLETIONS
 
-pytestmark = pytest.mark.skipif(
-    not pathlib.Path("/mnt/data1/models/qwen3-0.6b-f16.gguf").exists(),
-    reason="the Qwen3-0.6B checkpoint is not on this host",
+#: An explicit checkpoint wins.  The fallback searches the directories this repository's hosts keep
+#: Qwen3 GGUFs in, so the batched path, the KV-wipe regression test and the G2 gate run on a host
+#: that has *a* Qwen3-0.6B -- not only the f16 one the module used to name by absolute path.  G2
+#: compares batched against solo on the same file, so it is checkpoint-independent; only the golden
+#: fixture is not, and it skips unless its exact f16 (its recorded sha) is present.
+_CHECKPOINT_ENV = ("POCKETLLM_SERVING_GGUF", "POCKETLLM_MODEL", "CKPT_PATH")
+_CHECKPOINT_DIRS = (
+    pathlib.Path("/mnt/data1/models"),
+    pathlib.Path.home() / "models",
+    pathlib.Path.home() / "models" / "gguf",
 )
 
-CHECKPOINT = "/mnt/data1/models/qwen3-0.6b-f16.gguf"
+
+def _find_checkpoint() -> str:
+    for name in _CHECKPOINT_ENV:
+        override = os.environ.get(name)
+        if override and pathlib.Path(override).is_file():
+            return override
+    for directory in _CHECKPOINT_DIRS:
+        if not directory.is_dir():
+            continue
+        for candidate in sorted(directory.glob("Qwen3-0.6B*.gguf")):
+            return str(candidate)
+    return ""
+
+
+#: The checkpoint the engine is pointed at, or ``""`` when this host has none.
+CHECKPOINT = _find_checkpoint()
 
 #: The checkpoint's end-of-text id, read here rather than imported so a change to how the adapter
 #: finds it cannot hide behind the same lookup on both sides.
@@ -51,13 +74,29 @@ def _native_available() -> bool:
     return native.is_available()
 
 
-pytestmark = [
-    pytestmark,
-    pytest.mark.skipif(
-        not _native_available(),
-        reason="libpocketllm.so is not built (cmake -B build -S src && cmake --build build)",
-    ),
-]
+pytestmark = pytest.mark.skipif(
+    not _native_available(),
+    reason="libpocketllm.so is not built (cmake -B build -S src && cmake --build build)",
+)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _serving_gates_need_a_checkpoint() -> None:
+    """An absent checkpoint is a FAILURE here, not a skip.
+
+    This module is the gate for the batched path, the KV-wipe regression and G2, and the bug those
+    gates exist to catch is *silent wrong text* -- so a module that quietly skips when no checkpoint
+    is on the host is indistinguishable from the bug passing.  If there is no Qwen3-0.6B GGUF the
+    gates cannot run, and that has to be loud: every test in the module fails with a message naming
+    where a checkpoint is looked for.  (The engine library being unbuilt is still a skip -- that is
+    a build state of the host, not the condition under test.)
+    """
+    if not CHECKPOINT:
+        pytest.fail(
+            "no Qwen3-0.6B GGUF on this host, so the serving gates cannot run -- and a gate that "
+            "cannot run must fail, not skip. Set POCKETLLM_SERVING_GGUF (or POCKETLLM_MODEL / "
+            "CKPT_PATH), or place a Qwen3-0.6B*.gguf under /mnt/data1/models or ~/models"
+        )
 
 
 @pytest.fixture(scope="module")
