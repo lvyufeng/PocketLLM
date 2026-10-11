@@ -1110,7 +1110,7 @@ So the answer is split, and both halves are useful. On the **C path there is no 
 is 0.3% and the step is at the GEMV roofline. On the **host shell there is a large one** — the Python
 bridge materializes the full vocab twice per step for a token that is one integer, when
 `Session::forward` already has an `argmax_out` that fills the id from the device in 8 bytes.
-**The interface change landed as the follow-up (#645)**, and it is small and mirrors #643's shape. A
+**The interface change landed as the follow-up (#646)**, and it is small and mirrors #643's shape. A
 new additive ABI call, `pocketllm_forward_argmax(session, tokens, n, int32_t *out_token)`, returns the
 greedy id through a 4-byte out-parameter and leaves `pocketllm_forward` untouched for samplers;
 `native.Engine.next_token` calls it and never builds a list; the CLI's greedy loop and the serving
@@ -1131,8 +1131,18 @@ remainder. The new path is **byte-identical** to the old — it is the same C `a
 so the token sequence is unchanged — verified on `cpu` and `ascend` over 16 greedy steps from the same
 prompt. The win is greedy-only, which is the default and the documented fast path.
 
+**On the two before-numbers.** They describe the same before-state but are not the same
+measurement. **266–269 ms/step** is this change's own figure, and it is a *difference of two
+loops on one binary* — greedy-through-`forward` minus greedy-through-`next_token`, with
+nothing else inside the timed region — so it is read against the after-number from the same
+instrument. **308 ms/step**, in the paragraph above, is #644's figure for the same command: a *sum*
+of two separately-measured terms (102 for the C step plus ~205 for the host-shell overhead), not a
+single timed loop. The ~40 ms between them is that difference — a summed estimate against
+a timed whole — and the directly-measured **266–269** is the before-number the after-number
+in the table below is measured against.
+
 **#644 itself changed no behavior.** This section is measurement, not code: no op and no graph moved,
-and the ABI change it recommends is #645's, above, not this section's. The identity gates (#643's
+and the ABI change it recommends is #646's, above, not this section's. The identity gates (#643's
 byte-identical 0.6B/1.7B/4B) stand because nothing was rebuilt. The D2H and
 sampler figures come from standalone benchmarks against the shipped `libpocketllm.so`; the per-stage
 and per-op tables come from `POCKETLLM_ASCEND_PROFILE=1` on the same binary the canonical section's
