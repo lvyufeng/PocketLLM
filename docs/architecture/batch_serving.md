@@ -1,5 +1,15 @@
 # Batch serving on the 310B: concrete changes, the honest ceiling, and the smallest version
 
+> **Measured since.** Stages 1–2 landed and the per-sequence term of a batched decode step was measured
+> directly. It is **interior m = B work** — the batch-sized GEMM and the host f32↔f16 conversion and
+> transfer of m = B activations — not the KV re-read this page prices and not the B op launches per layer
+> the Stage-3 scoping re-attributed it to. The `1 × B` `AttentionStepCustom` loop is **~8%** of the
+> per-sequence slope and the pure op enqueue **~0.6%**, and the slope grows with context where launch count
+> does not. So this page's **Stage 3 — the batched attention kernel — does not earn its cost**, and the
+> batched-primitive assembly it recommends as the cheaper test removes at most that 8%. See
+> [The 310B batched-decode bound](ascend_310b_batch_decode_bound.md). §1c, §3 and §4 below are kept as
+> written; the recommendation is **STOP at Stage 1–2 for the 310B.**
+
 [Filling m on the 310B](ascend_m_filling.md) (#600) priced the shape limit and chose **neither** lever:
 batch serving's payoff is real (measured **3.7× per-sequence at k=4, 6.6× at k=8**) but its cost was a
 **new `ascend310b` attention kernel** plus a correctness-critical rewrite, for a board that serves one

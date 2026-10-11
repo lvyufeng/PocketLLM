@@ -89,6 +89,7 @@ nav:
       - Serving: architecture/serving.md
       - Filling m on the 310B: architecture/ascend_m_filling.md
       - Batch serving on the 310B: architecture/batch_serving.md
+      - The 310B batched-decode bound: architecture/ascend_310b_batch_decode_bound.md
       - The S600 native compile chain: architecture/s600_native_chain.md
   - Models:
       - Overview: models/README.md
