@@ -720,6 +720,84 @@ spend its budget on the loop, not the cache) and **`--cache_len 2048` for the 4B
 truncates at 1024 and decode is weight-bound, so doubling the window costs almost nothing). **Never build
 below `1024`** — the floor is the loop threshold plus the wrapper.
 
+#### The decode step from outside: the host contributes nothing, and there is no lever out here
+
+The 310B got two of its wins from changes *inside* the decode path — a KV-projection dtype fix (615 → 309
+ms/step) and a greedy fast path (266 → 137). S600 had never been given the same treatment, and the honest
+question is whether an equivalent lever exists on the *outside* of the delegate: the CLI shell
+(tokenize, sampling, detokenize, print), the `ctypes` boundary, the BPU-core allocation, the cache. The
+delegate is a black box — the compiled `.hbm` is text in, text out — so what can be measured from outside
+is exactly the shell and the graph's own rates, and nothing between.
+
+**Method: bracket every decoded piece with `perf_counter` at the callback.** The delegate makes a callback
+per piece; the host timestamp at each one gives the *host-observed* per-step time, to compare against the
+delegate's own `decode_tps` (whose reciprocal is its per-step claim). If the shell were a real share of the
+step, the host-observed step would exceed `1/decode_tps`; the difference is the host's share. Same
+enumeration prompt as the rest of this page, greedy, one process per graph, three runs each, median:
+
+| graph | delegate step (`1/decode_tps`) | host-observed step | host share |
+|---|---|---|---|
+| ours 0.6B `cache_1024` | 8.26 ms | 8.30 ms | **0.5%** |
+| ours 1.7B `cache_1024` | 11.26 ms | 11.36 ms | **0.9%** |
+| ours 1.7B `cache_4096` | 14.34 ms | 14.44 ms | **0.7%** |
+| shipped 1.7B `cache_4096` | 14.30 ms | 14.39 ms | **0.6%** |
+| ours 4B `cache_1024` | 20.07 ms | 20.17 ms | **0.5%** |
+| shipped 8B `cache_4096` | 33.77 ms | 33.92 ms | **0.4%** |
+
+**The shell is 0.4–0.9% of the step — 70 µs to 150 µs — and it does not grow with the work.** The gap is
+roughly constant in absolute terms (0.04–0.15 ms) while the step quadruples from the 0.6B to the 8B, so it
+is fixed per-piece cost (the Python callback boundary), not a share of anything the model does. Timing the
+shell's own phases separately confirms the same shape: `xlm_init`→ready is **5.3 s cold, 1.3–1.8 s warm**
+(page cache), and the over-cap token counter is built **once** and cached — neither is a per-step cost.
+
+**The callback is on the critical path, one-for-one — and that is what proves the host side has no room.**
+Injecting real host work into the callback is additive to the step, millisecond for millisecond:
+
+| injected per piece | wall step | host-observed step | delegate-reported step |
+|---|---|---|---|
+| 0 ms | 14.36 ms | 14.35 ms | 14.24 ms |
+| 2 ms | 16.37 ms | 16.37 ms | 16.27 ms |
+| 5 ms | 19.41 ms | 19.41 ms | 19.31 ms |
+| 10 ms | 24.32 ms | 24.41 ms | 24.31 ms |
+
+Two things fall out. First, the delegate **hands control to the host between tokens and waits for it** —
+the callback is not overlapped with the next step's BPU work, so host work and BPU work serialize (this is
+why a host-side per-piece hook is a *cost*, never a lever). Second, when 10 ms is injected, the delegate's
+own `decode_tps` drops to match the wall time (41 t/s, 24.3 ms reported) — so `decode_tps` is a **wall-time
+measurement including the callback**, not a BPU-only figure, and the small sub-1% gap between it and the
+host is pure timestamping skew. Nothing hides between them.
+
+**The watchdog's per-piece write is free.** The one piece of per-piece work this tree does add is the
+streaming `os.write` the generation watchdog emits per decoded piece. Bracketed the same way, a run that
+`os.write`s each piece and one that does not differ by **0.01 ms/step** (14.345 vs 14.355) — inside the
+run-to-run spread, i.e. unmeasurable. So the watchdog's live stream costs no decode rate, which is the
+check that it is safe to leave on.
+
+**`bpu_core` is fixed at compile time and is not a lever.** Every graph here is `corenum_4_4`, and a config
+whose `bpu_core` names a subset of the compiled cores does not simply run fewer of them — the delegate
+refuses it (`XLM_STATE_ERROR`, the graph did not run). The core count is a property of the `.hbm`, so
+"more cores = faster decode" is not something a caller can dial from the host; it would be a rebuild.
+
+**The cache already told the same story, and the new numbers corroborate it.** The 1.7B step is **11.26 ms
+at `cache_1024` and 14.34 ms at `cache_4096`** — same weights, same host, only the cache differs — so the
+**3.08 ms difference is the KV alone** (3072 extra cached tokens at ~0.115 MB/token ≈ 353 MB, ≈ 114 GB/s,
+the LPDDR5 rate the [step decomposition](#where-the-compiled-06bs-138-actually-comes-from-the-bpu-is-the-whole-step)
+fitted). The delegate reports the larger cache at 69.7 t/s against the smaller at 88.8 — a **1.27×** decode
+win, reproducing the ladder's figure on a fresh measurement, and the whole of it is DRAM bytes the host
+never sees.
+
+**What this cannot attribute, stated plainly.** The split *inside* `xlm_infer` — BPU-core compute vs the
+delegate's own op-launch/host glue (its tokenization, sampling bookkeeping, detokenization) — is invisible
+from outside the black box. The evidence that the step is DNN-bound is external and indirect: the shell is
+<1%, the cache moves the step by exactly the KV's bytes at the DRAM rate (which a host-bound step would
+not), and `hrt_model_exec`'s node profiler independently puts ~93% of the 0.6B step in BPU-core. But a
+host-glue share of a few percent inside the delegate could hide in that residue and this page would not see
+it. What is *established* is the shape of the answer: **the lever is not outside the delegate.** The shell
+is 0.4–0.9%, the callback is a cost rather than a saving, and the core count is fixed at build — so a
+310B-style win on S600 is a **rebuild** (a dtype / fast-path change inside the `.hbm`, which the compile
+host owns), not a host change. The one lever a caller does hold is the cache, and it is already spend
+against context, not free.
+
 #### Answer faithfulness: 9/10 on the 0.6B and 10/10 on the larger graphs
 
 A different build of the same weights can be faster and still reach different answers, and the whole
