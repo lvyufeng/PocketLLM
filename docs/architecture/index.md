@@ -16,6 +16,7 @@ forces. The pages here are the design record, in the order the layers depend on 
 | [Filling m on the 310B](ascend_m_filling.md) | The scoping answer to the shape limit: batch serving vs speculative decoding, their real wins, what each breaks, and why neither is next |
 | [The S600 native compile chain](s600_native_chain.md) | The scoping answer to "how would a 4B `.hbm` be built": the SDK's compiler, where it runs, and whether 4B is reachable |
 | [Batch serving on the 310B](batch_serving.md) | What a batch would concretely change, the honest per-sequence ceiling at m=2/4/16, and whether the custom attention kernel is really the gate |
+| [The 310B batched-decode bound](ascend_310b_batch_decode_bound.md) | The measured per-sequence cost of a batched decode step: interior m=B work, not op launches — so the fused attention kernel does not earn its cost |
 
 ## The three words
 
