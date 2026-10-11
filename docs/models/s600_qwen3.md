@@ -556,9 +556,57 @@ a smaller share of a heavier model — so 4096 buys the 1.7B **no rate**, only r
 deferred the 1.7B loop to a calibration or `w8` rebuild. The **rate model is confirmed** — the new 4096
 build reproduces the shipped 70 t/s and the 1.27× is exactly #637's number. But the 1.7B part of the
 recommendation is **revised**: the cache is not a pure rate knob, it is the difference between looping and
-answering, so the 1.7B wants the 4096 the clean shipped graph uses (`2048` is the cheaper step, untested).
+answering, so the 1.7B wants a window large enough to close the block — `4096` on the shipped graph, and
+`2048`, the cheaper step this paragraph deferred as *untested*, is measured next and closes the loop too.
 The 4B/8B `2048` call stands and is reinforced — a window too small to close a long thinking block is what
 breaks the 1.7B, and those sizes run their thinking longer still.
+
+#### The 1.7B at `cache_2048`: the loop closes, the list does not finish
+
+The one cache between ours (`1024`, loops) and the vendor's (`4096`, clean) — `2048`, the step #637 called
+"the cheaper step, untested" — has now been built and driven the same way as the pair it joins
+(`Qwen3-1.7B_language_chunk_512_cache_2048_w4_nash-p_corenum_4_4.hbm`, 1.79 GB, md5
+`41abcbeec8afa3ec4ec47a610eb12905`): the same `w4`, `chunk 512`, `march` and `corenum`, only the cache
+changed, three runs per cell, one graph per process, `bpu_core [0,1,2,3]`.
+
+| 1.7B, `_w4` | decode t/s | load | carveout after load | peak (long generation) | free |
+|---|---|---|---|---|---|
+| ours `cache_1024` | **89.1** | 5.62 s | 2.27 GiB (22.7%) | 2.42 GiB (24.2%) | 7.58 GiB |
+| **ours `cache_2048`** | **80.8** | 5.75 s | 2.86 GiB (28.6%) | **3.01 GiB (30.1%)** | 6.99 GiB |
+| ours `cache_4096` | **70.2** | 5.78 s | 3.48 GiB (34.8%) | 3.63 GiB (36.3%) | 6.37 GiB |
+| shipped `cache_4096` | **70.1** | 5.70 s | 3.48 GiB (34.8%) | 3.63 GiB (36.3%) | 6.37 GiB |
+
+`2048` lands where a midpoint should: **80.8 t/s** and **2.86 GiB**, between the `1024` build's
+89.1 / 2.27 and the `4096` build's 70.2 / 3.48. Decode is **9% below** `cache_1024` and **15% above**
+`cache_4096`; the carveout is 0.59 GiB more than `1024` and **0.62 GiB less** than `4096`.
+
+**The runaway loop is gone at `2048`.** The `France?` reproducer that never closes its block at
+`cache_1024` terminates cleanly at `2048`, exactly as it does at `4096`:
+
+| prompt | ours `cache_1024` | ours `cache_2048` | ours `cache_4096` |
+|---|---|---|---|
+| `France?` | 1004 pieces / 4467 chars, **no `</think>`**, 40-char window recurs | 300 pieces / 1313 chars, **closes**, 586-char coherent answer | 229 pieces / 989 chars, closes |
+| `1..200` | abbreviates (`… 200`) | **complete, 1…200** (2590 chars) | complete, 1…200 |
+| `1..400` | **no `</think>`, no list** (recurs 8×) | **closes**, but abbreviates (`1…10 … 400`, 987 chars) | **complete, 1…400** (3876 chars) |
+
+So `cache_2048` is **enough to close the reasoning block** — the 1.7B loop is not a `4096`-only fix — but
+it is **not enough to write the long enumeration in full**: `1..200` completes at `2048` where `1024`
+abbreviates it away, yet `1..400` still collapses to an ellipsis (`1 2 … 10 … 400`) where `4096` lists
+every number. The completion threshold tracks the cache, and monotonically: `1024` finishes a list of
+~100, `2048` of ~200, `4096` of ~400. A larger window buys strictly more of a long deterministic answer.
+
+**No corruption at `2048` — the 1.7B does not slip at either cache.** The corrupted-token signature the
+survey localized is a `4B`/`8B`/`cache_1024` property; the 1.7B never showed it, at `1024` or here. At
+`2048` the `1..200` list is complete and **correct**, and `1..400` abbreviates *cleanly* — an ellipsis, not
+a wrong number that then continues. So the enumeration answer is **clean at `2048`, as at `4096`**: the
+larger cache neither introduces a slip nor trades the loop for one; it closes the block and lengthens how
+far the list runs.
+
+**The `France?` loop onset, for the record.** At `2048` the answer is a fragment — *"France is a beautiful
+country in southern Europe, known for its beautiful landscapes, ri…"* — and it ends on its own at 300
+pieces, no loop window recurring three times. The `cache_1024` graph, on the same two tokens, never
+closes the block and runs to the cap. Same weights, same prompt, same greedy sampler; the cache is the
+only commanded difference, and it is the difference between an answer and a runaway.
 
 #### A request whose prompt does not fit the cache was an abort, and is now refused
 
@@ -1555,6 +1603,11 @@ distribution rather than a min/max/median:
 | 0.6B (w8 vs oracle `q4_k_m`) | **0 / 50** | 4 / 8 / **18** / 26 / 59 | **1 / 50** |
 | 1.7B (w4 vs oracle `Qwen3-1.7B-Q4_K_M`) | **0 / 50** | 2 / 7 / **11** / 17 / 38 | **9 / 50** |
 
+(The 1.7B row is the **shipped `cache_4096`** graph. The cache was then swept with the pipeline held
+fixed — our own `1024`/`2048`/`4096` builds — and it turns out **not** to move agreement; the pipeline
+does. That row sits in [its own subsection](#a-cache-row-on-the-accuracy-table-the-cache-is-not-what-moves-agreement)
+below, because it changes how the 1.7B row above should be read: it is the vendor's graph.)
+
 The distribution is itself the finding, and it **changes the headline on the 1.7B row.** Ten prompts
 said "most divergences are near-ties, but not all"; fifty say that is true of the **0.6B** — 39 of 50
 splits sit under one logit, and only one (`multi_02`, the EN→FR translation) reaches past five, at
@@ -1564,7 +1617,9 @@ found (row 05, 14.06) was therefore not an outlier to explain away; it was a vis
 the ten-prompt draw was too small to show the shape of.
 
 The corpus, both captures and both scored tables live in `~/scratch/ref/harness/` on the board
-(`artifacts/0.6B-w8.{s600,agreement}.json`, `artifacts/1.7B-w4.{s600,agreement}.json`), and the whole
+(`artifacts/0.6B-w8.{s600,agreement}.json`, `artifacts/1.7B-w4.{s600,agreement}.json`), as do the four
+cache-sweep captures of the 1.7B (`artifacts/1.7B-w4-{ours-c1024,c2048,ours-c4096}.{s600,agreement}.json`,
+the shipped `1.7B-w4` being the fourth), and the whole
 measurement is now **one command** — see [the harness](#the-harness-one-command) below, which is what
 makes the vendor's `w4` 0.6B a single invocation when it lands. The single-prompt artifacts remain at
 `~/scratch/ref/parity/s600_parity.json`.
@@ -1604,6 +1659,38 @@ Two readings fall out and neither is the old one:
 - **The deliberately ambiguous prompts are the most benign**, as expected — a near-tie the two sides
   resolve differently is what an open-ended first token *is* — and the `ambiguoustie` median prefix
   (0.6B 18, 1.7B 15) is above the overall median at both sizes.
+
+### A cache row on the accuracy table: the cache is not what moves agreement
+
+The 1.7B row above is the **shipped `cache_4096`** graph — its capture names the SDK `.hbm`, not ours —
+the same clean graph the loop discussion contrasts against. So a `cache_2048` row does not, by itself,
+isolate the cache: it would set our `2048` build against the vendor's `4096` and change the pipeline at
+the same time. The cache was therefore measured with the pipeline held fixed — our own `cache_1024`,
+`cache_2048` and `cache_4096` builds, same corpus, same config, same oracle (`libpocketllm.so` over
+`Qwen3-1.7B-Q4_K_M`), with the prompt ids verified identical across all four captures:
+
+| 1.7B `w4` graph | shared prefix min/p25/med/p75/max | histogram (0–4 / 5–9 / 10–19 / 20–29 / 30–39 / 40+) | splits ≥5 logits | gap max |
+|---|---|---|---|---|
+| ours `cache_1024` | 0 / 2 / 6 / 13 / 21 | 20 / 17 / 10 / 3 / 0 / 0 | 23 / 50 | 15.31 |
+| **ours `cache_2048`** | 0 / 2 / 6 / 9 / 25 | 20 / 19 / 9 / 2 / 0 / 0 | 22 / 50 | 24.34 |
+| ours `cache_4096` | 0 / 2 / 6 / 11 / 26 | 19 / 17 / 11 / 3 / 0 / 0 | 26 / 50 | 24.34 |
+| shipped `cache_4096` | 2 / 7 / 11 / 17 / 38 | 10 / 12 / 17 / 8 / 3 / 0 | 9 / 50 | 20.49 |
+
+**The cache is not the axis; the pipeline is.** Our three builds — which differ *only* in `cache_len` —
+are nearly indistinguishable from one another (median 6 at all three, ~20 of 50 prompts under five shared
+tokens, per-prompt divergence points coinciding on 24/50 for `1024` against `2048`). The vendor's `4096`
+graph is a different distribution entirely: median 11, eleven of fifty past twenty tokens against our
+nine or ten, and **nine** wide-margin splits against our **twenty-two to twenty-six**. So growing the
+cache from 1024 to 4096 — the change that closes the loop and lengthens the list — does **not** move the
+agreement with the oracle. The variable that does is provenance: on the same weights, the same width, the
+same cache and the same prompt ids, **our build agrees with the oracle markedly less than the vendor's**.
+
+This is a new axis on the table, and it does not contradict the loop result — the two measure different
+things. The cache governs whether the reasoning block *closes* and how far a list *runs*; it does not
+govern how closely the next token matches the oracle. And the accuracy row the page has quoted all along
+was the vendor's graph, which is why it read as the better one — not because `4096` is more accurate, but
+because that graph was not built by us. The self-built graph carries a quieter, second cost beside the
+loop: on this corpus it is the *less* oracle-like of the two, at every cache.
 
 ### The width confound, and why only one pair can remove it
 
