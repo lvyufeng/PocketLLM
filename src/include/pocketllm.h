@@ -147,6 +147,29 @@ POCKETLLM_API int pocketllm_forward(pocketllm_session *session, const int32_t *t
 POCKETLLM_API int pocketllm_forward_argmax(pocketllm_session *session, const int32_t *tokens, int n,
                                            int32_t *out_token);
 
+/* The Stage-1 batch decode: run `n_seq` sequences in one forward and write each
+ * sequence's greedy token id into `out_tokens`.
+ *
+ * `tokens` is the concatenation of every sequence's tokens, `n_per_seq[s]` how
+ * many of them belong to sequence s (decode passes one per sequence), and the
+ * sequences run from their own cached lengths, so their attention windows are
+ * ragged -- sequence 1 may be at position 40 while sequence 2 is at 300.  The
+ * model writes one token per sequence, in order.
+ *
+ * The point is the weights: every stack reads its weights once for all
+ * sequences, so the GEMM runs at `m = sum(n_per_seq)` instead of once per
+ * sequence.  This is what `docs/architecture/batch_serving.md` calls Stage 1:
+ * the sequence axis on the KV cache, with the single-sequence path unchanged
+ * (call `pocketllm_forward` / `pocketllm_forward_argmax` for one sequence).
+ *
+ * Returns 0 on success, a negative value on failure -- `kErrContextLength` when
+ * any sequence would run past the checkpoint's window.  `out_tokens` is written
+ * only on success and must hold `n_seq` int32s.  It is additive:
+ * `pocketllm_forward` and `pocketllm_forward_argmax` are unchanged. */
+POCKETLLM_API int pocketllm_forward_batch(pocketllm_session *session, const int32_t *tokens,
+                                          const int64_t *n_per_seq, int64_t n_seq,
+                                          int32_t *out_tokens);
+
 /* Drop the KV cache and the position counter.  The next `pocketllm_forward`
  * starts a fresh sequence.  Returns 0 on success, negative on failure. */
 POCKETLLM_API int pocketllm_reset(pocketllm_session *session);

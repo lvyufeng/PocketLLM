@@ -176,6 +176,15 @@ def _bind(lib: "CDLL") -> None:
         ctypes.POINTER(ctypes.c_int32),
     ]
 
+    lib.pocketllm_forward_batch.restype = ctypes.c_int
+    lib.pocketllm_forward_batch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.c_int64,
+        ctypes.POINTER(ctypes.c_int32),
+    ]
+
     lib.pocketllm_argmax.restype = ctypes.c_int
     lib.pocketllm_argmax.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_int]
 
@@ -380,6 +389,43 @@ class Engine:
         if rc < 0:
             raise EngineUnavailable(f"pocketllm_forward_argmax failed ({rc})")
         return int(out.value)
+
+    def next_tokens(self, sequences: list[list[int]]) -> list[int]:
+        """One greedy token per sequence, from one batched forward.
+
+        ``sequences`` is one token list per sequence; they run in a single
+        engine call, from each sequence's own cached length, and each returns
+        its own greedy id.  This is the Stage-1 batch path
+        (``docs/architecture/batch_serving.md``): the weights are read once for
+        the whole batch, so ``m = sum(len(s))`` instead of once per sequence.
+        The ids are the same each sequence would get from ``next_token`` alone,
+        which is the gate that proves the ragged windows are right.
+
+        The sequences must have been advanced together since the last
+        ``reset`` -- the engine keeps one cached position per sequence, in the
+        order given here.  Callers that want independent single sequences keep
+        using ``next_token``.
+        """
+        n_seq = len(sequences)
+        if n_seq == 0:
+            raise ValueError("next_tokens needs at least one sequence")
+        counts = [len(s) for s in sequences]
+        if any(c == 0 for c in counts):
+            raise ValueError("every sequence needs at least one token")
+        flat = [tok for s in sequences for tok in s]
+        tokens_arr = (ctypes.c_int32 * len(flat))(*flat)
+        counts_arr = (ctypes.c_int64 * n_seq)(*counts)
+        out = (ctypes.c_int32 * n_seq)(0)
+        rc = self._lib.pocketllm_forward_batch(
+            self._handle, tokens_arr, counts_arr, n_seq, out
+        )
+        if rc == _ERR_CONTEXT_LENGTH:
+            raise ContextLengthExceeded(
+                "a batched sequence would run past the checkpoint's context window"
+            )
+        if rc < 0:
+            raise EngineUnavailable(f"pocketllm_forward_batch failed ({rc})")
+        return [int(out[i]) for i in range(n_seq)]
 
     def reset(self) -> None:
         if self._lib.pocketllm_reset(self._handle) < 0:

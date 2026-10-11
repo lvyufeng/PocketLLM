@@ -33,13 +33,50 @@ def lib() -> "ctypes.CDLL":
     return native.load()
 
 
+def _exported_pocketllm_symbols() -> set[str]:
+    """The ``pocketllm_*`` names in the built library's dynamic symbol table.
+
+    Read with ``nm -D`` rather than probed one name at a time with ``getattr``:
+    a ``getattr`` loop can only ever prove a subset, and the mistake this guards
+    against -- a new entry point that reaches the header and the bridge but not
+    this list -- is exactly the one a subset check cannot see. ``nm -D`` prints
+    the table the dynamic linker resolves through, so a name here that is not in
+    ``expected`` is a real export, not a declaration.
+
+    Only ``pocketllm_*`` is returned. The ``W``/``V``/``u`` entries ``nm -D``
+    also prints are libstdc++ template instantiations with weak linkage, which
+    the library does not control and no call site can reach by accident.
+    """
+    import shutil
+    import subprocess
+
+    nm = shutil.which("nm")
+    if nm is None:
+        pytest.skip("nm is not on PATH, so the symbol table cannot be read")
+    path = native.engine_path()
+    if path is None:
+        pytest.skip("libpocketllm.so is not built")
+    result = subprocess.run(
+        [nm, "-D", "--defined-only", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return {
+        parts[-1]
+        for parts in (line.split() for line in result.stdout.splitlines())
+        if parts and parts[-1].startswith("pocketllm_")
+    }
+
+
 def test_the_library_exports_exactly_the_abi(lib: "ctypes.CDLL") -> None:
     """Only the header's functions are in the dynamic symbol table.
 
     The library is built with hidden visibility, so anything else that leaks is
     a symbol a third party could start calling by accident. The set is asserted
     as an equality rather than a superset because "one extra export" is exactly
-    the mistake this guards against.
+    the mistake this guards against: a new entry point added to the header and
+    the bridge, but forgotten here, is the failure this catches.
     """
     expected = {
         "pocketllm_abi_version",
@@ -49,13 +86,17 @@ def test_the_library_exports_exactly_the_abi(lib: "ctypes.CDLL") -> None:
         "pocketllm_decode",
         "pocketllm_forward",
         "pocketllm_forward_argmax",
+        "pocketllm_forward_batch",
         "pocketllm_reset",
         "pocketllm_argmax",
         "pocketllm_temperature",
         "pocketllm_sample",
     }
-    for name in expected:
-        assert hasattr(lib, name), f"{name} is not exported"
+    exported = _exported_pocketllm_symbols()
+    assert exported == expected, (
+        f"missing from the library: {sorted(expected - exported)}; "
+        f"exported but not in the header's list: {sorted(exported - expected)}"
+    )
 
 
 def test_the_reported_abi_version_is_the_one_python_expects(lib: "ctypes.CDLL") -> None:

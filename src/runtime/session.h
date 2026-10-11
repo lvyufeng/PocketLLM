@@ -76,6 +76,19 @@ class Session {
    * Throws on a failure; `c_api.cpp` turns that into the header's return code. */
   std::vector<float> forward(const int32_t *tokens, int64_t n, int64_t *argmax_out);
 
+  /* Run `n_seq` sequences in one batched forward and write each sequence's
+   * greedy token id into `out_tokens`.  `tokens` is the concatenation of the
+   * sequences' tokens, `n_per_seq[s]` how many of them belong to sequence s,
+   * and each sequence continues from its own cached length -- so the windows
+   * are ragged and the model writes one token per sequence.
+   *
+   * The weight-reading GEMMs run once at `m = sum(n_per_seq)`; this is the
+   * Stage-1 batch path (docs/architecture/batch_serving.md).  One sequence
+   * per call (`n_seq == 1`) reproduces `forward` exactly.  Throws on a
+   * failure, the same way `forward` does. */
+  void forward_batch(const int32_t *tokens, const int64_t *n_per_seq, int64_t n_seq,
+                     int32_t *out_tokens);
+
   /* Drop the KV cache and rewind to position 0. */
   void reset();
 

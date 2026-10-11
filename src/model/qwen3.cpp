@@ -491,7 +491,7 @@ void Qwen3Model::grow_rope_table(int64_t positions) {
   position_capacity_ = grown;
 }
 
-void Qwen3Model::ensure_capacity(int64_t n, int64_t end_pos) {
+void Qwen3Model::ensure_capacity(int64_t n, int64_t end_pos, int64_t head_rows) {
   backend_->release(x_);
   backend_->release(x_norm_);
   backend_->release(q_);
@@ -517,8 +517,10 @@ void Qwen3Model::ensure_capacity(int64_t n, int64_t end_pos) {
   gate_ = backend_->allocate(n * n_ff_ * 4);
   up_ = backend_->allocate(n * n_ff_ * 4);
   ffn_ = backend_->allocate(n * n_ff_ * 4);
-  last_ = backend_->allocate(n_embd_ * 4);
-  logits_ = backend_->allocate(n_vocab_ * 4);
+  /* One logit row per batch row the head projects: 1 on the single-sequence
+   * path, `n` on the batch path where every row is a sequence's own token. */
+  last_ = backend_->allocate(head_rows * n_embd_ * 4);
+  logits_ = backend_->allocate(head_rows * n_vocab_ * 4);
   /* The score row is per query token per head, over the whole visible cache, and
    * it is indexed by *absolute* key position -- so the span is the end position
    * of this batch, not the batch size. Sizing it to the batch is the easy mistake
@@ -647,149 +649,232 @@ void Qwen3Model::embed(kernel::DeviceBuffer tokens, int64_t n, kernel::DeviceBuf
   backend_->embedding(tokens, n, tok_embd_.data, n_vocab_, n_embd_, out);
 }
 
-void Qwen3Model::reset() { cache_length_ = 0; }
+void Qwen3Model::reset() {
+  /* Back to one sequence at position 0.  The KV slabs are kept -- a decode
+   * after a reset is the next thing that happens, and reallocating them to fill
+   * none of it is pure loss -- so `kv_slots_` and `cache_capacity_` stay. */
+  seq_len_.assign(1, 0);
+}
 
 kernel::DeviceBuffer Qwen3Model::forward(const int32_t *tokens, int64_t n, int64_t start_pos) {
-  if (n <= 0) {
-    throw Error("forward needs at least one token");
-  }
-  if (start_pos != cache_length_) {
+  /* The single-sequence path, kept as the `n_seq == 1` case of the batched
+   * graph so there is one implementation of the model and not two that can
+   * drift.  The position guard the original carried stays here, on the path
+   * that has a single scalar position to check. */
+  if (start_pos != cache_length()) {
     throw Error("forward at position " + std::to_string(start_pos) + " but the cache holds " +
-                std::to_string(cache_length_) + " positions");
+                std::to_string(cache_length()) + " positions");
   }
-  if (start_pos + n > capacity_) {
-    throw ContextLengthError("the sequence would reach position " + std::to_string(start_pos + n) +
-                             ", past the checkpoint's context length of " +
-                             std::to_string(capacity_));
+  const int64_t n_per_seq[1] = {n};
+  const int64_t starts[1] = {start_pos};
+  return forward_impl(tokens, n_per_seq, starts, 1);
+}
+
+kernel::DeviceBuffer Qwen3Model::forward_batch(const int32_t *tokens, const int64_t *n_per_seq,
+                                               int64_t n_seq) {
+  if (n_seq <= 0) {
+    throw Error("forward_batch needs at least one sequence");
+  }
+  /* Each sequence continues from its own cached length -- the caller passes
+   * tokens and counts, not positions, so a position that disagrees with the
+   * cache cannot be passed.  A sequence the cache has not seen starts at 0. */
+  std::vector<int64_t> starts(static_cast<std::size_t>(n_seq));
+  for (int64_t s = 0; s < n_seq; ++s) {
+    starts[static_cast<std::size_t>(s)] =
+        s < static_cast<int64_t>(seq_len_.size()) ? seq_len_[static_cast<std::size_t>(s)] : 0;
+  }
+  return forward_impl(tokens, n_per_seq, starts.data(), n_seq);
+}
+
+kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const int64_t *n_per_seq,
+                                              const int64_t *start_pos, int64_t n_seq) {
+  /* `m` is the whole batch: the rows every weight-reading GEMM contracts over,
+   * so the weights are read once for all sequences.  At n_seq == 1 this is the
+   * `n` the graph has always used and every loop below runs once, which is what
+   * keeps the single-sequence output bit-identical. */
+  int64_t m = 0;
+  int64_t max_end = 0;
+  std::vector<int64_t> cum(static_cast<std::size_t>(n_seq));
+  for (int64_t s = 0; s < n_seq; ++s) {
+    const int64_t n_s = n_per_seq[static_cast<std::size_t>(s)];
+    const int64_t at_pos = start_pos[static_cast<std::size_t>(s)];
+    if (n_s <= 0) {
+      throw Error("forward_impl needs at least one token per sequence");
+    }
+    if (at_pos + n_s > capacity_) {
+      throw ContextLengthError("a sequence would reach position " +
+                               std::to_string(at_pos + n_s) +
+                               ", past the checkpoint's context length of " +
+                               std::to_string(capacity_));
+    }
+    cum[static_cast<std::size_t>(s)] = m;
+    m += n_s;
+    if (at_pos + n_s > max_end) {
+      max_end = at_pos + n_s;
+    }
   }
 
-  ensure_capacity(n, start_pos + n);
+  /* The head projects one logit row per sequence, so `head_rows = n_seq`; at
+   * n_seq == 1 the head buffers are exactly the ones the original sized. */
+  ensure_capacity(m, max_end, n_seq);
 
-  /* Both the cache and the rotary table grow with the sequence, and they grow
-   * together: a token that fits the cache but not the table is a read past the
-   * end of the table. Sized to the end of this batch rather than to the context,
-   * so a session that decodes ten tokens has not allocated room for 40960. */
-  const int64_t needed = start_pos + n;
-  if (needed > cache_capacity_) {
-    int64_t grown = std::max<int64_t>(cache_capacity_, kInitialPositions);
-    while (grown < needed) {
-      grown = std::min<int64_t>(grown * 2, capacity_);
-    }
-    const std::size_t per_layer =
-        static_cast<std::size_t>(grown) * static_cast<std::size_t>(n_head_kv_ * head_dim_);
-    if (k_cache_.handle != 0) {
-      backend_->release(k_cache_);
-      backend_->release(v_cache_);
-    }
-    const int64_t elem = kernel::kv_dtype_size(kv_dtype_);
-    k_cache_ = backend_->allocate(static_cast<int64_t>(per_layer) * n_layer_ * elem);
-    v_cache_ = backend_->allocate(static_cast<int64_t>(per_layer) * n_layer_ * elem);
-    cache_capacity_ = grown;
-  }
-  grow_rope_table(needed);
+  /* The cache and the rotary table grow together, as before: a token that fits
+   * the cache but not the table is a read past the end of the table. */
+  ensure_kv(max_end, n_seq);
+  grow_rope_table(max_end);
 
   const int64_t kv_width = n_head_kv_ * head_dim_;
   const int64_t kv_elem = kernel::kv_dtype_size(kv_dtype_);
 
-  /* The prompt is uploaded once and gathered on the device; only the ids cross
-   * the bus, not the embedding rows they select. */
-  backend_->copy_to_device(tokens_, tokens, n * 4);
-  embed(tokens_, n, x_);
+  /* The whole batch's token ids go to the device once and are gathered on the
+   * device; only the ids cross the bus, not the embedding rows they select. */
+  backend_->copy_to_device(tokens_, tokens, m * 4);
+  embed(tokens_, m, x_);
 
   for (int64_t il = 0; il < n_layer_; ++il) {
     const Layer &layer = layers_[static_cast<std::size_t>(il)];
 
-    backend_->rms_norm(x_, layer.attn_norm, x_norm_, n, n_embd_, rms_eps_);
+    backend_->rms_norm(x_, layer.attn_norm, x_norm_, m, n_embd_, rms_eps_);
 
-    matmul(layer.wq, x_norm_, q_, n, false);
-    matmul(layer.wk, x_norm_, k_, n, false);
-    matmul(layer.wv, x_norm_, v_, n, false);
+    /* One pass of every projection for the whole batch: the weight is read once
+     * for all `m` rows, which is the amortization this change exists for. */
+    matmul(layer.wq, x_norm_, q_, m, false);
+    matmul(layer.wk, x_norm_, k_, m, false);
+    matmul(layer.wv, x_norm_, v_, m, false);
 
-    /* Per head, over `head_dim`. The projection is `n_head * head_dim` wide, so
-     * normalizing the row instead would reduce over sixteen times as many values
-     * and produce a different -- still finite, still plausible -- model. The
-     * weight is shared across heads and tokens, which is why one call can do all
-     * of them. */
-    backend_->rms_norm(q_, layer.q_norm, q_, n * n_head_, head_dim_, rms_eps_);
-    backend_->rms_norm(k_, layer.k_norm, k_, n * n_head_kv_, head_dim_, rms_eps_);
+    /* Per head, over `head_dim`, and shared across every row of the batch, so
+     * it runs over all `m` rows at once.  The weight is shared across heads and
+     * tokens, which is why one call can do all of them. */
+    backend_->rms_norm(q_, layer.q_norm, q_, m * n_head_, head_dim_, rms_eps_);
+    backend_->rms_norm(k_, layer.k_norm, k_, m * n_head_kv_, head_dim_, rms_eps_);
 
-    backend_->rope_neox(q_, n, n_head_, head_dim_, start_pos, rope_cos_, rope_sin_);
-    backend_->rope_neox(k_, n, n_head_kv_, head_dim_, start_pos, rope_cos_, rope_sin_);
-
-    /* The cache holds the *rotated* key: attention scores are not a function of
-     * the unrotated one, so storing before the rotation would silently drop the
-     * positional signal for every token after the first.
-     *
-     * The write goes to this layer's own slab. Writing to a single shared slab
-     * would leave the layer's keys overwritten by the next layer's by the time
-     * the next call read them. */
-    const int64_t layer_offset = cache_capacity_ * kv_width * il;
-    kernel::DeviceBuffer layer_k{k_cache_.handle +
-                                     static_cast<uintptr_t>(layer_offset * kv_elem),
-                                 kv_width * cache_capacity_ * kv_elem};
-    kernel::DeviceBuffer layer_v{v_cache_.handle +
-                                     static_cast<uintptr_t>(layer_offset * kv_elem),
-                                 kv_width * cache_capacity_ * kv_elem};
-    /* Both directions are device memory, so this is `copy_device_to_device` and
-     * not `copy_to_device`: the source is a device address, and a backend that
-     * dereferenced it as a host pointer would read the CPU's memory on a card.
-     * The CPU backend cannot tell the difference, which is exactly why the
-     * interface carries the distinction.
-     *
-     * When the cache is wider than the activations -- an f32 cache, which is
-     * every backend but the CPU one -- this is a plain copy of the rows.  The
-     * f16 cache is a *lossy* copy and has to be written by a kernel that
-     * converts, one row at a time, because the source rows are `head_dim`
-     * apart and the destination rows are `n_head_kv * head_dim` apart: a flat
-     * convert over the batch would interleave the heads into each other's
-     * slots. */
-    if (kv_elem == 4) {
-      backend_->copy_device_to_device(
-          kernel::DeviceBuffer{layer_k.handle + static_cast<uintptr_t>(start_pos * kv_width * 4),
-                               n * kv_width * 4},
-          k_, n * kv_width * 4);
-      backend_->copy_device_to_device(
-          kernel::DeviceBuffer{layer_v.handle + static_cast<uintptr_t>(start_pos * kv_width * 4),
-                               n * kv_width * 4},
-          v_, n * kv_width * 4);
-    } else {
-      const uintptr_t at = static_cast<uintptr_t>(start_pos * kv_width * kv_elem);
-      const int64_t bytes = n * kv_width * kv_elem;
-      backend_->kv_append(kernel::DeviceBuffer{layer_k.handle + at, bytes}, k_, n, n_head_kv_,
-                          head_dim_, kv_elem);
-      backend_->kv_append(kernel::DeviceBuffer{layer_v.handle + at, bytes}, v_, n, n_head_kv_,
-                          head_dim_, kv_elem);
+    /* RoPE is per sequence: a sequence's tokens take that sequence's own
+     * starting position.  At n_seq == 1 this is the single call the graph made. */
+    for (int64_t s = 0; s < n_seq; ++s) {
+      const int64_t n_s = n_per_seq[static_cast<std::size_t>(s)];
+      const int64_t row = cum[static_cast<std::size_t>(s)];
+      const int64_t at_pos = start_pos[static_cast<std::size_t>(s)];
+      kernel::DeviceBuffer q_s{q_.handle + static_cast<uintptr_t>(row * n_head_ * head_dim_ * 4),
+                               n_s * n_head_ * head_dim_ * 4};
+      kernel::DeviceBuffer k_s{k_.handle + static_cast<uintptr_t>(row * kv_width * 4),
+                               n_s * kv_width * 4};
+      backend_->rope_neox(q_s, n_s, n_head_, head_dim_, at_pos, rope_cos_, rope_sin_);
+      backend_->rope_neox(k_s, n_s, n_head_kv_, head_dim_, at_pos, rope_cos_, rope_sin_);
     }
 
-    const float scale = 1.0F / std::sqrt(static_cast<float>(head_dim_));
-    backend_->attention(q_, n, n_head_, layer_k, layer_v, n_head_kv_, head_dim_,
-                        /*first_key=*/0, start_pos, scale, attn_, scores_, kv_dtype_);
+    /* The per-layer slab base.  The layout is `[layer][sequence][position]`, so
+     * a sequence's slab is `n_layer` slabs further on; at n_seq == 1 the
+     * sequence term is zero and `layer_offset` is the original offset exactly. */
+    const int64_t layer_offset = cache_capacity_ * kv_width * il;
+    const int64_t per_seq_stride = cache_capacity_ * kv_width * n_layer_;
 
-    matmul(layer.wo, attn_, x_, n, /*accumulate=*/true);
+    for (int64_t s = 0; s < n_seq; ++s) {
+      const int64_t n_s = n_per_seq[static_cast<std::size_t>(s)];
+      const int64_t row = cum[static_cast<std::size_t>(s)];
+      const int64_t at_pos = start_pos[static_cast<std::size_t>(s)];
+      const int64_t seq_offset = layer_offset + per_seq_stride * s;
+      kernel::DeviceBuffer layer_k{k_cache_.handle +
+                                       static_cast<uintptr_t>(seq_offset * kv_elem),
+                                   kv_width * cache_capacity_ * kv_elem};
+      kernel::DeviceBuffer layer_v{v_cache_.handle +
+                                       static_cast<uintptr_t>(seq_offset * kv_elem),
+                                   kv_width * cache_capacity_ * kv_elem};
+      kernel::DeviceBuffer k_src{k_.handle + static_cast<uintptr_t>(row * kv_width * 4),
+                                 n_s * kv_width * 4};
+      kernel::DeviceBuffer v_src{v_.handle + static_cast<uintptr_t>(row * kv_width * 4),
+                                 n_s * kv_width * 4};
+      /* A sequence writes only its own slab, at its own position -- the write
+       * that makes the windows ragged.  The f32 path is a plain copy; the f16
+       * path converts per head, for the reason the original comment gives. */
+      if (kv_elem == 4) {
+        backend_->copy_device_to_device(
+            kernel::DeviceBuffer{layer_k.handle + static_cast<uintptr_t>(at_pos * kv_width * 4),
+                                 n_s * kv_width * 4},
+            k_src, n_s * kv_width * 4);
+        backend_->copy_device_to_device(
+            kernel::DeviceBuffer{layer_v.handle + static_cast<uintptr_t>(at_pos * kv_width * 4),
+                                 n_s * kv_width * 4},
+            v_src, n_s * kv_width * 4);
+      } else {
+        const uintptr_t at = static_cast<uintptr_t>(at_pos * kv_width * kv_elem);
+        const int64_t bytes = n_s * kv_width * kv_elem;
+        backend_->kv_append(kernel::DeviceBuffer{layer_k.handle + at, bytes}, k_src, n_s,
+                            n_head_kv_, head_dim_, kv_elem);
+        backend_->kv_append(kernel::DeviceBuffer{layer_v.handle + at, bytes}, v_src, n_s,
+                            n_head_kv_, head_dim_, kv_elem);
+      }
 
-    backend_->rms_norm(x_, layer.ffn_norm, x_norm_, n, n_embd_, rms_eps_);
-    matmul(layer.w_gate, x_norm_, gate_, n, false);
-    matmul(layer.w_up, x_norm_, up_, n, false);
-    backend_->silu_mul(gate_, up_, ffn_, n * n_ff_);
-    matmul(layer.w_down, ffn_, x_, n, /*accumulate=*/true);
+      /* Ragged by construction: this sequence scores its own queries against
+       * its own window `[0, at_pos + n_s - 1]`.  The op takes one query chunk
+       * against one window, so the batch is a loop of `n_seq` calls -- no new
+       * kernel, and at n_seq == 1 exactly the original call. */
+      const float scale = 1.0F / std::sqrt(static_cast<float>(head_dim_));
+      kernel::DeviceBuffer q_s{q_.handle + static_cast<uintptr_t>(row * n_head_ * head_dim_ * 4),
+                               n_s * n_head_ * head_dim_ * 4};
+      kernel::DeviceBuffer a_s{attn_.handle + static_cast<uintptr_t>(row * n_head_ * head_dim_ * 4),
+                               n_s * n_head_ * head_dim_ * 4};
+      backend_->attention(q_s, n_s, n_head_, layer_k, layer_v, n_head_kv_, head_dim_,
+                          /*first_key=*/0, at_pos, scale, a_s, scores_, kv_dtype_);
+    }
+
+    matmul(layer.wo, attn_, x_, m, /*accumulate=*/true);
+
+    backend_->rms_norm(x_, layer.ffn_norm, x_norm_, m, n_embd_, rms_eps_);
+    matmul(layer.w_gate, x_norm_, gate_, m, false);
+    matmul(layer.w_up, x_norm_, up_, m, false);
+    backend_->silu_mul(gate_, up_, ffn_, m * n_ff_);
+    matmul(layer.w_down, ffn_, x_, m, /*accumulate=*/true);
   }
 
-  /* Only the last position's logits are produced. A caller wanting a
-   * continuation asks for one token at a time; the prefill's earlier positions
-   * are computed because the layers are sequential, but their logits are not
-   * wanted and projecting them would be 151936 values per token of waste.
-   *
-   * The final row is a handle into `x_` with an offset, rather than a copy --
-   * a handle is an address and an address plus an offset is the next row. That
-   * is a legitimate thing to do to a `DeviceBuffer` precisely because the graph
-   * never dereferences one. */
-  const kernel::DeviceBuffer x_last{x_.handle + static_cast<uintptr_t>((n - 1) * n_embd_ * 4),
-                                    n_embd_ * 4};
-  backend_->rms_norm(x_last, output_norm_, last_, 1, n_embd_, rms_eps_);
-  matmul(output_, last_, logits_, 1, false);
+  /* Each sequence's logits come from its own last token.  At n_seq == 1 that is
+   * the single row the head has always projected.  The final row is a handle
+   * into `x_` with an offset, rather than a copy. */
+  for (int64_t s = 0; s < n_seq; ++s) {
+    const int64_t n_s = n_per_seq[static_cast<std::size_t>(s)];
+    const int64_t last_row = cum[static_cast<std::size_t>(s)] + n_s - 1;
+    const kernel::DeviceBuffer x_last{
+        x_.handle + static_cast<uintptr_t>(last_row * n_embd_ * 4), n_embd_ * 4};
+    const kernel::DeviceBuffer last_s{
+        last_.handle + static_cast<uintptr_t>(s * n_embd_ * 4), n_embd_ * 4};
+    const kernel::DeviceBuffer logits_s{
+        logits_.handle + static_cast<uintptr_t>(s * n_vocab_ * 4), n_vocab_ * 4};
+    backend_->rms_norm(x_last, output_norm_, last_s, 1, n_embd_, rms_eps_);
+    matmul(output_, last_s, logits_s, 1, false);
+  }
 
-  cache_length_ = start_pos + n;
+  /* Record every sequence's new length.  At n_seq == 1 this is the old scalar. */
+  seq_len_.resize(static_cast<std::size_t>(n_seq));
+  for (int64_t s = 0; s < n_seq; ++s) {
+    seq_len_[static_cast<std::size_t>(s)] =
+        start_pos[static_cast<std::size_t>(s)] + n_per_seq[static_cast<std::size_t>(s)];
+  }
   return logits_;
+}
+
+void Qwen3Model::ensure_kv(int64_t positions, int64_t n_seq) {
+  /* Grow when either the positions or the sequence slots exceed what the slabs
+   * hold.  The buffers are released and reallocated, not copied -- the same
+   * growth the single-sequence path always had, kept so its behavior at B=1 is
+   * unchanged -- and a session that has not decoded past the initial window
+   * never pays this. */
+  if (k_cache_.handle != 0 && positions <= cache_capacity_ && n_seq <= kv_slots_) {
+    return;
+  }
+  int64_t grown = std::max<int64_t>(cache_capacity_, kInitialPositions);
+  while (grown < positions) {
+    grown = std::min<int64_t>(grown * 2, capacity_);
+  }
+  const int64_t elem = kernel::kv_dtype_size(kv_dtype_);
+  const std::size_t per_layer = static_cast<std::size_t>(grown) *
+                                static_cast<std::size_t>(n_head_kv_ * head_dim_);
+  if (k_cache_.handle != 0) {
+    backend_->release(k_cache_);
+    backend_->release(v_cache_);
+  }
+  k_cache_ = backend_->allocate(static_cast<int64_t>(per_layer) * n_layer_ * n_seq * elem);
+  v_cache_ = backend_->allocate(static_cast<int64_t>(per_layer) * n_layer_ * n_seq * elem);
+  cache_capacity_ = grown;
+  kv_slots_ = n_seq;
 }
 
 }  // namespace pocketllm

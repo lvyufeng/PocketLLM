@@ -192,6 +192,29 @@ int pocketllm_forward_argmax(pocketllm_session *session, const int32_t *tokens, 
   }
 }
 
+int pocketllm_forward_batch(pocketllm_session *session, const int32_t *tokens,
+                            const int64_t *n_per_seq, int64_t n_seq, int32_t *out_tokens) {
+  if (session == nullptr || tokens == nullptr || n_per_seq == nullptr || n_seq <= 0 ||
+      out_tokens == nullptr) {
+    return -1;
+  }
+  try {
+    pocketllm::Session *self = as_session(session);
+    if (self->model() == nullptr) {
+      return -2;
+    }
+    /* One batched forward; `Session::forward_batch` reads each sequence's
+     * greedy id from its own row's device argmax, so the vocabulary stays on
+     * the device exactly as the single-sequence fast path keeps it. */
+    self->forward_batch(tokens, n_per_seq, n_seq, out_tokens);
+    return 0;
+  } catch (const pocketllm::ContextLengthError &e) {
+    return pocketllm::kErrContextLength;
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+
 int pocketllm_reset(pocketllm_session *session) {
   if (session == nullptr) {
     return -1;

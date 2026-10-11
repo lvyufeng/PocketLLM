@@ -108,8 +108,10 @@ class Qwen3Model {
   /* The longest sequence this model will accept, from `context_length`. */
   int64_t capacity() const { return capacity_; }
 
-  /* How many positions the cache holds. */
-  int64_t cache_length() const { return cache_length_; }
+  /* How many positions the cache holds.  This is sequence 0's length; the
+   * batch path keeps one length per sequence in `seq_len_`, and the
+   * single-sequence path is the member at index 0. */
+  int64_t cache_length() const { return seq_len_[0]; }
 
   /* Run `n` tokens occupying positions `start_pos .. start_pos + n - 1` and
    * return the logits of the *last* one, as a device buffer of `n_vocab`
@@ -120,6 +122,19 @@ class Qwen3Model {
    * The returned handle is owned by the model and stays valid until the next
    * call. It is *not* host memory: read it with the backend's `copy_to_host`. */
   kernel::DeviceBuffer forward(const int32_t *tokens, int64_t n, int64_t start_pos);
+
+  /* The Stage-1 batch decode.  `n_seq` sequences run in one pass, each
+   * contributing `n_per_seq[s]` tokens (the decode path contributes one per
+   * sequence), and the weight-reading GEMMs run once at `m = sum(n_per_seq)`
+   * instead of once per sequence.  Sequence `s` continues from its own length
+   * `seq_len_[s]` and writes to its own KV slab, so the attention windows are
+   * per-sequence -- ragged -- and the op is called once per sequence per layer.
+   *
+   * Returns a device buffer of `m` logit rows (one per sequence, its last
+   * token).  Single-sequence callers keep using `forward`; this is the batched
+   * entry and is what `pocketllm_forward_batch` drives. */
+  kernel::DeviceBuffer forward_batch(const int32_t *tokens, const int64_t *n_per_seq,
+                                     int64_t n_seq);
 
   /* Drop the KV cache. The buffers are kept -- a decode after a reset is the
    * next thing that happens, and reallocating 300 MB to fill none of it is
@@ -178,8 +193,26 @@ class Qwen3Model {
   /* Size the scratch buffers for a batch of `n` tokens whose last position is
    `end_pos - 1`. The second argument is not derivable from the first because the
    attention score row is indexed by absolute key position: a one-token decode at
-   position 300 needs a row 300 long, and `n` alone would say one. */
-  void ensure_capacity(int64_t n, int64_t end_pos);
+   position 300 needs a row 300 long, and `n` alone would say one.  `head_rows` is
+   the number of logit rows the head must hold: 1 for the single-sequence path
+   (only the last token is projected), `n` for the batch, whose every row is a
+   sequence's token. */
+  void ensure_capacity(int64_t n, int64_t end_pos, int64_t head_rows = 1);
+
+  /* Size the KV slabs to `positions` per sequence and `n_seq` sequence slots.
+   * The layout is `[layer][sequence][position][kv_head][head_dim]`, so the slab
+   * is `n_layer_ * n_seq * positions * n_head_kv * head_dim` elements wide.  At
+   * `n_seq == 1` this is the single-sequence slab the graph has always used, and
+   * the offsets below add zero for sequence 0. */
+  void ensure_kv(int64_t positions, int64_t n_seq);
+
+  /* The shared body of `forward` (n_seq == 1) and `forward_batch`.  One
+   * implementation of the graph, so the single-sequence path is not a second
+   * copy that can drift from the batched one: at n_seq == 1 every loop below
+   * runs exactly once with sequence 0's own start position, and the op stream
+   * is the one the graph has always issued. */
+  kernel::DeviceBuffer forward_impl(const int32_t *tokens, const int64_t *n_per_seq,
+                                    const int64_t *start_pos, int64_t n_seq);
   void build_rope_table();
   void grow_rope_table(int64_t positions);
 
@@ -250,7 +283,15 @@ class Qwen3Model {
    * together, because a token that fits the cache but not the table would be a
    * read past the end of the table. */
   int64_t position_capacity_ = 0;
-  int64_t cache_length_ = 0;
+  /* Every sequence's cache length, one entry per live sequence.  Index 0 is the
+   * single-sequence path's `cache_length_`; the batch path uses one entry per
+   * sequence, and they drift apart exactly by how far each sequence has been
+   * decoded -- which is the ragged window the batch has to honor. */
+  std::vector<int64_t> seq_len_{0};
+  /* How many sequence slots the KV slabs were allocated for.  Kept beside
+   * `cache_capacity_` because the two together size the slab and either can grow
+   * independently. */
+  int64_t kv_slots_ = 0;
 
   std::vector<Layer> layers_;
 };
