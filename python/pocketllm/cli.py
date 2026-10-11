@@ -92,6 +92,17 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--top-p", type=float, help="keep the smallest set whose mass reaches p")
     run.add_argument("--min-p", type=float, help="drop tokens below this fraction of the top one")
     run.add_argument("--seed", type=int, help="seed for the sampling draw; unset means it is not reproducible")
+    # The stall watchdog is a `run` flag and not a shared engine flag: it exists for the
+    # S600 delegate's lost-wake-up hang (#650), and the C engine's token loop has no
+    # single blocking call to hang in. See `_run_delegate_watchdogged`.
+    run.add_argument(
+        "--generation-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="one process per generation, killed if it emits nothing for this many seconds "
+        "(the S600 delegate can deadlock; default: off, run in-process)",
+    )
 
     serve = subparsers.add_parser("serve", help="start the OpenAI-compatible server")
     _add_engine_flags(serve)
@@ -606,6 +617,13 @@ def _run_delegate(namespace: argparse.Namespace, engine_args: EngineArgs) -> int
     # here, ahead of the .hbm load, not set.
     _require_delegate_env("run")
 
+    # The stall watchdog (#650): with ``--generation-timeout``, one generation runs in a
+    # child process the parent can kill, because the delegate's single blocking
+    # ``xlm_infer`` cannot be interrupted from inside the process that is in it.  The three
+    # shapes and why a subprocess is the only honest one are in ``pocketllm.watchdog``.
+    if namespace.generation_timeout is not None:
+        return _run_delegate_watchdogged(namespace, engine_args, model)
+
     try:
         engine = XlmEngine.open(
             model_path=str(model.hbm),
@@ -620,6 +638,21 @@ def _run_delegate(namespace: argparse.Namespace, engine_args: EngineArgs) -> int
         )
     except (XlmUnavailable, OSError) as exc:
         raise SystemExit(f"`pocketllm run` failed: {exc}") from exc
+
+    # When this process *is* the watchdog's child (see ``pocketllm.watchdog``), stream each
+    # decoded piece to stdout as it arrives so the parent's stall detector can tell "still
+    # decoding" from "hung".  The env var is set only by the wrapper, so an ordinary run
+    # never enters this and its output is byte-for-byte what it was.
+    #
+    # The prompt is echoed *before* the decode here, not after it (see the two exits at the
+    # end): the pieces are written during the call, so echoing the prompt afterwards would
+    # put it after its own answer.  The child's stdout is therefore
+    # ``prompt + pieces + "\n"``, which is character-for-character the in-process
+    # ``prompt + text + "\n"`` -- streaming must not change a byte of the answer.
+    streaming = bool(os.environ.get("POCKETLLM_WATCHDOG_STREAM"))
+    if streaming:
+        engine.set_stream_to_stdout(True)
+        print(namespace.prompt, end="", flush=True)
 
     try:
         text = engine.infer(namespace.prompt)
@@ -647,8 +680,91 @@ def _run_delegate(namespace: argparse.Namespace, engine_args: EngineArgs) -> int
         )
 
     # Mirror the native path's contract: echo the prompt, then the completion.
-    print(namespace.prompt, end="", flush=True)
-    print(text)
+    # In the streaming (watched) child the prompt was already echoed before the decode and
+    # the pieces are already on stdout, so only the terminating newline is left to write --
+    # skipping the echo here is what keeps the child's output byte-identical to this one's.
+    if not streaming:
+        print(namespace.prompt, end="", flush=True)
+    print(text if not streaming else "")
+    return 0
+
+
+def _run_delegate_watchdogged(
+    namespace: argparse.Namespace, engine_args: EngineArgs, model: object
+) -> int:
+    """Run one delegate generation in a watched child, so a hang is killable (#650).
+
+    ``--generation-timeout SECONDS`` selects this path.  The child is ``pocketllm run``
+    with the same flags, so *it* is the one that opens the delegate; the parent only
+    watches the child's stdout and kills it if the stream goes quiet past the window.
+    Whatever we print here must therefore not repeat the prompt the child echoes and
+    ``_run_delegate`` prints -- the child's redirected stdout carries the whole
+    ``prompt + answer``, and this function only prints that, so the on-wire text is
+    byte-identical to the in-process run.
+
+    A stall is **reported on stderr and turned into a non-zero exit**, not raised as a
+    traceback: the generation is lost, the partial text is all there is, and the caller
+    must be able to tell a killed run from a finished one by ``$?``.  The message names the
+    vendor cause so it is not read as a bug in this command.  A child that fails on its own
+    (a bad flag, a missing env var, a load error) is passed through: its stderr is relayed
+    and its own exit code is returned, so a real refusal is not hidden behind the wrapper.
+    """
+    import tempfile
+
+    from .watchdog import run_watchdogged, build_inner_argv
+
+    # The child re-parses the same flags, and the sampling refusals fire *in the child*,
+    # which is why they are not re-checked here.
+    argv = build_inner_argv(
+        model=str(model.hbm),
+        prompt=namespace.prompt,
+        device=engine_args.device,
+        # Pass the *resolved* tokenizer and config explicitly: the parent already turned
+        # `--model` (which may have been a demo JSON) into an `.hbm` path, and the child
+        # gets that path, so it needs the other two named or it re-derives them and refuses.
+        tokenizer_path=str(model.tokenizer_dir),
+        config_path=str(model.config),
+        backend=engine_args.backend,
+        model_format=getattr(engine_args, "model_format", "auto"),
+        max_model_len=engine_args.max_model_len,
+        dtype=engine_args.dtype,
+        kv_cache_dtype=getattr(engine_args, "kv_cache_dtype", "auto"),
+        max_tokens=namespace.max_tokens,
+        temperature=namespace.temperature,
+        top_k=namespace.top_k,
+        top_p=namespace.top_p,
+        min_p=namespace.min_p,
+        seed=namespace.seed,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="pocketllm-watchdog-") as tmp:
+        outcome = run_watchdogged(
+            argv,
+            stream_path=os.path.join(tmp, "stream.txt"),
+            stall_seconds=float(namespace.generation_timeout),
+        )
+
+    # The child produced the whole answer on its redirected stdout; the watchdog already
+    # forwarded it live, so there is nothing more to print on the happy path.
+    if outcome.stalled:
+        print(
+            f"`pocketllm run` generation timeout: no output for "
+            f"{outcome.silent_for:.0f}s (the --generation-timeout is {namespace.generation_timeout:g}s) "
+            f"and the process was killed after {outcome.elapsed:.0f}s. This is the S600 "
+            "delegate's known lost-wake-up deadlock, not a slow answer -- the generation is "
+            "lost and the text above is partial. The delegate has no cancellation, so a "
+            "watchdog is the only recovery; the fix is the vendor libxlm.so.",
+            file=sys.stderr,
+        )
+        # 124 is `timeout(1)`'s convention for "the command did not finish in time", which
+        # a caller or a shell script already knows how to read.
+        return 124
+    if outcome.exit_code != 0:
+        # The child failed on its own -- relay its stderr (the CLI's one-line refusal
+        # travelled there) and return its code, so the wrapper is transparent.
+        if outcome.stderr:
+            sys.stderr.write(outcome.stderr)
+        return outcome.exit_code
     return 0
 
 

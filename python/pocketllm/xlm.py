@@ -612,7 +612,7 @@ class XlmEngine:
             if context_size:
                 param.context_size = int(context_size)
 
-            state: dict[str, object] = {"sink": callback}
+            state: dict[str, object] = {"sink": callback, "stream_fd": None}
             ffi = _trampoline(state)
 
             handle = ctypes.c_void_p()
@@ -729,6 +729,27 @@ class XlmEngine:
         chunks: list[str] = state.get("chunks", [])  # type: ignore[assignment]
         return "".join(chunks)
 
+    def set_stream_to_stdout(self, enabled: bool = True) -> None:
+        """Make every decoded piece go to stdout as it arrives (the watchdog's sensor).
+
+        Off by default, because an ordinary ``infer`` returns the whole text and the
+        caller decides what to do with it.  When on, the trampoline writes each piece to
+        the process's **real** stdout (a saved duplicate of fd 1, not ``sys.stdout``,
+        which :func:`quiet_delegate_stdout` has pointed at stderr for the call's duration)
+        the instant the delegate produces it.  That is what lets the watchdog wrapper's
+        child show its parent a live stream: a stall is *no new bytes*, and a child that
+        writes only at completion shows the watcher nothing.
+        """
+        state = self._state  # type: ignore[attr-defined]
+        previous = state.get("stream_fd")
+        if enabled:
+            if previous is None:
+                state["stream_fd"] = os.dup(1)
+        else:
+            if previous is not None:
+                os.close(int(previous))
+            state["stream_fd"] = None
+
     @property
     def last_performance(self) -> Any:
         """The `xlm_model_performance_t` the delegate reported at the last ``STATE_END``.
@@ -745,6 +766,10 @@ class XlmEngine:
         if self._closed:
             return
         self._closed = True
+        fd = self._state.get("stream_fd")  # type: ignore[attr-defined]
+        if fd is not None:
+            os.close(int(fd))
+            self._state["stream_fd"] = None  # type: ignore[attr-defined]
         self._lib.xlm_destroy(ctypes.byref(self._handle))
 
     def __enter__(self) -> "XlmEngine":
@@ -779,6 +804,18 @@ def _trampoline(state: "dict[str, object]") -> CALLBACK:
             sink = state.get("sink")
             if callable(sink):
                 sink(piece, status)
+            # The watchdog's sensor: when the inner CLI is watched, every decoded piece
+            # also goes to stdout the moment the delegate makes it, so the parent sees a
+            # live stream and can tell "still decoding" from "hung". Unset in every normal
+            # run, so this is a no-op there and the CLI's output is unchanged.
+            #
+            # It writes to a saved duplicate of the real stdout, not to `sys.stdout`:
+            # `infer` runs the call inside `quiet_delegate_stdout`, which points fd 1 at
+            # stderr for the duration, so writing through fd 1 here would send the stream
+            # to the delegate's banner channel instead of the answer channel.
+            stream_fd = state.get("stream_fd")
+            if stream_fd is not None:
+                os.write(int(stream_fd), piece.encode("utf-8"))
         if status == STATE_END:
             state["performance"] = result.contents.performance
 
