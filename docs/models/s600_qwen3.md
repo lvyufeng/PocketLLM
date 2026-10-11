@@ -1541,19 +1541,69 @@ The project's accuracy target is agreement with the 2080ti C-engine oracle. This
 text-out and takes no token-id input**, so the comparison is made by feeding the oracle the exact ids
 the delegate's chat template produced and diffing the greedy continuations.
 
-**A single prompt flattered this path; a batch does not.** The first measurement used one prompt
-("The capital of France is") and read as "identical for 14 tokens, then a near-tie". Widening it to
-ten diverse prompts × both sizes tells a more honest story — **0/10 fully identical at either size**,
-and the agreement is a **prefix**, not the whole answer:
+**A single prompt flattered this path; a batch of ten is not yet a distribution.** The first
+measurement used one prompt ("The capital of France is") and read as "identical for 14 tokens, then a
+near-tie". Ten diverse prompts × both sizes said **0/10 fully identical at either size**, with the
+agreement a **prefix** and not the whole answer. That was more honest than one prompt, but ten is
+still too thin to carry a divergence *statistic* — a category could disagree completely and never
+appear in a ten-prompt draw, and a single large-margin prompt read as an outlier instead of a tail.
+The corpus is now **50 prompts across 7 categories**, measured by the same method, and reported as a
+distribution rather than a min/max/median:
 
-| Size | Fully identical | Shared exact prefix (tokens) | Median |
+| Size | Fully identical | Shared prefix min / p25 / median / p75 / max | Splits with a ≥5-logit gap |
 |---|---|---|---|
-| 0.6B (w8 vs oracle `q4_k_m`) | **0 / 10** | 8 … 59 | ~26 |
-| 1.7B (w4 vs oracle `Qwen3-1.7B-Q4_K_M`) | **0 / 10** | 4 … 52 | ~12 |
+| 0.6B (w8 vs oracle `q4_k_m`) | **0 / 50** | 4 / 8 / **18** / 26 / 59 | **1 / 50** |
+| 1.7B (w4 vs oracle `Qwen3-1.7B-Q4_K_M`) | **0 / 50** | 2 / 7 / **11** / 17 / 38 | **9 / 50** |
 
-The batch (10 prompts, their prompt ids, greedy continuation ids and text, both sizes, plus the
-tokenizer and the greedy `generation_config.json`) is `~/scratch/ref/s600_parity_batch.tgz` on the
-board; the single-prompt artifacts are `~/scratch/ref/parity/s600_parity.json`.
+The distribution is itself the finding, and it **changes the headline on the 1.7B row.** Ten prompts
+said "most divergences are near-ties, but not all"; fifty say that is true of the **0.6B** — 39 of 50
+splits sit under one logit, and only one (`multi_02`, the EN→FR translation) reaches past five, at
+**7.91** — and **not of the 1.7B**, where **9 of 50** splits are five logits or wider, reaching
+**20.49** on `code_06` (a Python word-count function). The one large-margin case the ten-prompt batch
+found (row 05, 14.06) was therefore not an outlier to explain away; it was a visible point on a tail
+the ten-prompt draw was too small to show the shape of.
+
+The corpus, both captures and both scored tables live in `~/scratch/ref/harness/` on the board
+(`artifacts/0.6B-w8.{s600,agreement}.json`, `artifacts/1.7B-w4.{s600,agreement}.json`), and the whole
+measurement is now **one command** — see [the harness](#the-harness-one-command) below, which is what
+makes the vendor's `w4` 0.6B a single invocation when it lands. The single-prompt artifacts remain at
+`~/scratch/ref/parity/s600_parity.json`.
+
+### The distribution, by category
+
+Every category diverges on **every** prompt — there is no category the board reproduces fully at
+either size — so the useful question is *where* it parts and *how confidently*, not *whether*. The
+shared-prefix histogram (50 prompts, both sizes) and the per-category breakdown:
+
+| shared prefix | 0–4 | 5–9 | 10–19 | 20–29 | 30–39 | 40+ |
+|---|---|---|---|---|---|---|
+| 0.6B `w8` | 3 | **15** | 12 | 11 | 5 | 4 |
+| 1.7B `w4` | 10 | 12 | **17** | 8 | 3 | 0 |
+
+| category | n | 0.6B prefix min/med/max | 0.6B gap med/max | 1.7B prefix min/med/max | 1.7B gap med/max |
+|---|---|---|---|---|---|
+| factual | 8 | 8 / 12 / 36 | 0.54 / 2.21 | 2 / 20 / 24 | 1.85 / 5.05 |
+| arithmetic | 7 | 4 / 29 / 59 | 0.70 / 1.28 | 4 / 9 / 26 | 1.05 / 2.41 |
+| code | 6 | 12 / 31 / 56 | 0.26 / 0.63 | 7 / 29 / 38 | **7.14 / 20.49** |
+| multilingual | 7 | 9 / 18 / 45 | 0.82 / **7.91** | 3 / 14 / 21 | 0.82 / 5.30 |
+| longform | 6 | 4 / 9 / 30 | 0.44 / 2.24 | 4 / 5 / 13 | 2.69 / 5.09 |
+| instruction | 6 | 6 / 7 / 27 | 0.32 / 1.54 | 2 / 11 / 15 | 4.37 / 6.85 |
+| ambiguous near-tie | 10 | 6 / 18 / 23 | 0.58 / 2.70 | 7 / 15 / 30 | 1.55 / 4.56 |
+
+Two readings fall out and neither is the old one:
+
+- **The 1.7B's widest disagreements are on structured output** — `code` and `instruction` are where
+  its gaps live (median 7.14 and 4.37 against 0.4–1.5 everywhere else), while its *prefixes* there
+  are long. It agrees on the scaffold (def/return, a numbered list, JSON braces) and then splits
+  hard on a token the two quantizations rank very differently. `code_06` diverges after **38** shared
+  tokens with a **20.49**-logit gap — the largest in either batch.
+- **The 0.6B's one wide split is multilingual**, and it is the mirror image: a short prefix (45 on
+  `multi_02`) and a 7.91 gap. Otherwise the width-confounded 0.6B is the *more* near-tie-dominated
+  of the two rows — the opposite of what "w8 vs q4_k_m is doubly mismatched" would predict, which is
+  itself a caution against reading the width confound as a severity knob.
+- **The deliberately ambiguous prompts are the most benign**, as expected — a near-tie the two sides
+  resolve differently is what an open-ended first token *is* — and the `ambiguoustie` median prefix
+  (0.6B 18, 1.7B 15) is above the overall median at both sizes.
 
 ### The width confound, and why only one pair can remove it
 
@@ -1564,10 +1614,10 @@ The two rows above do **not** confound width equally, and the weaker row is the 
 | 0.6B | `w8` (int8) | `q4_k_m` | **mismatched** (8 vs 4) | mismatched |
 | 1.7B | `w4` (int4) | `Qwen3-1.7B-Q4_K_M` | matched (4 vs 4) | mismatched |
 
-So the 0.6B divergence could be **width or scheme**, while the 1.7B row — where the 14.06-logit
-Row 05 disagreement lives — isolates **scheme**, because both sides are 4-bit. A same-width 0.6B
-pair would settle it, but **the vendor does not publish one**, and neither does it publish the
-mirror-image lever (a `w8` 1.7B):
+So the 0.6B divergence could be **width or scheme**, while the 1.7B row — where the wide-margin
+disagreements live (`code_06`'s 20.49; the ten-prompt batch's row 05 at 14.06) — isolates **scheme**,
+because both sides are 4-bit. A same-width 0.6B pair would settle it, but **the vendor does not
+publish one**, and neither does it publish the mirror-image lever (a `w8` 1.7B):
 
 - **The manifest lists exactly one language `.hbm` per LLM size**, and the widths are not
   interchangeable — `resolve_model_nash-p.md` (in the SDK at
@@ -1586,15 +1636,18 @@ That is a finding, not a gap awaiting a retry: the removal of the confound is **
 the only path that would produce a `w4` 0.6B or a `w8` 1.7B `.hbm` is the same
 [compile chain](../architecture/s600_native_chain.md) that a smaller 4B would need — built by us,
 on x86-64, not fetched. Until then the honest reading is: **the 0.6B row mixes width and scheme; the
-1.7B row isolates scheme; and the one large-margin divergence we have measured (Row 05) is on the
-row that isolates it.**
+1.7B row isolates scheme; and the wide-margin divergences we have measured — all nine of them, and
+the ten-prompt batch's row 05 — are on the row that isolates it.**
 
-**Most divergences are near-ties — but not all.** Row 01 (1.7B) splits on a **1.33**-logit gap, the
-"two coherent phrasings of the same fact" case the single prompt showed. **Row 05 (1.7B) does not**:
-the two engines diverge at the same 12-token context with the oracle scoring its own choice
-**57.33** against the S600's choice **43.26** — a **14.06** gap. A gap that large is not 4-bit
-rounding noise against the *same* weights; the S600's `.hbm` is therefore **not the oracle's
-`q4_k_m` numerically**, whatever the bucket's `w4` label says.
+**Near-ties dominate the 0.6B row; they do not dominate the 1.7B.** The fifty-prompt gap
+distribution says so directly: at 0.6B, **39 of 50** splits sit under one logit and only `multi_02`
+reaches past five; at 1.7B, **9 of 50** are five logits or wider, the largest `code_06` at **20.49**
+after 38 shared tokens. A twenty-logit margin is not rounding noise against the *same* weights — the
+oracle scores its own next token twenty logits above the board's, so the two sides are reading
+**different numbers**, which is the scheme mismatch below and not a tie the board lost. The ten-prompt
+batch's single 14.06 case (the old row 05) reproduces here **exactly** — this engine puts 57.33 on its
+choice against the board's 43.26 at the same context — and the fifty-prompt corpus shows it was a
+point on a tail, not an outlier.
 
 ### What quantization the `.hbm` actually is
 
@@ -1617,33 +1670,51 @@ from `leap_llm` at all. So the board `.hbm` and the oracle's GGUF are **two diff
 that happen to both be "4-bit", and a 14-logit disagreement is the expected consequence, not a bug
 in either engine.
 
-**The honest statement is therefore:** the output is **coherent and on-topic** (all ten prompts
-produced correct, well-formed answers — see the table below), but it is **token-identical to the
-oracle only for a prefix** (median ~12 tokens at 1.7B, ~26 at 0.6B), and at least one divergence
-(Row 05) is a large-margin disagreement that reflects the two sides being **different
-quantizations**, not a near-tie. This path cannot be compared to 1e-3 at the logit level — the
-delegate exposes no logits — so the token agreement above is the whole of the evidence, and the page
-says so rather than implying more.
+**The honest statement is therefore:** over fifty prompts the output is **coherent and on-topic** at
+both sizes, but it is **token-identical to the oracle for no prompt at all** (0/50 at each size) —
+only for a **prefix**, whose median is 18 tokens at 0.6B and 11 at 1.7B — and the 1.7B's splits are
+**not** all near-ties: nine of its fifty carry a ≥5-logit margin, up to 20.49, which is the two sides
+being **different quantizations** and not a coin-flip the board lost. This path cannot be compared to
+1e-3 at the logit level — the delegate exposes no logits — so the token agreement above is the whole
+of the evidence, and the page says so rather than implying more.
 
-### The per-prompt batch (S600 side)
+### The harness: one command
 
-| Prompt | 0.6B ids | 1.7B ids | Note |
-|---|---|---|---|
-| factual short-answer (largest planet) | 126 | 125 | both correct |
-| multi-step arithmetic (train distance) | 919 | 651 | both correct |
-| code snippet (iterative factorial) | 782 | 1330 | both correct |
-| list three primes > 20 | 429 | 509 | both correct |
-| two-part (boiling + freezing point) | 325 | 229 | **1.7B = Row 05, the 14.06 divergence** |
-| translate EN→FR | 225 | 271 | both correct |
-| summarize a paragraph | 232 | 442 | both correct |
-| yes/no with reasoning (is 0 even) | 251 | 401 | both correct |
-| long division (100th digit of 1/7) | 789 | **4055** | 1.7B loops in ` thinking`, never closes it |
-| long prefill (~225-token passage) | 120 | 122 | both correct |
+The measurement is a single invocation now, not a re-derivation, so a new graph (above all the
+vendor's `w4` 0.6B that would remove the width confound) is one command to score:
 
-Every answer is correct to a human read, including the intended-to-be-hard 1/7 prompt (the 0.6B
-computes `100 mod 6 = 4` → the 4th digit of `142857` = **8**, right). The one quality defect is
-1.7B's repetition loop on that prompt — a model artifact, kept in the record rather than dropped,
-and a strong oracle test precisely because a degenerate loop is hard to reproduce by accident.
+```bash
+python3 parity.py <graph.hbm> --config <config.json> --label 0.6B-w4 \
+    --oracle-ssh lvyufeng --gguf /mnt/data1/models/qwen3-0.6b-q4_k_m.gguf
+```
+
+It captures the 50-prompt corpus on the board, ships the artifact to the oracle host, replays each
+prompt on the **C engine**, and prints the table — identical / shared-prefix / divergence token per
+side / the oracle's top-2 gap at that step. `parity.py`, `corpus.py`, `capture_agreement.py`,
+`compare_agreement.py` and the artifacts are under `~/scratch/ref/harness/` (its `README.md` is the
+method). Two conventions are pinned there and matter: the oracle is **`libpocketllm.so`, not
+llama.cpp** — the C engine reproduces the page's `57.33 / 43.26 / 14.06` exactly while llama.cpp on
+the same GGUF shares zero tokens and, worse, its own greedy output moves with the context window it
+is asked for — and the oracle is handed the ids of the delegate's **ChatML-templated** text, both
+sides greedy, so agreement is measured on ids.
+
+### Answer quality over the fifty (S600 side)
+
+The corpus is not scored for correctness — the oracle is a quantization of the same weights, not a
+truth source — but it does surface the model-quality defects a small quantized checkpoint has:
+
+- **The 1.7B closes its reasoning block on all 50** and answers on-topic at every length; its longest
+  answers are the `code` prompts, which diverge widest (above) but stay coherent.
+- **The 0.6B closes its block on 49 of 50.** The exception is `code_02` ("reverse a string without
+  slicing"): it generates **4065 tokens** — the longest in either batch, and longer than every other
+  0.6B answer by 4× — **never closes ` thinking`**, and falls into a repetition loop on the phrase
+  *"must not use slicing. So, the solution…"* (that 40-character window recurs seven times in the
+  tail). It is the same failure mode the old ten-prompt set put on the 1.7B's `1/7` prompt and it is
+  kept in the record rather than dropped: a degenerate loop is a strong oracle test precisely because
+  it is hard to reproduce by accident, and here the board produced it where the oracle might not.
+
+The earlier ten-prompt answer-quality table and that 1.7B `1/7` loop remain in
+`~/scratch/ref/parity_batch/`.
 
 ## Sampling and caps the CLI enforces
 
