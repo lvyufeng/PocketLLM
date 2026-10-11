@@ -92,6 +92,13 @@ class Session {
   /* Drop the KV cache and rewind to position 0. */
   void reset();
 
+  /* Pre-size the KV slabs to `slots` sequence slots of `positions` rows each,
+   * before a batch is admitted.  The scheduler calls this because the slabs
+   * cannot grow once more than one sequence is live -- `ensure_kv` grows by
+   * release and reallocate without copying, which would wipe the batch.  See
+   * `Qwen3Model::reserve`.  Throws `ContextLengthError` if past the window. */
+  void reserve(int64_t positions, int64_t slots);
+
  private:
   Session(std::string gguf_path, std::string backend_name,
           std::unique_ptr<kernel::Backend> backend, std::unique_ptr<GgufReader> checkpoint,

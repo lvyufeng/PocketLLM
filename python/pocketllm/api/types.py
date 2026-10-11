@@ -105,6 +105,21 @@ class EngineArgs:
     speculative_method: str | None = None
     speculative_tokens: int = 1
     max_batch_size: int = 1
+    #: The KV window, in positions, that the batch scheduler reserves **per slot**
+    #: before admitting a group.  It is the row count of each sequence's slab.
+    #:
+    #: A batched decode cannot let the KV cache grow: the engine's grow path
+    #: releases and reallocates the slabs without copying, so a sequence crossing
+    #: a capacity boundary would wipe every other slot's history and return
+    #: fluent-wrong text with no error.  The scheduler therefore sizes the cache
+    #: once and stops a sequence cleanly (``finish_reason="length"``) when it
+    #: reaches this window.  It binds only when ``max_batch_size > 1``.
+    #:
+    #: Memory: on the ascend board the KV slab is f16, so the reservation is
+    #: ``window * n_layer * n_head_kv * head_dim * 2 bytes * max_batch_size``
+    #: -- about 59 MB per slot at 2048 on the 0.6B, and it scales with the
+    #: window before it scales with the batch.
+    batch_kv_window: int = 2048
     #: Whether to run the batch scheduler instead of the serialized session.
     #:
     #: ``None`` is "the backend's default" rather than "off": a backend that owns
@@ -149,6 +164,8 @@ class EngineArgs:
             raise ConfigurationError("speculative_tokens must be >= 1")
         if self.max_batch_size < 1:
             raise ConfigurationError("max_batch_size must be >= 1")
+        if self.batch_kv_window < 1:
+            raise ConfigurationError("batch_kv_window must be >= 1")
         if self.enable_batching is False and self.max_batch_size > 1:
             # Both fields are the operator's, and they disagree: a width is a
             # request for a scheduler that runs that many rows, and refusing the

@@ -10,10 +10,13 @@ adapter made a mistake that no fake would have caught:
 
 * the per-token decode, which mangles any script whose glyphs span more than one token;
 * the end-of-text token, which decodes to its literal spelling and was streamed as text;
-* the session lock, without which concurrent requests return *wrong answers and no error*.
+* the one thread that owns the engine, without which concurrent requests return *wrong
+  answers and no error*.
 
 The last of those is the module's reason to exist, and ``test_concurrent_requests_stay_separate``
-is the one that would fail loudest if it were removed.
+is the one that would fail loudest if it were removed.  Stage 2 replaced the session lock with a
+batch scheduler (``docs/architecture/batch_serving.md``): the engine is now driven by one thread
+that gives each request its own KV slot, so the isolation is structural rather than a lock.
 """
 
 from __future__ import annotations
@@ -350,13 +353,15 @@ def test_concurrent_requests_stay_separate(backend) -> None:
     assert not wrong, f"{len(wrong)} of {count} answers belong to another request: {wrong}"
 
 
-def test_the_session_lock_serializes_the_engine(backend) -> None:
-    """Mutual exclusion, observed rather than assumed.
+def test_the_scheduler_is_the_one_engine_user(backend) -> None:
+    """Isolation, observed rather than assumed.
 
-    The test above proves the *symptom* is gone; this proves the mechanism is what removed it, by
-    recording whether two generations were ever inside the engine at the same time.  Without it a
-    future refactor could widen the lock into a no-op that still happened to pass under a
-    favourable interleaving.
+    The test above proves the *symptom* is gone; this proves the mechanism is what removed it.
+    Stage 2 replaced the lock with a scheduler thread that owns the session, so the property is
+    now "exactly one engine call is ever in flight", not "a lock is held".  A future refactor
+    that let two scheduler steps overlap would return wrong text with no exception, so the count
+    is asserted directly: no two ``next_token``/``next_tokens`` calls are ever inside the engine
+    at once.
     """
     depth = 0
     peak = 0
@@ -366,7 +371,7 @@ def test_the_session_lock_serializes_the_engine(backend) -> None:
     class Counting:
         def __getattr__(self, name):
             attr = getattr(original, name)
-            if name != "forward":
+            if name not in ("next_token", "next_tokens", "forward"):
                 return attr
 
             def wrapped(*args, **kwargs):
@@ -406,7 +411,7 @@ def test_the_session_lock_serializes_the_engine(backend) -> None:
     finally:
         backend._engine = original
 
-    assert peak == 1, f"{peak} generations were inside the engine at once; the lock is not holding"
+    assert peak == 1, f"{peak} engine calls overlapped; the scheduler is not the sole engine user"
 
 
 # -- over HTTP ---------------------------------------------------------------
@@ -480,3 +485,171 @@ def test_health_and_metrics(served) -> None:
     with urlrequest.urlopen(served + "/metrics", timeout=10) as response:
         text = response.read().decode()
     assert "pocketllm_waiting_requests" in text
+
+
+# -- Stage 2: the scheduler's batched decode, versus solo -------------------
+
+
+def test_batched_streams_match_their_solo_output() -> None:
+    """The acceptance gate for batch serving: a batched request equals a solo one.
+
+    A wrong KV span returns *fluent text with no error*, so equality is the only proof.  Distinct
+    prompts of different lengths make the post-prefill positions ragged, and the width is asserted
+    against ``_batched_widths`` -- the width ``_run_group`` actually ran at, appended only inside
+    it -- so the test fails if the scheduler serialized rather than batched.
+    """
+    from pocketllm.server.native_backend import NativeBackend
+
+    prompts = [
+        "Reply with only the word: alpha",
+        "Name one color, one word only.",
+        "Reply with exactly: the quick brown fox",
+        "Say only: omega",
+    ]
+
+    def streamed(instance, text, rid):
+        events = list(
+            instance.stream(
+                build_chat_request(
+                    {"messages": [{"role": "user", "content": text}], "max_tokens": 12},
+                    request_id=rid,
+                )
+            )
+        )
+        return "".join(e.text for e in events if e.text), events[-1].finish_reason
+
+    for width in (2, 4):
+        chosen = prompts[:width]
+
+        solo = {}
+        solo_backend = NativeBackend(EngineArgs(model=CHECKPOINT, max_batch_size=1), "cpu")
+        try:
+            for i, text in enumerate(chosen):
+                solo[i] = streamed(solo_backend, text, f"solo-{width}-{i}")
+        finally:
+            solo_backend.close()
+
+        batched = {}
+        errors = {}
+        backend = NativeBackend(
+            EngineArgs(model=CHECKPOINT, max_batch_size=width, batch_kv_window=1024), "cpu"
+        )
+        try:
+            start = threading.Event()
+
+            def run(i, text):
+                start.wait()
+                try:
+                    batched[i] = streamed(backend, text, f"batch-{width}-{i}")
+                except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+                    errors[i] = repr(exc)
+
+            threads = [
+                threading.Thread(target=run, args=(i, text)) for i, text in enumerate(chosen)
+            ]
+            for thread in threads:
+                thread.start()
+            start.set()
+            for thread in threads:
+                thread.join(timeout=300)
+            groups = list(backend._batched_widths)
+        finally:
+            backend.close()
+
+        assert not errors, errors
+        assert max(groups, default=0) >= width, (
+            f"the batched decode never reached width {width}: {groups}"
+        )
+        for i in range(width):
+            assert batched[i] == solo[i], f"request {i} at width {width} drifted from its solo output"
+
+
+
+def test_a_ragged_group_past_the_reservation_does_not_wipe_a_slot() -> None:
+    """The regression test for the KV-wipe: a ragged group whose longest slot over-runs.
+
+    ``ensure_kv`` grows the slab by release + realloc *without copy* whenever a position passes the
+    reservation, so if one slot walks past it while another is still live, the other's KV is erased
+    and fluent-wrong tokens come back with rc=0 and no error.  A group decodes in lockstep and a
+    finished member keeps its slot, fed ``_FINISHED_TOKEN``, so an unbounded slot climbs one
+    position per step the *group* runs.  With a per-job bound -- ``window - len(prompt)`` -- the
+    shorter prompt gets the larger budget and keeps decoding while the longest prompt's already-full
+    slot keeps advancing, walking it past the reservation.
+
+    The bound has to be the group's, not each job's: every job stops ``window - cap`` steps past its
+    own prompt, where ``cap`` is the group's longest prompt, so no slot can reach the reservation.
+    A window of 256 is the smallest power of two the reservation can sit at, which is what lets the
+    longest slot actually reach it in a handful of steps; the two prompts differ enough that the
+    per-job bound would let the shorter one run well past.  The assertion is on the emitted count --
+    exactly ``window - cap`` per job, the lockstep count -- and on the finish reason, so a scheduler
+    that let either job run past the window fails here rather than silently wiping the other.
+    """
+    from pocketllm.server.native_backend import NativeBackend
+
+    window = 256
+    prompts = [
+        " ".join(f"w{i}" for i in range(30)) + " Now count upward from 1, one number per line:",
+        " ".join(f"q{i}" for i in range(70)) + " Now list the alphabet, one letter per line:",
+    ]
+
+    def one(instance, text, rid, max_tokens):
+        return instance.generate(
+            [
+                build_chat_request(
+                    {"messages": [{"role": "user", "content": text}], "max_tokens": max_tokens},
+                    request_id=rid,
+                )
+            ]
+        )[0]
+
+    solo_backend = NativeBackend(EngineArgs(model=CHECKPOINT, max_batch_size=1), "cpu")
+    try:
+        cap = max(
+            one(solo_backend, text, f"ragged-solo-{i}", 4).usage.prompt_tokens
+            for i, text in enumerate(prompts)
+        )
+    finally:
+        solo_backend.close()
+
+    assert cap < window, f"the longest prompt ({cap}) does not fit under window {window}"
+    bound = window - cap
+    assert bound >= 4, f"the prompts leave only {bound} steps under window {window}"
+
+    results = {}
+    errors = {}
+    backend = NativeBackend(
+        EngineArgs(model=CHECKPOINT, max_batch_size=2, batch_kv_window=window), "cpu"
+    )
+    try:
+        start = threading.Event()
+
+        def go(i, text):
+            start.wait()
+            try:
+                result = one(backend, text, f"ragged-{i}", bound + 64)
+                results[i] = (list(result.token_ids), result.finish_reason)
+            except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+                errors[i] = repr(exc)
+
+        threads = [threading.Thread(target=go, args=(i, text)) for i, text in enumerate(prompts)]
+        for thread in threads:
+            thread.start()
+        start.set()
+        for thread in threads:
+            thread.join(timeout=600)
+        batched_widths = list(backend._batched_widths)
+    finally:
+        backend.close()
+
+    assert not errors, errors
+    assert max(batched_widths, default=0) >= 2, batched_widths
+    for i in range(len(prompts)):
+        emitted, finish_reason = results[i]
+        assert len(emitted) == bound, (
+            f"request {i} emitted {len(emitted)} tokens, not the group bound {bound} "
+            f"(window {window} - longest prompt {cap}); a per-job bound lets the shorter prompt run "
+            "past the reservation, which grows the slab under -- and wipes -- the other slot"
+        )
+        assert finish_reason == "length", (
+            f"request {i} stopped with {finish_reason!r}, not at the window bound"
+        )

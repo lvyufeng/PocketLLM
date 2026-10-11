@@ -141,6 +141,18 @@ void Session::forward_batch(const int32_t *tokens, const int64_t *n_per_seq, int
   position_ = model_->cache_length();
 }
 
+void Session::reserve(int64_t positions, int64_t slots) {
+  if (model_ == nullptr) {
+    throw Error("this checkpoint is architecture '" +
+                checkpoint_->get_string("general.architecture", "?") +
+                "', which this build has no graph for; only 'qwen3' runs");
+  }
+  model_->reserve(positions, slots);
+  /* The cache now holds no sequence's history; the reservation is the size,
+   * not a decode position. */
+  position_ = 0;
+}
+
 void Session::reset() {
   position_ = 0;
   if (model_ != nullptr) {

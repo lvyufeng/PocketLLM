@@ -170,6 +170,22 @@ POCKETLLM_API int pocketllm_forward_batch(pocketllm_session *session, const int3
                                           const int64_t *n_per_seq, int64_t n_seq,
                                           int32_t *out_tokens);
 
+/* Pre-size the KV cache to `slots` sequence slots of `positions` rows each.
+ *
+ * The batch path exists so a scheduler can run `pocketllm_forward_batch` every
+ * step.  It cannot, however, let the cache *grow* while more than one sequence
+ * is live: the grow path releases and reallocates the slabs without copying,
+ * so a sequence crossing a capacity boundary would wipe every other slot's KV
+ * and return fluent-wrong text with no error.  A scheduler calls this once,
+ * before admitting a group, and then keeps every sequence's position inside the
+ * `positions` window; the forward path never reaches its grow branch.
+ *
+ * Idempotent, and it does not discard a cache it already covers.  `positions`
+ * past the checkpoint's context length is `kErrContextLength`.  Returns 0 on
+ * success, a negative value on failure.  Additive -- nothing else changes. */
+POCKETLLM_API int pocketllm_reserve(pocketllm_session *session, int64_t positions,
+                                    int64_t slots);
+
 /* Drop the KV cache and the position counter.  The next `pocketllm_forward`
  * starts a fresh sequence.  Returns 0 on success, negative on failure. */
 POCKETLLM_API int pocketllm_reset(pocketllm_session *session);

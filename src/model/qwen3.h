@@ -141,6 +141,24 @@ class Qwen3Model {
    * pure loss. */
   void reset();
 
+  /* Pre-size the KV slabs to `slots` sequence slots of `positions` rows each,
+   * before any sequence is admitted.
+   *
+   * This exists because `ensure_kv` -- the growth the forward path still does
+   * -- releases and reallocates the slabs *without copying* when either the
+   * row count or the slot count must grow.  That is fine for one sequence,
+   * whose history is being grown under its own live window, and catastrophic
+   * for a batch: the first sequence to cross a capacity boundary would wipe
+   * every other slot's KV and return fluent-wrong text with no error.  A
+   * scheduler therefore fixes the slab before the group starts and chooses a
+   * window it never lets a sequence exceed, so `ensure_kv`'s grow branch is
+   * never reached while more than one slot is live.
+   *
+   * Idempotent and non-destructive: calling it again with a size the slabs
+   * already hold is a no-op, so it does not throw away a live batch.  Throws
+   * `ContextLengthError` if `positions` is past the checkpoint's context. */
+  void reserve(int64_t positions, int64_t slots);
+
  private:
   explicit Qwen3Model(kernel::Backend &backend) : backend_(&backend) {}
 

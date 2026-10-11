@@ -87,6 +87,7 @@ def test_the_library_exports_exactly_the_abi(lib: "ctypes.CDLL") -> None:
         "pocketllm_forward",
         "pocketllm_forward_argmax",
         "pocketllm_forward_batch",
+        "pocketllm_reserve",
         "pocketllm_reset",
         "pocketllm_argmax",
         "pocketllm_temperature",
