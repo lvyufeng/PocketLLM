@@ -208,6 +208,14 @@ class Qwen3Model {
    * function because the destructor and the tie-breaking in it both need to
    * ask, and the answer must be the same in both places. */
   void release_weight(const Weight &weight);
+
+  /* Whether two `Weight`s denote the same bound tensor: the same form, and the
+   * same live handle.  This is how a tied head is told from one the checkpoint
+   * carries separately, and the test has to be identity rather than shape -- a
+   * Qwen3 head is `(n_embd, n_vocab)` whether it is tied or not, so shapes
+   * cannot tell the two apart. */
+  static bool same_buffer(const Weight &a, const Weight &b);
+
   /* Size the scratch buffers for a batch of `n` tokens whose last position is
    `end_pos - 1`. The second argument is not derivable from the first because the
    attention score row is indexed by absolute key position: a one-token decode at
