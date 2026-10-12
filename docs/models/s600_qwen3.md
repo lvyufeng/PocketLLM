@@ -1707,11 +1707,14 @@ the ten-prompt draw was too small to show the shape of.
 
 The corpus and every capture live in `~/scratch/ref/harness/` on the board: the two shipped rows
 (`artifacts/0.6B-w8.*`, `artifacts/1.7B-w4.*`), the four cache-sweep captures of the 1.7B
-(`artifacts/1.7B-w4-{ours-c1024,c2048,ours-c4096}.*`), and the seven provenance-pair captures
+(`artifacts/1.7B-w4-{ours-c1024,c2048,ours-c4096}.*`), the seven provenance-pair captures
 (`artifacts/0.6B-{ours,shipped}-w8.*`, `artifacts/0.6B-w4.*`, `artifacts/4B-{ours-c1024,shipped-c4096}.*`,
-`artifacts/8B-{ours,shipped}-w4.*`). The `f16`-oracle re-scoring lives beside them as
-`0.6B-{ours,shipped}-w8-f16`, `0.6B-w4-f16` and `q4_k_m-vs-f16` (0.6B), and
-`{1.7B,4B,8B}-{ours,shipped}-w4-f16` with `{1.7B,4B,8B}-q4km-vs-f16` (the whole-table run) — the same
+`artifacts/8B-{ours,shipped}-w4.*`), the `w8` builds (`artifacts/1.7B-w8-ours-c1024.*`,
+`artifacts/4B-w8-ours-c1024.*`), the calibration-corpus build (`artifacts/1.7B-ours-c1024-calib.*`)
+and the 8B `cache_4096` survey (`artifacts/8B-ours-c4096.*`). The `f16`-oracle re-scoring is **not**
+on the board: it lives on the oracle host under `~/s600_f16/artifacts/` (0.6B:
+`0.6B-{ours,shipped}-w8-f16`, `0.6B-w4-f16` and `q4_k_m-vs-f16`) and `~/s600_f16b/artifacts/`
+(`{1.7B,4B,8B}-{ours,shipped}-w4-f16` with `{1.7B,4B,8B}-q4km-vs-f16`, the whole-table run) — the same
 registry, scored against a second oracle. The whole measurement is now
 **one command** — see [the harness](#the-harness-one-command) below, which is what makes the vendor's
 `w4` 0.6B a single invocation when it lands. The single-prompt artifacts remain at
