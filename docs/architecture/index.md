@@ -10,6 +10,7 @@ forces. The pages here are the design record, in the order the layers depend on 
 | [Backends and dispatch](backend_model.md) | How an op finds a backend, and how a device is named |
 | [Execution](execution.md) | The execution layer, memory, plans, and reading a GGUF checkpoint |
 | [Device targets](devices.md) | What each backend is for and what it is waiting for |
+| [The fleet support matrix](fleet_support_matrix.md) | The three accelerator classes at a glance: what each runs, accuracy against the 2080ti oracle, and prefill/decode throughput |
 | [The C engine](c_engine.md) | The native `libpocketllm.so`: what it runs today, and the backend interface the graph is written against |
 | [Ascend 310B custom ops](ascend_310b.md) | The measured 310B result: the custom ops, the 161001 env trap, the cube's large-N edge, and the full Qwen3 forward that runs on it |
 | [Serving from the C engine](serving.md) | The design for `pocketllm serve`: the adapter the HTTP surface is missing, and the concurrency it must admit it does not have |
