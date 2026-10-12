@@ -1917,8 +1917,8 @@ floor is measuring the oracle's quantization error, not ours; a row below it is 
 The same re-scoring was carried out at the three larger sizes, so the provenance table is now read
 against truth everywhere rather than at the 0.6B alone. Each is the same shape: the shipped graph,
 our graph (both `w4` here, the width the larger checkpoints ship at) and the size's own
-`q4_k_m`-vs-`f16` floor, over the same 50-prompt corpus. The 1.7B table also carries our own `w8`
-build — a separate axis, recorded [below](#the-17b-at-w8-above-the-floor-against-truth).
+`q4_k_m`-vs-`f16` floor, over the same 50-prompt corpus. The 1.7B and 4B tables also carry our own `w8`
+builds — a separate axis, with the 1.7B's recorded [below](#the-17b-at-w8-above-the-floor-against-truth).
 
 **1.7B** (`n = 50`):
 
@@ -1935,6 +1935,7 @@ build — a separate axis, recorded [below](#the-17b-at-w8-above-the-floor-again
 |---|---|---|---|---|
 | shipped `w4` | 4 / 11 / **19** / 23 / 53 | 2 / 7 / 17 / 16 / 3 / 5 | 2 | **990** |
 | ours `w4` | 2 / 6 / **8** / 17 / 32 | 9 / 21 / 15 / 4 / 1 / 0 | 12 | **536** |
+| **ours `w8`** | 4 / 20 / **31** / 39 / 124 | 1 / 0 / 11 / 12 / 14 / 12 | **0** | **1656** |
 | **`q4_k_m` vs `f16` (the floor)** | 4 / 17 / **25** / 47 / 96 | 1 / 4 / 12 / 12 / 7 / 14 | 2 | **1552** |
 
 **8B** (`n = 46` — the four prompts that stalled on the board, `fact_07`, `long_04`, `long_05`,
@@ -1956,8 +1957,9 @@ Three readings hold across all four sizes:
   `q4_k_m`-vs-`f16` floor is Σ **995** (0.6B), **956** (1.7B), **1552** (4B), **1901** (8B): a GGML
   k-quant is a near-truth reference only for the smallest checkpoint. Read as a ratio to the floor,
   shipped/floor is **1.33 / 0.76 / 0.64 / 0.63** and ours/floor is **0.98 / 0.41 / 0.35 / 0.38** — so
-  from 1.7B up **both the shipped graph and ours sit below the floor** (every row here is `w4`; the
-  1.7B's own `w8` build is the exception, recorded
+  from 1.7B up **both the shipped graph and ours sit below the floor** (every `w4` row here does; the
+  `w8` builds at 1.7B and 4B are the exception — the 4B's Σ **1656** sits +104 (+6.7%) above its floor,
+  and the 1.7B's is recorded
   [below](#the-17b-at-w8-above-the-floor-against-truth)), and "below the floor" is *not* a property of
   our build alone. This is the strongest form of the 0.6B point: the `q4_k_m` reference
   is good only where the model is small, and above it every graph on this table — the vendor's
@@ -2028,7 +2030,7 @@ cache is not an accuracy lever for the 8B either. The full row and the enumerati
 
 #### The 1.7B at `w8`: above the floor against truth
 
-Every row in the tables above is the width the checkpoints ship at (`w4` at 1.7B and up). Our pipeline
+Every shipped-and-ours pair in the tables above is the width the checkpoints ship at (`w4` at 1.7B and up). Our pipeline
 can also compile the same checkpoint at `w8` — the **1.7B `w8`** build varies exactly one flag against
 our existing 1.7B `w4` `cache_1024` graph (`--w_bits 4 → 8`) — so the width is a variable the tables
 could not see until it was built and run. It was: built clean, relayed, captured on the same 50-prompt
@@ -2069,7 +2071,7 @@ Three scope notes, because this row is easy to over-read:
   sits **above** it — the first cell at 1.7B to do so.
 - **`w8` doubles the packed weights, and at 8B that exceeds the 10 GiB pool.** 8B `w8` is **not
   deployable**; the S600 stays `w4` at 8B, and that row is **below** the floor. This result is a
-  0.6B/1.7B statement and does not fix the 8B.
+  0.6B/1.7B/4B statement and does not fix the 8B.
 
 Two readings, one of which revises a reading above:
 
