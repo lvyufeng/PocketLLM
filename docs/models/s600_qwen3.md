@@ -326,6 +326,13 @@ what puts a digit's logit and `bunifuFlatButton`'s within a hair. The 1.7B loop 
 effect; the 8B slip is not one, and the two must not be read as the same failure. It is the build axis
 the provenance table measures, showing up as a single token in the text.
 
+**And it is confirmed for the full corpus, not just the one slip token.** The 8B cell separates cache
+from build on a single prompt, too narrow to carry a statistic; the matched-cache 1.7B row above carries
+it over all fifty. At the identical `cache_4096` ours trails the vendor **377 vs 724** against truth,
+and lifting *our* cache from 1024 to 4096 moved nothing (Σ **394** → **377**). So the cache is not the
+accuracy lever for the corpus either, and "the build, not the cache" is not a fact about one 8B
+enumeration — it is the matched-cache agreement result at the size where the confound is controlled out.
+
 **The answer to the enumeration question for the 1.7B is yes.** The `cache_4096` rebuild that cured the
 1.7B's runaway loop also lists all of `1..200` and `1..400` without corruption; the enumeration stays
 clean at the larger cache, so the loop and the slip do not trade places when the cache grows.
@@ -1958,16 +1965,39 @@ Three readings hold across all four sizes:
   stays the exception in direction: there our `w4`'s 15 splits are the *only* thing above the floor,
   on a graph otherwise pinned to the floor itself, while the `w8` row sits at it.
 
-**The 4B closes the table, and the row it closes is the one that still cannot be paired the decisive
-way.** The 4B is the last size with a shipped-and-ours pair, so the provenance gap now rests on **all
-four** sizes rather than three — but it is paired the *same* way as the others, ours at `cache_1024`
-against the vendor's `cache_4096`, so the cache is a second axis in the row exactly as it is in the 0.6B,
-1.7B and 8B rows. Separating cache from build at 4B the way the 8B's own `cache_4096` cell separates it
-would need **our** 4B rebuilt at `cache_4096`, and **no such build exists** — unlike the 8B, where our
-own `cache_4096` graph was available to run. So the "the slip is the build, not the cache" result above
-is an **8B-only** fact on this page; at 4B the honest reading is the weaker one, that our build is the
-less oracle-like graph and the cache is not controlled out. Whether the 4B's 16-split tail would survive
-a cache-matched own build is **not measured, and not claimed**.
+**The 4B closes the table, and it is the one row still paired the confounded way.** The 4B is the last
+size with a shipped-and-ours pair, so the provenance gap now rests on **all four** sizes rather than
+three — but it is paired the *same* way as the others, ours at `cache_1024` against the vendor's
+`cache_4096`, so the cache is a second axis in the row. Separating cache from build at 4B the way the
+1.7B's and 8B's own `cache_4096` builds separate it would need **our** 4B rebuilt at `cache_4096`, and
+**no such build exists**. Whether the 4B's 16-split tail would survive a cache-matched own build is
+therefore **not measured for the 4B**, and not claimed.
+
+**At the 1.7B the cache *is* now controlled out, and the gap survives it.** Our own 1.7B `cache_4096`
+build — the rebuild that closes the `France?` loop — was captured on the same 50-prompt corpus and
+scored against the vendor graph *at the same cache*, so cache length is the one variable this cell
+pins. It is the matched-cache row the table did not have:
+
+| 1.7B graph (all `w4`) | cache | vs `f16` (truth) min/p25/med/p75/max | ≥5-logit splits | Σ prefix |
+|---|---|---|---|---|
+| ours `w4` | 1024 | 0 / 2 / **6** / 12 / 21 | 23 | **394** |
+| ours `w4` | 4096 | 0 / 2 / **6** / 11 / 26 | 23 | **377** |
+| shipped `w4` | 4096 | 2 / 8 / **14** / 19 / 38 | 6 | **724** |
+| **`q4_k_m` vs `f16` (the floor)** | — | 2 / 9 / **19** / 26 / 79 | 3 | **956** |
+
+At **matched** cache (both `cache_4096`) our graph trails the vendor **377 vs 724** against truth —
+**less than half** — so the provenance gap is the **build**, not the cache: the cache-mismatch confound
+is removed and the gap stays. The sweep makes the point twice over. Our own `cache_4096` (Σ **377**) is
+a hair *worse* than our `cache_1024` (Σ **394**) — a wash, not an improvement — so the deeper cache buys
+the loop and not the corpus. Scored directly against each other at the same cache, the two graphs share
+**379** tokens of leading continuation across the fifty prompts, with **13 of 50** diverging after
+agreeing on only two tokens — structural from the start of the continuation, not a late drift.
+
+The two axes stay separate, and this result does not overturn the loop finding. The cache **is** still
+the lever for the `France?` runaway loop — our `cache_4096` closes it (229 pieces, a 40-char window
+recursing twice) where `cache_1024` runs away — but that is the *loop*, a degenerate 2-token prompt. The
+new result is narrower and different: the cache is **not** what closes the **corpus-agreement** gap, and
+at matched cache our graph is still less than half the vendor's agreement with truth.
 
 **The 8B's corrupted token is present in the capture and invisible in the agreement data.** The
 `bunifuFlatButton` glitch — a single Qwen vocabulary token, id `95234`, that substitutes for a *digit*

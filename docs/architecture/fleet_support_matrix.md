@@ -54,7 +54,7 @@ is measuring the quantizer's error, not the board's.
 |---|---|---|
 | **2080ti** | the oracle itself — token-identical to llama.cpp on both widths | logit-level 1e-3 (`--print-top K`) |
 | **310B** | ✅ **at the quantizer's own floor, never below** (see below) | **token agreement only** (no logits surface) |
-| **S600** | 🟡 a real provenance gap vs truth; cause not yet identified (calibration ruled out) | **token agreement only** (`xlm` returns text, no logits, no seed) |
+| **S600** | 🟡 a real provenance gap vs truth; cause not yet identified (calibration and cache ruled out) | **token agreement only** (`xlm` returns text, no logits, no seed) |
 
 **310B.** Against f16 the board reaches Σ prefix **1078 / 939 / 1620** (0.6B / 1.7B / 4B) where the
 `q4_k_m` checkpoint's own distance from truth is the floor **995 / 956 / 1552** — ratios **1.08 /
@@ -72,7 +72,12 @@ first candidate — the compile-time calibration corpus, which defaults to a set
 — was **tested and falsified**: a corpus matched to the parity categories moved the KV-cache scales
 *away* from the vendor's on 44 of 49 tensors (median distance to the vendor's scales: **1.8%** for the
 default corpus, **16.4%** for the matched one), so the default calibration was already vendor-matched
-and calibration is not the lever. With the KV scales near-identical and the weights data-free-identical
+and calibration is not the lever. The **cache** has since been ruled out too: at the 1.7B, our own
+`cache_4096` build scored against the vendor graph at the *same* cache trails it **377 vs 724** against
+f16 — less than half — and lifting our cache from 1024 to 4096 moved nothing (**394 → 377**), so the
+confound is removed and the gap is the build, not the cache. (The cache remains the lever for the 1.7B
+`France?` *runaway loop*, a separate axis — the deeper cache closes the loop but not the corpus gap.)
+With the KV scales near-identical and the weights data-free-identical
 (`w_max/7`), the remaining candidates are the compiler graph's operator rounding and accumulation
 order, or a vendor weight-quant scheme that is not data-free. See
 [the native compile chain](s600_native_chain.md) and the S600 model page for the record.
@@ -115,7 +120,7 @@ declined — see [the batched-decode bound](ascend_310b_batch_decode_bound.md) a
 | Device | Accuracy | Performance |
 |---|---|---|
 | **2080ti** | the oracle — token-exact vs llama.cpp | CPU at parity with llama.cpp on prefill, ahead on decode; CUDA kernels naive |
-| **S600** | real provenance gap vs truth; cause under investigation (calibration falsified) | 88 t/s @0.6B → 30 t/s @8B; our compiled graphs beat the shipped ones |
+| **S600** | real provenance gap vs truth; cause under investigation (calibration and cache both falsified) | 88 t/s @0.6B → 30 t/s @8B; our compiled graphs beat the shipped ones |
 | **310B** | ✅ **at the floor, never below** — the goal is met on this board | 3.8 → 1.7 t/s; batching lifts aggregate to ~8 t/s |
 
 ## Scope
