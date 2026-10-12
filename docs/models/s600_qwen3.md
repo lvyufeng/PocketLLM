@@ -1797,13 +1797,15 @@ exist on the board, each pair at a **matched width** so the pipeline is the only
 | 0.6B `w8` | ours `c1024` | shipped `c4096` | 2 / 7 / **13** / 23 / 64 | 6 / 13 / 12 / 12 / 3 / 4 | **0** | 4 / 8 / **18** / 26 / 59 | 3 / 15 / 12 / 11 / 5 / 4 | 1 |
 | 0.6B `w4` | ours `c1024` | — (no vendor `w4`) | 0 / 0 / **4** / 6 / 22 | 32 / 10 / 4 / 4 / 0 / 0 | **14** | — | — | — |
 | 1.7B `w4` | ours `c1024` | shipped `c4096` | 0 / 2 / **6** / 13 / 21 | 20 / 17 / 10 / 3 / 0 / 0 | **23** | 2 / 7 / **11** / 17 / 38 | 10 / 12 / 17 / 8 / 3 / 0 | 9 |
+| 1.7B `w8` | ours `c1024` | — (no vendor `w8`) | 2 / 9 / **17** / 25 / 79 | 6 / 8 / 18 / 13 / 2 / 3 | 7 | — | — | — |
 | **4B `w4`** | ours `c1024` | shipped `c4096` | 2 / 6 / **8** / 16 / 35 | 8 / 21 / 15 / 4 / 2 / 0 | **16** | 4 / 11 / **18** / 24 / 42 | 3 / 6 / 19 / 15 / 5 / 2 | 2 |
 | 8B `w4` | ours `c1024` | shipped `c4096` | 2 / 7 / **11** / 20 / 61 | 5 / 14 / 15 / 8 / 3 / 1 | 2 | 4 / 14 / **23** / 33 / 88 | 2 / 5 / 15 / 12 / 8 / 8 | 2 |
 
 **The gap holds at every size — our build is the less oracle-like one in all four vendor pairs — but its
-magnitude and its shape are not the same.** The table carries a **fifth row**, the `0.6B w4` our-own
-build, which has no vendor counterpart to pair against (the SDK publishes no `w4` 0.6B); its own
-comparisons are within 0.6B and are read below. Paired per prompt (ours minus shipped on the *same*
+magnitude and its shape are not the same.** The table carries two further our-own rows that have no
+vendor counterpart to pair against: the `0.6B w4` build (the SDK publishes no `w4` 0.6B), whose own
+comparisons are within 0.6B and are read below, and the `1.7B w8` build (no vendor `w8` 1.7B exists
+either), whose result is recorded in full [below](#the-17b-at-w8-above-the-floor-against-truth). Paired per prompt (ours minus shipped on the *same*
 prompt, so a shared easy prompt cannot flatter either side):
 
 | size | prompts | ours shorter | equal | ours longer | median Δ | Δ range |
@@ -1915,7 +1917,8 @@ floor is measuring the oracle's quantization error, not ours; a row below it is 
 The same re-scoring was carried out at the three larger sizes, so the provenance table is now read
 against truth everywhere rather than at the 0.6B alone. Each is the same shape: the shipped graph,
 our graph (both `w4` here, the width the larger checkpoints ship at) and the size's own
-`q4_k_m`-vs-`f16` floor, over the same 50-prompt corpus.
+`q4_k_m`-vs-`f16` floor, over the same 50-prompt corpus. The 1.7B table also carries our own `w8`
+build — a separate axis, recorded [below](#the-17b-at-w8-above-the-floor-against-truth).
 
 **1.7B** (`n = 50`):
 
@@ -1923,6 +1926,7 @@ our graph (both `w4` here, the width the larger checkpoints ship at) and the siz
 |---|---|---|---|---|
 | shipped `w4` | 2 / 8 / **14** / 19 / 38 | 6 / 11 / 21 / 10 / 2 / 0 | 6 | **724** |
 | ours `w4` | 0 / 2 / **6** / 12 / 21 | 17 / 18 / 12 / 3 / 0 / 0 | **23** | **394** |
+| **ours `w8`** | 2 / 12 / **19** / 27 / 89 | 2 / 5 / 19 / 13 / 5 / 6 | 2 | **1174** |
 | **`q4_k_m` vs `f16` (the floor)** | 2 / 9 / **19** / 26 / 79 | 7 / 8 / 11 / 18 / 3 / 3 | 3 | **956** |
 
 **4B** (`n = 50`):
@@ -1952,8 +1956,10 @@ Three readings hold across all four sizes:
   `q4_k_m`-vs-`f16` floor is Σ **995** (0.6B), **956** (1.7B), **1552** (4B), **1901** (8B): a GGML
   k-quant is a near-truth reference only for the smallest checkpoint. Read as a ratio to the floor,
   shipped/floor is **1.33 / 0.76 / 0.64 / 0.63** and ours/floor is **0.98 / 0.41 / 0.35 / 0.38** — so
-  from 1.7B up **both the shipped graph and ours sit below the floor**, and "below the floor" is *not*
-  a property of our build alone. This is the strongest form of the 0.6B point: the `q4_k_m` reference
+  from 1.7B up **both the shipped graph and ours sit below the floor** (every row here is `w4`; the
+  1.7B's own `w8` build is the exception, recorded
+  [below](#the-17b-at-w8-above-the-floor-against-truth)), and "below the floor" is *not* a property of
+  our build alone. This is the strongest form of the 0.6B point: the `q4_k_m` reference
   is good only where the model is small, and above it every graph on this table — the vendor's
   included — is closer to truth than the oracle is.
 - **The 1.7B's wide-margin tail survives against truth.** Its `q4_k_m` row carried **23** ≥5-logit
@@ -1963,7 +1969,10 @@ Three readings hold across all four sizes:
   earlier, it disagrees more confidently than either the reference quant or the shipped graph, and
   truth agrees. The 4B's 12 splits and the 8B's 4 are likewise above their floors' 2 and 0. The 0.6B
   stays the exception in direction: there our `w4`'s 15 splits are the *only* thing above the floor,
-  on a graph otherwise pinned to the floor itself, while the `w8` row sits at it.
+  on a graph otherwise pinned to the floor itself, while the `w8` row sits at it. At the 1.7B the
+  same test now reads in reverse: our `w8` build carries **2** wide-margin splits where our `w4`
+  carries **23** — so the tail is a property of our 1.7B **at `w4`**, not of the 1.7B pipeline as such
+  ([below](#the-17b-at-w8-above-the-floor-against-truth)).
 
 **The 4B closes the table, and it is the one row still paired the confounded way.** The 4B is the last
 size with a shipped-and-ours pair, so the provenance gap now rests on **all four** sizes rather than
@@ -2016,6 +2025,67 @@ the same corpus, our 8B at the vendor's cache has the *same* wide 8B-style defic
 against the shipped graph at the same cache; median Δ **0** against our own `cache_1024` graph), so the
 cache is not an accuracy lever for the 8B either. The full row and the enumeration that came with it are
 [in the survey below](#cache-versus-build-on-the-accuracy-table).
+
+#### The 1.7B at `w8`: above the floor against truth
+
+Every row in the tables above is the width the checkpoints ship at (`w4` at 1.7B and up). Our pipeline
+can also compile the same checkpoint at `w8` — the **1.7B `w8`** build varies exactly one flag against
+our existing 1.7B `w4` `cache_1024` graph (`--w_bits 4 → 8`) — so the width is a variable the tables
+could not see until it was built and run. It was: built clean, relayed, captured on the same 50-prompt
+corpus, and scored against both oracles. **Against truth it is the first cell at this size at or above
+the floor, and it sits 450 tokens above the vendor's `w4` `cache_4096` graph.**
+
+Build provenance: `oellm_build --model_name qwen3 --march nash-p --w_bits 8 --chunk_size 512
+--cache_len 1024 --prefill_core_num 4 --decode_core_num 4 --device cpu`, exited clean
+(`Exit status: 0`, wall **6:25:33**). Output
+`Qwen3-1.7B_language_chunk_512_cache_1024_w8_nash-p_corenum_4_4.hbm`, **2,484,199,624 B**, md5
+`14c18c05975c4684474faacb9110397a`, relayed 2080ti→Mac→board and md5-verified at all three ends
+(re-verified on the board immediately before and after the capture). Captured 2026-10-12 as
+`1.7B-w8-ours-c1024` — **50/50 prompts, 0 stalls** — and scored on the 2080ti against
+`qwen3-1.7b-f16.gguf` (truth) and `Qwen3-1.7B-Q4_K_M.gguf`.
+
+| 1.7B graph (vs `f16` truth; our graphs `cache_1024`, the vendor's `cache_4096`) | Σ prefix |
+|---|---|
+| **ours `w8`** | **1174** |
+| ours `w4` | 394 |
+| shipped `w4` | 724 |
+| **`q4_k_m` vs `f16` (the floor)** | **956** |
+
+Against `f16` the `w8` row reads min/p25/med/p75/max **2 / 12 / 19 / 27 / 89**, histogram
+**2 / 5 / 19 / 13 / 5 / 6**, **2** wide-margin splits (ours `w4`: 23; the floor: 3) and **0 / 50**
+fully identical — **Σ 1174, +218 above the floor (+22.8%)**. Against `q4_k_m` the same capture
+reads min/p25/med/p75/max **2 / 9 / 17 / 25 / 79**, histogram **6 / 8 / 18 / 13 / 2 / 3**, **7**
+wide-margin splits, **Σ 906** — the row added to the `q4_k_m` table
+[above](#the-provenance-gap-holds-at-the-other-sizes-and-it-is-not-uniform).
+
+Three scope notes, because this row is easy to over-read:
+
+- **The metric is token agreement against a near-lossless `f16` checkpoint taken as truth** — the
+  agreed proxy for this board. The board exposes **no logits** (`xlm` returns text), so the project's
+  **1e-3** bound has **no numeric form on this side**: this is not a 1e-3 logit match and must not be
+  read as one.
+- **The floor is the `q4_k_m` checkpoint's *own* agreement with truth** (Σ 956), not a clean-model
+  ceiling: a graph *at* the floor is measuring the quantizer's error, not its own. `w8` at **1174**
+  sits **above** it — the first cell at 1.7B to do so.
+- **`w8` doubles the packed weights, and at 8B that exceeds the 10 GiB pool.** 8B `w8` is **not
+  deployable**; the S600 stays `w4` at 8B, and that row is **below** the floor. This result is a
+  0.6B/1.7B statement and does not fix the 8B.
+
+Two readings, one of which revises a reading above:
+
+- **The below-floor collapse is a property of `w4`, not of the size.** At 1.7B our `w4` sits below
+  the floor (394 vs 956) exactly as it does at 4B and 8B, while our `w8` sits above it — and at 0.6B
+  our `w8` sat at the floor. The w4/w8 asymmetry the 0.6B first showed holds at the 1.7B too.
+- **The 1.7B's confident-wrong tail is a `w4` property.** The 23 wide-margin splits that made the
+  1.7B the worst row on the truth-anchored table fall to **2** at `w8` — below the floor's own 3 —
+  and the hardest category follows: `code`'s median shared prefix against truth goes from **2** at
+  `w4` to **42** at `w8`.
+
+A statistics convention, since Σ and "median" can disagree about which median: **Σ is the decision
+axis on this page** (the floor comparison is what decides the goal), and the medians in the tables
+are the harness's positional `prefs[n // 2]` over the 50 prompts. The textbook even-`n` mean-of-two
+would read **18.5** on the `f16` row where the tables say **19**; both are correct under their own
+definitions, and the tables keep the positional one.
 
 ### The width confound, and why only one pair can remove it
 
