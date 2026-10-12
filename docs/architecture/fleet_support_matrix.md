@@ -39,8 +39,14 @@ decode.
 | Qwen3-4B | ✅ q4_k_m, f16 | ✅ w4 | ✅ q4_k_m |
 | Qwen3-8B | ✅ q4_k_m, f16 | ✅ w4 (87.7% of the pool) | ⚠️ runs, but at the memory/swap edge |
 | Sampling | temperature/top-k/top-p/min-p/seed | same (RNG on the host) | same (RNG on the host) |
-| `serve` | ✅ | ✅ board-tested | ✅ board-tested (`supports_batch = False`) |
+| `serve` | ✅ (batch when `max_batch_size > 1`) | ✅ board-tested — **no batch, see below** | ✅ board-tested (batch when `max_batch_size > 1`) |
 | Accuracy surface | **logits** (1e-3 expressible) | text/tokens only | tokens only |
+
+**S600 `serve` — no batch.** A measured wall, not a design choice: the delegate accepts
+`request_num <= 4` but its capacity for Qwen3 is 1 (`max_batch_num is: 1`, a table keyed by model
+type inside `libxlm.so`), and a 2- or 4-request batch of NORMAL-priority requests SIGSEGVs inside
+the runtime. Cancellation is a wall of the same kind — the SDK's public surface has no cancel
+symbol. Full record: `python/pocketllm/server/xlm_backend.py`, `capabilities()`.
 
 ## Accuracy against the 2080ti oracle
 

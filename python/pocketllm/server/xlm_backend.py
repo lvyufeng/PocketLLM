@@ -187,12 +187,31 @@ class XlmBackend:
 
         ``supports_streaming`` is true and is the delegate's own strength: it
         hands text back chunk by chunk as it decodes, so a stream is native here
-        rather than reconstructed.  ``supports_batch`` is false because one
-        delegate holds one cache.  ``supports_logprobs`` and
-        ``supports_structured_outputs`` are false because there is no logits
-        surface to rank and no constrained-decoding path to hold a schema with.
-        ``supports_cancellation`` is false because ``xlm_infer`` runs to
-        completion and nothing in the SDK observes a flag mid-call.
+        rather than reconstructed.
+
+        ``supports_batch`` is false for a measured reason, and a stronger one
+        than a cache that is merely shared: the runtime accepts a batch-shaped
+        call and then dies on it.  ``xlm_infer`` takes ``xlm_input_t`` with a
+        ``request_num`` count and a request array, and the delegate's inner entry
+        accepts up to 4 requests (refusing more with its own log line), but for
+        Qwen3 its capacity is 1 -- ``xlm_init`` logs ``max_batch_num is: 1`` from
+        a table keyed by model type inside ``libxlm.so``, before any ``.hbm`` is
+        read and regardless of the config file -- and a batch of two or four
+        NORMAL-priority requests SIGSEGVs inside ``XlmImpl::XlmInferPrefill``.
+        Probe, logs and the gdb backtrace: ``/home/sunrise/scratch/batch_probe/``
+        on the board.
+
+        ``supports_logprobs`` and ``supports_structured_outputs`` are false
+        because there is no logits surface to rank and no constrained-decoding
+        path to hold a schema with.
+
+        ``supports_cancellation`` is false because there is nothing to cancel
+        with: the SDK's entire public surface is twelve ``xlm_*`` symbols and
+        none is a cancel, abort or interruption; the callback returns ``void``,
+        ``xlm_result_t`` carries no control channel, and ``xlm_infer`` runs a
+        whole prefill and decode synchronously.  Priority preemption
+        (``NORMAL``/``HIGH``/``URGENT``) is scheduling, not cancellation -- and
+        is itself refused inside a batch of more than one.
         """
         return BackendCapabilities(
             name="horizon",
