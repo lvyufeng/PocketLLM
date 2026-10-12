@@ -120,9 +120,9 @@ this board's ceiling.
 
 | Model | Prefill | Decode | One-time plane build |
 |---|---|---|---|
-| Qwen3-0.6B | 0.065 s/token | **0.26 s/token** (3.8 t/s) | ~18.5 s |
-| Qwen3-1.7B | 0.065 s/token | **0.39 s/token** (2.6 t/s) | ~91.5 s |
-| Qwen3-4B | 0.129 s/token | **0.587 s/token** (1.7 t/s) | ~212–225 s |
+| Qwen3-0.6B | 0.065 s/token | **0.129 s/token** (7.8 t/s) | ~24.2 s |
+| Qwen3-1.7B | 0.065 s/token | **0.39 s/token** (2.6 t/s) | ~85.6 s |
+| Qwen3-4B | 0.129 s/token | **0.640 s/token** (1.6 t/s) | ~202 s |
 | Qwen3-8B | — | **1.55 s/token** (0.65 t/s; release on) | ~430 s |
 
 The wall is almost entirely the **one-time plane build**, not decode. Batching is the throughput
@@ -137,7 +137,7 @@ declined — see [the batched-decode bound](ascend_310b_batch_decode_bound.md) a
 |---|---|---|
 | **2080ti** | the oracle — token-exact vs llama.cpp | CPU at parity with llama.cpp on prefill, ahead on decode; CUDA kernels naive |
 | **S600** | ✅ **at the floor at 0.6B `w8`, above it at 1.7B `w8`** (Σ **1174** vs floor 956); `w4` builds still trail the vendor; **8B stays `w4`** — below the floor | 88 t/s @0.6B → 30 t/s @8B; our compiled graphs beat the shipped ones |
-| **310B** | ✅ **at the floor, never below** — the goal is met on this board | 3.8 → 1.7 t/s; batching lifts aggregate to ~8 t/s; 8B now fits: 0.65 t/s, no swap |
+| **310B** | ✅ **at the floor, never below** — the goal is met on this board | 7.8 → 1.6 t/s; batching lifts aggregate to ~8 t/s; 8B now fits: 0.65 t/s, no swap |
 
 ## Scope
 
