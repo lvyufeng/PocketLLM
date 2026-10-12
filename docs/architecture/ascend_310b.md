@@ -623,7 +623,7 @@ which would cut the 14.1 GiB of fp16 planes to the ~4.4 GiB of packed weights �
 neither of those levers:** the 4.68 GiB of packed bytes are only needed until their decoded form
 exists, and releasing them at load takes the resident set from 21.10 GiB to the 16.42 GiB of
 planes and table — measured, the same 8B now loads in 507.7 s and decodes at 1.73 s/token with
-the swapfile untouched (the release section above has the numbers).
+the swapfile untouched (the release section below has the numbers).
 
 The honest statement of coverage is now four sizes: **0.6B, 4B and 8B token-identical, and 1.7B runs
 and fits with one documented near-tie** — the same fp16-plane precision limit this whole page is
