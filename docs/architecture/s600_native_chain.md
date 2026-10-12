@@ -417,6 +417,11 @@ result: the baseline graph spans that cache difference and still lands within **
 the cache contributes at most ~1.8% while the calibration jump to **16.4%** dominates it. The behavioural
 A/B (baseline vs matched) is at matched cache and carries no such confound at all.
 
+The **cache** is separately ruled out as the corpus-gap cause too: our own 1.7B `cache_4096` build
+scored against the vendor graph at the *same* cache still trails it **377 vs 724** against `f16`, and
+lifting our cache from 1024 to 4096 moved nothing (**394 → 377**), so the gap is the build — on
+[the model page](../models/s600_qwen3.md#the-whole-table-truth-anchored-at-every-size).
+
 ## Where each claim comes from
 
 - Wheels, versions, arch tags: `ls -l` over `oellm_build/` and the extracted wheel trees.
