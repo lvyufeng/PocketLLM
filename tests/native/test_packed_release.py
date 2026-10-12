@@ -19,16 +19,30 @@ decoding it, and this file pins the two properties that matter:
   the same tokens with the release on as with it off --
   `$POCKETLLM_ASCEND_KEEP_PACKED=1` is the backend's own kill switch, so the
   "before" side is the code as it was rather than a hand-built expectation.
-* **The bytes actually go.**  The released run's peak resident set must be lower
-  by the packed bytes.  That is the whole point of the change -- the 8B is
-  supposed to fit on this board because of it -- and a release that quietly
-  stopped happening would pass every numerical test in the tree.
+* **The bytes actually go.**  After the same workload, the released child's
+  device pool must be free by the packed bytes more than the packed-kept
+  child's.  That is the whole point of the change -- the 8B is supposed to fit
+  on this board because of it -- and a release that quietly stopped happening
+  would pass every numerical test in the tree.
+
+The pool and not the process: the NPU allocates from this board's unified LPDDR
+(`aclrtMalloc`), and those allocations are not in the process's VmRSS or VmHWM --
+reading those two shows the host's own staging buffers and nearly nothing of the
+weights, which is how the first version of this test managed to measure the
+released run *peaking higher* than the packed-kept one.  The child asks the
+allocator (`aclrtGetMemInfo`) for the pool instead, the same reading the 8B
+measurement uses.  Both arms start from the same pool and the machine is idle
+(two runs of the pair agreed to within 1.5 MB at start), so the difference
+between them is what the release gave back.  The reading is taken *after* the
+workload rather than right after the load, because a few of the load's frees
+only show in the allocator's accounting once work has run; the load-time reading
+is carried along in the failure message for the record.
 
 Each side runs in its own child process.  The backend owns the device
 (`aclInit`/`aclFinalize`) and its decode caches are never evicted, so two
 sessions in one process would measure the first one's residency as much as the
-second's.  Everything skips without the library, without `/proc/self/status`, or
-without a checkpoint whose weights are packed -- a skip is not a pass.
+second's.  Everything skips without the library or without a checkpoint whose
+weights are packed -- a skip is not a pass.
 """
 
 from __future__ import annotations
@@ -61,33 +75,41 @@ KEEP_PACKED = "POCKETLLM_ASCEND_KEEP_PACKED"
 PROMPT = "The capital of France is"
 STEPS = 8
 
-#: The child process.  It prints one JSON object: the greedy ids and this
-#: process's peak resident set.  VmHWM and not VmRSS because the question is
-#: what the run needed, not what was left over at the end.
+#: The child process.  It prints one JSON object: the greedy ids and the device
+#: pool's free bytes, read right after the load and again after the workload.
 PROBE = r'''
+import ctypes
 import json
 import sys
 
 from pocketllm import native
 
+#: `aclrtMemAttr::ACL_DDR_MEM`: this board's NPU allocates from the host's own
+#: LPDDR, so this is the pool the weights live in.
+ACL_DDR_MEM = 0
 
-def peak_rss():
-    with open("/proc/self/status", encoding="ascii") as status:
-        for line in status:
-            if line.startswith("VmHWM:"):
-                return int(line.split()[1]) * 1024
-    raise SystemExit("no VmHWM line in /proc/self/status")
+
+def pool_free():
+    acl = ctypes.CDLL("libascendcl.so")
+    free = ctypes.c_size_t()
+    total = ctypes.c_size_t()
+    rc = acl.aclrtGetMemInfo(ACL_DDR_MEM, ctypes.byref(free), ctypes.byref(total))
+    if rc != 0:
+        raise SystemExit(f"aclrtGetMemInfo failed with {rc}")
+    return int(free.value)
 
 
 checkpoint, steps, prompt = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 with native.Engine.open(checkpoint, "ascend") as engine:
+    after_open = pool_free()
     tokens = engine.encode(prompt, add_special=False, parse_special=True)
     token = engine.next_token(tokens)
     ids = [token]
     for _ in range(steps):
         token = engine.next_token([token])
         ids.append(token)
-print(json.dumps({"ids": ids, "peak": peak_rss()}))
+    after_decode = pool_free()
+print(json.dumps({"ids": ids, "after_open": after_open, "after_decode": after_decode}))
 '''
 
 #: What a run that could not reach the board's runtime looks like.  These turn a
@@ -181,12 +203,8 @@ def runs() -> tuple[pathlib.Path, dict, dict]:
 needs_engine = pytest.mark.skipif(
     not native.is_available(), reason="libpocketllm.so is not built"
 )
-needs_linux = pytest.mark.skipif(
-    not pathlib.Path("/proc/self/status").is_file(),
-    reason="the RSS evidence reads /proc/self/status",
-)
 
-pytestmark = [needs_engine, needs_linux]
+pytestmark = [needs_engine]
 
 
 def test_the_release_does_not_move_a_token(runs: tuple[pathlib.Path, dict, dict]) -> None:
@@ -207,18 +225,20 @@ def test_the_release_does_not_move_a_token(runs: tuple[pathlib.Path, dict, dict]
 
 
 def test_the_release_gives_the_packed_bytes_back(runs: tuple[pathlib.Path, dict, dict]) -> None:
-    """The peak resident set drops by the packed bytes.
+    """After the same workload, the pool is free by the packed bytes more.
 
-    Half the packed bytes is the bound: the two runs build the same decoded
+    Half the packed bytes is the bound: the two children build the same decoded
     planes and both pay the decode's own staging, so the difference between them
     is the packed set and nothing else -- and half of it is far more than any
-    allocator's noise and far less than the bytes the release claims.
+    allocator's slack and far less than the bytes the release claims.
     """
     checkpoint, released, kept = runs
     packed = _packed_bytes(checkpoint)
-    freed = kept["peak"] - released["peak"]
+    freed = kept["after_decode"] - released["after_decode"]
     assert freed >= packed // 2, (
-        f"{checkpoint.name}: the released run peaked at {released['peak']} B and the "
-        f"packed-kept run at {kept['peak']} B, a difference of {freed} B against "
-        f"{packed} B of packed weights; the release did not give the bytes back"
+        f"{checkpoint.name}: after the same decode the released child's pool has "
+        f"{released['after_decode']} B free and the packed-kept child's {kept['after_decode']} B, "
+        f"a difference of {freed} B against {packed} B of packed weights; the release did not "
+        f"give the bytes back (right after the load the two read "
+        f"{released['after_open']} B and {kept['after_open']} B)"
     )
