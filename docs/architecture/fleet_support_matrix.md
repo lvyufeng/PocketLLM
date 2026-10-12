@@ -92,7 +92,7 @@ order, or a vendor weight-quant scheme that is not data-free. See
 | Qwen3-4B w4 (ours c1024) | 4339–4571 | **49.9** | 6.35 s | 39.6% |
 
 Our own `cache_1024` builds sit **above their shipped twins on both axes** — faster and smaller in
-the pool. Read against [s600_qwen3.md](../models/s600_qwen3.md#the-ladder-across-sizes): the 8B is
+the pool. Read against [s600_qwen3.md](../models/s600_qwen3.md#measured-ladder): the 8B is
 this board's ceiling.
 
 ### Orange Pi — Ascend 310B (marginal decode, `--steps 8` vs `32`)
