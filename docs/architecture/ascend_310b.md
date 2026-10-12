@@ -619,7 +619,11 @@ nothing that touches only the *host* side can make it: the thing that does not f
 device allocation against a 23.7 GiB pool with a ~7 GiB driver carve-out. The ladder's exit for a
 checkpoint this size is the packed-weight path ([W4A16](#precision-two-different-errors-and-which-one-is-the-graphs)),
 which would cut the 14.1 GiB of fp16 planes to the ~4.4 GiB of packed weights — a change to what the
-*cube* consumes, not to what the host holds, and not this change.
+*cube* consumes, not to what the host holds, and not this change. **The fit moved anyway, by
+neither of those levers:** the 4.68 GiB of packed bytes are only needed until their decoded form
+exists, and releasing them at load takes the resident set from 21.10 GiB to the 16.42 GiB of
+planes and table — measured, the same 8B now loads in 507.7 s and decodes at 1.73 s/token with
+the swapfile untouched (the release section below has the numbers).
 
 The honest statement of coverage is now four sizes: **0.6B, 4B and 8B token-identical, and 1.7B runs
 and fits with one documented near-tie** — the same fp16-plane precision limit this whole page is
@@ -691,12 +695,50 @@ fit in the pool does not fail — it succeeds from the host's point of view and 
 which is the 500 s clean run versus the ~1197 s one: the wall is the paging, not the decode. (Swap at
 rest, with no model, is already ~0.9 GiB used of 24 GiB.)
 
-**The one missing lever here is a *release*, not an arena shrink.** The ~4.68 GiB of resident packed
-blocks is needed only until its fp16 plane is built, so in principle it could be freed then — except
-`token_embd.blocks` is read on **every forward** (the embedding gather decodes it to the dense table),
-and the cube cache (`cube_cache_`) is **keyed on the same buffer handle**, so freeing a weight's blocks
-must also drop its cache entry or the next decode reads through a freed pointer. That is the real
-residency lever on this board, and it is care about handle lifetimes, not a buffer resize.
+**The one missing lever here was a *release*, not an arena shrink — and it is pulled.** The ~4.68 GiB
+of resident packed blocks is needed only until its fp16 plane is built, so it is freed then:
+`Qwen3Model::load` ends with `materialize_packed_weights()`, which asks the backend
+(`Backend::materializes_packed_weights()`, true only here) to build every decode the forward path will
+read — `cube_for`'s fp16 plane per GEMM weight, `dense_table_for`'s f32 table for the embedding, and
+on a *tied* checkpoint both forms of the one buffer the table and the head share — and then releases
+the packed bytes, per weight, largest first. `$POCKETLLM_ASCEND_KEEP_PACKED=1` turns the whole pass
+off, and `$POCKETLLM_ASCEND_W4A16=1` turns it off implicitly because that op decodes the packed bytes
+on every call and has no cached plane to fall back on.
+
+**What the release measures out to.** On the 8B (`Qwen3-8B-Q4_K_M.gguf`, 36 layers, untied head) the
+load now ends holding the 16.42 GiB of decoded forms and none of the 4.68 GiB of packed bytes: it
+takes **507.7 s** and leaves **1.06 GiB** of the 23.12 GiB pool free, with `SwapFree` unmoved to
+within 1.5 MiB across the whole run. The decode that follows runs at **1.73 s per token**
+(1.726-1.733 s across eight greedy steps after the 5-token canonical prompt) — the 8B's first clean
+*rate* on this board; the same probe reads 0.129 s per token on the 0.6B, which is the canonical
+table's 0.129 s/token for that checkpoint, so it is the same instrument measuring both. The contrast
+arm is the backend's own kill switch: with `$POCKETLLM_ASCEND_KEEP_PACKED=1` the load is quick
+(53.1 s — no planes are built) and the wall moves into the *prefill*, which takes **443.1 s** while
+the lazy plane build runs the pool down to 3.73 GiB and puts **4.05 GiB into swap**; the two decoded
+tokens then cost 24.0 s and 55.7 s against the release's 1.73 s, with 3.09 GiB of swap faulting back
+in. Same checkpoint, same board: the term being released is the 4.68 GiB of packed bytes, and it is
+the difference between a 0.58 tok/s decode and a swap measurement.
+
+**The instrument is not the process's resident set.** The pool figures above are
+`aclrtGetMemInfo(ACL_DDR_MEM)`, which on this board answers with exactly `/proc/meminfo`'s `MemFree`,
+byte for byte. `VmRSS` and `VmHWM` do **not** contain the NPU's `aclrtMalloc` memory: a peak-RSS
+comparison of the two arms measures the host's staging and reports the released run peaking *higher*
+(2,233,487,360 B against 1,868,619,776 B on the 0.6B). The release's own gate
+(`tests/native/test_packed_release.py`) reads the pool for that reason — the same nine greedy tokens
+with the release on and off, and **510,107,648 B** of pool back against the 0.6B's 390,491,136 B of
+packed weights.
+
+The handle-lifetime hazard this page named is real, and the resolution is *not* to drop the cache
+entry: the entry **is** the decode, the handle stays its key for the model's life, and the rule is
+order — materialize first, release second, and never decode again. The caches are keyed on the handle
+*and* the shape the caller asked for, so a lookup that misses after the release is a shape the load
+did not materialize; the backend refuses it by throwing (`require_packed_live`) rather than decoding
+freed memory into a plane that would then be used as a weight. That failure would be fluent wrong
+text, not a crash, which is why it is a guard and not a comment.
+
+`token_embd.blocks` is read on every forward only in the sense that `embedding_quant` *asks* for it
+every forward: `dense_table_for` caches the f32 table under the same handle, so the decode happens
+once and the embedding's packed bytes are dead with every other weight's.
 
 **The other lever is the plane's *width*, and the measured middle is untried.** Shrinking host-side buffers moves
 nothing (the prior section: the heap is ~33 MiB and every staging buffer is a local). The W4A16 packed
@@ -705,9 +747,9 @@ path would cut the 14.1 GiB of fp16 planes to ~4.4 GiB — but it *requantizes* 
 fails the page's 1e-3 bar and produces incoherent text; that is measured, not speculative. A faithful
 int8 plane (~3.8 GiB, `q4_K` decoded exactly and stored as int8 rather than fp16) would need a new
 cube op or a new dtype the op accepts, and it is the one middle rung nobody has built. Until then the
-8B's home on this board is a ~17 GiB pool that its fp16 planes fill, and its decode is a swap
-measurement rather than a rate — which is why the canonical table above carries no 8B *throughput*
-number, only its gate result.
+8B's home on this board is a ~17 GiB pool that its fp16 planes fill, and with the packed bytes
+released the 8B's decode is a rate after all — **1.73 s per token** on the probe above — where
+the canonical table's 8B row, taken before the release, still has no marginal at all.
 
 *Verified on the board, read-only, for this section: the idle `npu-smi` charge, `/proc/meminfo`,
 `/proc/cmdline`, the swap device and swappiness, and the full GGUF tensor table. The plane, head and

@@ -204,6 +204,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <aclnnop/aclnn_argmax.h>
@@ -596,6 +597,29 @@ void pack_q4k(const uint8_t *blocks, int64_t n, int64_t k, PackedQ4K *out) {
   }
 }
 
+/* An environment flag, in this tree's spelling: set, non-empty and not "0".
+ *
+ * Both of the flags below are read where they are used rather than cached in a
+ * static, so that a test can open one session with a flag and one without in
+ * the same process.  Neither is on a per-token path: the W4A16 flag is asked
+ * once per `gemm_quant` call and the keep-packed flag once per load. */
+bool env_flag(const char *name) {
+  const char *const value = std::getenv(name);
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+/* `$POCKETLLM_ASCEND_W4A16=1` selects the requantizing W4A16 GEMM for an
+ * experiment -- see `gemm_quant` for what it costs and why it is not the
+ * graph's path. */
+bool w4a16_selected() { return env_flag("POCKETLLM_ASCEND_W4A16"); }
+
+/* `$POCKETLLM_ASCEND_KEEP_PACKED=1` is the kill switch for the load-time
+ * release of the checkpoint's packed bytes: with it set the backend answers
+ * `materializes_packed_weights()` false, keeps every packed weight resident and
+ * decodes lazily, which is exactly what it did before the release existed.
+ * It exists to bisect a wrong token between the release and everything else. */
+bool keep_packed_requested() { return env_flag("POCKETLLM_ASCEND_KEEP_PACKED"); }
+
 /* ---- the backend --------------------------------------------------------- */
 
 class AscendBackend final : public Backend {
@@ -759,11 +783,8 @@ class AscendBackend final : public Backend {
      * packed), and a slower GEMM.  `$POCKETLLM_ASCEND_W4A16=1` selects the
      * lossy-but-fast W4A16 op for an experiment, where the requantization error
      * is the point being measured rather than a surprise. */
-    const char *const w4a16_env = std::getenv("POCKETLLM_ASCEND_W4A16");
-    const bool w4a16_wanted =
-        w4a16_env != nullptr && w4a16_env[0] != '\0' && w4a16_env[0] != '0';
-    const bool w4a16_ok = w4a16_wanted && type_id == quant::kGgmlQ4K && m == 1 && !accumulate &&
-                          n % kGemmAlign == 0 && k % kGroup == 0;
+    const bool w4a16_ok = w4a16_selected() && type_id == quant::kGgmlQ4K && m == 1 &&
+                          !accumulate && n % kGemmAlign == 0 && k % kGroup == 0;
     if (!w4a16_ok) {
       const DeviceBuffer plane = cube_for(blocks, n, k, type_id);
       run_cube_weight(read_f32(x, m * k, ACL_FLOAT), CubeWeight{n, k, plane}, m, n, k, accumulate,
@@ -1242,6 +1263,80 @@ class AscendBackend final : public Backend {
   bool prefers_kv_projection_in_cache_dtype() const override {
     const char *from_env = std::getenv("POCKETLLM_ASCEND_KV_PROJ_F16");
     return from_env == nullptr || from_env[0] == '\0' || from_env[0] != '0';
+  }
+
+  /* ON, because this is the backend the release exists for.
+   *
+   * Every packed weight this backend is asked to run is decoded once into a
+   * device artifact -- `cube_for`'s fp16 plane or `dense_table_for`'s f32 table
+   * -- and cached under the packed buffer's handle, and no run reads the packed
+   * bytes again after that decode.  On the 8B the two sets are 4.68 GiB of
+   * packed bytes and 16.4 GiB of decoded ones, both resident for the model's
+   * whole life, and only the second set is ever read: releasing the first is
+   * what brings the model inside this board's memory, and it is a residency
+   * change with no arithmetic in it at all (the tests assert greedy output is
+   * byte-identical to the packed-kept run rather than assume it).
+   *
+   * Two things turn it off, and both are stated rather than silent:
+   *
+   *   * `$POCKETLLM_ASCEND_W4A16=1` selects the requantizing op, which reads
+   *     the packed q4_K bytes *on every call* (`pack_for`) instead of a cached
+   *     plane.  With that op in play the packed bytes are the weight, so they
+   *     stay -- the same answer the CPU and the card give, for the same reason.
+   *   * `$POCKETLLM_ASCEND_KEEP_PACKED=1` is the kill switch: the load-time
+   *     release is skipped, every decode is the lazy one it was, and a wrong
+   *     token can be bisected between the release and everything else. */
+  bool materializes_packed_weights() const override {
+    return !keep_packed_requested() && !w4a16_selected();
+  }
+
+  /* Build the decode the matching forward call will look up, now, while the
+   * packed bytes are still there to build it from.  `dense_table_for` is the
+   * embedding gather's f32 table and `cube_for` is the GEMM's fp16 plane; which
+   * one a `Weight` needs is the caller's statement, not this backend's guess. */
+  void materialize_packed(DeviceBuffer blocks, int64_t rows, int64_t cols, int type_id,
+                          PackedUse use) override {
+    ensure_context();
+    if (use == PackedUse::kEmbedding) {
+      dense_table_for(blocks, rows, cols, type_id);
+      return;
+    }
+    cube_for(blocks, rows, cols, type_id);
+  }
+
+  /* Release the packed bytes and remember the handle as spent.
+   *
+   * The order matters and is the reverse of the build: the artifact is already
+   * in its cache, so the free cannot strand a later lookup that is going to
+   * hit, and the insertion is what makes a later lookup that *misses* throw
+   * instead of decoding freed memory.  Recording first would be a window in
+   * which a legal lookup threw; recording after the free would be a window in
+   * which an illegal one read garbage. */
+  void release_packed(DeviceBuffer blocks) override {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      spent_packed_.insert(blocks.handle);
+    }
+    release(blocks);
+  }
+
+  /* Refuse a lookup that missed on a handle whose bytes were released at load.
+   *
+   * The caches below are keyed on the packed handle *and* the shape and type
+   * the caller asked for, so a miss on a spent handle means the forward path
+   * asked for something `materialize_packed` did not build -- and with the
+   * bytes gone there is nothing left to build it from.  Decoding anyway would
+   * read whatever the allocator left in that memory and hand back a plane of
+   * it, used as a weight: a fluent wrong answer, not a crash.  Throwing names
+   * the handle and the two ways to reach this state.  Callers hold `mutex_`. */
+  void require_packed_live(uintptr_t handle) const {
+    if (spent_packed_.find(handle) == spent_packed_.end()) {
+      return;
+    }
+    throw Error("ascend: the packed weight at handle " + std::to_string(handle) +
+                " was released at load and this call asks for a decode that was not built; "
+                "either a forward path asked for a shape the load did not materialize, or "
+                "POCKETLLM_ASCEND_W4A16 was set after the weights were released");
   }
 
   void argmax(DeviceBuffer values, int64_t n, DeviceBuffer out) override {
@@ -1840,8 +1935,12 @@ class AscendBackend final : public Backend {
 
   /* Decode+repack a q4_K matrix once per distinct source pointer.  The pointer
    * is the key rather than the contents because scanning the contents would cost
-   * more than the repack it is trying to avoid; a checkpoint allocates each
-   * weight once and never frees it, which is what makes the pointer stable. */
+   * more than the repack it is trying to avoid.  What makes the pointer stable
+   * is that a `Weight` keeps its handle for the model's life: the *allocation*
+   * behind it may be released at load (the release is off while this path is
+   * selected, but a flag set after a load would still land here), and the handle
+   * survives that as a key -- which is why a miss has to be refused rather than
+   * decoded. */
   const PackedQ4K &pack_for(DeviceBuffer blocks, int64_t n, int64_t k) {
     const std::string key = std::to_string(blocks.handle) + ":" + std::to_string(n) + ":" +
                             std::to_string(k);
@@ -1850,6 +1949,7 @@ class AscendBackend final : public Backend {
     if (it != cache_.end()) {
       return it->second;
     }
+    require_packed_live(blocks.handle);
     /* The q4_K tensor lives in device memory; the decode (`dequant_q4_k`) reads
      * host bytes.  Bring it back once, prepare the packed image, and keep only
      * the packed image -- the decoded copy is the memory the quantization was
@@ -1898,6 +1998,7 @@ class AscendBackend final : public Backend {
       if (it != cube_cache_.end()) {
         return it->second.blocks;
       }
+      require_packed_live(blocks.handle);
     }
     const int64_t blocks_per_row = k / quant::kBlockWeights;
     const int64_t total = n * blocks_per_row * block_bytes;
@@ -1947,6 +2048,7 @@ class AscendBackend final : public Backend {
       if (it != table_cache_.end()) {
         return it->second;
       }
+      require_packed_live(blocks.handle);
     }
     const int64_t blocks_per_row = d / quant::kBlockWeights;
     const int64_t total = vocab * blocks_per_row * block_bytes;
@@ -2057,6 +2159,16 @@ class AscendBackend final : public Backend {
   std::unordered_map<std::string, DeviceBuffer> table_cache_;
   std::unordered_map<std::string, std::pair<DeviceBuffer, DeviceBuffer>> rope_cache_;
   std::unordered_map<std::string, DeviceBuffer> norm_cache_;
+  /* Handles whose packed bytes were released at load, so that a cache miss on
+   * one is a refusal and not a decode of freed memory (see
+   * `require_packed_live`).  Guarded by `mutex_`, like every cache above.
+   *
+   * A handle can only be in here after its own decode is cached, and every
+   * packed weight is bound before the release pass begins, so no live packed
+   * buffer can ever be mistaken for one of these: what the set distinguishes is
+   * "this key has a decode" from "this key's source is gone", and the two are
+   * never both true. */
+  std::unordered_set<uintptr_t> spent_packed_;
 };
 
 }  // namespace
