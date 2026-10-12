@@ -234,7 +234,7 @@ def test_the_release_gives_the_packed_bytes_back(runs: tuple[pathlib.Path, dict,
     """
     checkpoint, released, kept = runs
     packed = _packed_bytes(checkpoint)
-    freed = kept["after_decode"] - released["after_decode"]
+    freed = released["after_decode"] - kept["after_decode"]
     assert freed >= packed // 2, (
         f"{checkpoint.name}: after the same decode the released child's pool has "
         f"{released['after_decode']} B free and the packed-kept child's {kept['after_decode']} B, "
