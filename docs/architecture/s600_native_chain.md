@@ -356,6 +356,67 @@ test: it skips when the artifact is absent (naming the path it looked at), and o
 graph answers the canonical prompt, that three greedy runs are byte-identical, and that the `bpu_core`
 mismatch is refused rather than silently wrong.
 
+## The calibration corpus: tested and ruled out
+
+The first build result raised a specific hypothesis. The two graphs' KV-cache scales differ
+(`layer_0_cache_key` is `0.0120087` on the vendor graph and `0.0120163` on ours, and **110 of 112** such
+tensors differ), a scale is set by the **calibration activation range**, and so the reasoning-text
+divergence — and the 1.7B's runaway loop — might be traced to the **calibration corpus** the compiler was
+given. The builder defaults to a corpus with roughly no code and no CJK, and the provenance gap is widest
+on exactly those categories, so the corpus was the leading candidate. It has now been tested and does not
+hold.
+
+**The experiment.** A **matched** calibration corpus — **74 records**, weighted to the code and CJK
+categories the parity corpus exercises — was compiled into a second 1.7B `cache_1024` graph, identical to
+the baseline in every other parameter. The two artifacts were then compared on two axes: their baked
+KV-cache scales (`model_info`, host-side — the decider), and their token agreement against the `q4_k_m`
+oracle over the 50-prompt corpus, plus the `France?` loop reproducer:
+
+| | our baseline (`cache_1024`) | our matched-calib (`cache_1024`) |
+|---|---|---|
+| md5 | `0b41e627f2227c029b14ed63928fd33f` | `587cd4d9476c68c16d2130ecaa10885a` |
+| calibration corpus | builder default (~0 code, ~0 CJK) | matched, 74 records, code/CJK-weighted |
+| median distance to the vendor's KV scales | **1.8%** | **16.4%** |
+| KV tensors within ±5% of the vendor | **46 / 56** | **20 / 56** |
+| KV scales moved *toward* the vendor | — (reference) | **5 of 49** |
+| Σ shared prefix vs `q4_k_m` (50 prompts) | **376** | **365** |
+
+**The scale result — and the correction to "110 of 112".** The matched corpus moved the KV-cache scales
+**away** from the vendor's, not toward them, on **44 of the 49** tensors that moved (only 5 moved toward
+it), so the new graph is **16.4%** from the vendor's scales where the baseline is **1.8%** — about **7×
+farther**. This also corrects how the "**110 of 112 tensors differ**" line above should be read: that was
+a count of *non-identical* values, not a magnitude, and those differences are mostly **sub-2%**. The
+baseline's default calibration was **already vendor-matched**; the count says the two builds are not
+bit-identical, not that one is far from the other.
+
+**The behavioural confirmation.** The token A/B agrees with the scales. The matched graph's Σ prefix is
+**365** against the baseline's **376** — equal at the median (both **6**), slightly *worse* at both tails
+(p75 **9** vs **13**; ≥5-logit splits **27** vs **23**; paired per prompt **11 worse / 31 equal / 8
+better**, median Δ **0**). And the `France?` runaway loop does **not** close: the matched graph emits
+`</think>` early but then degenerates into a `#Museums #Museums …` hashtag loop to the generation cap
+(**996** pieces, a 40-char window recurs **161×**), where the baseline loops the same way in prose
+(**1004** pieces, `</think>` never closes, recurs **11×** — the exact figure the loop discussion on
+[the model page](../models/s600_qwen3.md#the-17b-loop-a-2-token-reproducer-its-onset-and-the-one-build-parameter-that-differs)
+records). Neither is clean; the matched corpus *changed the loop's attractor and tightened it*. The build
+that actually closes this loop is our own 1.7B at **`cache_len 4096`** (**229** pieces / 989 chars, recurs
+**2×**) — a different build, where the cache is the lever, not the calibration.
+
+**Verdict: the calibration corpus is ruled out, on both axes.** The matched corpus was farther from the
+vendor at the scale level *and* no better — slightly worse — at the token level, so the corpus is not the
+provenance gap's cause, and the **cause is again open.** Two candidates remain, named for the record and
+not claimed: the compiler graph's **operator rounding and accumulation order** (a graph-level numeric
+difference the scales do not show), or a **vendor weight-quantization scheme that is not data-free** —
+ours is `w_max/7`, a data-free symmetric scale, so two data-free builds of the same weights quantize
+bit-identically by construction, and any residual weight-level difference would have to come from the
+vendor side. (The support matrix carries the same verdict at the fleet level:
+[the fleet support matrix](fleet_support_matrix.md).)
+
+**The one confound, bounded rather than ignored.** Our graphs are `cache_1024` and the vendor's is
+`cache_4096`, so the scale comparison crosses the cache as well as the calibration. It does not carry the
+result: the baseline graph spans that cache difference and still lands within **1.8%** of the vendor, so
+the cache contributes at most ~1.8% while the calibration jump to **16.4%** dominates it. The behavioural
+A/B (baseline vs matched) is at matched cache and carries no such confound at all.
+
 ## Where each claim comes from
 
 - Wheels, versions, arch tags: `ls -l` over `oellm_build/` and the extracted wheel trees.

@@ -581,7 +581,9 @@ sit behind the same rebuild, and both are precision). The rebuild above **is** t
 measurement: if the loops vanish, cache-length sensitivity; if they persist, provenance/calibration. **It
 has now been run** — our 1.7B at `cache_len 4096` — and the runaway loop does not appear at the larger
 cache; [the next subsection](#the-rebuilt-17b-at-the-vendors-cache-the-runaway-loop-is-the-cache) has the
-table and the verdict.
+table and the verdict. The **calibration corpus itself has since been tested and ruled out** as the
+lever — the matched corpus moved the KV scales *away* from the vendor and left agreement no better — on
+[the native compile chain](../architecture/s600_native_chain.md#the-calibration-corpus-tested-and-ruled-out).
 
 **The compiled 0.6B and 4B do not reach it — the 1.7B crosses the threshold first.** The "only the 1.7B
 loops" line was originally drawn on short generations that ended cleanly, which the 1.7B's own trigger
