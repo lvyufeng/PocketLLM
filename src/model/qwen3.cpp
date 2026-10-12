@@ -50,6 +50,16 @@ constexpr int64_t kInitialPositions = 256;
 
 }  // namespace
 
+bool Qwen3Model::same_buffer(const Weight &a, const Weight &b) {
+  /* Both the form and the live handle have to agree.  Comparing only one of the
+   * two handles would read a pair of dense weights -- where `blocks` is the zero
+   * handle on both -- as the same buffer, and a packed pair has the mirror
+   * problem with `data`.  (A tied head is a copy of the whole `Weight`, so it
+   * agrees on all three.) */
+  return a.quantized == b.quantized && a.data.handle == b.data.handle &&
+         a.blocks.handle == b.blocks.handle;
+}
+
 Qwen3Model::~Qwen3Model() {
   /* Every buffer the model owns is a raw handle, so a defaulted destructor
    * frees none of them -- and the leak is invisible on the host, where a few
@@ -84,11 +94,12 @@ Qwen3Model::~Qwen3Model() {
     }
   }
   /* The output projection is tied to the embedding when the checkpoint has no
-   * separate head, in which case the two members hold the *same* handle and
-   * releasing both would be a double free.  Comparing the handles is how the
-   * tie is detected here; a flag would be a second copy of a fact that is
-   * already in the values. */
-  if (output_.rows != 0 && (output_.rows != tok_embd_.rows || output_.cols != tok_embd_.cols)) {
+   * separate head, in which case the two members hold the *same* buffer and
+   * releasing both would be a double free.  `same_buffer` is how the tie is
+   * detected -- by the buffers' identity, never by their shape: an untied
+   * Qwen3 head is `(n_embd, n_vocab)`, exactly the table's shape, so a test on
+   * the shape reads every separate head as a tie and never releases it. */
+  if (output_.rows != 0 && !same_buffer(output_, tok_embd_)) {
     release_weight(output_);
   }
   release_weight(tok_embd_);
@@ -204,10 +215,12 @@ Weight Qwen3Model::bind_matrix(const GgufReader &checkpoint, const std::string &
   weight.blocks = bind_packed(checkpoint, name).blocks;
   /* A GEMM weight is the one place the panel layout is wanted, and only when it
    * is a q4_K whose shape tiles exactly.  The token embedding is deliberately
-   * *not* repacked: it feeds `embedding_quant`'s gather as well as the tied head
-   * GEMM, and the gather reads the file layout -- qwen3-0.6B carries a separate
-   * `output.weight`, so the tie costs nothing here and the table stays readable
-   * by the one kernel that already understands it.
+   * *not* repacked: it feeds `embedding_quant`'s gather, which reads the file
+   * layout, and when the checkpoint ties the head to the table the same bytes
+   * are a GEMM operand too.  Whether a checkpoint ties them is the file's
+   * business -- both kinds are in this project's set -- and the cost of not
+   * repacking is paid only on the CPU panel path, which is selected by name at
+   * load.
    *
    * **The shape guard skips rather than throws, and that is not a fallback.**
    * The panel path is on by default now, so a checkpoint with a q4_K weight that
