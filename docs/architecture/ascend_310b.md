@@ -194,7 +194,7 @@ against the **q4_k_m** checkpoint the board runs (the floor). A build whose agre
 truth equals the q4_k_m checkpoint's own agreement with truth is measuring the *quantizer's*
 error, not the board's; a build below that floor is a real, board-owned deficit.
 
-Fifty prompts, three sizes, three axes (columns: shared-prefix min / p25 / median / p75 / max,
+Fifty prompts, four sizes, three axes (columns: shared-prefix min / p25 / median / p75 / max,
 summed prefix Σ, and splits with a ≥5-logit oracle margin):
 
 | size | axis | pref min/p25/**med**/p75/max | Σ prefix | splits ≥5 |
@@ -208,26 +208,46 @@ summed prefix Σ, and splits with a ≥5-logit oracle margin):
 | 4B | 310B vs `q4_k_m` | 13 / 35 / **71** / 102 / 128 | 3495 | 5 / 49 |
 | 4B | 310B vs `f16` | 4 / 17 / **25** / 47 / 112 | 1620 | 2 / 50 |
 | 4B | **floor** (`q4_k_m` vs `f16`) | 4 / 17 / **25** / 47 / 96 | 1552 | 2 / 50 |
+| 8B | 310B vs `q4_k_m` | 5 / 31 / **61** / 91 / 128 | 3158 | 9 / 48 |
+| 8B | 310B vs `f16` | 4 / 17 / **32** / 49 / 100 | 1832 | 1 / 50 |
+| 8B | **floor** (`q4_k_m` vs `f16`) | 4 / 19 / **34** / 53 / 119 | 1901 | 0 / 50 |
 
-**The 310B is AT the floor at every size, and never below it.** Against the f16 truth the
-board reaches **Σ 1078 / 939 / 1620** (0.6B / 1.7B / 4B) where the `q4_k_m` checkpoint's own
-distance from truth is the floor **Σ 995 / 956 / 1552** — ratios **1.08 / 0.98 / 1.04**. So the
-board's agreement with a near-lossless reference is **as good as the quantized checkpoint's own
-agreement with it**, and at 4B fractionally better; the two are within run-to-run noise of each
-other. The reading is direct: **the board is not adding a token-agreement deficit of its own** —
-what disagreement there is, is the `q4_k_m` quantization's, which the board inherits by running
-the same weights. The 0.6B floor Σ 995 is the S600 page's own measured 0.6B floor reproduced
-**exactly**, which cross-checks the corpus and the oracle across two boards.
+**The 310B sits at the floor at every size — at 8B, the furthest under it.** Against
+the f16 truth the board reaches **Σ 1078 / 939 / 1620 / 1832** (0.6B / 1.7B / 4B / 8B) where the
+`q4_k_m` checkpoint's own distance from truth is the floor **Σ 995 / 956 / 1552 / 1901** — ratios
+**1.08 / 0.98 / 1.04 / 0.96**. Through 4B the board's agreement with a near-lossless reference is
+**as good as the quantized checkpoint's own agreement with it** — within run-to-run noise of each
+other, and at 4B fractionally better. The reading through 4B is direct: **the board is not adding a
+token-agreement deficit of its own** — what disagreement there is, is the `q4_k_m` quantization's,
+which the board inherits by running the same weights. The 0.6B floor Σ 995 is the S600 page's own
+measured 0.6B floor reproduced **exactly**, which cross-checks the corpus and the oracle across two
+boards.
+
+**The 8B is the size where the board's Σ lands furthest under the floor's — 69 tokens over the 50
+prompts (−3.6%, Σ 1832 vs 1901; the 1.7B's own low-side miss was −1.8%) — and the row-level
+structure says what that deficit is.** On **35 of the 50 prompts the board and the checkpoint
+part from truth at the *same* token with the *same* oracle margin**: the board's own arithmetic
+contributes nothing there. On 7 prompts the board holds on longer than the checkpoint (+136
+tokens together) and on 8 it parts earlier (−205), which is the whole −69. Six of those eight
+early splits are near-ties — board-side oracle margins **0.02, 0.16, 0.16, 0.53, 0.92, 1.66** —
+the class of prompt the fp16 plane's arithmetic can tip either way;
+`instr_03` parts at 3.7; and one, `code_03`, parts at 49 against the floor's 119 with a
+**7.8-logit** margin, the run's only wide-margin disagreement (the floor has none). Where the
+board does part it is typically *less* sure than the floor is at its own split — gap median
+**0.36** against the floor's **0.45**. So the 8B deficit is a scattered increment of board
+arithmetic, mostly near-ties plus one confident row, not a systematic drift — and it is what a
+−3.6% Σ at this size is made of.
 
 **This is the token-level confirmation of the section above.** The precision section measured a
 **~1.2e-1** error for the W4A16 op — the int4 requantization of the checkpoint's q4_K weights —
 and concluded the graph's path stays the dense cube on the faithfully-decoded plane, not W4A16.
 The end-to-end result is that conclusion restated at the token level: W4A16 is env-gated off
 (`$POCKETLLM_ASCEND_W4A16`, `backend.cpp:762`), the shipped path decodes `q4_k`/`q6_k` with the
-tree's own dequant and drives `MatmulCubeCustom` (~2.7e-4), and the board lands **at the floor**,
-not below it. Had the ~1e-1 requantization been the path, the suite would sit far under the
-floor — it does not. So the token agreement is the end-to-end evidence that **the faithful
-decode + cube is what actually executes.**
+tree's own dequant and drives `MatmulCubeCustom` (~2.7e-4), and the board lands **at the floor** —
+the 8B's −3.6% is the largest shortfall in the table and it is arithmetic scatter, above. Had the
+~1e-1 requantization been the path, the suite would sit far under the floor — it does not. So the
+token agreement is the end-to-end evidence that **the faithful decode + cube is what actually
+executes.**
 
 **The one place the 1.7B is *not* merely at the floor is its confident disagreements.** Its
 310B-vs-f16 row carries **5** splits with a ≥5-logit margin against the floor's **3** — the
@@ -244,7 +264,7 @@ symmetric per-channel int4, not `q4_k_m`'s super-block k-quant), so it agrees fa
 says nothing about which board is "better" — it says the 310B row is a *same-quantizer*
 comparison and the S600 `w4` row is a *cross-quantizer* one.
 
-**Scope, stated rather than implied.** Three limitations bound what this table means:
+**Scope, stated rather than implied.** Two limitations bound what this table means:
 
 - **No logits surface on the board path.** The 310B exposes ids, not a distribution, so the
   project's "aligned to 1e-3" is expressible **only as token agreement** — the same limitation
@@ -252,9 +272,19 @@ comparison and the S600 `w4` row is a *cross-quantizer* one.
 - **The scheme confound.** `310B vs q4_k_m` is **same-quantizer** (hence the high Σ); the
   `vs f16` rows and the floor are **cross-quantizer**. The floor is what makes the second
   readable, and it is why the "at the floor" verdict — not the raw Σ — is the result.
-- **The 8B is omitted.** It is at the board's memory edge (swap, stalls), so a token-agreement
-  row there would be confounded by board instability rather than model fidelity; the table's
-  scope is 0.6B / 1.7B / 4B by that choice.
+
+**The 8B was omitted for a memory reason, and the release removed it.** The row was left out
+while the board sat at its memory edge at 8B (swap, stalls), which would have confounded token
+agreement with board instability. With the #676 packed-bytes release — the default since, and the
+build this capture ran (the kill switch `$POCKETLLM_ASCEND_KEEP_PACKED` unset) — the 4.68 GiB of
+packed `q4_k`/`q6_k` bytes are freed once the 16.42 GiB of planes and table are built at load.
+The capture then ran to **50 of 50 rows** (47 capped at the 128-token ceiling) in ~4 h 10 min:
+`MemAvailable` bottoms at **4,145–4,153 MiB** in the load's shadow (minutes 8–14; the pre-release
+probe's dip was ~0.58 GB), recovers to ~4,614 MiB, and holds a **4,573–4,638 MiB** band for the
+remaining four hours; `SwapFree` gives up **539 MiB (0.53 GiB)** — one step at t+15 min, the
+trough at t+1.5 h — and is flat after, back at its pre-run level when the process exits: no
+stall, no OOM, no thrash. The 8B accuracy cell is measurable on this board precisely because the
+packed bytes are released.
 
 The corpus, the two capture/score scripts and every artifact are recorded on the harness page's
 convention: the corpus is byte-identical to the S600 one (md5 `0feef55b9b879a6ec4529317a3162312`),
@@ -623,7 +653,10 @@ which would cut the 14.1 GiB of fp16 planes to the ~4.4 GiB of packed weights �
 neither of those levers:** the 4.68 GiB of packed bytes are only needed until their decoded form
 exists, and releasing them at load takes the resident set from 21.10 GiB to the 16.42 GiB of
 planes and table — measured, the same 8B now loads in 507.7 s and decodes at 1.73 s/token with
-the swapfile untouched (the release section below has the numbers).
+the swapfile untouched **in that probe run** (the release section below has the numbers); the
+four-hour accuracy capture above is the longer-run reading of the same release-on configuration,
+and there `SwapFree` gives up **539 MiB (0.53 GiB)** once and holds it flat
+([the accuracy section](#end-to-end-accuracy-the-310b-sits-at-the-quantizers-own-floor)).
 
 The honest statement of coverage is now four sizes: **0.6B, 4B and 8B token-identical, and 1.7B runs
 and fits with one documented near-tie** — the same fp16-plane precision limit this whole page is
@@ -708,7 +741,9 @@ on every call and has no cached plane to fall back on.
 **What the release measures out to.** On the 8B (`Qwen3-8B-Q4_K_M.gguf`, 36 layers, untied head) the
 load now ends holding the 16.42 GiB of decoded forms and none of the 4.68 GiB of packed bytes: it
 takes **507.7 s** and leaves **1.06 GiB** of the 23.12 GiB pool free, with `SwapFree` unmoved to
-within 1.5 MiB across the whole run. The decode that follows runs at **1.73 s per token**
+within 1.5 MiB across the whole probe run. (The four-hour accuracy capture above is the longer-run
+reading of this configuration: `SwapFree` gives up **539 MiB (0.53 GiB)** once, holds it flat, and
+returns it at exit.) The decode that follows runs at **1.73 s per token**
 (1.726-1.733 s across eight greedy steps after the 5-token canonical prompt) — the 8B's first clean
 *rate* on this board; the same probe reads 0.129 s per token on the 0.6B, which is the canonical
 table's 0.129 s/token for that checkpoint, so it is the same instrument measuring both. The contrast

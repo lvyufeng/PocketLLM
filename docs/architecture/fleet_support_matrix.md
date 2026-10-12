@@ -37,7 +37,7 @@ decode.
 | Qwen3-0.6B | ✅ f16, q4_k_m | ✅ w8 | ✅ q4_k_m |
 | Qwen3-1.7B | ✅ q4_k_m, f16 | ✅ w4, w8 | ✅ q4_k_m |
 | Qwen3-4B | ✅ q4_k_m, f16 | ✅ w4 | ✅ q4_k_m |
-| Qwen3-8B | ✅ q4_k_m, f16 | ✅ w4 (87.7% of the pool) | ✅ q4_k_m, release on (fits; 0.65 t/s, no swap) |
+| Qwen3-8B | ✅ q4_k_m, f16 | ✅ w4 (87.7% of the pool) | ✅ q4_k_m, release on (fits; 0.65 t/s, no swap in the fit probe) |
 | Sampling | temperature/top-k/top-p/min-p/seed | same (RNG on the host) | same (RNG on the host) |
 | `serve` | ✅ (batch when `max_batch_size > 1`) | ✅ board-tested — **no batch, see below** | ✅ board-tested (batch when `max_batch_size > 1`) |
 | Accuracy surface | **logits** (1e-3 expressible) | text/tokens only | tokens only |
@@ -59,16 +59,19 @@ is measuring the quantizer's error, not the board's.
 | Device | Result | What "1e-3" means here |
 |---|---|---|
 | **2080ti** | the oracle itself — token-identical to llama.cpp on both widths | logit-level 1e-3 (`--print-top K`) |
-| **310B** | ✅ **at the quantizer's own floor, never below** (see below) | **token agreement only** (no logits surface) |
+| **310B** | ✅ **at the quantizer's own floor at every size** — the 8B cell is the furthest under the floor's Σ (−3.6%, see below) | **token agreement only** (no logits surface) |
 | **S600** | ✅ **at the quantizer's own floor at 0.6B `w8`** (973 ≈ 995) **and above it at 1.7B `w8`** (Σ **1174** vs floor **956**) **and 4B `w8`** (Σ **1656** vs floor **1552**) — the first cells at or above the floor at 1.7B and 4B; the provenance gap vs the shipped graphs still holds at every size (cause not yet identified); **8B stays `w4` — below the floor** | **token agreement only** (`xlm` returns text, no logits, no seed) |
 
-**310B.** Against f16 the board reaches Σ prefix **1078 / 939 / 1620** (0.6B / 1.7B / 4B) where the
-`q4_k_m` checkpoint's own distance from truth is the floor **995 / 956 / 1552** — ratios **1.08 /
-0.98 / 1.04**. So the board's agreement with near-lossless weights is *as good as the quantized
-checkpoint's own*, and it adds no token-agreement deficit of its own. This is the token-level
-confirmation that the faithful `q4_k`/`q6_k` decode + cube is what actually executes: the W4A16 op's
-**~1.2e-1** requantization error is real but is **not the path run** (it is env-gated off at
-`backend.cpp:762`). Full section: [ascend_310b.md](ascend_310b.md#end-to-end-accuracy-the-310b-sits-at-the-quantizers-own-floor).
+**310B.** Against f16 the board reaches Σ prefix **1078 / 939 / 1620 / 1832** (0.6B / 1.7B / 4B / 8B)
+where the `q4_k_m` checkpoint's own distance from truth is the floor **995 / 956 / 1552 / 1901** —
+ratios **1.08 / 0.98 / 1.04 / 0.96**. Through 4B the board's agreement with near-lossless weights is
+*as good as the quantized checkpoint's own*; the new 8B cell lands furthest under the floor (Σ 1832
+vs 1901, −3.6%), and its row-level shape — 35 of 50 prompts part from truth at the *same* token as
+the checkpoint does, and the −69 net is eight early splits against seven later ones — reads as
+board arithmetic scatter, not a lost path. This is the token-level confirmation that the faithful
+`q4_k`/`q6_k` decode + cube is what actually executes: the W4A16 op's **~1.2e-1** requantization
+error is real but is **not the path run** (it is env-gated off at `backend.cpp:762`). Full section:
+[ascend_310b.md](ascend_310b.md#end-to-end-accuracy-the-310b-sits-at-the-quantizers-own-floor).
 
 **S600.** Against f16 the provenance gap holds at every size — shipped beats ours on total shared
 prefix (**1327 vs 973**, **724 vs 394**, **990 vs 536**, **1196 vs 729**). The `q4_k_m`-vs-f16 floor
@@ -139,7 +142,7 @@ declined — see [the batched-decode bound](ascend_310b_batch_decode_bound.md) a
 |---|---|---|
 | **2080ti** | the oracle — token-exact vs llama.cpp | CPU at parity with llama.cpp on prefill, ahead on decode; CUDA kernels naive |
 | **S600** | ✅ **at the floor at 0.6B `w8`, above it at 1.7B `w8`** (Σ **1174** vs floor 956) **and 4B `w8`** (Σ **1656** vs floor 1552); `w4` builds still trail the vendor; **8B stays `w4`** — below the floor | 88 t/s @0.6B → 30 t/s @8B; our compiled graphs beat the shipped ones |
-| **310B** | ✅ **at the floor, never below** — the goal is met on this board | 7.8 → 1.6 t/s; batching lifts aggregate to ~8 t/s; 8B now fits: 0.65 t/s, no swap |
+| **310B** | ✅ **at the floor at every size (0.6B–8B measured)** — the goal is met on this board, with the 8B the furthest under the floor's Σ (−3.6%) | 7.8 → 1.6 t/s; batching lifts aggregate to ~8 t/s; 8B now fits: 0.65 t/s, no swap in the fit probe; 0.53 GiB touched once in the 4 h accuracy capture |
 
 ## Scope
 
