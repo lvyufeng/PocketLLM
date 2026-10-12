@@ -505,6 +505,13 @@ __global__ void attention_kernel(const float *q, int64_t n_heads, const float *k
     local_max = fmaxf(local_max, row[s]);
   }
   const float max_score = block_max(local_max, scratch);
+  /* `block_max`'s last read of `scratch[0]` is not covered by a barrier -- the
+   * reduction loop ends on one, the `return` comes after it -- and `block_sum`
+   * below opens by writing that same scratch. Without this barrier a warp that
+   * has finished pass two can overwrite the maximum while another warp is still
+   * reading it: a wrong-but-finite softmax shift, and a prefill that does not
+   * reproduce run to run. */
+  __syncthreads();
 
   /* Pass two: the shifted exponentials, in place, and their sum. Shifted by the
    * max for the same reason the CPU shifts: a score row at a scale of 1000 would
