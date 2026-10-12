@@ -748,8 +748,9 @@ fails the page's 1e-3 bar and produces incoherent text; that is measured, not sp
 int8 plane (~3.8 GiB, `q4_K` decoded exactly and stored as int8 rather than fp16) would need a new
 cube op or a new dtype the op accepts, and it is the one middle rung nobody has built. Until then the
 8B's home on this board is a ~17 GiB pool that its fp16 planes fill, and with the packed bytes
-released the 8B's decode is a rate after all — **1.73 s per token** on the probe above — where
-the canonical table's 8B row, taken before the release, still has no marginal at all.
+released the 8B's decode is a rate after all — **1.73 s per token** on the probe above — and
+the canonical table's 8B row now carries the post-release `--steps 8` vs `32` marginal,
+**1.55 s/token** (see below).
 
 *Verified on the board, read-only, for this section: the idle `npu-smi` charge, `/proc/meminfo`,
 `/proc/cmdline`, the swap device and swappiness, and the full GGUF tensor table. The plane, head and
@@ -1399,7 +1400,9 @@ The numbers above were taken across five separate branches (#597–#601), each a
 tool, so they do not all come from one binary and two of them (the 0.6B and 4B decode rates in their
 own sections) were measured with the residual *method* this section corrects. This is the single
 consistent measurement, on merged `main` at `d16f182`, from one build with **every knob at its
-shipped default** (see the check below). It supersedes the per-section figures where they differ.
+shipped default** (see the check below). It supersedes the per-section figures where they differ, with one exception: **the 8B
+row is a post-release re-take** on the #676 build with the release on and the same shipped
+defaults, because the pre-release binary could not separate its marginal (see below).
 
 **Method.** `pocketllm-run`, `--prompt "The capital of France is"` (5 prompt tokens), `--device
 ascend`, on a quiet board. *Decode* is the `--steps N` / `--steps M` marginal — the walls differenced
@@ -1415,7 +1418,7 @@ the 5-token prompt minus that prompt's own prefill.
 | Qwen3-0.6B | **0.129 s/token** | 0.065 s/token | ~24.2 s | 24.5 s |
 | Qwen3-1.7B | **0.390 s/token** | 0.065 s/token | ~85.6 s | 85.9 s |
 | Qwen3-4B | **0.640 s/token** | 0.129 s/token | ~202 s | 208.9 s |
-| Qwen3-8B | **not cleanly separable — see below** | — | ~500 s | 486.5 s (clean run) |
+| Qwen3-8B | **1.55 s/token** | — | ~430 s | 444.0 s |
 
 The `--steps 8` wall is essentially the plane build at every size, which is why 8 steps costs about
 what 1 step does. The decode rates move with the checkpoint exactly as the weight count predicts
@@ -1438,18 +1441,25 @@ longer-context one; both are real points on the same curve, and neither is wrong
 quotes the 8→32 bracket because it is the range every checkpoint shares and the one a generation
 actually opens in.
 
-**The 8B has no clean decode marginal on this board, and that is a memory fact, not a decode one.**
-At 8 steps it completes in **486.5 s** and is token-identical to CPU (the gate above). But its
-**~21.7 GiB** measured device peak (16.42 GiB of planes and table) against the pool's ~17.4 GiB
-usable, plus a 4.7 GiB mmap'd checkpoint on a 23.7 GiB host, pushes `MemAvailable` to ~0.6 GB and the
-process into swap: measured, the same
+**The 8B row is a post-release re-take, and the release is what makes its marginal separable.**
+Before the release that marginal was a memory fact, not a decode one: at 8 steps the run completes
+in **486.5 s** and is token-identical to CPU (the gate above), but its **~21.7 GiB** measured device
+peak (16.42 GiB of planes and table) against the pool's ~17.4 GiB usable, plus a 4.7 GiB mmap'd
+checkpoint on a 23.7 GiB host, pushes `MemAvailable` to ~0.6 GB and the process into swap: the same
 `--steps 8` run takes **486.5 s** on a quiet board (nearly all plane build) and its `--steps 32` leg
-has been timed at **2402 s**, with an intermediate `--steps 1`/`8` pair at 634 s / ~16 min. The
-marginal between two such walls is dominated by how much the kernel paged out, not by decode, and it
-can even come out negative (a longer run whose plane build reclaimed more cleanly beats a shorter one
-that paid the eviction). That is why no 8B *rate* is claimed here — the same caveat the 8B section
-above already carries. The 8B's contribution to this table is the coverage and gate result, not a
-throughput number.
+was timed at **2402 s**, with an intermediate `--steps 1`/`8` pair at 634 s / ~16 min, and the
+marginal between two such walls is dominated by how much the kernel paged out, not by decode (it can
+even come out negative, a longer run whose plane build reclaimed more cleanly beating a shorter one
+that paid the eviction). With the packed bytes released the same protocol is clean: on the #676
+build with the release on (`POCKETLLM_ASCEND_KEEP_PACKED` unset, every knob at its shipped default),
+two repeat pairs of the `--steps 8`/`32` walls read 443.95 / 444.13 s and 481.15 / 481.12 s against a
+431.40 s `--steps 1` wall, giving 1.54985 and 1.54096 s/token — **1.55 s/token** — with
+`MemAvailable` held at ~23.1 GB and `SwapFree` moving under 16 MB. That is the differenced marginal,
+the 8-to-32 window every checkpoint shares. The release probe's **1.73 s/step** and the marginal are
+different quantities, not revisions of each other: the probe times each of the first eight steps
+through the Python bridge, so its step walls keep the bridge's per-call host work; the marginal
+differences two CLI walls 24 steps apart, where per-call host work and per-run constants cancel
+alike. Both are real points on the 8B's curve; the probe's per-step record above stays as it is.
 
 **Every knob defaults to the shipped path.** The series added five env knobs; each is checked here to
 default to the value the page's numbers were taken at, so the default binary *is* the measured one:
@@ -1462,7 +1472,8 @@ default to the value the page's numbers were taken at, so the default binary *is
 | `POCKETLLM_ASCEND_W4A16` | unset | the faithful dense path, not the requantized op (#599) |
 | `POCKETLLM_ASCEND_KV_F16` | unset | f32 cache (`preferred_kv_dtype` = kF32) (#582) |
 
-The four identity gates hold on this build, from the same binary each table row came from:
+The four identity gates hold on this build, from the binary each table row came from (the 8B row is its
+post-release re-take and re-prints the same 8-step list):
 **0.6B token-identical**, **1.7B the documented near-tie** (`17689 Spain` vs `279 the` at generated
 index 5 — reproduced exactly, same two ids, same order), **4B exactly**
 `[12095 Paris 13. 576 The 6722 capital 315 of 9856 Germany 374 is 19846 Berlin]`, and **8B
