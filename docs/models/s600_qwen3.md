@@ -312,7 +312,7 @@ The row moves our 8B's median **up** two tokens (11 → 13), confirming the cach
 lever — but the **≥5-logit splits double, 2 → 4**, matching the enumeration: the deeper cache made this
 build *worse* on the exact axis that separates build from cache. Paired per prompt, against the shipped
 graph at the **same cache** our build is the shorter-prefix side on **31 of 48** prompts (9 equal, 8
-longer, median Δ **−7.5**, range −69…+38); the `88`-token shared prefix the shipped graph reaches is
+longer, median Δ **−7**, range −69…+38); the `88`-token shared prefix the shipped graph reaches is
 still one ours never approaches (max 61 at both caches). Same build, cache `1024 → 4096`: **30 of 44
 identical** to the token, median Δ **0** — the cache changes the cache, not the build.
 
@@ -1707,7 +1707,8 @@ the ten-prompt draw was too small to show the shape of.
 
 The corpus and every capture live in `~/scratch/ref/harness/` on the board: the two shipped rows
 (`artifacts/0.6B-w8.*`, `artifacts/1.7B-w4.*`), the four cache-sweep captures of the 1.7B
-(`artifacts/1.7B-w4-{ours-c1024,c2048,ours-c4096}.*`), the seven provenance-pair captures
+(`artifacts/1.7B-w4-{ours-c1024,c2048,ours-c4096}.*` plus the shipped `1.7B-w4.*` at its default
+`cache_4096` as the sweep's fourth point), the seven provenance-pair captures
 (`artifacts/0.6B-{ours,shipped}-w8.*`, `artifacts/0.6B-w4.*`, `artifacts/4B-{ours-c1024,shipped-c4096}.*`,
 `artifacts/8B-{ours,shipped}-w4.*`), the `w8` builds (`artifacts/1.7B-w8-ours-c1024.*`,
 `artifacts/4B-w8-ours-c1024.*`), the calibration-corpus build (`artifacts/1.7B-ours-c1024-calib.*`)
@@ -1816,7 +1817,7 @@ prompt, so a shared easy prompt cannot flatter either side):
 | 0.6B `w8` | 50 | 15 | **24** | 11 | **0** | −38 … +35 |
 | 0.6B `w4` | 50 | **46** | 2 | 2 | **−12** | −59 … +8 |
 | 1.7B `w4` | 50 | **30** | 12 | 8 | **−2** | −36 … +12 |
-| **4B `w4`** | 50 | **33** | 8 | 9 | **−4.5** | −38 … +27 |
+| **4B `w4`** | 50 | **33** | 8 | 9 | **−4** | −38 … +27 |
 | 8B `w4` | 46 | **32** | 8 | 6 | **−8** | −69 … +36 |
 
 - **0.6B is the weakest case, and it nearly reverses on individual prompts** — the paired difference is
@@ -1841,7 +1842,7 @@ prompt, so a shared easy prompt cannot flatter either side):
   (max 61). But — unlike the 1.7B — the **wide-margin split count is equal** (2 and 2); the 8B's
   disagreement is a *systematic step earlier*, not a different distribution of confidence.
 - **4B is the middle case, and the first one that is both wide and drifted**: 33 of 50 prompts shorter
-  at a moderate median Δ **−4.5** (8 against 18, so the median itself is only a four-token step), but
+  at a moderate median Δ **−4** (8 against 18, so the median itself is only a four-token step), but
   the tail is heavy — **16** wide-margin splits against the shipped graph's **2**, eight times the rate
   and the largest *asymmetry* of the four pairs. The wide splits are not one model's noise: the shipped
   graph keeps `code_01`'s 9.69 exactly and adds a single 9.90 (`code_04`), while ours spreads 16 splits
@@ -2026,7 +2027,7 @@ of our 8B having already left the oracle's trajectory, which is why a divergence
 it: the corruption is real, it is ours, and it lives past the point the table stops looking.
 
 **The 8B's own `cache_4096` build now joins this table** and confirms the two axes are separate: run on
-the same corpus, our 8B at the vendor's cache has the *same* wide 8B-style deficit (median Δ **−7.5**
+the same corpus, our 8B at the vendor's cache has the *same* wide 8B-style deficit (median Δ **−7**
 against the shipped graph at the same cache; median Δ **0** against our own `cache_1024` graph), so the
 cache is not an accuracy lever for the 8B either. The full row and the enumeration that came with it are
 [in the survey below](#cache-versus-build-on-the-accuracy-table).
