@@ -341,7 +341,17 @@ class _RequestUnion(ctypes.Union):
 
 
 class LmRequest(ctypes.Structure):
-    """`xlm_lm_request_t` (144 bytes).  One request in a batch.
+    """`xlm_lm_request_t` (144 bytes).  Element of ``xlm_input_t.requests``.
+
+    **The batch shape is real in the ABI and dead in this runtime.**  The array
+    and its count exist, and the delegate's inner entry accepts up to 4
+    requests, but for Qwen3 the delegate's capacity is 1: ``xlm_init`` logs
+    ``max_batch_num is: 1`` from a table keyed by model type inside
+    ``libxlm.so`` (not from the config file and not from the ``.hbm``), and a
+    batch of two or four NORMAL-priority requests SIGSEGVs inside
+    ``XlmImpl::XlmInferPrefill`` -- measured on the board, probe and logs under
+    ``/home/sunrise/scratch/batch_probe/``.  :class:`XlmEngine` therefore always
+    sends ``request_num=1``; that is a measured limit, not a design preference.
 
     ``new_chat`` is the equivalent of the engine's context reset: the delegate
     keeps conversation state between calls, so a fresh prompt has to say so or
