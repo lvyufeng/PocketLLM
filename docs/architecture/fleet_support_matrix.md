@@ -123,7 +123,7 @@ this board's ceiling.
 | Qwen3-0.6B | 0.065 s/token | **0.26 s/token** (3.8 t/s) | ~18.5 s |
 | Qwen3-1.7B | 0.065 s/token | **0.39 s/token** (2.6 t/s) | ~91.5 s |
 | Qwen3-4B | 0.129 s/token | **0.587 s/token** (1.7 t/s) | ~212–225 s |
-| Qwen3-8B | — | not cleanly separable (swap) | ~500 s |
+| Qwen3-8B | — | **1.73 s/token** (0.58 t/s; release on, short context) | ~500 s |
 
 The wall is almost entirely the **one-time plane build**, not decode. Batching is the throughput
 lever: aggregate 1.42 → 8.16 t/s over B=1…16, with a step of `0.1378 + 0.0641·(B−1)` s. The bound is
