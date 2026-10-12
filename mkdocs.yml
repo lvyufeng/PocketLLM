@@ -84,6 +84,7 @@ nav:
       - Backends and dispatch: architecture/backend_model.md
       - Execution: architecture/execution.md
       - Device targets: architecture/devices.md
+      - The fleet support matrix: architecture/fleet_support_matrix.md
       - The C engine: architecture/c_engine.md
       - Ascend 310B custom ops: architecture/ascend_310b.md
       - Serving: architecture/serving.md
