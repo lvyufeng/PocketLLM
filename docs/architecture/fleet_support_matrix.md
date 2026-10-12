@@ -37,7 +37,7 @@ decode.
 | Qwen3-0.6B | ✅ f16, q4_k_m | ✅ w8 | ✅ q4_k_m |
 | Qwen3-1.7B | ✅ q4_k_m, f16 | ✅ w4, w8 | ✅ q4_k_m |
 | Qwen3-4B | ✅ q4_k_m, f16 | ✅ w4 | ✅ q4_k_m |
-| Qwen3-8B | ✅ q4_k_m, f16 | ✅ w4 (87.7% of the pool) | ✅ q4_k_m, release on (fits; 0.65 t/s, no swap) |
+| Qwen3-8B | ✅ q4_k_m, f16 | ✅ w4 (87.7% of the pool) | ✅ q4_k_m, release on (fits; 0.65 t/s, no swap in the fit probe) |
 | Sampling | temperature/top-k/top-p/min-p/seed | same (RNG on the host) | same (RNG on the host) |
 | `serve` | ✅ (batch when `max_batch_size > 1`) | ✅ board-tested — **no batch, see below** | ✅ board-tested (batch when `max_batch_size > 1`) |
 | Accuracy surface | **logits** (1e-3 expressible) | text/tokens only | tokens only |
@@ -142,7 +142,7 @@ declined — see [the batched-decode bound](ascend_310b_batch_decode_bound.md) a
 |---|---|---|
 | **2080ti** | the oracle — token-exact vs llama.cpp | CPU at parity with llama.cpp on prefill, ahead on decode; CUDA kernels naive |
 | **S600** | ✅ **at the floor at 0.6B `w8`, above it at 1.7B `w8`** (Σ **1174** vs floor 956) **and 4B `w8`** (Σ **1656** vs floor 1552); `w4` builds still trail the vendor; **8B stays `w4`** — below the floor | 88 t/s @0.6B → 30 t/s @8B; our compiled graphs beat the shipped ones |
-| **310B** | ✅ **at the floor at every size (0.6B–8B measured)** — the goal is met on this board, with the 8B the furthest under the floor's Σ (−3.6%) | 7.8 → 1.6 t/s; batching lifts aggregate to ~8 t/s; 8B now fits: 0.65 t/s, no swap |
+| **310B** | ✅ **at the floor at every size (0.6B–8B measured)** — the goal is met on this board, with the 8B the furthest under the floor's Σ (−3.6%) | 7.8 → 1.6 t/s; batching lifts aggregate to ~8 t/s; 8B now fits: 0.65 t/s, no swap in the fit probe; 0.53 GiB touched once in the 4 h accuracy capture |
 
 ## Scope
 

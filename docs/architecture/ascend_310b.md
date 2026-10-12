@@ -278,10 +278,13 @@ while the board sat at its memory edge at 8B (swap, stalls), which would have co
 agreement with board instability. With the #676 packed-bytes release — the default since, and the
 build this capture ran (the kill switch `$POCKETLLM_ASCEND_KEEP_PACKED` unset) — the 4.68 GiB of
 packed `q4_k`/`q6_k` bytes are freed once the 16.42 GiB of planes and table are built at load.
-The capture then ran to **50 of 50 rows** (47 capped at the 128-token ceiling) in ~4 h 10 min
-with `MemAvailable` held at 4.2–4.7 GiB (against the pre-release probe's ~0.58 GB dip) and
-~0.5 GiB of swap touched once early and flat thereafter: no stall, no OOM, no thrash. The 8B
-accuracy cell is measurable on this board precisely because the packed bytes are released.
+The capture then ran to **50 of 50 rows** (47 capped at the 128-token ceiling) in ~4 h 10 min:
+`MemAvailable` bottoms at **4,145–4,153 MiB** in the load's shadow (minutes 8–14; the pre-release
+probe's dip was ~0.58 GB), recovers to ~4,614 MiB, and holds a **4,573–4,638 MiB** band for the
+remaining four hours; `SwapFree` gives up **539 MiB (0.53 GiB)** — one step at t+15 min, the
+trough at t+1.5 h — and is flat after, back at its pre-run level when the process exits: no
+stall, no OOM, no thrash. The 8B accuracy cell is measurable on this board precisely because the
+packed bytes are released.
 
 The corpus, the two capture/score scripts and every artifact are recorded on the harness page's
 convention: the corpus is byte-identical to the S600 one (md5 `0feef55b9b879a6ec4529317a3162312`),
@@ -650,7 +653,10 @@ which would cut the 14.1 GiB of fp16 planes to the ~4.4 GiB of packed weights �
 neither of those levers:** the 4.68 GiB of packed bytes are only needed until their decoded form
 exists, and releasing them at load takes the resident set from 21.10 GiB to the 16.42 GiB of
 planes and table — measured, the same 8B now loads in 507.7 s and decodes at 1.73 s/token with
-the swapfile untouched (the release section below has the numbers).
+the swapfile untouched **in that probe run** (the release section below has the numbers); the
+four-hour accuracy capture above is the longer-run reading of the same release-on configuration,
+and there `SwapFree` gives up **539 MiB (0.53 GiB)** once and holds it flat
+([the accuracy section](#end-to-end-accuracy-the-310b-sits-at-the-quantizers-own-floor)).
 
 The honest statement of coverage is now four sizes: **0.6B, 4B and 8B token-identical, and 1.7B runs
 and fits with one documented near-tie** — the same fp16-plane precision limit this whole page is
@@ -735,7 +741,9 @@ on every call and has no cached plane to fall back on.
 **What the release measures out to.** On the 8B (`Qwen3-8B-Q4_K_M.gguf`, 36 layers, untied head) the
 load now ends holding the 16.42 GiB of decoded forms and none of the 4.68 GiB of packed bytes: it
 takes **507.7 s** and leaves **1.06 GiB** of the 23.12 GiB pool free, with `SwapFree` unmoved to
-within 1.5 MiB across the whole run. The decode that follows runs at **1.73 s per token**
+within 1.5 MiB across the whole probe run. (The four-hour accuracy capture above is the longer-run
+reading of this configuration: `SwapFree` gives up **539 MiB (0.53 GiB)** once, holds it flat, and
+returns it at exit.) The decode that follows runs at **1.73 s per token**
 (1.726-1.733 s across eight greedy steps after the 5-token canonical prompt) — the 8B's first clean
 *rate* on this board; the same probe reads 0.129 s per token on the 0.6B, which is the canonical
 table's 0.129 s/token for that checkpoint, so it is the same instrument measuring both. The contrast
