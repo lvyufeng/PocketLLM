@@ -691,12 +691,27 @@ fit in the pool does not fail — it succeeds from the host's point of view and 
 which is the 500 s clean run versus the ~1197 s one: the wall is the paging, not the decode. (Swap at
 rest, with no model, is already ~0.9 GiB used of 24 GiB.)
 
-**The one missing lever here is a *release*, not an arena shrink.** The ~4.68 GiB of resident packed
-blocks is needed only until its fp16 plane is built, so in principle it could be freed then — except
-`token_embd.blocks` is read on **every forward** (the embedding gather decodes it to the dense table),
-and the cube cache (`cube_cache_`) is **keyed on the same buffer handle**, so freeing a weight's blocks
-must also drop its cache entry or the next decode reads through a freed pointer. That is the real
-residency lever on this board, and it is care about handle lifetimes, not a buffer resize.
+**The one missing lever here was a *release*, not an arena shrink — and it is pulled.** The ~4.68 GiB
+of resident packed blocks is needed only until its fp16 plane is built, so it is freed then:
+`Qwen3Model::load` ends with `materialize_packed_weights()`, which asks the backend
+(`Backend::materializes_packed_weights()`, true only here) to build every decode the forward path will
+read — `cube_for`'s fp16 plane per GEMM weight, `dense_table_for`'s f32 table for the embedding, and
+on a *tied* checkpoint both forms of the one buffer the table and the head share — and then releases
+the packed bytes, per weight, largest first. `$POCKETLLM_ASCEND_KEEP_PACKED=1` turns the whole pass
+off, and `$POCKETLLM_ASCEND_W4A16=1` turns it off implicitly because that op decodes the packed bytes
+on every call and has no cached plane to fall back on.
+
+The handle-lifetime hazard this page named is real, and the resolution is *not* to drop the cache
+entry: the entry **is** the decode, the handle stays its key for the model's life, and the rule is
+order — materialize first, release second, and never decode again. The caches are keyed on the handle
+*and* the shape the caller asked for, so a lookup that misses after the release is a shape the load
+did not materialize; the backend refuses it by throwing (`require_packed_live`) rather than decoding
+freed memory into a plane that would then be used as a weight. That failure would be fluent wrong
+text, not a crash, which is why it is a guard and not a comment.
+
+`token_embd.blocks` is read on every forward only in the sense that `embedding_quant` *asks* for it
+every forward: `dense_table_for` caches the f32 table under the same handle, so the decode happens
+once and the embedding's packed bytes are dead with every other weight's.
 
 **The other lever is the plane's *width*, and the measured middle is untried.** Shrinking host-side buffers moves
 nothing (the prior section: the heap is ~33 MiB and every staging buffer is a local). The W4A16 packed

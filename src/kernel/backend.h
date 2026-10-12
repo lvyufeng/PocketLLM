@@ -49,6 +49,19 @@ struct DeviceBuffer {
   int64_t bytes = 0;
 };
 
+/* Which of a packed weight's two consumers a materialize call is for.
+ *
+ * The two are separate because they are separate *shapes* of the same bytes: a
+ * weight's own `(rows, cols)` is what `gemm_quant` reads, while the embedding
+ * gather is read as `(vocab, d)`, and a backend that files a decoded copy under
+ * the numbers the forward path passes needs to be told which pair to build.
+ * A tied checkpoint, where one buffer backs both, needs both forms -- and the
+ * model says so by calling `materialize_packed` once with each. */
+enum class PackedUse : int32_t {
+  kGemm = 0,      /* `gemm_quant(x, blocks, ..., rows, cols, type_id, ...)` */
+  kEmbedding = 1, /* `embedding_quant(tokens, n, blocks, vocab, d, type_id, ...)` */
+};
+
 class Backend {
  public:
   virtual ~Backend() = default;
@@ -205,6 +218,61 @@ class Backend {
    * contents, so `preferred_kv_dtype` is unaffected: the storage width and the
    * projection width are separate questions and this answers only the second. */
   virtual bool prefers_kv_projection_in_cache_dtype() const { return false; }
+
+  /* Whether this backend can be handed the checkpoint's packed weights at load,
+   * asked to build its own decoded copy of each, and then left holding only
+   * those copies -- the packed bytes released.
+   *
+   * OFF by default, and the default is the whole contract. On the CPU and on
+   * the card the packed bytes *are* the weight: `gemm_quant` decodes them where
+   * they lie and there is no second copy to fall back on, so releasing them
+   * would be a use-after-free and the answer to this question is false for
+   * them.  A backend that answers true is stating that it keeps a resident
+   * decode of every packed weight it is asked for and that it can serve the
+   * forward path from that decode alone -- the Ascend backend's device planes
+   * are the case this exists for, where the packed bytes and the fp16 plane
+   * they decode to are both resident for the model's whole life and only one of
+   * them is ever read again.
+   *
+   * The numerics of a backend that answers false are untouched by this hook:
+   * `Qwen3Model::load` calls nothing on it and no buffer of its moves.  That is
+   * what keeps the CPU and CUDA greedy decodes byte-identical to what they were
+   * before the hook existed. */
+  virtual bool materializes_packed_weights() const { return false; }
+
+  /* Build this backend's own decoded form of a packed weight, so that
+   * `release_packed` below may let the checkpoint's bytes go.
+   *
+   * `rows`/`cols` and `use` are the same numbers and the same consumer the
+   * forward path will pass -- a backend that keys its copy on the buffer's
+   * handle plus the shape would otherwise miss on the very call the copy was
+   * built for, and a miss after the release has no source left to decode.
+   * Called only on a backend whose `materializes_packed_weights()` is true, and
+   * only before that weight's `release_packed`.  A weight that two consumers
+   * read -- a tied embedding, whose bytes are both the gather table and the
+   * head's operand -- is materialized once per consumer and released once.
+   *
+   * May throw; a throw leaves the packed bytes owned by the caller, which is
+   * what makes a failed load release exactly the buffers it still holds. */
+  virtual void materialize_packed(DeviceBuffer blocks, int64_t rows, int64_t cols, int type_id,
+                                  PackedUse use) {
+    (void)blocks;
+    (void)rows;
+    (void)cols;
+    (void)type_id;
+    (void)use;
+  }
+
+  /* Release `blocks`, whose every decoded form the calls above have built.
+   *
+   * Called after the last `materialize_packed` for a buffer and at most once
+   * per buffer, so a backend may record the handle here -- as spent, as this
+   * one's Ascend implementation does -- rather than keep the bytes.  The caller
+   * keeps the handle value: it is still what the forward path passes and still
+   * what a backend keys its copy by, and the model marks the weight released so
+   * its destructor does not free it a second time.  Only called on a backend
+   * whose `materializes_packed_weights()` is true. */
+  virtual void release_packed(DeviceBuffer blocks) { (void)blocks; }
 
   /* The index of the largest of `n` values, written to device memory. Returns a
    * device address rather than an integer so the caller transfers four bytes

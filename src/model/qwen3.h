@@ -82,6 +82,13 @@ struct Weight {
    * authority.  CUDA-only; false everywhere else, including the embedding
    * table. */
   bool q6k_repacked = false;
+  /* The bytes in `blocks` were released at load, after the backend built its own
+   * decoded form of them (`Backend::materializes_packed_weights`).  The handle
+   * is *kept*: it is the key that form is filed under and the forward path still
+   * passes it -- but it is no longer an allocation, so only this flag stands
+   * between the destructor and a double free.  False on every backend that reads
+   * the packed bytes where they lie, which is every backend but Ascend. */
+  bool packed_released = false;
 };
 
 class Qwen3Model {
@@ -203,6 +210,18 @@ class Qwen3Model {
   void matmul(const Weight &w, kernel::DeviceBuffer x, kernel::DeviceBuffer out, int64_t m,
               bool accumulate) const;
   void embed(kernel::DeviceBuffer tokens, int64_t n, kernel::DeviceBuffer out) const;
+
+  /* Build, in a backend that keeps a decoded copy of a packed weight, the copy
+   * of every packed weight the forward path will read, and then release the
+   * checkpoint's bytes.  A no-op on a backend that does not
+   * (`Backend::materializes_packed_weights`) -- which is every backend but
+   * Ascend, so their loads and their numerics are untouched.
+   *
+   * Called once, at the end of `load`, after every weight is bound.  It is
+   * idempotent per weight, not per model: a weight already released is skipped,
+   * which is what lets a retry after a partial failure be written the same way
+   * as the first attempt. */
+  void materialize_packed_weights();
 
   /* Drop whichever of a `Weight`'s two buffers is the live one. A member
    * function because the destructor and the tie-breaking in it both need to

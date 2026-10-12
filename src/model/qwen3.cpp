@@ -109,7 +109,13 @@ void Qwen3Model::release_weight(const Weight &weight) {
   /* Exactly one of the two handles is live in a `Weight`; releasing the other
    * would free a null and, on a device, fault. */
   if (weight.quantized) {
-    if (weight.blocks.handle != 0) {
+    /* A weight whose packed bytes were released at load keeps its handle as a
+     * key -- the backend files its decoded copy under it and `matmul`/`embed`
+     * pass it again on every token -- so the allocation behind it is already
+     * gone and freeing it again would be a double free.  `packed_released` is
+     * the only thing that records which of the two states a quantized weight is
+     * in; the handle value looks the same in both. */
+    if (weight.blocks.handle != 0 && !weight.packed_released) {
       backend_->release(weight.blocks);
     }
   } else if (weight.data.handle != 0) {
@@ -330,6 +336,79 @@ Weight Qwen3Model::bind_table(const GgufReader &checkpoint, const std::string &n
   return table;
 }
 
+void Qwen3Model::materialize_packed_weights() {
+  /* Asked once, here.  A backend that says no -- the CPU and the card -- is
+   * never called below, so its buffers, its loads and its numerics are exactly
+   * what they were before this function existed. */
+  if (!backend_->materializes_packed_weights()) {
+    return;
+  }
+
+  /* The embedding table first, and on a tied checkpoint the head in the same
+   * breath: a tied head *is* this buffer, so the gather's f32 table and the
+   * head GEMM's fp16 plane are two decodes of one allocation and the single
+   * release at the end of this block is what both of them stand on.  Releasing
+   * after the table alone would take the head's operand with it -- and the
+   * head is read before the table is, on every forward.
+   *
+   * The numbers passed are the ones the forward path passes, and they have to
+   * be: `embed` gathers at `(n_vocab_, n_embd_)` and `matmul` reads a weight at
+   * its own `(rows, cols)`, and the backend files its decoded copy under
+   * exactly those.  A mismatch here is a cache miss later, after the bytes are
+   * gone, which the backend refuses by throwing rather than answering. */
+  if (tok_embd_.quantized && !tok_embd_.packed_released) {
+    const bool tied = output_.rows != 0 && same_buffer(output_, tok_embd_);
+    backend_->materialize_packed(tok_embd_.blocks, n_vocab_, n_embd_, tok_embd_.type_id,
+                                 kernel::PackedUse::kEmbedding);
+    if (tied) {
+      backend_->materialize_packed(output_.blocks, output_.rows, output_.cols, output_.type_id,
+                                   kernel::PackedUse::kGemm);
+    }
+    backend_->release_packed(tok_embd_.blocks);
+    tok_embd_.packed_released = true;
+    if (tied) {
+      /* One buffer, two members: the flag travels with the release, or the
+       * destructor's tie test would free it a second time. */
+      output_.packed_released = true;
+    }
+  }
+
+  /* An untied head is its own buffer, and the second-largest decode there is. */
+  if (output_.quantized && output_.rows != 0 && !output_.packed_released &&
+      !same_buffer(output_, tok_embd_)) {
+    backend_->materialize_packed(output_.blocks, output_.rows, output_.cols, output_.type_id,
+                                 kernel::PackedUse::kGemm);
+    backend_->release_packed(output_.blocks);
+    output_.packed_released = true;
+  }
+
+  /* Then the layers.  The order is the embedding first and the layers after it,
+   * and on every checkpoint this build reads that is also size order: the table
+   * and the head are a vocabulary wide and a layer's matrices are a hidden size
+   * wide, a factor of a hundred on a 0.6B and thirty on an 8B.
+   *
+   * Size order is what the peak wants.  The decoded form of a weight is several
+   * times its packed bytes -- 16 bits a weight against q4_K's 4.5 -- so the
+   * resident total climbs through this pass and does not come down, while the
+   * decode's own staging (a host copy of the packed bytes, then an f32 image of
+   * the whole matrix, four bytes a weight) is the one term that is additive
+   * where it happens rather than traded for the bytes it replaces.  Paying the
+   * largest staging first, while the least decoded form is resident, is what
+   * keeps the peak near the planes themselves. */
+  for (Layer &layer : layers_) {
+    for (Weight *weight : {&layer.wq, &layer.wk, &layer.wv, &layer.wo, &layer.w_gate,
+                           &layer.w_up, &layer.w_down}) {
+      if (!weight->quantized || weight->packed_released) {
+        continue;
+      }
+      backend_->materialize_packed(weight->blocks, weight->rows, weight->cols, weight->type_id,
+                                   kernel::PackedUse::kGemm);
+      backend_->release_packed(weight->blocks);
+      weight->packed_released = true;
+    }
+  }
+}
+
 std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
                                              kernel::Backend &backend) {
   const std::string arch = checkpoint.get_string("general.architecture", "");
@@ -441,6 +520,13 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
     layer.w_down = model->bind_matrix(checkpoint, base + "ffn_down.weight");
     model->layers_.push_back(layer);
   }
+
+  /* Every weight is bound and nothing has been read yet: the one moment where a
+   * backend that keeps its own decoded copy of a packed weight can build those
+   * copies and let the checkpoint's bytes go.  It is a no-op everywhere else,
+   * and it is deliberately before the scratch allocation below so the pass's
+   * peak is weights and planes and nothing else. */
+  model->materialize_packed_weights();
 
   model->build_rope_table();
   model->ensure_capacity(1, 1);
