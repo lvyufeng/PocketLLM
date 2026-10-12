@@ -6,8 +6,8 @@ performance ladder, the memory mode the board has to boot in to reach its large 
 determinism contract. Every
 number and every failure below was measured on the board — first on 2026-10-09, then again on
 2026-10-10 **after the `balanced` memory switch and its reboot**, when all four Qwen3 sizes became
-runnable; whether either transfers to another S600 is a claim to re-check in place, and the SDK
-version is part of the result.
+runnable, and the `w8` rebuilds once more on 2026-10-13; whether either transfers to another S600 is a
+claim to re-check in place, and the SDK version is part of the result.
 
 Two facts frame the rest, and both are easy to get wrong:
 
@@ -92,9 +92,11 @@ not through the ABI backend of the same name. The `horizon` kind is what `--devi
 
 ## Measured ladder
 
-**This is the canonical ladder: all four shipped Qwen3 sizes plus our own compiled 0.6B and 4B, on the
-`balanced` pool, measured in one session on 2026-10-10 (the compiled 0.6B was added the same day, once
-its build landed).** Fixed prompt **"The capital of France is"**,
+**This is the canonical ladder: all four shipped Qwen3 sizes plus our own compiled graphs — the 0.6B and
+4B `cache_1024` builds, and the `w8` rebuilds of the 1.7B and 4B — on the `balanced` pool, measured in one
+session on 2026-10-10 (the compiled 0.6B was added the same day, once its build landed).** The two `w8`
+rebuild rows were added later, measured **2026-10-13** by the same method and the same scripts; their
+numbers are not from the 2026-10-10 session. Fixed prompt **"The capital of France is"**,
 greedy `generation_config.json`, canonical-prompt three decode runs per graph, one process per graph.
 Throughput and load time from the delegate's `last_performance()` (`xlm_model_performance_t`); memory
 held from the kernel's own ION accounting (`/sys/kernel/debug/ion/heaps/all_heap_info`), read **after
@@ -111,13 +113,16 @@ costs in the 10.00 GiB `ion_carveout`.
 | Qwen3-4B (w4) | 3.10 GiB | 6.44 s | 2415–2573 t/s | **42.8 t/s** (42.77 / 42.72 / 42.78) | 6,686,113,792 B (6.23 GiB) | 62.3% |
 | Qwen3-8B (w4) | 5.31 GiB | 7.66 s | 1939–2040 t/s | **29.7 t/s** (29.65 / 29.66 / 29.70) | 9,417,129,984 B (8.77 GiB) | **87.7%** |
 | Qwen3-0.6B (w8), ours `cache_1024` | 0.98 GiB | 5.31 s | 11636–13128 t/s | **121.6 t/s** (122.18 / 121.72 / 120.82) | 1,702,756,352 B (1.59 GiB) | 15.9% |
+| Qwen3-1.7B (w8), ours `cache_1024` | 2.31 GiB | 6.05 s | 8127–9143 t/s | **65.4 t/s** (65.49 / 65.31 / 65.31) | 3,141,009,408 B (2.93 GiB) | 29.3% |
 | Qwen3-4B (w4), ours `cache_1024` | 3.00 GiB | 6.35 s | 4339–4571 t/s | **49.9 t/s** (49.99 / 49.96 / 49.86) | 4,254,269,440 B (3.96 GiB) | 39.6% |
+| Qwen3-4B (w8), ours `cache_1024` | 4.69 GiB | 7.34 s | 4163–4491 t/s | **33.1 t/s** (33.07 / 33.10 / 33.04) | 6,073,548,800 B (5.66 GiB) | 56.6% |
 
 Decode falls with size — 88.3 → 70.2 → 42.8 → 29.7 t/s on the shipped graphs — and the memory column
 rises with it, which is the whole of the ladder's shape: the BPU's per-token cost and the pool's
-footprint both track the parameter count. Our own `cache_1024` builds sit *above* their shipped twins
-on both axes (faster, and smaller in the pool), which is the subject of the last note below. Every
-graph's three runs produced **byte-identical text**, so each number is a rate and not a draw.
+footprint both track the parameter count. Our own `w4` `cache_1024` builds sit *above* their shipped
+twins on both axes (faster, and smaller in the pool), which is the subject of the note on them below —
+the two `w8` rebuilds keep the pool edge but not the rate one, and their own note below covers the bill.
+Every graph's three runs produced **byte-identical text**, so each number is a rate and not a draw.
 
 **The switch did not regress 0.6B or 1.7B.** The board changed memory *mode*
 (`cpu_first` → `balanced`), and the two small graphs were re-measured against the numbers this page
@@ -142,7 +147,7 @@ same measurement at the same instant, and their numbers agree to the byte. Rough
 is available to a `.hbm` file once the load's fixed overhead is accounted for, which is an 8B–9B class
 model and not a 14B.
 
-*A graph we compile ourselves is faster.* Our own `Qwen3-1.7B` build at `cache_1024` (1.66 GiB, md5
+*A `w4` graph we compile ourselves is faster.* Our own `Qwen3-1.7B` build at `cache_1024` (1.66 GiB, md5
 `0b41e627f2227c029b14ed63928fd33f`) also loads and runs: decode **88 t/s** (88.84 / 87.90 / 87.59) and
 prefill 8982 t/s, against the shipped `cache_4096` graph's ~70 t/s / ~5.2k t/s in the same session —
 which is why the 1.7B row above is a *shipped-graph* number and not a 1.7B number. It is the first
@@ -154,6 +159,17 @@ the smallest size carries the biggest decode edge of the three and has
 [a section of its own](#our-compiled-06b-vs-the-shipped-06b). Whether a smaller graph gets **4B** under
 the `cpu_first` ceiling is answered — it does not, and the pool had to move instead; see
 [the large models after the switch](#the-large-models-after-the-switch).
+
+**The two `w8` rows are the accuracy rebuilds, and the rate is what they pay.** The 1.7B and 4B `w8`
+graphs exist to move agreement against truth
+([the 1.7B's row](#the-17b-at-w8-above-the-floor-against-truth)), and this table is their bill: decode
+**65.4 t/s** at 1.7B against the `w4` `cache_1024` graph's **89.1**, and **33.1** at 4B against **49.9**
+— 27% and 34% slower — while the pool grows **+0.66 GiB** (2.27 → 2.93) and **+1.70 GiB** (3.96 → 5.66).
+Prefill moves the same way but less (8127–9143 against 8828–9846; 4163–4491 against 4339–4571), load is
+6.05 s and 7.34 s against 5.62 and 6.35, and both builds sit well inside `balanced` — the 4B `w8` leaves
+4.34 GiB of the pool free. The width is also the second single-variable escape from the 1.7B loop: it
+closes the block at the loop's own cache
+([the loop at `w8`](#the-loop-at-w8-the-same-cache-closes-it-on-wider-weights)).
 
 **The 8B compiles too, and it is the lighter and faster of the pair.** Our own `Qwen3-8B` build at
 `cache_1024` (5.61 GB, md5 `84a312d26361d21b0d8daf398a48651b`) loads in **7.87 s** and costs the pool
@@ -566,7 +582,8 @@ separated. The decisive rebuild is still **ours at the vendor's own cache** — 
 identical ([the command](../architecture/s600_native_chain.md#the-concrete-command-sequence)): a **clean**
 result pins `cache_len 1024` as the cause; a **still-looping** one says the difference is calibration or
 provenance — our build pipeline or our calibration — not the cache. (`cache_len 2048` is the cheaper first
-step; `w_bits 8, cache_len 1024` the `w4` control.)
+step; `w_bits 8, cache_len 1024` the `w4` control. Both have since been run, and both close the block —
+[the `w8` rebuild at the loop's own cache below](#the-loop-at-w8-the-same-cache-closes-it-on-wider-weights).)
 
 **The loop is a precision trajectory, not a graph defect.** Four measurements separate the two. One,
 the onset is **content-determined and position-independent**: in **absolute context position** it lands
@@ -644,6 +661,9 @@ build reproduces the shipped 70 t/s and the 1.27× is exactly #637's number. But
 recommendation is **revised**: the cache is not a pure rate knob, it is the difference between looping and
 answering, so the 1.7B wants a window large enough to close the block — `4096` on the shipped graph, and
 `2048`, the cheaper step this paragraph deferred as *untested*, is measured next and closes the loop too.
+The `w8` rebuild is a third closure — same `cache_1024`, wider weights, block closes — so the runaway
+tracks the `w4`/`1024` pairing and not the window alone
+([the loop at `w8`](#the-loop-at-w8-the-same-cache-closes-it-on-wider-weights)).
 The 4B/8B `2048` call stands and is reinforced — a window too small to close a long thinking block is what
 breaks the 1.7B, and those sizes run their thinking longer still.
 
@@ -693,6 +713,33 @@ country in southern Europe, known for its beautiful landscapes, ri…"* — and 
 pieces, no loop window recurring three times. The `cache_1024` graph, on the same two tokens, never
 closes the block and runs to the cap. Same weights, same prompt, same greedy sampler; the cache is the
 only commanded difference, and it is the difference between an answer and a runaway.
+
+#### The loop at `w8`: the same cache closes it on wider weights
+
+The other single-variable escape from the `cache_1024` loop was already built: the 1.7B `w8` rebuild
+[below](#the-17b-at-w8-above-the-floor-against-truth) varies **exactly one commanded flag** against the
+looping `w4` `cache_1024` graph — `--w_bits 4 → 8`, same `cache_len 1024`, `chunk`, `march`, `corenum`
+and pipeline — and driven through the same reproducer (`France?`, greedy, one graph per process, measured
+2026-10-13) it says the loop is **gone**:
+
+| prompt | ours `w4` `cache_1024` | **ours `w8` `cache_1024`** |
+|---|---|---|
+| `France?` | 1004 pieces / 4467 chars, **no `</think>`**, 40-char window recurs **11×** | **353 pieces / 1631 chars, closes the block, recurs 2×** |
+| `1..400` list | 3605 chars, **no `</think>` and no list** (recurs 8×) | 3536 chars, **closes**, writes **1…36** before the 1024-token window ends it (recurs 2×) |
+
+The runs are modes, not draws: two `France?` generations are byte-identical (`sha256 8098aa71…`), and
+the list is byte-identical three of three (`sha256 22e640d7…`). The block closes and an answer follows —
+*"France is a country in Europe, known for its rich history, culture, and iconic landmarks. Its capital,
+Paris, …"* — where the `w4` graph never closes at all, and the **353** pieces land between
+`cache_2048`'s **300** and the shipped graph's **407**. The recurrence level falls to **2×**, the same
+the two clean `cache_4096` builds show. The one honest qualifier is the list: the `w8` graph **does**
+start the enumeration — 1…36, cut when the window fills — where the `w4` graph wrote none of it; that is
+the 1024-token budget, not a runaway.
+
+So the runaway needs **both** the `w4` weights and the 1024 window: widening either one ends it. That is
+the same reading [the `4096` rebuild](#the-rebuilt-17b-at-the-vendors-cache-the-runaway-loop-is-the-cache)
+and the onset analysis already give — a precision trajectory, not a fixed graph defect — with the `w8`
+rebuild now the second single-variable confirmation, from the width side.
 
 #### A request whose prompt does not fit the cache was an abort, and is now refused
 
