@@ -1990,9 +1990,8 @@ At **matched** cache (both `cache_4096`) our graph trails the vendor **377 vs 72
 is removed and the gap stays. The sweep makes the point twice over. Our own `cache_4096` (Σ **377**) is
 a hair *worse* than our `cache_1024` (Σ **394**) — a wash, not an improvement — so the deeper cache buys
 the loop and not the corpus. Scored directly against each other at the same cache, the two graphs share
-**379** tokens of leading continuation across the fifty prompts, with **13 of 50** diverging at the
-second token (immediately after the ChatML framing): the disagreement is structural from the first
-generated token, not a late drift.
+**379** tokens of leading continuation across the fifty prompts, with **13 of 50** diverging after
+agreeing on only two tokens — structural from the start of the continuation, not a late drift.
 
 The two axes stay separate, and this result does not overturn the loop finding. The cache **is** still
 the lever for the `France?` runaway loop — our `cache_4096` closes it (229 pieces, a 40-char window
