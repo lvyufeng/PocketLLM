@@ -35,7 +35,7 @@ decode.
 | Path | eager kernels | **AOT**: host compiles a `.hbm`, board runs it | aclnn/ACL + AscendC custom ops |
 | Weight format | GGUF `f16` / `q4_k_m` | `leap_llm` symmetric per-channel int4 | GGUF `q4_k`/`q6_k`, faithfully decoded |
 | Qwen3-0.6B | ✅ f16, q4_k_m | ✅ w8 | ✅ q4_k_m |
-| Qwen3-1.7B | ✅ q4_k_m, f16 | ✅ w4 | ✅ q4_k_m |
+| Qwen3-1.7B | ✅ q4_k_m, f16 | ✅ w4, w8 | ✅ q4_k_m |
 | Qwen3-4B | ✅ q4_k_m, f16 | ✅ w4 | ✅ q4_k_m |
 | Qwen3-8B | ✅ q4_k_m, f16 | ✅ w4 (87.7% of the pool) | ⚠️ runs, but at the memory/swap edge |
 | Sampling | temperature/top-k/top-p/min-p/seed | same (RNG on the host) | same (RNG on the host) |
@@ -60,7 +60,7 @@ is measuring the quantizer's error, not the board's.
 |---|---|---|
 | **2080ti** | the oracle itself — token-identical to llama.cpp on both widths | logit-level 1e-3 (`--print-top K`) |
 | **310B** | ✅ **at the quantizer's own floor, never below** (see below) | **token agreement only** (no logits surface) |
-| **S600** | 🟡 a real provenance gap vs truth; cause not yet identified (calibration and cache ruled out) | **token agreement only** (`xlm` returns text, no logits, no seed) |
+| **S600** | ✅ **at the quantizer's own floor at 0.6B `w8`** (973 ≈ 995) **and above it at 1.7B `w8`** (Σ **1174** vs floor **956** — the first cell at that size at or above it); the provenance gap vs the shipped graphs still holds at every size (cause not yet identified); **8B stays `w4` — below the floor** | **token agreement only** (`xlm` returns text, no logits, no seed) |
 
 **310B.** Against f16 the board reaches Σ prefix **1078 / 939 / 1620** (0.6B / 1.7B / 4B) where the
 `q4_k_m` checkpoint's own distance from truth is the floor **995 / 956 / 1552** — ratios **1.08 /
@@ -87,6 +87,16 @@ With the KV scales near-identical and the weights data-free-identical
 (`w_max/7`), the remaining candidates are the compiler graph's operator rounding and accumulation
 order, or a vendor weight-quant scheme that is not data-free. See
 [the native compile chain](s600_native_chain.md) and the S600 model page for the record.
+
+**One axis now reaches the floor at 1.7B, and it is `w8`.** Our own 1.7B `w8` build — one flag
+changed against our 1.7B `w4` `cache_1024` graph (`--w_bits 4 → 8`) — scores Σ **1174** against f16
+truth where the size's floor is **956**: the first cell at 1.7B at or above the floor (ours `w4`
+**394**, the vendor's `w4` `cache_4096` **724**), and its confident-wrong tail collapses with it
+(23 wide-margin splits → **2**). The limit is recorded with the result: **`w8` doubles the packed
+weights, so the 8B `w8` exceeds the 10 GiB pool and is not deployable — the S600 stays `w4` at 8B,
+and that row is below the floor.** This is a 0.6B/1.7B statement, not a fleet-wide one. Full record,
+with build provenance and scope notes:
+[s600_qwen3.md](../models/s600_qwen3.md#the-17b-at-w8-above-the-floor-against-truth).
 
 ## Performance
 
@@ -126,7 +136,7 @@ declined — see [the batched-decode bound](ascend_310b_batch_decode_bound.md) a
 | Device | Accuracy | Performance |
 |---|---|---|
 | **2080ti** | the oracle — token-exact vs llama.cpp | CPU at parity with llama.cpp on prefill, ahead on decode; CUDA kernels naive |
-| **S600** | real provenance gap vs truth; cause under investigation (calibration and cache both falsified) | 88 t/s @0.6B → 30 t/s @8B; our compiled graphs beat the shipped ones |
+| **S600** | ✅ **at the floor at 0.6B `w8`, above it at 1.7B `w8`** (Σ **1174** vs floor 956); `w4` builds still trail the vendor; **8B stays `w4`** — below the floor | 88 t/s @0.6B → 30 t/s @8B; our compiled graphs beat the shipped ones |
 | **310B** | ✅ **at the floor, never below** — the goal is met on this board | 3.8 → 1.7 t/s; batching lifts aggregate to ~8 t/s |
 
 ## Scope
