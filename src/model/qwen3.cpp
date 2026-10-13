@@ -417,10 +417,12 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
   }
 
   std::unique_ptr<Qwen3Model> model(new Qwen3Model(backend));
-  /* The repacked panel GEMM is opt-in, CPU-only and AVX2-only.  Deciding it here,
-   * once, keeps `matmul` from asking three questions per weight per layer, and
-   * keeps the answer the same for every weight in the session -- which is what
-   * makes the path a *selected whole GEMM* rather than a per-tensor choice. */
+  /* The repacked panel layout is opt-in, CPU-only and AVX2-only.  Deciding it
+   * here, once, keeps `matmul` from asking three questions per weight per layer,
+   * and keeps the answer the same for every weight in a session -- one layout
+   * per tensor, never mixed.  (The name is historical: the layout no longer
+   * selects a GEMM; the panel GEMV is the model's only panel kernel, and both
+   * headers say why.  See `matmul`.) */
   model->panel_gemm_ = kernel::repack_enabled() && kernel::repack_available() &&
                        std::string(backend.name()) == "cpu";
   /* The byte-expanded q6_K layout is selected by the backend, not a build flag:
@@ -640,7 +642,10 @@ void Qwen3Model::ensure_capacity(int64_t n, int64_t end_pos, int64_t head_rows) 
    * one weight -- and overflowed *silently*, because a heap buffer has no
    * bounds, so the entries it trampled were the next weight's or the KV cache's
    * and the model answered `0! 0! 0!` nine layers later.  The `n / 4 + 4` is the
-   * panel GEMM's own slop (`nr / 4` groups plus four for the tail pass). */
+   * panel GEMM's own slop (`nr / 4` groups plus four for the tail pass); the
+   * shipped dispatch runs only the row-at-a-time GEMV, whose `quant::Q8KBlock`
+   * rows this formula covers too, so the bound is kept as the panel layout's own
+   * rather than narrowed to the kernel that currently reads it. */
   int64_t act_bytes = 0;
   if (panel_gemm_) {
     const int64_t widest = n_embd_ > n_ff_ ? n_embd_ : n_ff_;
@@ -661,55 +666,35 @@ void Qwen3Model::matmul(const Weight &w, kernel::DeviceBuffer x, kernel::DeviceB
                         bool accumulate) const {
   kernel::DeviceBuffer no_bias;
   if (w.quantized) {
-    /* A repacked weight is readable at every `m`, which is why the panel path is
-     * selected for the whole session rather than per shape: the decode GEMM has
-     * to come from the same bytes the prefill GEMM does.  When `w.panel` is set
-     * the row kernel is never called for it -- not even for the rows a batched
-     * call would leave over -- because `dot_row_q8k` reads the file's per-row
-     * blocks and these are panels.  It would not fail; it would answer fluently.
+    /* A repacked weight is readable at every `m`, and it is read one activation
+     * row at a time by `gemv_q4k_8x8` -- the same kernel at every call shape.
+     * When `w.panel` is set the row kernel is never called for it, because
+     * `dot_row_q8k` reads the file's per-row blocks and these are panels.  It
+     * would not fail; it would answer fluently.
      *
-     * Two kernels, one weight layout:
-     *   `m % 8 == 0` -> `gemm_q4k_8x8`, the panel GEMM, whose whole win is that
-     *                   a prefill no longer re-decodes the matrix `m / 8` times;
-     *   otherwise    -> `gemv_q4k_8x8`, one activation row at a time, which is
-     *                   the decode path.
-     * Neither is bit-identical to `dot_row_q8k`; `kernel/repack_q4k.h` says why,
-     * and `gemm_quant`'s own schedule -- the thing the mutual-consistency
-     * invariant pins -- is untouched because neither of these is it. */
-    if (w.panel && m % 8 == 0) {
-      const float *src = reinterpret_cast<const float *>(x.handle);
-      /* An accumulating call builds its tile out of line and adds it to `out` at
-       * the end, because `out` and `x` are different buffers: `out` is the
-       * residual being accumulated into and `x` is the operand the GEMM is
-       * consuming, and for `wo`/`w_down` the kernel would otherwise overwrite
-       * the row it is still reading. */
-      float *dst = reinterpret_cast<float *>(out.handle);
-      if (accumulate) {
-        dst = reinterpret_cast<float *>(panel_tile_.handle);
-      }
-      kernel::Q8Kx4 *acts = reinterpret_cast<kernel::Q8Kx4 *>(act_packed_.handle);
-      kernel::repack_activations(src, m, w.cols, acts);
-      kernel::gemm_q4k_8x8(static_cast<int>(w.cols), dst, static_cast<size_t>(w.rows),
-                           reinterpret_cast<const kernel::Q4Kx8 *>(w.blocks.handle), acts,
-                           static_cast<int>(m), static_cast<int>(w.rows));
-      if (accumulate) {
-        /* The residual is `out`, not `x`.  Both accumulating calls in the graph
-         * pass `x_` as the destination and the projection's own input as `x`, so
-         * `out` already holds the residual the new term is added to.  Adding `x`
-         * instead is a plausible-looking line that silently replaces the residual
-         * with the projection -- and because the graph's last two matmuls are
-         * both accumulating, it corrupts every block from layer 0 on. */
-        float *out_f = reinterpret_cast<float *>(out.handle);
-        const int64_t total = m * w.rows;
-        for (int64_t i = 0; i < total; ++i) {
-          out_f[i] = out_f[i] + dst[i];
-        }
-      }
-      return;
-    }
+     * **One kernel at every `m`, and that is a correctness constraint.**  This
+     * site used to select the panel GEMM (`gemm_q4k_8x8`) when `m % 8 == 0` and
+     * the GEMV otherwise, so a row's arithmetic was a function of the batch it
+     * rode in: a 16-token prompt and the same prompt split 16 + one decode step
+     * produced different logits, and a stream batched with others stopped being
+     * byte-equal to its solo run -- silent wrong text with a 200, not a perf
+     * note (the serving adapter's `equals_solo`).  The two kernels are not
+     * bit-identical (see `kernel/repack_q4k.h`), so no dispatch keyed on `m` can
+     * keep that contract; the GEMV is the one canonical arithmetic.  The GEMM is
+     * retained in the kernel library -- it is the panel layout's own 8x8 tile
+     * arithmetic and it carries the measured prefill win at large `m`, see the
+     * kernel header -- but no call shape reaches it.
+     *
+     * Neither kernel is bit-identical to `dot_row_q8k`; `kernel/repack_q4k.h`
+     * says why, and `gemm_quant`'s own schedule -- the thing the
+     * mutual-consistency invariant pins -- is untouched because neither of these
+     * is it. */
     if (w.panel) {
-      /* The panel GEMV writes its whole output row, so an accumulating call
-       * needs the same out-of-line tile the GEMM does. */
+      /* The panel kernel writes its whole output row, so an accumulating call
+       * needs an out-of-line tile: `out` is the residual being accumulated into
+       * and `x` is still being read row by row -- for `wo`/`w_down` they are the
+       * same handle -- so writing the row where it belongs would overwrite the
+       * operand mid-walk. */
       const int64_t row_blocks = w.cols / quant::kBlockWeights;
       const float *src = reinterpret_cast<const float *>(x.handle);
       quant::Q8KBlock *acts = reinterpret_cast<quant::Q8KBlock *>(act_packed_.handle);
@@ -724,7 +709,12 @@ void Qwen3Model::matmul(const Weight &w, kernel::DeviceBuffer x, kernel::DeviceB
                            reinterpret_cast<const kernel::Q4Kx8 *>(w.blocks.handle), acts,
                            static_cast<int>(m), static_cast<int>(w.rows));
       if (accumulate) {
-        /* `out` is the residual; see the panel GEMM above. */
+        /* The residual is `out`, not `x`.  Both accumulating calls in the graph
+         * pass `x_` as the destination and the projection's own input as `x`, so
+         * `out` already holds the residual the new term is added to.  Adding `x`
+         * instead is a plausible-looking line that silently replaces the residual
+         * with the projection -- and because the graph's last two matmuls are
+         * both accumulating, it corrupts every block from layer 0 on. */
         float *out_f = reinterpret_cast<float *>(out.handle);
         const int64_t total = m * w.rows;
         for (int64_t i = 0; i < total; ++i) {
