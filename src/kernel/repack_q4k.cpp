@@ -1,5 +1,6 @@
-/* The repacked q4_K panel GEMM.  See repack_q4k.h for why it exists, what opts
- * in, and why it is not bit-identical to the row kernel.
+/* The repacked q4_K panel kernels: the tile GEMM (kept, no longer dispatched)
+ * and the GEMV every panel weight is read by.  See repack_q4k.h for why they
+ * exist, what opts in, and why neither is bit-identical to the row kernel.
  *
  * The kernel body is a deliberate port of llama.cpp's `ggml_gemm_q4_K_8x8_q8_K`
  * AVX2 path (ggml/src/ggml-cpu/arch/x86/repack.cpp).  Its shuffle offsets are

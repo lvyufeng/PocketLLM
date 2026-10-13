@@ -478,43 +478,60 @@ The dispatch lives in `gemm_quant` and is shape-driven: `m / R` groups take the 
 batched kernel costs a decode nothing — which is why the change is a prefill change and the decode
 column of the A/B is flat.
 
-### The repacked q4_K panel GEMM, and the one place it is not bit-exact
+### The repacked q4_K panels: one kernel at every `m`, and the tile GEMM that is not dispatched
 
 `dot_Rrows_q8k` walks **one** weight column against `R` activation rows and decodes each weight block
-once per walk, so a prefill GEMM still re-reads the whole weight matrix `m / R` times. The panel path
-is llama.cpp's answer to the same problem, ported deliberately rather than re-derived: pre-tile the
-weights into eight-column panels (`Q4Kx8`) and the activations into four-row groups (`Q8Kx4`), so one
-kernel pass produces an 8×8 tile of the output with every operand block decoded once. **A repacked
-panel is the same byte count as the eight `q4_K` blocks it replaces** (`1152 == 8 × 144`), which is
-what lets the loader repack a weight through a scratch buffer and copy it back into the same slot.
+once per walk, so a prefill GEMM still re-reads the whole weight matrix `m / R` times. The panel
+layout is llama.cpp's answer to the same problem, ported deliberately rather than re-derived:
+pre-tile the weights into eight-column panels (`Q4Kx8`) and the activations into four-row groups
+(`Q8Kx4`), so one kernel pass produces an 8×8 tile of the output with every operand block decoded
+once. **A repacked panel is the same byte count as the eight `q4_K` blocks it replaces** (`1152 == 8 ×
+144`), which is what lets the loader repack a weight through a scratch buffer and copy it back into the
+same slot. The layout has two kernels — the tile GEMM and the one-row GEMV below — and **the model
+dispatches the GEMV at every `m`; the tile GEMM is kept but not dispatched**. Most of the measurements
+in this section predate that dispatch change and carry a label where it matters.
 
-**This is the one kernel in the tree that is not bit-identical to the row kernel, and that is stated
-rather than discovered.** The panel kernel's four `maddubs` products of a 32-weight sub-block
-accumulate in **int16** and take one `madd_epi16` scale multiply, where our own layout needs four
-`madd_epi16` because our four `j` iterations carry different scales. The int16 association is legal
-only for q4_K: 4-bit weights (0–15) against int8 activations (±127) give at most 1905 per `maddubs`
-lane, so four sum to 7620 < 32767. q6_K's 6-bit values would overflow, which is why **only q4_K has a
-panel path** — everything else stays on the row kernel, and qwen3-0.6B's `output.weight` is q6_k, so
-the head is never repacked **on the CPU**. (The card has a separate `q6_K` byte-expansion repack with
-its own reason — see [the section below](#the-q6_k-byte-expansion-repack-and-why-the-card-needs-one-the-cpu-does-not).)
+**The tile GEMM is the one kernel in the tree that is not bit-identical to the row kernel, and that is
+stated rather than discovered.** Its four `maddubs` products of a 32-weight sub-block accumulate in
+**int16** and take one `madd_epi16` scale multiply, where our own layout needs four `madd_epi16`
+because our four `j` iterations carry different scales. The int16 association is legal only for q4_K:
+4-bit weights (0–15) against int8 activations (±127) give at most 1905 per `maddubs` lane, so four sum
+to 7620 < 32767. q6_K's 6-bit values would overflow, which is why **only q4_K has a panel layout** —
+everything else stays on the row kernel, and qwen3-0.6B's `output.weight` is q6_k, so the head is
+never repacked **on the CPU**. (The card has a separate `q6_K` byte-expansion repack with its own
+reason — see [the section below](#the-q6_k-byte-expansion-repack-and-why-the-card-needs-one-the-cpu-does-not).)
 
-It is a **selected whole GEMM, never mixed with the row kernel**: when the panel path is on it computes
-the entire sub-batch and `dot_row_q8k` is not called for that weight at all. That is what leaves the
-mutual-consistency invariant untouched — `gemm_quant`'s own schedule is unchanged, and
+The layout is never mixed with `gemm_quant` inside a tensor: a weight whose bytes are panels is read
+only by the panel kernel, whatever the shape, so `gemm_quant`'s own schedule is unchanged and
 `test_the_four_row_weight_walk_is_the_one_row_walk_four_times` still describes it exactly.
 
-The decode half of the layout is `gemv_q4k_8x8`: one activation row against the same panels, reading
-the row kernel's own `quant::Q8KBlock` array, because a repacked weight has to be readable at **every**
-`m` and not only at multiples of eight. Without it a repacked checkpoint would decode from misread
-bytes — and it would not fail, it would answer fluently. Both kernels are **split across output-column
-panels**, the split that wins: splitting output *rows* makes every thread stream the whole weight
-matrix and measures ~1.7× *slower* than the row kernel at 22 threads.
+**The dispatch is one kernel at every `m`, and that is a correctness constraint.** `Qwen3Model::matmul`
+used to select the tile GEMM when a call's total row count was a multiple of eight and the GEMV
+otherwise, which made a row's arithmetic a function of the batch it rode in: a 16-token prompt and the
+same prompt split 16 + one decode step produced different logits, so a batched stream answered
+different text from its solo run — `equals_solo`, the serving adapter's contract, silent wrong text
+with a 200 rather than a perf note. Two kernels that are not bit-identical cannot both be canonical for
+a row, so no dispatch keyed on `m` closes it: the GEMV is the one arithmetic
+(`Qwen3Model::matmul`, `kernel/repack_q4k.h`), the tile GEMM is kept as the layout's own tile
+arithmetic and its measured large-`m` prefill win, and `$POCKETLLM_CPU_REPACK=0` remains the A/B
+against the row kernel. `tests/native/test_cpu_dispatch_invariance.py` pins the property at the engine
+level under both arms; `tests/serving/test_native_backend.py`'s batched-versus-solo test is where the
+divergence was first seen.
+
+The panel kernel the model runs is `gemv_q4k_8x8`: one activation row against the same panels, reading
+the row kernel's own `quant::Q8KBlock` array — written because a repacked weight has to be readable at
+**every** `m` and not only at multiples of eight, and now the only reader of the layout. Without it a
+repacked checkpoint would decode from misread bytes — and it would not fail, it would answer fluently.
+Both panel kernels are **split across output-column panels**, the split that wins: splitting output
+*rows* makes every thread stream the whole weight matrix and measures ~1.7× *slower* than the row
+kernel at 22 threads.
 
 The activation pack calls `quant::quantize_q8_block` — the row kernel's own quantizer — rather than a
 second transcription of it, so the two engines quantize an activation identically and the
 token-for-token match against llama.cpp is structural rather than a thing to re-check.
 
-**Measured** (`q4_k_m`, interleaved A/B against the row kernel, `pp512` and `tg64`):
+**Measured with the tile GEMM still dispatched** (`q4_k_m`, interleaved A/B against the row kernel,
+`pp512` and `tg64`):
 
 | | row kernel | panel path | ratio |
 |---|---:|---:|---:|
@@ -529,11 +546,12 @@ shape of a kernel that forgot `parallel_for` rather than one that is intrinsical
 
 **It is on by default, and the env var inverts the usual sense.** Every other selector in this tree
 is opt-in — unset is the shipped default and setting the variable adds a behaviour. Here the shipped
-default *is* the panel path, because it is what carries `pp512` from about 0.86× of llama.cpp to
-parity, and a caller who never read this file should get the fast one: `POCKETLLM_CPU_REPACK=0`
+default *is* the panel layout, and what it ships is the GEMV, which decodes faster than the row kernel
+(the A/B above); a caller who never read this file should get the fast one: `POCKETLLM_CPU_REPACK=0`
 withholds it and restores the row kernel.
 
-At the default 22 threads on `q4_k_m`, interleaved against llama.cpp on the same host:
+With the tile GEMM still dispatched, at the default 22 threads on `q4_k_m`, interleaved against
+llama.cpp on the same host:
 
 | | row kernel | panel path (shipped default) | llama.cpp |
 |---|---:|---:|---:|
@@ -545,12 +563,34 @@ two medians land within a percent of each other in either direction. **Decode is
 and is not in question. `t44` is where both engines' numbers break down on this host and is not a
 comparison to quote; the t22 column is.
 
-**The contract the extra speed buys is a different last bit, and the tests say so.** The per-op
-difference from the row kernel is at most **1.6 × 10⁻⁶ relative** over 504 checked GEMMs and 336
-GEMVs on a 32-token prefill (zero outputs outside a 1e-3 absolute band). What that buys is real but
-bounded: with the flag on, `tests/native/` is **286 passed** and, on the full suite, **1001 passed /
-70 skipped** — the same totals as with it off — including the exact greedy-token match against
-llama.cpp, the batched-versus-incremental equality and the logits check. Where it does move is a
+**After the unified dispatch** (this change's own A/B on 0.6B `q4_k_m`, default threads; decode is a
+64-step greedy loop with three runs, prefill a single call with twelve repeats a shape):
+
+| | before (tile GEMM at `m % 8 == 0`) | after (GEMV at every `m`) |
+|---|---:|---:|
+| `tg64` (t/s) | 119.6 / 118.8 / 106.0 | 108.9 / 111.1 / 119.9 |
+| prefill `m = 16`, aligned (ms) | 50.8–53.5 | 53.7–60.6 |
+| prefill `m = 17` (ms) | 55.2–56.6 | 56.5–60.0 |
+| prefill `m = 75` (ms) | 121.3–124.1 | 117.5–121.5 |
+
+Decode and the unaligned prefills are flat inside the host's run-to-run band; the price is the tile
+GEMM's edge on **aligned** prefills, which grows with `m` — at `m = 75` padded to 80 the GEMM measured
+700–728 rows/s against the GEMV's 604–639, about 15%. The shipped GEMV still beats the row kernel on
+these shapes (same session, `$POCKETLLM_CPU_REPACK=0`: 82.3–87.5 t/s decode against 87.5–105.5, and
+479–574 rows/s at `m = 75` against 557–628; `m = 17` is 189–190 against 279–302), so the default stays
+where it is. The footprint was measured too, and it is exactly the previously-panel shapes: the logits
+bytes move at 0.6B `m = 184/192/200` and 1.7B `m = 64/96/512`, and are bit-identical at 0.6B
+`m = 191/193` and 1.7B `m = 63/95/511`; no sampled greedy token moved anywhere except the one serving
+prompt whose prefill is aligned (16 tokens), which moves to the answer the batched path already
+produced.
+
+**The contract the extra speed buys is a different last bit, and the tests say so.** Measured with the
+tile GEMM still dispatched, the per-op difference from the row kernel is at most **1.6 × 10⁻⁶
+relative** over 504 checked GEMMs and 336 GEMVs on a 32-token prefill (zero outputs outside a 1e-3
+absolute band; the GEMV half of that set is still the shipped arithmetic). What that buys is real but
+bounded: in that measurement's own runs the flag's two arms have identical suite totals — `tests/native/`
+**286 passed** and the full suite **1001 passed / 70 skipped** — including the exact greedy-token
+match against llama.cpp, the batched-versus-incremental equality and the logits check. Where it does move is a
 *long* greedy sequence on a near-tie: on a 32-token prompt the two paths share their first 30
 generated tokens and split at the 31st, which is the chaos amplification of a 1.6 × 10⁻⁶ per-op
 difference and the regime `tests/native/llama_oracle.py` already documents. **f16 is the control and
@@ -559,7 +599,8 @@ repack is a different selector and does not touch f16 either), and the f16 check
 byte-identical with the flag on and off at every length tested. Thread invariance is unaffected
 either way: the output is bit-identical at 1, 4, 22 and 44 threads, with the reduce never split.
 
-**Where the remaining prefill time is** (`perf record`, `pp512`, t22, inclusive shares): the panel
+**Where the remaining prefill time is** (measured with the tile GEMM still dispatched; `perf record`,
+`pp512`, t22, inclusive shares): the panel
 GEMM 41%, attention's score and fold passes 14%, the q6_K head 7.5%, and the pool's **barrier spin
 7.2%** — 14% at t44. The GEMM's share now matches llama.cpp's own 47% for `ggml_gemm_q4_K_8x8_q8_K`,
 so the GEMM is no longer the differentiator it was: single-threaded, both engines are near 60% of
@@ -574,8 +615,8 @@ before this default does not silently switch engines.
 
 ### The q6_K byte-expansion repack, and why the card needs one the CPU does not
 
-The panel GEMM above is a **CPU** layout: its integer `maddubs` path is legal only for `q4_K` (six-bit
-weights overflow the int16 accumulator), which is why the section says "only q4_K has a panel path"
+The panel layout above is **CPU-only**: its integer `maddubs` path is legal only for `q4_K` (six-bit
+weights overflow the int16 accumulator), which is why the section says "only q4_K has a panel layout"
 and "the head is never repacked". The **CUDA** backend has a different problem and its own answer, and
 the two must not be read as one: on the card there is no panel kernel at all, and the repack there is
 a **byte-expansion of `q6_K` alone**, selected by the backend.
@@ -1039,9 +1080,9 @@ engine is using flash attention, median of two): **681.0 t/s against our 501.5, 
 0.70× when the score tiling landed. With `-fa 1` llama.cpp measures 796.0. Prefill is still the gap
 and the remaining term is `gemm_quant`, whose `n = 1024, k = 1024` shape is 305 ms of the ~1070 ms
 call on 22 threads — the four-row GEMM behind llama.cpp's eight-row repacked form. That form has since
-been ported, behind `POCKETLLM_CPU_REPACK`; see [the repacked q4_K panel
-GEMM](#the-repacked-q4_k-panel-gemm-and-the-one-place-it-is-not-bit-exact) for what it is worth and
-why it does not close the gap on its own.
+been ported, behind `POCKETLLM_CPU_REPACK`; see [the repacked q4_K
+panels](#the-repacked-q4_k-panels-one-kernel-at-every-m-and-the-tile-gemm-that-is-not-dispatched) for
+what the layout is worth and why the tile GEMM no longer dispatches.
 
 ### Eight query rows per key walk
 

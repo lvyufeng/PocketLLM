@@ -270,14 +270,17 @@ class Qwen3Model {
   kernel::DeviceBuffer scores_;
   kernel::DeviceBuffer tokens_;
   kernel::DeviceBuffer rope_cos_, rope_sin_;
-  /* The packed activations the repacked q4_K panel GEMM reads, `nr / 4 * n / 256`
-   * `Q8Kx4` groups. Nothing else uses it: the panel path is a *selected whole
-   * GEMM*, so this is filled and consumed inside one `matmul` call and may be
-   * released immediately. It is a member rather than a local because
-   * reallocating it per weight per layer would be 200 allocations a token, and
-   * because the only size that can change with the batch is the batch. */
+  /* The packed activations the panel kernel reads -- one `quant::Q8KBlock` row
+   * per activation row for `gemv_q4k_8x8`, the kernel every panel weight is read
+   * by.  Sized (in `ensure_capacity`) to the wider `Q8Kx4` groups the retained
+   * but not dispatched panel GEMM would pack, so the bound does not depend on
+   * which of the two kernels a session runs.  Filled and consumed inside one
+   * `matmul` call and may be released immediately; a member rather than a local
+   * because reallocating it per weight per layer would be 200 allocations a
+   * token, and because the only size that can change with the batch is the
+   * batch. */
   kernel::DeviceBuffer act_packed_;
-  /* Where an *accumulating* panel GEMM builds its tile.  The two accumulating
+  /* Where an *accumulating* panel call builds its tile.  The two accumulating
    * calls in the graph (`wo`, `w_down`) write into a buffer the residual is
    * already in -- `out` and `x` are the same handle -- so the tile cannot be
    * written there, and `x` is still being read row by row.  A third buffer is
@@ -285,10 +288,11 @@ class Qwen3Model {
    * one more argument rather than a second kernel.  Only allocated when the
    * panel path is on. */
   kernel::DeviceBuffer panel_tile_;
-  /* Is the repacked panel path on for this run? Decided once at load -- from
-   * `repack_enabled()` and the backend's name -- rather than per `matmul`,
+  /* Is the repacked panel layout in use for this run? Decided once at load --
+   * from `repack_enabled()` and the backend's name -- rather than per `matmul`,
    * because it is a property of the session and a per-call string comparison
-   * would be a per-op decision that cannot change. */
+   * would be a per-op decision that cannot change.  The name is historical: the
+   * layout no longer selects a GEMM (see `model/qwen3.cpp`'s `matmul`). */
   bool panel_gemm_ = false;
   /* Is the byte-expanded q6_K layout in use this run? Unlike the q4_K panels it
    * is sent by the *backend*, not the model: only CUDA reads the repacked block,
