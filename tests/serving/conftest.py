@@ -22,8 +22,6 @@ import pathlib
 
 import pytest
 
-from pocketllm.api import EngineArgs
-
 #: An explicit checkpoint wins.  The fallback searches the directories this repository's hosts keep
 #: Qwen3 GGUFs in, so the batched path, the KV-wipe regression test and the G2 gate run on a host
 #: that has *a* Qwen3-0.6B -- not only the f16 one the module used to name by absolute path.  G2
@@ -96,14 +94,3 @@ def require_checkpoint() -> None:
             "cannot run must fail, not skip. Set POCKETLLM_SERVING_GGUF (or POCKETLLM_MODEL / "
             "CKPT_PATH), or place a Qwen3-0.6B*.gguf under /mnt/data1/models or ~/models"
         )
-
-
-def open_backend(**engine_kwargs: object):
-    """Open a ``NativeBackend`` on the serving checkpoint and device.
-
-    A thin helper so both engine modules construct the adapter the same way; the caller owns the
-    returned backend and closes it.
-    """
-    from pocketllm.server.native_backend import NativeBackend
-
-    return NativeBackend(EngineArgs(model=SERVING_CHECKPOINT, **engine_kwargs), SERVING_DEVICE)
