@@ -175,8 +175,9 @@ class NativeBackend:
 
     Constructed with :class:`~pocketllm.api.EngineArgs` and an already-resolved device
     backend name, because the two vocabularies differ: ``--device`` is a *kind* the
-    registry validates and the C core is asked for a *backend*, which is ``cpu`` or
-    ``cuda`` today.  :func:`pocketllm.cli._run_device` is the same resolution the ``run``
+    registry validates and the C core is asked for a *backend* -- ``cpu`` in every
+    build, ``cuda`` or ``ascend`` in a build that has one, and the 310B board serves
+    on ``ascend``.  :func:`pocketllm.cli._run_device` is the same resolution the ``run``
     path applies, and this takes its answer rather than repeating it.
     """
 

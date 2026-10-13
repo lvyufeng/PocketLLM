@@ -204,3 +204,62 @@ pay the one-time plane build, `reset`s and `reserve`s, runs the prompt once (pre
 and prefill, so their difference is pure decode. `S=1` and `S=65` were used for the B=1/2/4/8 decomposition of
 §4; `S=16` for the standalone sweep of §3. The per-sequence slopes are read from the B=1 and B=4 differences;
 the B=8 point is the linearity check.
+
+## 9. The serve path, end to end
+
+§3–§5 measure the *engine's* batched decode. The number a serving operator acts on is the one the `serve`
+path produces — the Stage-2 scheduler plus the HTTP/SSE surface — and it is smaller, because a served request
+also pays prefill, its first token, and the per-sequence ops that do not amortize. Measured on the same board
+and checkpoint as §2, through `NativeBackend` with `max_batch_size = n`, `batch_kv_window` 2048, greedy
+`max_tokens=32`, four 6–9-token prompts, all `n` submitted at once:
+
+| run | streams | aggregate tok/s | decode-only tok/s | first token (s) |
+|---|---|---|---|---|
+| n=1 (baseline) | 1 | 5.53 | 7.11 | 1.24 |
+| n=2 serialized | 2 | 5.96 | 6.54 | 1.24, 0.61 |
+| n=2 batched | 2 | 7.73 | 9.48 | 1.72, 1.72 |
+| n=4 serialized | 4 | 6.16 | 6.35 | 1.22, 0.59, 0.57, 0.62 |
+| n=4 batched | 4 | 9.58 | 11.81 | 2.85 ×4 |
+
+Against the serialized baseline — the same server with the requests sent one at a time — that is **1.30× at
+n=2 and 1.55× at n=4** aggregate, and **1.45× / 1.86×** decode-only. The decode-only figure is the one §4's
+ceiling prices, and at m=4 it lands on it (~1.9×). The aggregate is lower because a batch's prefill and first
+token do not amortize: the group's first token arrives after every member's prefill (2.85 s vs 1.24 s solo).
+Per request the rate *falls* — 2.95 vs 7.11 decode tok/s at n=4 — so batch serving buys throughput, not
+latency, which is what the scheduler's one-group-at-a-time admission already implies.
+
+Where the time goes, from the same two runs under `POCKETLLM_ASCEND_PROFILE` (identical step counts, so the
+per-op process totals are comparable):
+
+| op | n=1 calls | n=1 ms/call | n=4 calls | n=4 ms/call | total ratio |
+|---|---|---|---|---|---|
+| `gemm_quant` | 6304 | 0.414 | 6400 | 0.828 | 2.03× |
+| `attention` | 896 | 0.859 | 3584 | 0.866 | 4.03× |
+| `rope_neox` | 1792 | 0.166 | 7168 | 0.184 | 4.44× |
+| `rms_norm` | 3616 | 0.129 | 3712 | 0.229 | 1.82× |
+| `silu_mul` | 896 | 0.198 | 896 | 0.419 | 2.12× |
+| `kv_append` | 1792 | 0.013 | 7168 | 0.013 | 3.98× |
+
+The lever is visible exactly where §4 says it is: for four times the streams the weight-reading GEMMs run
+**1.5% more calls**, each about twice as expensive, so the GEMM total grows 2.03× — that is the amortization,
+and it is why the decode-only gain is ~1.9× and not ~4×. What is per-sequence instead scales with B:
+`attention` (one `AttentionStepCustom` call per sequence per layer, 4.03×, and the largest single term at
+n=4), `rope_neox` (4.44×) and `kv_append` (3.98×). `rms_norm` and `silu_mul` sit between — batch-wide calls
+carrying m = B rows, ~2× the work. At 0.6B the GEMM is only about half a step's wall, which is the same
+interior-work bound §4 found, read from the serving side.
+
+Both arms produced **identical text per prompt** at every n (batched and serialized, all four prompts), and
+the per-stream equality is asserted on token ids by `tests/serving/test_native_batch.py`
+(`test_batched_streams_match_their_solo_output`), which also exercises the KV-wipe guard at batch widths
+1, 2 and 4 on this board. Both files resolve the checkpoint and device through
+`tests/serving/conftest.py`, so the batched and solo arms run on the *same* GGUF; the batched tests sit
+in their own module because the board permits one open engine at a time and this module's *service*
+tests pool one for the whole session -- see the conftest. Reproduce with:
+
+```bash
+export POCKETLLM_SERVING_GGUF=$HOME/models/Qwen3-0.6B-Q4_K_M.gguf POCKETLLM_SERVING_DEVICE=ascend
+# one NativeBackend(args, DEVICE) + the OpenAI handler on an ephemeral port, then n requests
+# fired together (batched) or one after another (serialized) with max_tokens=32, stream=True;
+# the wall is per-token SSE arrival stamps, not the response body.
+POCKETLLM_ASCEND_PROFILE=1 python measure_serve.py 4 32 batched
+```

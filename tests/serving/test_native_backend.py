@@ -17,13 +17,19 @@ The last of those is the module's reason to exist, and ``test_concurrent_request
 is the one that would fail loudest if it were removed.  Stage 2 replaced the session lock with a
 batch scheduler (``docs/architecture/batch_serving.md``): the engine is now driven by one thread
 that gives each request its own KV slot, so the isolation is structural rather than a lock.
+
+**This module pools one engine for the whole session** -- the ``backend`` fixture below -- which is
+what the service tests need and what keeps its model load to one.  The batched/ragged tests cannot
+share it: they each open their own engine with a different ``max_batch_size`` or ``batch_kv_window``,
+and a board permits only one open engine at a time (``aclInit`` fails on the second -- see the
+conftest).  They live in ``test_native_batch.py`` so pytest finalizes this module's engine before
+that module opens its own; the shared checkpoint and device discovery they both use is in
+``conftest.py``.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import pathlib
 import threading
 import time
 from urllib import error, request as urlrequest
@@ -34,81 +40,40 @@ from pocketllm.api import ConfigurationError, EngineArgs
 from pocketllm.protocol import build_chat_request, build_completion_request
 from pocketllm.protocol.contract import COMPLETIONS
 
-#: An explicit checkpoint wins.  The fallback searches the directories this repository's hosts keep
-#: Qwen3 GGUFs in, so the batched path, the KV-wipe regression test and the G2 gate run on a host
-#: that has *a* Qwen3-0.6B -- not only the f16 one the module used to name by absolute path.  G2
-#: compares batched against solo on the same file, so it is checkpoint-independent; only the golden
-#: fixture is not, and it skips unless its exact f16 (its recorded sha) is present.
-_CHECKPOINT_ENV = ("POCKETLLM_SERVING_GGUF", "POCKETLLM_MODEL", "CKPT_PATH")
-_CHECKPOINT_DIRS = (
-    pathlib.Path("/mnt/data1/models"),
-    pathlib.Path.home() / "models",
-    pathlib.Path.home() / "models" / "gguf",
+from .conftest import (
+    SERVING_CHECKPOINT as CHECKPOINT,
+    SERVING_DEVICE as _DEVICE,
+    native_available,
+    require_checkpoint,
 )
-
-
-def _find_checkpoint() -> str:
-    for name in _CHECKPOINT_ENV:
-        override = os.environ.get(name)
-        if override and pathlib.Path(override).is_file():
-            return override
-    for directory in _CHECKPOINT_DIRS:
-        if not directory.is_dir():
-            continue
-        # The name filter is case-insensitive on purpose: the same checkpoint is spelled
-        # `Qwen3-0.6B-Q4_K_M.gguf` on one host and `qwen3-0.6b-q4_k_m.gguf` on another, and a
-        # case-sensitive glob made the second host fail the module with "no Qwen3-0.6B GGUF on
-        # this host" while the file sat in the directory it names.
-        for candidate in sorted(directory.glob("*.gguf")):
-            if candidate.name.lower().startswith("qwen3-0.6b"):
-                return str(candidate)
-    return ""
-
-
-#: The checkpoint the engine is pointed at, or ``""`` when this host has none.
-CHECKPOINT = _find_checkpoint()
 
 #: The checkpoint's end-of-text id, read here rather than imported so a change to how the adapter
 #: finds it cannot hide behind the same lookup on both sides.
 EOS = 151645
 
 
-def _native_available() -> bool:
-    from pocketllm import native
-
-    return native.is_available()
-
-
 pytestmark = pytest.mark.skipif(
-    not _native_available(),
+    not native_available(),
     reason="libpocketllm.so is not built (cmake -B build -S src && cmake --build build)",
 )
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _serving_gates_need_a_checkpoint() -> None:
-    """An absent checkpoint is a FAILURE here, not a skip.
+    """An absent checkpoint is a FAILURE here, not a skip -- see the conftest's rationale.
 
-    This module is the gate for the batched path, the KV-wipe regression and G2, and the bug those
-    gates exist to catch is *silent wrong text* -- so a module that quietly skips when no checkpoint
-    is on the host is indistinguishable from the bug passing.  If there is no Qwen3-0.6B GGUF the
-    gates cannot run, and that has to be loud: every test in the module fails with a message naming
-    where a checkpoint is looked for.  (The engine library being unbuilt is still a skip -- that is
-    a build state of the host, not the condition under test.)
+    The engine library being unbuilt is still a skip (the ``pytestmark`` above); a missing
+    checkpoint is not, because a module that quietly skips is indistinguishable from the bug
+    passing.
     """
-    if not CHECKPOINT:
-        pytest.fail(
-            "no Qwen3-0.6B GGUF on this host, so the serving gates cannot run -- and a gate that "
-            "cannot run must fail, not skip. Set POCKETLLM_SERVING_GGUF (or POCKETLLM_MODEL / "
-            "CKPT_PATH), or place a Qwen3-0.6B*.gguf under /mnt/data1/models or ~/models"
-        )
+    require_checkpoint()
 
 
 @pytest.fixture(scope="module")
 def backend():
     from pocketllm.server.native_backend import NativeBackend
 
-    instance = NativeBackend(EngineArgs(model=CHECKPOINT), "cpu")
+    instance = NativeBackend(EngineArgs(model=CHECKPOINT), _DEVICE)
     yield instance
     instance.close()
 
@@ -182,7 +147,7 @@ def test_a_missing_checkpoint_fails_at_construction() -> None:
     from pocketllm.server.native_backend import NativeBackend
 
     with pytest.raises(ConfigurationError):
-        NativeBackend(EngineArgs(model="/nonexistent/model.gguf"), "cpu")
+        NativeBackend(EngineArgs(model="/nonexistent/model.gguf"), _DEVICE)
 
 
 # -- the field audit ---------------------------------------------------------
@@ -529,171 +494,3 @@ def test_health_and_metrics(served) -> None:
     with urlrequest.urlopen(served + "/metrics", timeout=10) as response:
         text = response.read().decode()
     assert "pocketllm_waiting_requests" in text
-
-
-# -- Stage 2: the scheduler's batched decode, versus solo -------------------
-
-
-def test_batched_streams_match_their_solo_output() -> None:
-    """The acceptance gate for batch serving: a batched request equals a solo one.
-
-    A wrong KV span returns *fluent text with no error*, so equality is the only proof.  Distinct
-    prompts of different lengths make the post-prefill positions ragged, and the width is asserted
-    against ``_batched_widths`` -- the width ``_run_group`` actually ran at, appended only inside
-    it -- so the test fails if the scheduler serialized rather than batched.
-    """
-    from pocketllm.server.native_backend import NativeBackend
-
-    prompts = [
-        "Reply with only the word: alpha",
-        "Name one color, one word only.",
-        "Reply with exactly: the quick brown fox",
-        "Say only: omega",
-    ]
-
-    def streamed(instance, text, rid):
-        events = list(
-            instance.stream(
-                build_chat_request(
-                    {"messages": [{"role": "user", "content": text}], "max_tokens": 12},
-                    request_id=rid,
-                )
-            )
-        )
-        return "".join(e.text for e in events if e.text), events[-1].finish_reason
-
-    for width in (2, 4):
-        chosen = prompts[:width]
-
-        solo = {}
-        solo_backend = NativeBackend(EngineArgs(model=CHECKPOINT, max_batch_size=1), "cpu")
-        try:
-            for i, text in enumerate(chosen):
-                solo[i] = streamed(solo_backend, text, f"solo-{width}-{i}")
-        finally:
-            solo_backend.close()
-
-        batched = {}
-        errors = {}
-        backend = NativeBackend(
-            EngineArgs(model=CHECKPOINT, max_batch_size=width, batch_kv_window=1024), "cpu"
-        )
-        try:
-            start = threading.Event()
-
-            def run(i, text):
-                start.wait()
-                try:
-                    batched[i] = streamed(backend, text, f"batch-{width}-{i}")
-                except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
-                    errors[i] = repr(exc)
-
-            threads = [
-                threading.Thread(target=run, args=(i, text)) for i, text in enumerate(chosen)
-            ]
-            for thread in threads:
-                thread.start()
-            start.set()
-            for thread in threads:
-                thread.join(timeout=300)
-            groups = list(backend._batched_widths)
-        finally:
-            backend.close()
-
-        assert not errors, errors
-        assert max(groups, default=0) >= width, (
-            f"the batched decode never reached width {width}: {groups}"
-        )
-        for i in range(width):
-            assert batched[i] == solo[i], f"request {i} at width {width} drifted from its solo output"
-
-
-
-def test_a_ragged_group_past_the_reservation_does_not_wipe_a_slot() -> None:
-    """The regression test for the KV-wipe: a ragged group whose longest slot over-runs.
-
-    ``ensure_kv`` grows the slab by release + realloc *without copy* whenever a position passes the
-    reservation, so if one slot walks past it while another is still live, the other's KV is erased
-    and fluent-wrong tokens come back with rc=0 and no error.  A group decodes in lockstep and a
-    finished member keeps its slot, fed ``_FINISHED_TOKEN``, so an unbounded slot climbs one
-    position per step the *group* runs.  With a per-job bound -- ``window - len(prompt)`` -- the
-    shorter prompt gets the larger budget and keeps decoding while the longest prompt's already-full
-    slot keeps advancing, walking it past the reservation.
-
-    The bound has to be the group's, not each job's: every job stops ``window - cap`` steps past its
-    own prompt, where ``cap`` is the group's longest prompt, so no slot can reach the reservation.
-    A window of 256 is the smallest power of two the reservation can sit at, which is what lets the
-    longest slot actually reach it in a handful of steps; the two prompts differ enough that the
-    per-job bound would let the shorter one run well past.  The assertion is on the emitted count --
-    exactly ``window - cap`` per job, the lockstep count -- and on the finish reason, so a scheduler
-    that let either job run past the window fails here rather than silently wiping the other.
-    """
-    from pocketllm.server.native_backend import NativeBackend
-
-    window = 256
-    prompts = [
-        " ".join(f"w{i}" for i in range(30)) + " Now count upward from 1, one number per line:",
-        " ".join(f"q{i}" for i in range(70)) + " Now list the alphabet, one letter per line:",
-    ]
-
-    def one(instance, text, rid, max_tokens):
-        return instance.generate(
-            [
-                build_chat_request(
-                    {"messages": [{"role": "user", "content": text}], "max_tokens": max_tokens},
-                    request_id=rid,
-                )
-            ]
-        )[0]
-
-    solo_backend = NativeBackend(EngineArgs(model=CHECKPOINT, max_batch_size=1), "cpu")
-    try:
-        cap = max(
-            one(solo_backend, text, f"ragged-solo-{i}", 4).usage.prompt_tokens
-            for i, text in enumerate(prompts)
-        )
-    finally:
-        solo_backend.close()
-
-    assert cap < window, f"the longest prompt ({cap}) does not fit under window {window}"
-    bound = window - cap
-    assert bound >= 4, f"the prompts leave only {bound} steps under window {window}"
-
-    results = {}
-    errors = {}
-    backend = NativeBackend(
-        EngineArgs(model=CHECKPOINT, max_batch_size=2, batch_kv_window=window), "cpu"
-    )
-    try:
-        start = threading.Event()
-
-        def go(i, text):
-            start.wait()
-            try:
-                result = one(backend, text, f"ragged-{i}", bound + 64)
-                results[i] = (list(result.token_ids), result.finish_reason)
-            except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
-                errors[i] = repr(exc)
-
-        threads = [threading.Thread(target=go, args=(i, text)) for i, text in enumerate(prompts)]
-        for thread in threads:
-            thread.start()
-        start.set()
-        for thread in threads:
-            thread.join(timeout=600)
-        batched_widths = list(backend._batched_widths)
-    finally:
-        backend.close()
-
-    assert not errors, errors
-    assert max(batched_widths, default=0) >= 2, batched_widths
-    for i in range(len(prompts)):
-        emitted, finish_reason = results[i]
-        assert len(emitted) == bound, (
-            f"request {i} emitted {len(emitted)} tokens, not the group bound {bound} "
-            f"(window {window} - longest prompt {cap}); a per-job bound lets the shorter prompt run "
-            "past the reservation, which grows the slab under -- and wipes -- the other slot"
-        )
-        assert finish_reason == "length", (
-            f"request {i} stopped with {finish_reason!r}, not at the window bound"
-        )
