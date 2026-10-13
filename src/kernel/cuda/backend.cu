@@ -421,7 +421,7 @@ __global__ void gemm_quant_kernel(const float *x, const uint8_t *blocks, const f
  * row**. At `m == 1` that is once, and it is the right trade -- the activation
  * reuse the shared tile buys is worth more than the weight read it repeats. At
  * `m == 512` the same block is fetched and decoded 512 times: 512 x 756 MB of
- * weight reads to compute 512 rows, measured at 523-572 GB/s of weight traffic
+ * weight reads to compute 512 rows, measured at 516-577 GB/s of weight traffic
  * across the geometry sweep, against the card's own 583 GB/s coalesced-read
  * rate. The weights are the traffic, and a projection's panel is L2-resident (a
  * 2048-wide one is ~2.4 MB against a 6 MB L2), so those repeat reads already run
@@ -443,17 +443,19 @@ __global__ void gemm_quant_kernel(const float *x, const uint8_t *blocks, const f
  * host). Each cell is `rowR` against the *same-geometry* `gemm_quant_kernel`,
  * so the base it is divided by is that geometry's own, not a common one:
  *
- *     threads/block   base ms   row4    row6    row8
- *          64          755.2    2.05x   2.28x   2.36x
- *         128          755.7    2.22x   2.46x   2.62x
- *         256          715.1    2.14x   2.42x   2.66x
- *         512          709.1    2.12x   2.32x   2.58x
+ *     threads/block     base ms   row4    row6    row8
+ *       32 (shipped)     786.0    1.91x   1.74x   1.32x
+ *       64               763.4    2.05x   2.30x   2.38x
+ *      128               765.0    2.20x   2.45x   2.61x
+ *      256               703.3    2.15x   2.43x   2.65x
+ *      512               713.3    2.11x   2.32x   2.57x
  *
- * (row8 was not run at the shipped 32-column geometry; there row4 is 1.92x and
- * row6 1.74x against a 776.0 ms base, so the 256-thread row8's 269.2 ms is
- * **2.9x** relative to what the engine ships today.) `R = 8` at 256 threads is
- * the best measured -- 2.66x on all three runs it was taken, against 2.61-2.62x
- * for the 128-thread form -- and it is the one the launcher picks. The wide
+ * (Against the geometry the engine actually ships -- 32 columns, where the same
+ * sweep puts row4 at 1.91x, row6 at 1.74x and row8 at 1.32x over a 786.0 ms
+ * base -- the 256-thread row8's 265.0 ms is **2.97x** relative to what the
+ * engine ships today.) `R = 8` at 256 threads is the best measured -- 2.65x,
+ * against 2.61x for the 128-thread form -- and it is the one the launcher
+ * picks. The wide
  * block is doing real work here that it cannot do at decode: with `R` rows
  * folded into one thread, `grid.x = ceil(n / 256)` leaves
  * `grid.y = ceil(m / 8) = 64` blocks, so the grid is still full at a wide block
@@ -461,7 +463,7 @@ __global__ void gemm_quant_kernel(const float *x, const uint8_t *blocks, const f
  *
  * `R = 8` is also why the decode path does not use this kernel. At `m == 1`
  * `grid.y` is 1 whatever `R` is, so the row tile only spends threads on rows that
- * do not exist: measured 0.40x at 256 threads. The two kernels are complementary,
+ * do not exist: measured 0.53x at 256 threads. The two kernels are complementary,
  * and `gemm_quant` picks by `m`. */
 template <int R>
 __global__ void gemm_quant_row_kernel(const float *x, const uint8_t *blocks, const float *bias,
@@ -874,7 +876,7 @@ class CudaBackend final : public Backend {
      * threads, each cell against the same-geometry 256-thread one-row kernel:
      *
      *     m       1      4      8     16     32     64    128    256    512
-     *     row8  0.40x  0.45x  0.54x  0.90x  1.53x  2.27x  2.52x  2.59x  2.66x
+     *     row8  0.53x  0.61x  0.54x  0.93x  1.52x  2.31x  2.54x  2.58x  2.65x
      *
      * The crossover sits between 16 and 32: below it the tile is mostly rows
      * that do not exist, above it the weight traffic the tile removes dominates.
@@ -886,9 +888,9 @@ class CudaBackend final : public Backend {
      * The threshold picks the *kernel*; the geometry each kernel runs at is
      * separate and both were measured. 32 columns for the one-row kernel is the
      * value from the `columns/block` table at the top of this comment. At
-     * `m = 512` the shipped pairing is worth **2.9x** rather than the sweep's
-     * 2.66x, because the arm it replaces is that 32-column geometry -- 776.0 ms
-     * measured, against the 715.1 ms the 256-thread base above divides by. 256
+     * `m = 512` the shipped pairing is worth **2.97x** rather than the sweep's
+     * 2.65x, because the arm it replaces is that 32-column geometry -- 786.0 ms
+     * measured, against the 703.3 ms the 256-thread base above divides by. 256
      * threads for the row kernel is from the `R`/block-size table on
      * `gemm_quant_row_kernel`, where the wide block is not the mistake it is at
      * decode: the tile has already folded `R` rows into one thread, so `grid.y`
