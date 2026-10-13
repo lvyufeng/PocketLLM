@@ -55,8 +55,13 @@ def _find_checkpoint() -> str:
     for directory in _CHECKPOINT_DIRS:
         if not directory.is_dir():
             continue
-        for candidate in sorted(directory.glob("Qwen3-0.6B*.gguf")):
-            return str(candidate)
+        # The name filter is case-insensitive on purpose: the same checkpoint is spelled
+        # `Qwen3-0.6B-Q4_K_M.gguf` on one host and `qwen3-0.6b-q4_k_m.gguf` on another, and a
+        # case-sensitive glob made the second host fail the module with "no Qwen3-0.6B GGUF on
+        # this host" while the file sat in the directory it names.
+        for candidate in sorted(directory.glob("*.gguf")):
+            if candidate.name.lower().startswith("qwen3-0.6b"):
+                return str(candidate)
     return ""
 
 
