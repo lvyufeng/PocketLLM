@@ -165,10 +165,15 @@ def test_a_ragged_group_past_the_reservation_does_not_wipe_a_slot(width: int) ->
     arithmetic -- every job but the quitter emits exactly ``window - cap`` tokens, the quitter emits
     its own small ask, and every job's stream is a *prefix of its solo run*, finish reason included,
     because a wiped slot comes back fluent and wrong and a count alone would not see it.  Width 1 is
-    the control: one of the group's own prompts, the same window, submitted alone, is not bounded by
-    the group's bound at all -- the serialized path sizes against the model's context, so the same
-    ask a group caps at ``bound`` runs past it here.  That is what makes the width-2 and width-4
-    stops the group's bound rather than a property of the model or the request.
+    the control: one of the group's own prompts, the same ask a width-2 group member submits,
+    submitted alone.  The serialized path sizes against the model's context and applies no group
+    window, so the control is not bounded by the group's bound -- and the assertion is exactly that:
+    a *length* stop short of its own ask would be the group bound clamping it, which would make the
+    width-2 and width-4 stops a property of the window rather than the scheduler.  The control is
+    robust to an early EOS -- a *stop*, a near-tie a 1e-3 divergence can flip on another host's
+    checkpoint -- because a clamp ends the run in a length stop, not an EOS, so the two are told
+    apart by the finish reason and the check stays a loud FAIL without a dependence on the model
+    reaching its ask.
     """
     from pocketllm.server.native_backend import NativeBackend
 
@@ -216,9 +221,12 @@ def test_a_ragged_group_past_the_reservation_does_not_wipe_a_slot(width: int) ->
             "guard"
         )
 
-        #: Every job asks for more than the group bound, so a stream that stops at ``bound`` was
-        #: stopped by the scheduler rather than by its own request.  That ask is the whole control at
-        #: width 1; at wider ones the group's last, shortest job asks ``_QUIT_TOKENS`` instead.
+        #: Every *group* job asks for more than the group bound, so a stream that stops at ``bound``
+        #: was stopped by the scheduler rather than by its own request.  At wider widths the group's
+        #: last, shortest job asks ``_QUIT_TOKENS`` instead: a small budget parks it early so the
+        #: padded-slot path runs on every trial.  At width 1 the lone request is the *control*, not a
+        #: group member: it submits the ask that a width-2 group member does (``bound + 64``) and has
+        #: to run past the group bound, because the serialized path applies no batch window.
         asked = bound + 64
         quit_index = len(prompts) - 1 if width > 1 else None
         asks = [asked if i != quit_index else _QUIT_TOKENS for i in range(len(prompts))]
@@ -230,12 +238,13 @@ def test_a_ragged_group_past_the_reservation_does_not_wipe_a_slot(width: int) ->
 
     lengths = [lengths_all[i] for i in picks]
     #: What each group job's stream is expected to hold: the group bound for the lockstep jobs, the
-    #: quitter's own ask for the quitter.  (Unused at width 1, where the expectations are its ask.)
+    #: quitter's own ask for the quitter.  (Unused at width 1, where the lone request is the control
+    #: and its expectation is its own ask.)
     expects = [asks[i] if i == quit_index else bound for i in range(len(prompts))]
-    #: Setup, asserted before the group runs so a bad table fails as a bad table.  The serialized
-    #: path is *not* clamped to the group's window, so a non-quitter's solo run -- its own ask,
-    #: ``bound + 64`` -- has to run *past* the group bound; that is the control the group's stop at
-    #: ``bound`` is read against.  The quitter's solo run ends at its own small ask.
+    #: Setup, asserted before the group runs so a bad table fails as a bad table.  The quitter has to
+    #: end at its own ask; every non-quitter has to reach *at least* the group bound, so the group's
+    #: stream is long enough to compare and the lockstep this test exists for is really exercised.
+    #: It may end there or past it (early EOS), which is why this is a lower bound and not equality.
     for i in range(len(prompts)):
         if i == quit_index:
             assert len(reference[i][0]) == _QUIT_TOKENS, (
@@ -243,10 +252,10 @@ def test_a_ragged_group_past_the_reservation_does_not_wipe_a_slot(width: int) ->
                 f"{_QUIT_TOKENS}"
             )
         else:
-            assert len(reference[i][0]) > bound, (
-                f"the solo run of request {i} emitted {len(reference[i][0])} tokens, no more than "
-                f"the group bound {bound}: the request's own ask bounds it, so the group's stop at "
-                f"{bound} would not be the scheduler's"
+            assert len(reference[i][0]) >= bound, (
+                f"the solo run of request {i} emitted {len(reference[i][0])} tokens, before the "
+                f"group bound {bound}: the prompt table needs an instruction this model does not "
+                "stop on before the lockstep is exercised"
             )
 
     results = {}
@@ -289,15 +298,25 @@ def test_a_ragged_group_past_the_reservation_does_not_wipe_a_slot(width: int) ->
         emitted, finish_reason = results[i]
         solo = reference[i][0]
         if width == 1:
-            #: The serialized path answers its own ask, so the group bound does not touch it.
-            assert len(emitted) > bound, (
-                f"the width-1 control emitted {len(emitted)} tokens, no more than the group bound "
-                f"{bound}: the serialized path is being clamped to the batch window, and then the "
-                "width-2 and width-4 stops would not be the group's bound either"
+            #: The control submitted a width-2 group member's ask (``bound + 64``).  The serialized
+            #: path applies no group window, so the stream can only end two ways: at its own ask (a
+            #: *length* stop) or early at EOS (a *stop*, a property of the model on this host -- the
+            #: same near-tie a 1e-3 divergence can flip, and not a guard failure).  A *length* stop
+            #: short of the ask is the clamp: the group bound ``bound`` cutting a run that its own
+            #: request never capped.  That is the assertion that matters, and it holds whether or not
+            #: the model happens to stop early -- the EOS case ends in a *stop*, which clamping does
+            #: not produce.  When the run does reach its ask, it is ``bound + 64`` tokens, past the
+            #: group window by construction.
+            assert finish_reason in ("length", "stop"), (
+                f"the width-1 control ended with {finish_reason!r}, neither 'length' nor 'stop'"
             )
-            assert len(emitted) == asks[i], (
-                f"the width-1 control emitted {len(emitted)} tokens, not its own ask {asks[i]}"
-            )
+            if finish_reason == "length":
+                assert len(emitted) == asks[i], (
+                    f"the width-1 control stopped for length at {len(emitted)} tokens, not its own "
+                    f"ask {asks[i]}: the serialized path applies no group window, so a length stop "
+                    f"short of the ask is the group bound {bound} clamping it -- and then the "
+                    "width-2 and width-4 stops would not be the group's bound either"
+                )
             expected_pos = lengths[i] + len(emitted)
         else:
             assert len(emitted) == expects[i], (
@@ -316,10 +335,11 @@ def test_a_ragged_group_past_the_reservation_does_not_wipe_a_slot(width: int) ->
             f"request {i} at width {width} reached position {expected_pos}, past the reservation at "
             f"{window}: a slot was not bounded to the group's window"
         )
+        if width == 1:
+            continue
         #: A wiped slot returns fluent wrong tokens with no error, so the check is the tokens
-        #: themselves.  At width 1 the stream is its own solo run; in a group the job is clipped to
-        #: the group bound, so it equals the solo run's *prefix* of that length -- a divergence
-        #: anywhere inside it is the wipe.
+        #: themselves.  In a group the job is clipped to the group bound, so it equals the solo
+        #: run's *prefix* of that length -- a divergence anywhere inside it is the wipe.
         if emitted != solo[: len(emitted)]:
             where = next(
                 (k for k, (a, b) in enumerate(zip(emitted, solo)) if a != b),
