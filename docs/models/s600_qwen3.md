@@ -6,8 +6,8 @@ performance ladder, the memory mode the board has to boot in to reach its large 
 determinism contract. Every
 number and every failure below was measured on the board — first on 2026-10-09, then again on
 2026-10-10 **after the `balanced` memory switch and its reboot**, when all four Qwen3 sizes became
-runnable, and the `w8` rebuilds once more on 2026-10-13; whether either transfers to another S600 is a
-claim to re-check in place, and the SDK version is part of the result.
+runnable, and the `w8` rebuilds — under the `bpu_first` pool — once more on 2026-10-13; whether either
+transfers to another S600 is a claim to re-check in place, and the SDK version is part of the result.
 
 Two facts frame the rest, and both are easy to get wrong:
 
@@ -31,15 +31,16 @@ D-Robotics LLM SDK (`D-Robotics_LLM_S600_1.0.2_SDK`) ships the runtime (`oellm_r
 compiler tree (`oellm_build/`), tokenizer + `generation_config.json` under
 `oellm_runtime/configs/Qwen3_config/`, and per-size `.hbm` graphs under `oellm_runtime/model/Qwen3_*/`.
 
-**All four shipped Qwen3 sizes load and generate in `balanced` mode** — the board boots `cpu_first`,
-where the two large ones are refused; see [the memory mode](#the-4b-8b-ceiling-applied):
+**All four shipped Qwen3 sizes load and generate on this board's raised pool** — in `bpu_first`
+(18.00 GiB, applied 2026-10-13) as it stands, and in `balanced` (10.00 GiB) before that; the board boots
+`cpu_first`, where the two large ones are refused. See [the memory mode](#the-4b-8b-ceiling-applied):
 
 | Size | `.hbm` | Precision | File size | Loads? |
 |---|---|---|---|---|
 | Qwen3-0.6B | `Qwen3-0.6B_language_chunk_512_cache_4096_w8_nash-p_corenum_4_4.hbm` | w8 | 1.02 GiB | **yes** |
 | Qwen3-1.7B | `Qwen3-1.7B_language_chunk_512_cache_4096_w4_nash-p_corenum_4_4.hbm` | w4 | 1.70 GiB | **yes** |
-| Qwen3-4B | `Qwen3-4B_language_chunk_512_cache_4096_w4_nash-p_corenum_4_4.hbm` | w4 | 3.10 GiB | **yes, in `balanced`** |
-| Qwen3-8B | `Qwen3-8B_language_chunk_512_cache_4096_w4_nash-p_corenum_4_4.hbm` | w4 | 5.31 GiB | **yes, in `balanced`** |
+| Qwen3-4B | `Qwen3-4B_language_chunk_512_cache_4096_w4_nash-p_corenum_4_4.hbm` | w4 | 3.10 GiB | **yes, in `balanced` / `bpu_first`** |
+| Qwen3-8B | `Qwen3-8B_language_chunk_512_cache_4096_w4_nash-p_corenum_4_4.hbm` | w4 | 5.31 GiB | **yes, in `balanced` / `bpu_first`** |
 
 The naming is the compiler's: `chunk_512` is the prefill chunk, `cache_4096` the max context,
 `corenum_4_4` the BPU-core assignment. Every large model in the SDK ships as `corenum_4_4`; **there
@@ -93,36 +94,45 @@ not through the ABI backend of the same name. The `horizon` kind is what `--devi
 ## Measured ladder
 
 **This is the canonical ladder: all four shipped Qwen3 sizes plus our own compiled graphs — the 0.6B and
-4B `cache_1024` builds, and the `w8` rebuilds of the 1.7B and 4B — on the `balanced` pool, measured in one
-session on 2026-10-10 (the compiled 0.6B was added the same day, once its build landed).** The two `w8`
-rebuild rows were added later, measured **2026-10-13** by the same method and the same scripts; their
-numbers are not from the 2026-10-10 session. Fixed prompt **"The capital of France is"**,
-greedy `generation_config.json`, canonical-prompt three decode runs per graph, one process per graph.
-Throughput and load time from the delegate's `last_performance()` (`xlm_model_performance_t`); memory
-held from the kernel's own ION accounting (`/sys/kernel/debug/ion/heaps/all_heap_info`), read **after
-the load completes and before the first decode** — the load-time peak, the same instant
+4B `cache_1024` builds, and the `w8` rebuilds of the 1.7B, 4B and 8B.** Every row but the last was
+measured on the `balanced` pool in one session on 2026-10-10 (the compiled 0.6B was added the same day,
+once its build landed); the `w8` rebuild rows were added later, measured **2026-10-13** by the same
+method and the same scripts, and the 8B `w8` row — the largest footprint here — is the one row measured
+on the `bpu_first` pool applied that day ([why the pool moved](#the-4b-8b-ceiling-applied)). The `pool`
+column names the pool each row's `of pool` percentage is against. Fixed prompt **"The capital of France
+is"**, greedy `generation_config.json`, canonical-prompt three decode runs per graph, one process per
+graph. Throughput and load time from the delegate's `last_performance()` (`xlm_model_performance_t`);
+memory held from the kernel's own ION accounting (`/sys/kernel/debug/ion/heaps/all_heap_info`), read
+**after the load completes and before the first decode** — the load-time peak, the same instant
 [the margin section](#the-8b-sits-comfortably-in-balanced-the-numbers) measures, so the two tables
 agree. (A decode adds ~152 MiB of KV/scratch on top; that is per-request work-in-flight, not what the
 model costs in the pool, and it is excluded here deliberately.) The memory column is what each model
-costs in the 10.00 GiB `ion_carveout`.
+costs in its row's `ion_carveout`.
 
-| Size | `.hbm` | Load | Prefill | Decode | Memory held at load (carveout) | of pool |
-|---|---|---|---|---|---|---|
-| Qwen3-0.6B (w8) | 1.02 GiB | 5.26 s | 6169–7111 t/s | **88.3 t/s** (88.09 / 88.73 / 88.28) | 2,995,585,024 B (2.79 GiB) | 27.9% |
-| Qwen3-1.7B (w4) | 1.70 GiB | 5.70 s | 5172–5818 t/s | **70.2 t/s** (70.18 / 70.13 / 70.16) | 3,734,503,424 B (3.48 GiB) | 34.8% |
-| Qwen3-4B (w4) | 3.10 GiB | 6.44 s | 2415–2573 t/s | **42.8 t/s** (42.77 / 42.72 / 42.78) | 6,686,113,792 B (6.23 GiB) | 62.3% |
-| Qwen3-8B (w4) | 5.31 GiB | 7.66 s | 1939–2040 t/s | **29.7 t/s** (29.65 / 29.66 / 29.70) | 9,417,129,984 B (8.77 GiB) | **87.7%** |
-| Qwen3-0.6B (w8), ours `cache_1024` | 0.98 GiB | 5.31 s | 11636–13128 t/s | **121.6 t/s** (122.18 / 121.72 / 120.82) | 1,702,756,352 B (1.59 GiB) | 15.9% |
-| Qwen3-1.7B (w8), ours `cache_1024` | 2.31 GiB | 6.05 s | 8127–9143 t/s | **65.4 t/s** (65.49 / 65.31 / 65.31) | 3,141,009,408 B (2.93 GiB) | 29.3% |
-| Qwen3-4B (w4), ours `cache_1024` | 3.00 GiB | 6.35 s | 4339–4571 t/s | **49.9 t/s** (49.99 / 49.96 / 49.86) | 4,254,269,440 B (3.96 GiB) | 39.6% |
-| Qwen3-4B (w8), ours `cache_1024` | 4.69 GiB | 7.34 s | 4163–4491 t/s | **33.1 t/s** (33.07 / 33.10 / 33.04) | 6,073,548,800 B (5.66 GiB) | 56.6% |
+| Size | `.hbm` | Load | Prefill | Decode | Memory held at load (carveout) | pool | of pool |
+|---|---|---|---|---|---|---|---|
+| Qwen3-0.6B (w8) | 1.02 GiB | 5.26 s | 6169–7111 t/s | **88.3 t/s** (88.09 / 88.73 / 88.28) | 2,995,585,024 B (2.79 GiB) | `balanced` | 27.9% |
+| Qwen3-1.7B (w4) | 1.70 GiB | 5.70 s | 5172–5818 t/s | **70.2 t/s** (70.18 / 70.13 / 70.16) | 3,734,503,424 B (3.48 GiB) | `balanced` | 34.8% |
+| Qwen3-4B (w4) | 3.10 GiB | 6.44 s | 2415–2573 t/s | **42.8 t/s** (42.77 / 42.72 / 42.78) | 6,686,113,792 B (6.23 GiB) | `balanced` | 62.3% |
+| Qwen3-8B (w4) | 5.31 GiB | 7.66 s | 1939–2040 t/s | **29.7 t/s** (29.65 / 29.66 / 29.70) | 9,417,129,984 B (8.77 GiB) | `balanced` | **87.7%** |
+| Qwen3-0.6B (w8), ours `cache_1024` | 0.98 GiB | 5.31 s | 11636–13128 t/s | **121.6 t/s** (122.18 / 121.72 / 120.82) | 1,702,756,352 B (1.59 GiB) | `balanced` | 15.9% |
+| Qwen3-1.7B (w8), ours `cache_1024` | 2.31 GiB | 6.05 s | 8127–9143 t/s | **65.4 t/s** (65.49 / 65.31 / 65.31) | 3,141,009,408 B (2.93 GiB) | `balanced` | 29.3% |
+| Qwen3-4B (w4), ours `cache_1024` | 3.00 GiB | 6.35 s | 4339–4571 t/s | **49.9 t/s** (49.99 / 49.96 / 49.86) | 4,254,269,440 B (3.96 GiB) | `balanced` | 39.6% |
+| Qwen3-4B (w8), ours `cache_1024` | 4.69 GiB | 7.34 s | 4163–4491 t/s | **33.1 t/s** (33.07 / 33.10 / 33.04) | 6,073,548,800 B (5.66 GiB) | `balanced` | 56.6% |
+| Qwen3-8B (w8), ours `cache_1024` | 8.46 GiB | 9.41 s | 2909–3030 t/s | **20.5 t/s** (20.45–20.49) | 10,472,783,872 B (9.75 GiB) | **`bpu_first`** | **54.2%** |
 
 Decode falls with size — 88.3 → 70.2 → 42.8 → 29.7 t/s on the shipped graphs — and the memory column
 rises with it, which is the whole of the ladder's shape: the BPU's per-token cost and the pool's
 footprint both track the parameter count. Our own `w4` `cache_1024` builds sit *above* their shipped
 twins on both axes (faster, and smaller in the pool), which is the subject of the note on them below —
-the two `w8` rebuilds keep the pool edge but not the rate one, and their own note below covers the bill.
-Every graph's three runs produced **byte-identical text**, so each number is a rate and not a draw.
+the `w8` rebuilds keep the pool edge but not the rate one, and their own note below covers the bill.
+Every graph's three runs produced **byte-identical text**, so each number is a rate and not a draw —
+the 8B `w8` row included, **nine runs across three loads with a single digest**
+(sha256 `76025885…`). The 8B is where that determinism has measured exceptions, which is why the new
+row is quoted as nine runs: our 8B `w4` `cache_4096` build, re-run under `bpu_first` on this same
+canonical prompt, gave three **non**-identical runs (2026-10-13), and the survey above records the
+shipped 8B diverging once in four `1..200` runs
+([the caveat](#the-corrupted-token-is-the-build-not-the-cache)).
 
 **The switch did not regress 0.6B or 1.7B.** The board changed memory *mode*
 (`cpu_first` → `balanced`), and the two small graphs were re-measured against the numbers this page
@@ -160,16 +170,22 @@ the smallest size carries the biggest decode edge of the three and has
 the `cpu_first` ceiling is answered — it does not, and the pool had to move instead; see
 [the large models after the switch](#the-large-models-after-the-switch).
 
-**The two `w8` rows are the accuracy rebuilds, and the rate is what they pay.** The 1.7B and 4B `w8`
+**The `w8` rows are the accuracy rebuilds, and the rate is what they pay.** The 1.7B, 4B and 8B `w8`
 graphs exist to move agreement against truth
 ([the 1.7B's row](#the-17b-at-w8-above-the-floor-against-truth)), and this table is their bill: decode
-**65.4 t/s** at 1.7B against the `w4` `cache_1024` graph's **89.1**, and **33.1** at 4B against **49.9**
-— 27% and 34% slower — while the pool grows **+0.66 GiB** (2.27 → 2.93) and **+1.70 GiB** (3.96 → 5.66).
-Prefill moves the same way but less (8127–9143 against 8828–9846; 4163–4491 against 4339–4571), load is
-6.05 s and 7.34 s against 5.62 and 6.35, and both builds sit well inside `balanced` — the 4B `w8` leaves
-4.34 GiB of the pool free. The width is also the second single-variable escape from the 1.7B loop: it
-closes the block at the loop's own cache
-([the loop at `w8`](#the-loop-at-w8-the-same-cache-closes-it-on-wider-weights)).
+**65.4 t/s** at 1.7B against the `w4` `cache_1024` graph's **89.1**, **33.1** at 4B against **49.9**,
+and **20.5** at 8B against the 8B `w4` `cache_1024` build's **33.2** — 27%, 34% and 38% slower — while
+the pool grows **+0.66 GiB** (2.27 → 2.93), **+1.70 GiB** (3.96 → 5.66) and **+3.23 GiB** (6.52 →
+9.75). Prefill moves the same way but less (8127–9143 against 8828–9846; 4163–4491 against 4339–4571;
+2909–3030 against ~3.06k at 8B), load is 6.05 s, 7.34 s and 9.41 s against 5.62, 6.35 and 7.87, and the
+1.7B and 4B builds sit well inside `balanced` — the 4B `w8` leaves 4.34 GiB of the pool free. **The 8B
+does not: its 9.75 GiB held at load is 97.5% of `balanced`'s 10.00 GiB, so it is the one row measured
+under the raised `bpu_first` pool** — 18.00 GiB, where it holds 54.2% and leaves 8.25 GiB to spare; the
+pool was moved for this build ([the ceiling section](#the-4b-8b-ceiling-applied)). Its row is the band
+of nine runs across three loads, and the three loads agree to the byte: loads **9.88 / 9.41 / 9.37 s**,
+decode **20.45–20.49 t/s**, prefill **2909–3030 t/s**, carveout **10,472,783,872 B in all three**. The
+width is also the second single-variable escape from the 1.7B loop: it closes the block at the loop's
+own cache ([the loop at `w8`](#the-loop-at-w8-the-same-cache-closes-it-on-wider-weights)).
 
 **The 8B compiles too, and it is the lighter and faster of the pair.** Our own `Qwen3-8B` build at
 `cache_1024` (5.61 GB, md5 `84a312d26361d21b0d8daf398a48651b`) loads in **7.87 s** and costs the pool
@@ -192,9 +208,12 @@ way: it is a **state-dependent numerical near-tie
 resolved wrongly** (a digit's logit and a garbage token's within a hair), the same *root* as the 1.7B loop
 but a sharper expression: one token, no repetition build-up, and it resumes. `cache_1024 w8` is the build
 that targets it (width is the natural lever for a numerical near-tie), but the ~25% run-to-run variance and
-the prompt-varying token make it a **bet, not a guarantee** — the intermittent path points at the decode
-side too, so a single clean `w8` run would not prove the slip gone. It is the thing to fix before this
-graph is trusted.
+the prompt-varying token made it a **bet, not a guarantee** — the intermittent path points at the decode
+side too, so a single clean `w8` run would not prove the slip gone. **The bet has now been drawn**: the
+`w8` build exists, runs at **20.5 t/s** under `bpu_first` ([its ladder row](#measured-ladder)), and its
+50-prompt capture carries the glitch **zero** times — while still leaving the `1..N` enumeration
+unmeasured, so the caveat narrows to that battery
+([the 8B at `w8`](#the-8b-at-w8-the-width-lever-falls-short)).
 
 The raw per-length run is the evidence for "state-dependent, not index-fixed":
 
@@ -1283,11 +1302,13 @@ allocator only takes whole megabytes; the conclusion stands as a negative rather
 
 ## The 4B / 8B ceiling — APPLIED
 
-**The board runs `balanced`, and 4B and 8B load.** The refusal below is what the board did in the
+**The board's pool is raised, and 4B and 8B load.** The refusal below is what the board did in the
 `cpu_first` mode it booted in, where `ion_carveout` — the pool the whole `.hbm` is loaded into — is
-**2.00 GiB**. The SDK ships a supported tool, `hb_switch_ion.sh`, that moves the board to `balanced`,
-where that same pool is **10.00 GiB**; the switch was applied and the board rebooted **2026-10-10**, and
-both large graphs now initialize and generate (see [the ladder](#measured-ladder) and
+**2.00 GiB**. The SDK ships a supported tool, `hb_switch_ion.sh`, that moves the board to `balanced`
+(**10.00 GiB**) and on to `bpu_first` (**18.00 GiB**); `balanced` was applied and the board rebooted
+**2026-10-10**, `bpu_first` followed on **2026-10-13**
+([the second switch](#a-second-switch-bpu_first-applied-2026-10-13)), and the large graphs initialize
+and generate (see [the ladder](#measured-ladder) and
 [the large models after the switch](#the-large-models-after-the-switch)). So the ceiling was a *mode*, not a vendor limit on
 the model size, and it is now gone on this board.
 
@@ -1444,8 +1465,14 @@ For the S600 the three modes set `ion_carveout` (the `.hbm` pool) to:
 | Mode | `ion_carveout` | Fits |
 |---|---|---|
 | `cpu_first` (the board's boot default) | **2.00 GiB** | 0.6B, 1.7B — not 4B/8B |
-| `balanced` (**applied on this board 2026-10-10**) | **10.00 GiB** | 4B (3.00 GiB) **and** 8B (5.31 GiB) |
-| `bpu_first` | 17.93 GiB | 4B/8B, at the cost of general RAM |
+| `balanced` (applied 2026-10-10, superseded 2026-10-13) | **10.00 GiB** | 4B (3.00 GiB) **and** 8B (5.31 GiB) |
+| `bpu_first` (**applied on this board 2026-10-13**) | **18.00 GiB** (19,327,352,832 B) | every graph on this page, including the 8B `w8` (9.75 GiB), at the cost of general RAM |
+
+**The `bpu_first` row used to read 17.93 GiB; it is 18.00 GiB.** The switch script's own comment calls
+the pool "18360MiB" — the same transposed-digit typo as `balanced`'s "10480MiB", corrected on this page
+[below](#the-balanced-map-was-proved-without-booting-first) — while the reg cells it writes are exact:
+`42 0 4 80000000` is 4·2³² + 2³¹ = **19,327,352,832 B = 18,432 MiB = 18.00 GiB**, and the live pool the
+kernel actually reserves measured exactly that ([the applied record](#a-second-switch-bpu_first-applied-2026-10-13)).
 
 So the S600's 4B/8B support was **one supported command plus a reboot** away. The board boots
 `cpu_first`, whose 2.00 GiB pool is what refused the graphs — nothing about the model size, the SDK
@@ -1456,8 +1483,42 @@ failure.
 **The switch is APPLIED, and the reboot succeeded.** `hb_switch_ion.sh balanced` was run and the board
 rebooted 2026-10-10; it came up healthy with `ion_carveout` at 10.00 GiB and `MemTotal` at 46.48 GiB
 (the before/after table is [above](#the-4b-8b-ceiling-applied)), and 4B, 8B and our compiled 4B all
-load and generate. What follows is the offline well-formedness proof that made the reboot a one-shot,
-kept because the mode is a boot-time setting a future board will have to move again.
+load and generate. The offline well-formedness proof that made that reboot a one-shot is kept
+[below](#the-balanced-map-was-proved-without-booting-first), because the mode is a boot-time setting a
+future board will have to move again.
+
+### A second switch: `bpu_first`, applied 2026-10-13
+
+**On 2026-10-13 the board moved again, `balanced` → `bpu_first`, for the 8B `w8` build** — at 9.75 GiB
+held at load it would sit at 97.5% of `balanced`'s 10.00 GiB, so the raise is what gives it working
+headroom (its row is [in the ladder](#measured-ladder)). `sudo /usr/hobot/bin/hb_switch_ion.sh
+bpu_first` ran clean (`rc 0`), the DTB went md5 `6ce6e801c7dd5103553a3a9db36e9224` →
+`d599b1a1be952ba947e0545f88259c15`, and the reboot came back healthy. Measured:
+
+| | `balanced` (2026-10-10) | `bpu_first` (applied 2026-10-13) |
+|---|---|---|
+| `ion_carveout` (DT `reg`) | `41 40000000 2 80000000` = 10.00 GiB | `42 0 4 80000000` = **18.00 GiB** |
+| live carve-out (kernel reserve log) | 10,737,418,240 B | **19,327,352,832 B = 18,432 MiB = 18.00 GiB** |
+| `free -m` total | 47,599 MB | **39,407 MB** — a drop of **exactly 8192 MB**, the pool's own +8 GiB |
+| `MemTotal` | 46.48 GiB | **38.48 GiB** |
+
+The `free -m` delta is the second check on the size, and it reads to the byte: a 17.93 GiB pool would
+have moved 7.93 GiB of general RAM, and the board moved **8.00**. The live start addresses are *not*
+the DTB's `bpu_first` start addresses — the boot chain packs the regions sequentially in node order,
+honoring the DTB **sizes** exactly (the same rule reproduces the `cpu_first` and `balanced` maps) — so
+the number to trust is the size, and it is 18.00 GiB.
+
+**Nothing regressed with the mode.** The 1.7B `w8` control, re-run under `bpu_first`, decodes
+**65.38 / 65.38 / 65.40 t/s** — its ladder row's 65.4 — with byte-identical text, and the 8B `w4`
+`cache_4096` build loads clean in **7.81 s** holding 9,427,156,992 B (8.78 GiB, 48.8% of the 18.00 GiB
+pool), decoding 29.77–29.81 t/s. Only the pool *fractions* moved, because the pool is what changed:
+the 1.7B costs 16.3% of 18.00 GiB, where its ladder row's 29.3% is against 10.00.
+
+**Rollback, updated.** The script's backup file on disk is now the factory `cpu_first` table
+(`/boot/hobot/rdk-s600-mcb-v1p0.dtb.bak`, md5 `35ae26dac46500abe140d1d59b669ce8`), so
+`hb_switch_ion.sh default` restores **`cpu_first`** and consumes the backup — it is *not* a way back to
+`balanced`. The way back to `balanced` is `hb_switch_ion.sh balanced`; the four independent recoveries
+below all still apply.
 
 ### The balanced map was proved without booting first
 
@@ -1480,8 +1541,9 @@ there produced the `balanced` regs the script itself writes; `fdtget -t x` reads
 
 The reg cells are `[addr_hi addr_lo size_hi size_lo]`, so `ion_carveout`'s `0x2 0x80000000` is
 2·2³² + 2³¹ = **10,737,418,240 B = 10,240 MiB = 10.00 GiB**. (The script's own comment calls it
-"10480MiB" — a transposed-digit typo; the cells are exact.) Only **three** of the four nodes actually
-change: `ion_reserved` is already at its `balanced` value in `cpu_first`.
+"10480MiB" — a transposed-digit typo, the same family as `bpu_first`'s "18360MiB"
+[above](#a-second-switch-bpu_first-applied-2026-10-13); the cells are exact.) Only **three** of the
+four nodes actually change: `ion_reserved` is already at its `balanced` value in `cpu_first`.
 
 **Well-formedness, checked against the *measured* map.** The boot DTB's own `/memory` node lists only
 1.77 GiB — U-Boot patches the real map in at boot — so the proof uses the live map instead: **63.77 GiB
@@ -1968,8 +2030,10 @@ floor is measuring the oracle's quantization error, not ours; a row below it is 
 The same re-scoring was carried out at the three larger sizes, so the provenance table is now read
 against truth everywhere rather than at the 0.6B alone. Each is the same shape: the shipped graph,
 our graph (both `w4` here, the width the larger checkpoints ship at) and the size's own
-`q4_k_m`-vs-`f16` floor, over the same 50-prompt corpus. The 1.7B and 4B tables also carry our own `w8`
-builds — a separate axis, with the 1.7B's recorded [below](#the-17b-at-w8-above-the-floor-against-truth).
+`q4_k_m`-vs-`f16` floor, over the same 50-prompt corpus. The 1.7B, 4B and 8B tables also carry our own
+`w8` builds — a separate axis, with the 1.7B's recorded
+[below](#the-17b-at-w8-above-the-floor-against-truth) and the 8B's
+[in its own subsection](#the-8b-at-w8-the-width-lever-falls-short).
 
 **1.7B** (`n = 50`):
 
@@ -1989,13 +2053,15 @@ builds — a separate axis, with the 1.7B's recorded [below](#the-17b-at-w8-abov
 | **ours `w8`** | 4 / 20 / **31** / 39 / 124 | 1 / 0 / 11 / 12 / 14 / 12 | **0** | **1656** |
 | **`q4_k_m` vs `f16` (the floor)** | 4 / 17 / **25** / 47 / 96 | 1 / 4 / 12 / 12 / 7 / 14 | 2 | **1552** |
 
-**8B** (`n = 46` — the four prompts that stalled on the board, `fact_07`, `long_04`, `long_05`,
-`ambi_01`, carry no board continuation and are excluded here exactly as in the `q4_k_m` 8B row above):
+**8B** (each row on the prompt set it has, because a stall costs a row and the three sets differ: the
+shipped graph and the floor are `n = 50`, our `w4` is `n = 46` — its four stalls `fact_07`, `long_04`,
+`long_05`, `ambi_01` — and our `w8` is `n = 49` — one stall, `ambi_04`):
 
 | graph | vs `f16` (truth) min/p25/med/p75/max | hist (0–4/5–9/10–19/20–29/30–39/40+) | ≥5-logit splits | Σ prefix |
 |---|---|---|---|---|
 | shipped `w4` | 4 / 16 / **21** / 33 / 67 | 1 / 3 / 18 / 14 / 9 / 5 | 2 | **1196** |
 | ours `w4` | 2 / 7 / **12** / 20 / 71 | 6 / 11 / 17 / 6 / 5 / 1 | 4 | **729** |
+| **ours `w8`** | 6 / 17 / **28** / 44 / 109 | 0 / 3 / 13 / 10 / 8 / 15 | **1** | **1619** |
 | **`q4_k_m` vs `f16` (the floor)** | 4 / 19 / **34** / 53 / 119 | 1 / 4 / 9 / 6 / 12 / 18 | 0 | **1901** |
 
 Three readings hold across all four sizes:
@@ -2007,25 +2073,79 @@ Three readings hold across all four sizes:
 - **The floor grows with the model, and at the larger sizes it overtakes *both* graphs.** The
   `q4_k_m`-vs-`f16` floor is Σ **995** (0.6B), **956** (1.7B), **1552** (4B), **1901** (8B): a GGML
   k-quant is a near-truth reference only for the smallest checkpoint. Read as a ratio to the floor,
-  shipped/floor is **1.33 / 0.76 / 0.64 / 0.63** and ours/floor is **0.98 / 0.41 / 0.35 / 0.38** — so
-  from 1.7B up **both the shipped graph and ours sit below the floor** (every `w4` row here does; the
-  `w8` builds at 1.7B and 4B are the exception — the 4B's Σ **1656** sits +104 (+6.7%) above its floor,
-  and the 1.7B's is recorded
-  [below](#the-17b-at-w8-above-the-floor-against-truth)), and "below the floor" is *not* a property of
-  our build alone. This is the strongest form of the 0.6B point: the `q4_k_m` reference
-  is good only where the model is small, and above it every graph on this table — the vendor's
-  included — is closer to truth than the oracle is.
+  shipped/floor is **1.33 / 0.76 / 0.64 / 0.63** and ours/floor is **0.98 / 0.41 / 0.35 / 0.38** at
+  `w4` — so from 1.7B up **both the shipped graph and ours sit below the floor** (every `w4` row here
+  does, and "below the floor" is *not* a property of our build alone). The `w8` rebuilds are the
+  counter-current, and they thin out as the model grows: ours/floor reads **1.23** at 1.7B
+  ([recorded below](#the-17b-at-w8-above-the-floor-against-truth)), **1.07** at 4B — the 4B's Σ
+  **1656** sits +104 (+6.7%) above its floor — and only **0.85** at 8B, where the lever lifts the row
+  **+890** (Σ 729 → 1619) and the floor still wins
+  ([the 8B at `w8`](#the-8b-at-w8-the-width-lever-falls-short)). This is the strongest form of the
+  0.6B point: the `q4_k_m` reference is good only where the model is small, and above it every graph
+  on this table — the vendor's included — is closer to truth than the oracle is.
 - **The 1.7B's wide-margin tail survives against truth.** Its `q4_k_m` row carried **23** ≥5-logit
   splits, the worst on the table; re-scored against `f16` it carries **23** again — the same count —
   while the size's own floor carries only **3** and the shipped graph **6**. The tail is therefore a
   real property of our 1.7B build, not the oracle's error: at this size ours does not merely drift
   earlier, it disagrees more confidently than either the reference quant or the shipped graph, and
-  truth agrees. The 4B's 12 splits and the 8B's 4 are likewise above their floors' 2 and 0. The 0.6B
+  truth agrees. The 4B's 12 splits and the 8B's 4 are likewise above their floors' 2 and 0, and the
+  8B `w8`'s single split sits between its `w4` sibling's 4 and the floor's 0. The 0.6B
   stays the exception in direction: there our `w4`'s 15 splits are the *only* thing above the floor,
   on a graph otherwise pinned to the floor itself, while the `w8` row sits at it. At the 1.7B the
   same test now reads in reverse: our `w8` build carries **2** wide-margin splits where our `w4`
   carries **23** — so the tail is a property of our 1.7B **at `w4`**, not of the 1.7B pipeline as such
   ([below](#the-17b-at-w8-above-the-floor-against-truth)).
+
+#### The 8B at `w8`: the width lever falls short
+
+The 8B is the third size we have rebuilt at `w8` (after the 1.7B and 4B), and the one where the lever
+is not enough. Build provenance: the same compile chain as the other `w8` rebuilds
+([the native compile chain](../architecture/s600_native_chain.md)) — `compile_hbo` 9604.9 s +
+`link_models` 553.5 s, log clean. Output
+`Qwen3-8B_language_chunk_512_cache_1024_w8_nash-p_corenum_4_4.hbm`, **9,078,659,624 B (8.46 GiB)**,
+md5 `fec5669a018d9723eccef05491ba3bb2`, relayed 2080ti→Mac→board and md5-verified at all three ends
+(re-verified on the board immediately before the capture). Captured 2026-10-13 as `8B-w8-ours-c1024` —
+50 prompts, **one stall** (`ambi_04`, the [#650 hang](#the-intermittent-hang-a-lost-wake-up-inside-the-delegates-decode-path)
+the harness watches for, on a prompt none of the `w4` captures stalled on) — and scored on the 2080ti
+against `qwen3-8b-f16.gguf` (truth). Its rate row is in [the ladder](#measured-ladder): **20.5 t/s**
+decode at **9.75 GiB** of pool, the one `bpu_first` row.
+
+| 8B graph (vs `f16` truth) | Σ prefix | n |
+|---|---|---|
+| shipped `w4` | 1196 | 50 |
+| ours `w4` | 729 | 46 |
+| **ours `w8`** | **1619** | **49** |
+| **`q4_k_m` vs `f16` (the floor)** | **1901** | **50** |
+
+**The row is real progress — the highest Σ of any graph row on this table — and it still lands below
+the floor.** Against truth it reads min/p25/med/p75/max **6 / 17 / 28 / 44 / 109**, histogram
+**0 / 3 / 13 / 10 / 8 / 15**, **1** wide-margin split (`multi_07`, 5.15) and **0 / 49** fully
+identical: **Σ 1619** — **−282 against the floor's 1901** and **+890 over our `w4`'s 729**. On the 45
+prompts both share (the apples-to-apples cut, since a stall costs a row) the lift and the gap hold:
+**719 → 1530** against the floor's **1751** there — a matched gap of **−221**, and the closest any
+8B-family build on this page has come to this size's floor. The shape of the remaining gap, from both
+directions:
+
+- **Against its own `w4` sibling, a broad lift.** On the 45 shared prompts the `w8` is the
+  longer-prefix side on **34** of them (equal 6, shorter 5), median Δ **+14**, range −19…+105 — the
+  improvement is the row, not a handful of prompts.
+- **Against the floor, short but close.** Paired per prompt the `w8` is shorter on **28 of 49**
+  (equal 6, longer 15), median Δ **−3**, range −76…+79 — a step-earlier deficit that has almost
+  closed, and a two-sided tail at that. At every percentile the distribution sits inside the
+  floor's (median 28 vs 34, p75 44 vs 53, max 109 vs 119), which is the shape of "closer, not
+  there".
+- **The size keeps the page's verdict: below the floor.** At 8B every one of our builds — `w4` and
+  now `w8` — agrees with truth less than the GGUF `q4_k_m` quantizer does. Note what that does not
+  mean: at this size the floor is mostly the *oracle's own* error, so "below the floor" is not
+  "worse than `q4_k_m`" — it is that the deficit is still visible *above* the oracle's error, which
+  it no longer is at 1.7B (+218) or 4B (+104).
+- **The corrupted token is gone from the corpus.** The `bunifuFlatButton` glitch — 12 occurrences in
+  the `w4` `cache_1024` capture, 13 in the `cache_4096` one — appears **zero** times here (no token
+  `95234`, no text hit, across all 49 completed rows), the first our-build 8B capture clean on the
+  corpus (the shipped 8B's capture was already clean; the paragraph below carries the same count).
+  But the `1..N` enumeration battery was **not** re-run at `w8`, and the page's own caution applies:
+  the slip is intermittent and prompt-moved, so a clean corpus narrows the bet rather than settling
+  it.
 
 **The 4B closes the table, and it is the one row still paired the confounded way.** The 4B is the last
 size with a shipped-and-ours pair, so the provenance gap now rests on **all four** sizes rather than
@@ -2072,6 +2192,13 @@ glitch token sits **after** the first divergence — 130 to 924 tokens after it,
 token 4 but slips at 603 — so it never *causes* the split the harness scores. It is a downstream artifact
 of our 8B having already left the oracle's trajectory, which is why a divergence-only comparison misses
 it: the corruption is real, it is ours, and it lives past the point the table stops looking.
+
+**The `w8` rebuild's capture carries it zero times.** No token `95234` and no `bunifuFlatButton` in any
+of its 49 completed rows, against the `w4` `cache_1024` row's 12 — the first our-build 8B capture clean
+on the corpus, and the strongest single sign so far that width is the right lever for this near-tie
+([the row and its scope](#the-8b-at-w8-the-width-lever-falls-short)). The shipped 8B's capture was
+already clean, so this closes a gap between our `w4` builds and the vendor's graph; the `1..N`
+enumeration was not re-run, so it does not close the question.
 
 **The 8B's own `cache_4096` build now joins this table** and confirms the two axes are separate: run on
 the same corpus, our 8B at the vendor's cache has the *same* wide 8B-style deficit (median Δ **−7**
@@ -2120,9 +2247,11 @@ Three scope notes, because this row is easy to over-read:
 - **The floor is the `q4_k_m` checkpoint's *own* agreement with truth** (Σ 956), not a clean-model
   ceiling: a graph *at* the floor is measuring the quantizer's error, not its own. `w8` at **1174**
   sits **above** it — the first cell at 1.7B to do so.
-- **`w8` doubles the packed weights, and at 8B that exceeds the 10 GiB pool.** 8B `w8` is **not
-  deployable**; the S600 stays `w4` at 8B, and that row is **below** the floor. This result is a
-  0.6B/1.7B/4B statement and does not fix the 8B.
+- **`w8` roughly doubles the packed weights, and at 8B it needs the raised pool.** The 8B `w8` build
+  holds **9.75 GiB** at load — 97.5% of `balanced`'s 10.00 GiB, so it is deployed under the `bpu_first`
+  pool (18.00 GiB, 54.2%) since the 2026-10-13 switch, not `balanced`. It exists, it runs, and it
+  moves the 8B's agreement **+890** — while still sitting below the size's floor, unlike the 1.7B and
+  4B rebuilds ([the 8B at `w8`](#the-8b-at-w8-the-width-lever-falls-short)).
 
 Two readings, one of which revises a reading above:
 
@@ -2439,9 +2568,18 @@ per-core scratch that land in the same pool. Measured: 5,704,908,800 B (`.hbm`) 
 (+0.33 GiB from 4B to 8B), which leaves roughly **6.5 GiB for a `.hbm` file** once it is accounted
 for. Since a w4 graph's file runs a bit above its weight size, that is about an **8B–9B class model**
 — an 8B fits with ~1.2 GiB to spare, and there is no headroom for a 14B (which at w4 would be roughly
-8 GiB of weights alone). **Anything past that is `bpu_first` (17.93 GiB), not `balanced`** — which is
-the one number that answers the "what else can this board run" follow-up, and it is why the switch was
-worth making for 8B specifically rather than as a general 14B door.
+8 GiB of weights alone). **Anything past that is `bpu_first` — 18.00 GiB**
+([the applied value](#a-second-switch-bpu_first-applied-2026-10-13); this page used to print 17.93),
+**not `balanced`** — which is the one number that answers the "what else can this board run" follow-up,
+and it is why the switch was worth making for 8B specifically rather than as a general 14B door.
+
+**The board has since moved there (2026-10-13) for the 8B `w8` build**, and the budget above shows
+why: at **9.75 GiB** held at load it would leave `balanced` 97.5% full — **0.25 GiB free against the
+1.23 GiB (12.3%) this section calls comfortable** — so the raised pool is where it runs, at 54.2% of
+18.00 GiB ([its ladder row](#measured-ladder)). Its `cache_1024` shape also carries a much smaller
+pool overhead than the `cache_4096` budget above: **9,078,659,624 B of file + 1,394,124,248 B
+(1.30 GiB) = the 10,472,783,872 B measured**, against the ~3.5 GiB overhead the shipped
+`cache_4096` 8B pays.
 
 ### The host shell's cost is below the noise floor
 
