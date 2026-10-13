@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -412,6 +413,115 @@ __global__ void gemm_quant_kernel(const float *x, const uint8_t *blocks, const f
   *dst = accumulate ? *dst + total : total;
 }
 
+/* The decode split: `S` blocks walk one column, each owning `k / S` of its
+ * weights, and a second kernel sums the `S` partials in slice order.
+ *
+ * `gemm_quant_kernel` above gives a whole column to a single thread, so at
+ * `m == 1` the grid *is* `ceil(n / 32)` -- 32 blocks for `k_proj`, 64 for
+ * `q_proj` -- and 32-64 one-warp blocks on a 68-SM card leaves the card
+ * nearly idle.  The cost of that is in the profile, not the arithmetic: on the
+ * checkpoint's own GEMM list those shapes move weights at 36-72 GB/s against
+ * the card's ~580 GB/s coalesced-read ceiling, while the shapes with a large
+ * grid (`ffn_gate`, the head) reach 159-191 GB/s with the same kernel.
+ * Splitting `k` multiplies the grid by `S` and changes nothing about what a
+ * thread computes.
+ *
+ * Measured on `probe5b` (source and logs beside `probe4_*` on the bench host;
+ * the 1.7B checkpoint's tensor list and byte counts, 1200.1 MiB of weights per
+ * token, quiet host, `probe5b_quiet.log`, whole token of 197 calls, median of
+ * 3, against the *same-geometry* column-per-thread kernel):
+ *
+ *     base   11.580 ms   108.7 GB/s        head alone: 1.821 ms  192.2 GB/s
+ *     S=8     6.263 ms   200.9 GB/s  1.85x  head alone: 1.863 ms  0.98x
+ *
+ * per shape, base -> S=8 (us): k_proj 32.7 -> 10.6 (3.08x), v_proj 32.5 ->
+ * 10.5 (3.10x), q_proj 33.6 -> 12.0 (2.80x), o_proj 32.8 -> 11.2 (2.94x),
+ * ffn_down 94.9 -> 33.0 (2.88x), ffn_down q6_K 148.0 -> 70.4 (2.10x),
+ * ffn_gate 44.5 -> 32.8 (1.36x), ffn_up 44.8 -> 32.3 (1.39x).  The gain is
+ * largest where the pre-split grid is smallest and gone where the grid is
+ * already a whole card: the 151936-wide head is 4748 blocks and loses 2% --
+ * the two extra passes over the partials buy no parallelism it did not
+ * already have.  That is why the head keeps the kernel it had and the
+ * dispatch is gated on the grid size.
+ *
+ * **The arithmetic is fp32 and reassociated: this is not bit-exact against
+ * the kernel it replaces.**  A slice runs the sequential kernel's own additions
+ * over its stretch, from 0.0: at `S == 8` on a 2048-long `k` the first slice
+ * *is* the sequential kernel's first 256 accumulations, bit for bit, and the
+ * other seven are the same additions from zero where the sequential chain
+ * starts from a running total.  Within a slice the set and order of operations
+ * is the sequential kernel's; only the association between slices is new.  The
+ * reduce joins the partials in slice index order, so a given binary and input
+ * produce one answer, run to run.  Measured against the sequential kernel over
+ * the probe's 151936 outputs: max |delta| 1.83e-3, max relative 6.1e-4 (both on
+ * near-zero outputs), max |delta| / rms(output) 3.3e-6 -- last-place rounding of
+ * a 2048-term fp32 accumulation, three orders of magnitude below the 1.6e-2
+ * that the int8-activation path (llama.cpp's `dp4a` decode) measures on the
+ * same probe.  End to end on the 1.7B checkpoint over eight greedy decode
+ * steps the logits move by max |delta| 6.1e-5, max |delta| / rms 1.5e-5, and
+ * not one token.  What holds it here is the token-identity gate against
+ * llama.cpp: the delta may not move a token.
+ *
+ * `$POCKETLLM_CUDA_DECODE_SPLIT=0` turns the whole path off for an A/B or a
+ * bisect; the default is on.  The block limit and the `k` divisibility rule
+ * are the dispatcher's, below. */
+constexpr int kDecodeSplit = 8;
+
+/* One `k / S` slice of a column, into `partial[slice * n + j]`.  The staging
+ * is the sequential kernel's, per super-block, so the accumulation inside a
+ * slice is the sequential one; only the `S` starting points are new. */
+template <int S>
+__global__ void gemm_quant_split_kernel(const float *x, const uint8_t *blocks, float *partial,
+                                        int64_t n, int64_t k, int type_id, int block_bytes,
+                                        int q6k_repacked) {
+  const int64_t j = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int lane = threadIdx.x;
+  const bool active = (j < n);
+  const int64_t n_blk = k / quant::kBlockWeights;
+  const int64_t per = n_blk / S;
+  const int64_t b0 = per * blockIdx.y;
+  const int64_t b1 = (blockIdx.y == S - 1) ? n_blk : b0 + per;
+  const int64_t row_bytes = n_blk * block_bytes;
+  const uint8_t *col_blocks = active ? blocks + j * row_bytes : blocks;
+  __shared__ float xs[quant::kBlockWeights];
+  float total = 0.0F;
+  for (int64_t b = b0; b < b1; ++b) {
+    for (int i = lane; i < quant::kBlockWeights; i += blockDim.x) {
+      xs[i] = x[b * quant::kBlockWeights + i];
+    }
+    __syncthreads();
+    if (active) {
+      quant_block_accumulate<1>(type_id, col_blocks + b * block_bytes, xs, &total,
+                                q6k_repacked != 0);
+    }
+    __syncthreads();
+  }
+  if (active) {
+    partial[static_cast<int64_t>(blockIdx.y) * n + j] = total;
+  }
+}
+
+/* The `S` partials of a column, summed in slice order, then the bias and the
+ * accumulate flag in the order the sequential kernel applied them -- so the
+ * tail of the arithmetic is unchanged and only the join is new. */
+template <int S>
+__global__ void gemm_quant_split_reduce_kernel(const float *partial, const float *bias, float *out,
+                                               int64_t n, int accumulate) {
+  const int64_t j = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (j >= n) {
+    return;
+  }
+  float total = partial[j];
+#pragma unroll
+  for (int s = 1; s < S; ++s) {
+    total += partial[static_cast<int64_t>(s) * n + j];
+  }
+  if (bias != nullptr) {
+    total += bias[j];
+  }
+  out[j] = accumulate ? out[j] + total : total;
+}
+
 /* The packed product over a tile of output columns *and a tile of output rows*,
  * walking the weight row one super-block at a time.
  *
@@ -736,6 +846,19 @@ class CudaBackend final : public Backend {
     check(cudaGetDeviceProperties(&prop, 0), "cudaGetDeviceProperties");
     name_ = prop.name;
     memory_ = static_cast<double>(prop.totalGlobalMem) / (1024.0 * 1024.0);
+    /* The decode split's kill switch, read once like the CPU backend's repack
+     * flag: unset or anything but a leading `0` is on. */
+    const char *split_env = std::getenv("POCKETLLM_CUDA_DECODE_SPLIT");
+    decode_split_ = !(split_env != nullptr && split_env[0] == '0');
+    /* Half of a full wave: the plain decode kernel is one warp per block and 64
+     * registers, so `32 * multiProcessorCount` blocks fill the card once. */
+    split_block_limit_ = 16 * static_cast<int64_t>(prop.multiProcessorCount);
+  }
+
+  ~CudaBackend() override {
+    if (partials_.handle != 0) {
+      cudaFree(reinterpret_cast<void *>(partials_.handle));
+    }
   }
 
   const char *name() const override { return "cuda"; }
@@ -912,7 +1035,38 @@ class CudaBackend final : public Backend {
       return;
     }
     const unsigned threads = 32;
-    const dim3 grid(static_cast<unsigned>((n + threads - 1) / threads), static_cast<unsigned>(m));
+    const int64_t n_blk = k / quant::kBlockWeights;
+    const int64_t grid_blocks = (n + threads - 1) / threads;
+    /* The decode split (see `gemm_quant_split_kernel` for what it is and what
+     * it measures).  Three conditions, each with a reason:
+     *
+     * - `m == 1`: this is the decode path's kernel, and `m > 1` already fills
+     *   the grid with rows -- the split is measured at `m == 1` only.
+     * - `n_blk % S == 0`: an even `S`-way split of whole super-blocks, which is
+     *   the shape the probe measured; `k = 1024` (4 super-blocks) falls back.
+     * - `grid_blocks <= split_block_limit_`: the split is worth launching only while
+     *   the pre-split grid is starved.  A full wave is `32 blocks * SMs` (32
+     *   one-warp blocks is a Turing SM's ceiling at this kernel's 64
+     *   registers); the limit is half of that -- far above the largest measured
+     *   winner (ffn_gate/up at 192 blocks = 2.8 per SM, 1.36x) and far below
+     *   the one measured loss (the head at 4748 blocks = 70 per SM, 0.98x).
+     *   The largest split grid this admits on a 68-SM card is 1088 blocks,
+     *   and the split multiplies it by 8. */
+    if (decode_split_ && m == 1 && n_blk % kDecodeSplit == 0 &&
+        grid_blocks <= split_block_limit_) {
+      float *partial = ensure_partials(kDecodeSplit * n);
+      const dim3 split_grid(static_cast<unsigned>(grid_blocks), kDecodeSplit);
+      gemm_quant_split_kernel<kDecodeSplit><<<split_grid, threads>>>(
+          f(x), reinterpret_cast<const uint8_t *>(blocks.handle), partial, n, k, type_id,
+          block_bytes, q6k_repacked ? 1 : 0);
+      check(cudaGetLastError(), "gemm_quant split");
+      gemm_quant_split_reduce_kernel<kDecodeSplit><<<static_cast<unsigned>(grid_blocks),
+                                                     threads>>>(
+          partial, bias.handle ? f(bias) : nullptr, w(out), n, accumulate ? 1 : 0);
+      check(cudaGetLastError(), "gemm_quant split reduce");
+      return;
+    }
+    const dim3 grid(static_cast<unsigned>(grid_blocks), static_cast<unsigned>(m));
     gemm_quant_kernel<<<grid, threads>>>(f(x), reinterpret_cast<const uint8_t *>(blocks.handle),
                                          bias.handle ? f(bias) : nullptr, w(out), m, n, k, type_id,
                                          block_bytes, accumulate ? 1 : 0, q6k_repacked ? 1 : 0);
@@ -1091,8 +1245,36 @@ class CudaBackend final : public Backend {
   }
   static float *w(DeviceBuffer buffer) { return reinterpret_cast<float *>(buffer.handle); }
 
+  /* The decode split's partial buffer, grown to the largest split call this
+   * process has seen and then reused.  It belongs to the backend rather than
+   * to the caller because `Backend::gemm_quant` has no scratch argument and
+   * adding one would change an interface the CPU backend and the graph both
+   * speak; one process owns one device and the engine drives one stream, so
+   * one buffer is the whole requirement.  At the block limit the split admits,
+   * the largest `n` on this checkpoint's list is 6144 and the buffer is
+   * `8 * 6144 * 4` = 196 KB. */
+  float *ensure_partials(int64_t floats) {
+    if (floats > partials_floats_) {
+      if (partials_.handle != 0) {
+        check(cudaFree(reinterpret_cast<void *>(partials_.handle)), "cudaFree split partials");
+        partials_ = DeviceBuffer{};
+        partials_floats_ = 0;
+      }
+      const int64_t bytes = floats * 4;
+      void *memory = nullptr;
+      check(cudaMalloc(&memory, static_cast<std::size_t>(bytes)), "cudaMalloc split partials");
+      partials_ = DeviceBuffer{reinterpret_cast<uintptr_t>(memory), bytes};
+      partials_floats_ = floats;
+    }
+    return reinterpret_cast<float *>(partials_.handle);
+  }
+
   std::string name_;
   double memory_ = 0.0;
+  DeviceBuffer partials_{};
+  int64_t partials_floats_ = 0;
+  bool decode_split_ = true;
+  int64_t split_block_limit_ = 0;
 };
 
 std::unique_ptr<Backend> make_cuda_backend() { return std::make_unique<CudaBackend>(); }

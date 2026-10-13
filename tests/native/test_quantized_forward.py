@@ -272,6 +272,22 @@ def test_the_incremental_path_agrees_with_the_batched_one(device: str) -> None:
     quantized path has its own scratch to get wrong -- `embedding_quant` writes
     a row per token, and a row stride computed from the wrong block width is
     invisible to a single batched prefill whose positions happen to line up.
+
+    **The contract is bit-exactness except where a chunk is a single token.**
+    Cuts 1 and 4 each leave one chunk of length one -- `PROMPT[:1]` and
+    `PROMPT[4:]` -- and a one-token forward is `m == 1`, which is the CUDA
+    backend's decode split: the column's `k` is walked in eight slices and the
+    eight partials are joined in slice order, an fp32 reassociation that is
+    last-place rounding and not bit-exact. On this checkpoint it is the
+    `attn_output` projection that takes it (`k = 2048`, eight super-blocks);
+    cuts 2 and 3 chunk two and three tokens, never enter the split, and are
+    byte-identical, as are all four cuts with `POCKETLLM_CUDA_DECODE_SPLIT=0`.
+    Measured per cut on the card: 1 -> 5.63e-5, 2 -> 0.0, 3 -> 0.0,
+    4 -> 3.81e-5, against a logit spread of ~25 -- 64x below the tightest
+    near-tie observed anywhere (3.6e-3 on the 1.7B), so it cannot move a token,
+    which is what the greedy-sequence tests in this file hold. A future change
+    that widens the split past `m == 1` must fail the exact arms here loudly;
+    they are deliberately not softened.
     """
     with native.Engine.open(str(CHECKPOINT), device) as engine:
         batched = engine.forward(PROMPT)
@@ -282,9 +298,19 @@ def test_the_incremental_path_agrees_with_the_batched_one(device: str) -> None:
             engine.forward(PROMPT[:cut])
             splits.append(engine.forward(PROMPT[cut:]))
 
+    spread = max(batched) - min(batched)
     for cut, incremental in zip((1, 2, 3, 4), splits):
         worst = _worst(batched, incremental)
-        assert worst == 0.0, f"splitting the prompt at {cut} changed the logits by {worst}"
+        if cut in (1, 4):
+            # Cuts 1 and 4 chunk a single token, and the decode split is
+            # `m == 1`-only: the rounding class of that reassociation, not the
+            # scratch this test exists to catch.
+            assert worst <= 1e-3 * spread, (
+                f"splitting the prompt at {cut} moved the logits by {worst}, "
+                f"more than the split's rounding class ({1e-3 * spread})"
+            )
+        else:
+            assert worst == 0.0, f"splitting the prompt at {cut} changed the logits by {worst}"
 
 
 def test_the_backends_agree_on_a_quantized_checkpoint() -> None:
