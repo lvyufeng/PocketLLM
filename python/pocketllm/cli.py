@@ -245,7 +245,9 @@ def _run_device(engine_args: EngineArgs) -> str:
     Two vocabularies meet here and only one of them is ours.  ``--device`` is
     ``EngineArgs.device`` -- a *kind*, from the set ``pocketllm devices`` lists,
     which is what a user picks from and what the Python registry validates.  The
-    C core is asked for a *backend*, and it serves ``cpu`` and ``cuda`` today.
+    C core is asked for a *backend*: ``cpu`` in every build, plus ``cuda`` or
+    ``ascend`` in a build that has one -- the 310B board serves on ``ascend`` --
+    which is why the name is passed through rather than mapped here.
 
     ``auto`` is resolved here rather than passed down, because the C core has no
     auto: it refuses a name it does not know.  It resolves to ``cpu``, which
