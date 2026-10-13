@@ -746,7 +746,77 @@ block trades blocks for warps and does not help decode: 16 / 64 / 128 columns pe
 `tg128` **60.6 / 63.7 / 63.4** against 32's **69.6** (`pp512` 306 / 381 / **445** against 436 — only
 128 is better there, and it pays 6 t/s on decode). The block count `n / 32` is the decode optimum this
 shape has; what would move it is a different kernel *shape* — persistent blocks, or sharing the weight
-pass across columns — not a different layout.
+pass across columns — not a different layout. **The second of those shapes was made and measured — a
+weight pass shared across eight output rows — and it is the next section.**
+
+### The prefill GEMM read each weight block once per row; the row tile reads it once per eight
+
+The shape the paragraph above ends at is the one the CPU backend has walked since its R=8 change:
+`dot_Rrows_q8k` applies one decoded weight block to eight activation rows, and the card's
+`gemm_quant_kernel` was the last one-row-per-weight-walk GEMM in the tree. Its threads own one
+`(row, column)` pair each, so the column's weight block is fetched from L2 and decoded **once per
+output row** — at `m = 512` that is 512 reads of the same 756 MB of weights to compute 512 rows.
+Measured across the block-width sweep, that traffic runs at **516–577 GB/s** against the card's own
+**583 GB/s** coalesced-read rate: the repeat reads are not slow *execution*, they are the memory
+system's ceiling, and the only way past it is to ask for fewer of them.
+
+`gemm_quant_row_kernel<R>` gives a thread `R` output rows instead of one. It decodes the column's
+weight block **once** and applies it to all `R` staged activations; every row keeps its **own** serial
+`+=` chain, in the same column order, with the same expression — nothing is reassociated, so the
+output is bit-identical by construction. `quant_block_accumulate` is a template on `R` and the `R == 1`
+call is exactly the one-row call, which is what makes "decode is untouched" a property of the code
+rather than a claim about the numbers. The launcher dispatches on `m` (`kRowThreshold = 32`), the axis
+the two kernels trade on: decode is `m == 1`, where the row tile measures **0.53×** the one-row
+kernel and keeps the kernel it had.
+
+**`R` and the block width were measured together** on the 1.7B checkpoint's own GEMM list (28 layers ×
+7 projections, `m = 512`, 756 MB of cold weights). Each cell is `rowR` against the *same-geometry*
+one-row kernel, so the base it divides by is that geometry's own, not a common one:
+
+| threads/block | base ms | row4 | row6 | row8 |
+|---:|---:|---:|---:|---:|
+| 32 (shipped) | 786.0 | 1.91× | 1.74× | 1.32× |
+| 64 | 763.4 | 2.05× | 2.30× | 2.38× |
+| 128 | 765.0 | 2.20× | 2.45× | 2.61× |
+| 256 | 703.3 | 2.15× | 2.43× | **2.65×** |
+| 512 | 713.3 | 2.11× | 2.32× | 2.57× |
+
+The wide block is not the mistake at prefill that it is at decode: with `R` rows folded into one
+thread, `grid.x = ceil(n / 256)` still leaves `grid.y = ceil(m / 8) = 64` blocks, so the grid stays
+full and the extra warps hide the serial accumulation chain instead of starving the grid. R = 8 at 256
+threads is the shipped pairing, and against the 32-column geometry the engine actually shipped the
+same change is **2.97×** (786.0 ms → 265.0 ms) rather than the sweep's 2.65×, because the arm being
+replaced is that geometry.
+
+The m-sweep is the crossover, each cell again against the same-geometry 256-thread one-row kernel:
+
+| m | 1 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 512 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| row8 | 0.53× | 0.61× | 0.54× | 0.93× | 1.52× | 2.31× | 2.54× | 2.58× | 2.65× |
+
+It sits between 16 and 32: below it the tile is mostly rows that do not exist, above it the weight
+traffic the tile removes dominates. 32 is the first `m` clearly on the winning side, not the first that
+breaks even — and prefill sits an order of magnitude past it.
+
+**End-to-end** (`Qwen3-1.7B-Q4_K_M.gguf`, `cuda`, five interleaved A/B rounds against the same binary
+at `origin/main` on an idle host; the llama.cpp column is the PrismML build at 842b188, `-ngl 99
+-sm none`):
+
+| | before | after | ratio | llama.cpp | ours/llama after |
+|---|---:|---:|---:|---:|---:|
+| `pp512` t/s | 420.1 | 1016.1 | **2.42×** | 9668.4 | 0.105 |
+| `tg128` t/s | 68.5 | 68.4 | 1.00× | 264.1 | 0.259 |
+
+**The gate is bit-identity, not a tolerance.** The native suite's token-identity tests pass on `cpu`
+and `cuda` for both the 0.6B f16 and the 0.6B `q4_k_m` checkpoints (27 tests, the greedy sequence
+against llama.cpp's among them), and the probe reports `bitdiff 0` for every `R`, block width and
+shape it swept. At prefill lengths — where the row kernel runs — the logits are compared as digests,
+and both arms are deterministic: the shared-scratch race that made the baseline's long prompts
+irreproducible run to run was found while gating this change and fixed separately in #684, and both
+builds here carry that barrier. 1.7B `q4_k_m` at `m = 64`, `m = 96` and `m = 512`, and 0.6B `q4_k_m`
+at `m = 192`, each return one digest per arm over three runs, and the two arms are byte-equal.
+`q4_K` takes the row path with the rest of the projections; the repacked `q6_K` branch is exercised by
+the 29 `q6_K` tensors each checkpoint carries, which this backend repacks at load.
 
 ### The horizontal reduce, and why the lane pairing is load-bearing
 

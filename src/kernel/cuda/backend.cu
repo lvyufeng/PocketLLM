@@ -196,8 +196,9 @@ __global__ void gemm_kernel(const float *x, const float *w, const float *bias, f
  * The scale index for Q6_K is `i / 16 + 2 * sub` -- indexed by run as well as by
  * position -- which is the piece a decoder indexing by position alone gets right
  * for one run in four; it is written the way `dequant_q6_k` writes it. */
+template <int R>
 __device__ void quant_block_accumulate(int type_id, const uint8_t *block, const float *xs,
-                                       float &total, bool q6k_repacked) {
+                                       float *total, bool q6k_repacked) {
   if (q6k_repacked) {
     /* The repacked q6_K block: one `int8` per weight (`q - 32`), then sixteen
      * `int8` scales, then `d`. The per-weight assembly is gone -- a byte load
@@ -224,7 +225,14 @@ __device__ void quant_block_accumulate(int type_id, const uint8_t *block, const 
       for (int i = 0; i < 16; ++i) {
         const int q = static_cast<int>((w[i >> 2] >> ((i & 3) * 8)) & 0xFFu);
         const int signed_q = q < 128 ? q : q - 256;
-        total += xs[g * 16 + i] * (ds * static_cast<float>(signed_q));
+        const float wv = ds * static_cast<float>(signed_q);
+        /* The tile is `R` rows of `kBlockWeights` floats, row-major, so row
+         * `rr`'s weight `g * 16 + i` sits at `rr * kBlockWeights + g * 16 + i`.
+         * `R == 1` collapses this to the scalar accumulation it replaces. */
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) {
+          total[rr] += xs[rr * quant::kBlockWeights + g * 16 + i] * wv;
+        }
       }
     }
     return;
@@ -281,7 +289,15 @@ __device__ void quant_block_accumulate(int type_id, const uint8_t *block, const 
       for (int i = 0; i < 32; ++i, ++col) {
         const int q = static_cast<int>((word[i >> 2] >> ((i & 3) * 8)) & 0xFFu);
         const int nibble = high ? (q >> 4) : (q & 0x0F);
-        total += xs[col] * (sd * static_cast<float>(nibble) - md);
+        const float wv = sd * static_cast<float>(nibble) - md;
+        /* One decode of the weight, `R` accumulations. Row `rr`'s activation of
+         * this column is `xs[rr * kBlockWeights + col]`; `R == 1` collapses the
+         * loop to the single `total[0] += xs[col] * wv` the one-row kernel does,
+         * same expression, same order. */
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) {
+          total[rr] += xs[rr * quant::kBlockWeights + col] * wv;
+        }
       }
     }
     return;
@@ -304,7 +320,11 @@ __device__ void quant_block_accumulate(int type_id, const uint8_t *block, const 
         const int q = low | high;
         const int scale = quant::as_int8(block, 192 + half * 8 + i / 16 + 2 * sub);
         const float ds = d * static_cast<float>(scale);
-        total += xs[col] * (ds * static_cast<float>(q - 32));
+        const float wv = ds * static_cast<float>(q - 32);
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) {
+          total[rr] += xs[rr * quant::kBlockWeights + col] * wv;
+        }
       }
     }
   }
@@ -333,7 +353,14 @@ __device__ void quant_block_accumulate(int type_id, const uint8_t *block, const 
  * accumulate -- a barrier some threads skip is a hang, not a wrong number, and an
  * earlier draft of this kernel that let an inactive lane *write zeros into the
  * staged block* corrupted the real columns sharing that buffer. Only lanes that
- * are loading a valid address write to shared here. */
+ * are loading a valid address write to shared here.
+ *
+ * **This is the small-`m` path.** It is the right kernel while a column's weight
+ * block is read once per output row, which is what decode wants and what
+ * `gemm_quant_row_kernel` below cannot beat there (measured: at `m == 1` row
+ * blocking is 0.4-0.7x). The launcher dispatches between the two on `m`; see the
+ * block comment above `gemm_quant_row_kernel` for where the crossover is and
+ * why. */
 __global__ void gemm_quant_kernel(const float *x, const uint8_t *blocks, const float *bias,
                                   float *out, int64_t m, int64_t n, int64_t k, int type_id,
                                   int block_bytes, int accumulate, int q6k_repacked) {
@@ -369,8 +396,8 @@ __global__ void gemm_quant_kernel(const float *x, const uint8_t *blocks, const f
        * reassociates the accumulation. This thread's own weight block -- the
        * column `j` it owns -- is read from global (L2-resident after the first
        * block touches it) and decoded with the hoisted scale/min unpack. */
-      quant_block_accumulate(type_id, col_blocks + b * block_bytes, xs, total,
-                             q6k_repacked != 0);
+      quant_block_accumulate<1>(type_id, col_blocks + b * block_bytes, xs, &total,
+                                q6k_repacked != 0);
     }
     __syncthreads();
   }
@@ -383,6 +410,120 @@ __global__ void gemm_quant_kernel(const float *x, const uint8_t *blocks, const f
   }
   float *dst = out + r * n + j;
   *dst = accumulate ? *dst + total : total;
+}
+
+/* The packed product over a tile of output columns *and a tile of output rows*,
+ * walking the weight row one super-block at a time.
+ *
+ * This is the prefill path. It exists because of what `gemm_quant_kernel` above
+ * costs per output element: each of its threads owns one `(row, column)` pair,
+ * so the column's weight block is read from L2 and decoded **once per output
+ * row**. At `m == 1` that is once, and it is the right trade -- the activation
+ * reuse the shared tile buys is worth more than the weight read it repeats. At
+ * `m == 512` the same block is fetched and decoded 512 times: 512 x 756 MB of
+ * weight reads to compute 512 rows, measured at 523-572 GB/s of weight traffic
+ * across the geometry sweep, against the card's own 583 GB/s coalesced-read
+ * rate. The weights are the traffic, and a projection's panel is L2-resident (a
+ * 2048-wide one is ~2.4 MB against a 6 MB L2), so those repeat reads already run
+ * at the memory system's measured ceiling; the way forward is to ask for fewer
+ * of them.
+ *
+ * So this kernel gives a thread `R` output rows instead of one. It decodes the
+ * column's weight block **once** and applies it to all `R` staged activations.
+ * Nothing else changes: the expression per weight is the same
+ * `xs[col] * (sd * q - md)`, and each row keeps its **own** serial `+=` chain in
+ * the same column order. There is no reassociation -- `total[rr]` accumulates
+ * exactly the sequence `gemm_quant_kernel` accumulates for row `r0 + rr` -- so
+ * the output is bit-identical, which is what lets this land without moving a
+ * token. The bit-identity is by construction and was measured as `bitdiff 0`
+ * over every shape and every `R` and block size tried.
+ *
+ * `R` and `blockDim.x` were measured together on the 1.7B checkpoint's own GEMM
+ * list (28 layers x 7 projections, `m = 512`, 756 MB of cold weights, same
+ * host). Each cell is `rowR` against the *same-geometry* `gemm_quant_kernel`,
+ * so the base it is divided by is that geometry's own, not a common one:
+ *
+ *     threads/block   base ms   row4    row6    row8
+ *          64          755.2    2.05x   2.28x   2.36x
+ *         128          755.7    2.22x   2.46x   2.62x
+ *         256          715.1    2.14x   2.42x   2.66x
+ *         512          709.1    2.12x   2.32x   2.58x
+ *
+ * (row8 was not run at the shipped 32-column geometry; there row4 is 1.92x and
+ * row6 1.74x against a 776.0 ms base, so the 256-thread row8's 269.2 ms is
+ * **2.9x** relative to what the engine ships today.) `R = 8` at 256 threads is
+ * the best measured -- 2.66x on all three runs it was taken, against 2.61-2.62x
+ * for the 128-thread form -- and it is the one the launcher picks. The wide
+ * block is doing real work here that it cannot do at decode: with `R` rows
+ * folded into one thread, `grid.x = ceil(n / 256)` leaves
+ * `grid.y = ceil(m / 8) = 64` blocks, so the grid is still full at a wide block
+ * and the extra warps hide the serial accumulation chain.
+ *
+ * `R = 8` is also why the decode path does not use this kernel. At `m == 1`
+ * `grid.y` is 1 whatever `R` is, so the row tile only spends threads on rows that
+ * do not exist: measured 0.40x at 256 threads. The two kernels are complementary,
+ * and `gemm_quant` picks by `m`. */
+template <int R>
+__global__ void gemm_quant_row_kernel(const float *x, const uint8_t *blocks, const float *bias,
+                                      float *out, int64_t m, int64_t n, int64_t k, int type_id,
+                                      int block_bytes, int accumulate, int q6k_repacked) {
+  const int64_t r0 = static_cast<int64_t>(blockIdx.y) * R;
+  const int64_t j = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int lane = threadIdx.x;
+  const bool active = (j < n);
+
+  const int64_t n_blk = k / quant::kBlockWeights;
+  const int64_t row_bytes = n_blk * block_bytes;
+  /* Same guard as the one-row kernel: an inactive thread must not form the
+   * pointer, even though it never dereferences it. */
+  const uint8_t *col_blocks = active ? blocks + j * row_bytes : blocks;
+
+  __shared__ float xs[R][quant::kBlockWeights];
+  float total[R];
+#pragma unroll
+  for (int rr = 0; rr < R; ++rr) {
+    total[rr] = 0.0F;
+  }
+
+  for (int64_t b = 0; b < n_blk; ++b) {
+    /* Stage all `R` rows' activation super-block, then one barrier. A row past
+     * `m` (the ragged last tile) stages zeros and its `total` is never stored,
+     * so its absence changes nothing. */
+    for (int idx = lane; idx < R * quant::kBlockWeights; idx += blockDim.x) {
+      const int rr = idx / quant::kBlockWeights;
+      const int ii = idx % quant::kBlockWeights;
+      const int64_t row = r0 + rr;
+      xs[rr][ii] = (row < m) ? x[row * k + b * quant::kBlockWeights + ii] : 0.0F;
+    }
+    __syncthreads();
+    if (active) {
+      /* One decode of this column's weight block, `R` accumulations. `total` is
+       * an array and `xs` is the row tile, so the same helper serves both
+       * kernels -- with `R == 1` this call is the one-row call. */
+      quant_block_accumulate<R>(type_id, col_blocks + b * block_bytes, xs[0], total,
+                                q6k_repacked != 0);
+    }
+    __syncthreads();
+  }
+
+  if (!active) {
+    return;
+  }
+#pragma unroll
+  for (int rr = 0; rr < R; ++rr) {
+    const int64_t r = r0 + rr;
+    if (r >= m) {
+      continue;
+    }
+    /* `total[rr]` is the column's whole `k`-sum for row `r`; the bias and the
+     * `+=`-on-residual are the same two operations the one-row kernel applies. */
+    float value = total[rr];
+    if (bias != nullptr) {
+      value += bias[j];
+    }
+    float *dst = out + r * n + j;
+    *dst = accumulate ? *dst + value : value;
+  }
 }
 
 __global__ void embedding_quant_kernel(const int32_t *tokens, int64_t n_tokens,
@@ -720,7 +861,54 @@ class CudaBackend final : public Backend {
      * 32 is the value that measured best. The win comes from having enough
      * blocks, and it falls off as the block widens again -- an earlier run gave
      * tg128 16.5 t/s at 64 and 13.8 at 128, against 24.2 at 32 -- so 256 is not
-     * the only bad value, just the worst one measured. */
+     * the only bad value, just the worst one measured.
+     *
+     * **Which kernel, and on what.** The 32-column one-row kernel above is the
+     * small-`m` path; `gemm_quant_row_kernel` is the large-`m` one. The choice is
+     * `m`, because that is the axis the two kernels trade on: the one-row kernel
+     * reads and decodes a column's weight block once *per output row*, and the
+     * row kernel reads and decodes it once *per row tile*, so the row kernel wins
+     * as soon as there are enough rows to amortize the `R`-wide tile and loses
+     * when there are not. Measured on the 1.7B checkpoint's own GEMM list (28
+     * layers x 7 projections, cold weights, interleaved), 8-row tile at 256
+     * threads, each cell against the same-geometry 256-thread one-row kernel:
+     *
+     *     m       1      4      8     16     32     64    128    256    512
+     *     row8  0.40x  0.45x  0.54x  0.90x  1.53x  2.27x  2.52x  2.59x  2.66x
+     *
+     * The crossover sits between 16 and 32: below it the tile is mostly rows
+     * that do not exist, above it the weight traffic the tile removes dominates.
+     * `kRowThreshold` is 32 -- the first `m` measured clearly on the winning
+     * side, not the first that breaks even. Prefill (`m` = the prompt length,
+     * 512 in the measurements) is more than an order of magnitude past it;
+     * decode (`m == 1`) is on the near side and keeps the kernel it already had.
+     *
+     * The threshold picks the *kernel*; the geometry each kernel runs at is
+     * separate and both were measured. 32 columns for the one-row kernel is the
+     * value from the `columns/block` table at the top of this comment. At
+     * `m = 512` the shipped pairing is worth **2.9x** rather than the sweep's
+     * 2.66x, because the arm it replaces is that 32-column geometry -- 776.0 ms
+     * measured, against the 715.1 ms the 256-thread base above divides by. 256
+     * threads for the row kernel is from the `R`/block-size table on
+     * `gemm_quant_row_kernel`, where the wide block is not the mistake it is at
+     * decode: the tile has already folded `R` rows into one thread, so `grid.y`
+     * supplies the blocks and the extra warps hide the serial accumulation chain
+     * instead of starving the grid. */
+    constexpr int kRows = 8;
+    /* The row kernel's tile is `R` rows, so a grid of `ceil(m / R)` blocks is
+     * only worth launching once `m` is a multiple of it in practice; below that
+     * the kernel is staging rows it will never store. */
+    constexpr int64_t kRowThreshold = 32;
+    if (m >= kRowThreshold) {
+      const unsigned threads = 256;
+      const dim3 grid(static_cast<unsigned>((n + threads - 1) / threads),
+                      static_cast<unsigned>((m + kRows - 1) / kRows));
+      gemm_quant_row_kernel<kRows><<<grid, threads>>>(
+          f(x), reinterpret_cast<const uint8_t *>(blocks.handle), bias.handle ? f(bias) : nullptr,
+          w(out), m, n, k, type_id, block_bytes, accumulate ? 1 : 0, q6k_repacked ? 1 : 0);
+      check(cudaGetLastError(), "gemm_quant");
+      return;
+    }
     const unsigned threads = 32;
     const dim3 grid(static_cast<unsigned>((n + threads - 1) / threads), static_cast<unsigned>(m));
     gemm_quant_kernel<<<grid, threads>>>(f(x), reinterpret_cast<const uint8_t *>(blocks.handle),
