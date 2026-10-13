@@ -859,6 +859,119 @@ at `m = 192`, each return one digest per arm over three runs, and the two arms a
 `q4_K` takes the row path with the rest of the projections; the repacked `q6_K` branch is exercised by
 the 29 `q6_K` tensors each checkpoint carries, which this backend repacks at load.
 
+### The decode GEMM's grid was `ceil(n / 32)` blocks; the split gives each column eight of them
+
+At `m == 1` the packed GEMM's grid *is* its output width — one warp per 32 columns — so the 1.7B's
+decode launches 32 blocks for `k_proj` and `v_proj`, 64 for `q_proj`/`o_proj`/`ffn_down` and 192 for
+`ffn_gate`/`ffn_up`, on a 68-SM card. The weights those blocks walk are the whole model — 1200.1 MiB
+per token — and the probe measures them moving at **36–72 GB/s** against the **~580 GB/s**
+coalesced-read plateau `probe4_quiet.log` establishes, while the shapes that already fill the card
+(`ffn_gate` at 192 blocks, the 4748-block head) reach **159–192 GB/s** with the same kernel and the
+same decoder. The starvation is in the grid, not the arithmetic, and the fix is to give the grid
+more blocks that compute the same thing.
+
+`gemm_quant_split_kernel<S>` gives each `(column, k-slice)` pair its own block. A slice is a run of
+whole 256-weight super-blocks — `k / S` of them, so the dispatcher requires `S` to divide `n_blk` —
+and `blockIdx.y` is the slice index, which multiplies the grid by `S`. Each thread walks its own
+stretch with the same staged activation super-block in shared memory and the same
+`quant_block_accumulate` call, in the same order, and writes one float per column into
+`partial[slice * n + j]`; a second kernel sums the partials in slice order and then applies the bias
+and the accumulate flag in the order the sequential kernel applied them, so the tail of the
+arithmetic is unchanged.
+
+`S = 8` is the shipped width, chosen against `S = 2` and `S = 4` on the same probe — 1.37×, 1.68× and
+1.85× for the whole token — because the win keeps growing while the grid is starved and by `S = 8`
+the wide shapes are where more slices buy less than the extra partial traffic costs. The probe also
+prices the alternatives that are not shipped (a col-major repack at 1.04×, an int8-activation path at
+llama.cpp's `dp4a` shape at 1.63×, or 2.05× stacked with this one), and where probe and engine
+disagreed the engine won: the first probe read `x` per weight from global and put the head at
+4.85 ms against the engine's own nsys profile at 1.84 ms. Staging the activation super-block the way
+`gemm_quant_kernel` does brought the probe's head to 1.82 ms (1.0% under that profile) and its whole
+token to 11.58 ms against the profile's 11.20 ms (3.4%); every number below is from the corrected
+form (`probe5b`).
+
+Per shape, base → `S = 8`, µs, median of 5 (`probe5b_breakdown.log`):
+
+| tensor | n | k | format | base µs | GB/s | S=8 µs | ratio |
+|---:|---:|---:|---|---:|---:|---:|---:|
+| `q_proj` | 2048 | 2048 | q4_K | 33.6 | 70.3 | 12.0 | 2.80× |
+| `k_proj` | 1024 | 2048 | q4_K | 32.7 | 36.0 | 10.6 | 3.08× |
+| `v_proj` | 1024 | 2048 | q4_K | 32.5 | 36.2 | 10.5 | 3.10× |
+| `o_proj` | 2048 | 2048 | q4_K | 32.8 | 71.9 | 11.2 | 2.94× |
+| `ffn_gate` | 6144 | 2048 | q4_K | 44.5 | 158.9 | 32.8 | 1.36× |
+| `ffn_up` | 6144 | 2048 | q4_K | 44.8 | 158.0 | 32.3 | 1.39× |
+| `ffn_down` | 2048 | 6144 | q4_K | 94.9 | 74.5 | 33.0 | 2.88× |
+| `v_proj` | 1024 | 2048 | q6_K repacked | 34.8 | 67.8 | 12.3 | 2.83× |
+| `ffn_down` | 2048 | 6144 | q6_K repacked | 148.0 | 95.6 | 70.4 | 2.10× |
+| head | 151936 | 2048 | q6_K repacked | 1834.7 | 190.8 | 1915.6 | **0.96×** |
+
+One token of the 1.7B's own tensor list is **11.580 → 6.263 ms (1.85×)**, 108.7 → 200.9 GB/s.
+
+**The head keeps the kernel it had.** Its 4748 blocks are a whole card already, and the split's two
+extra passes over the partials buy no parallelism it did not have: 0.96×. That is the dispatcher's
+third condition, and it is a *grid* test rather than a shape test, so any projection that grows to a
+full card is excluded by the same rule:
+
+- `m == 1` — the split is the decode path's kernel. `m > 1` already fills the grid with rows, and
+  `m >= 32` is the row kernel's, above.
+- `n_blk % S == 0` — whole super-blocks per slice. The 0.6B's `k = 1024` (four super-blocks) fails
+  it and falls back; its `attn_output` (`k = 2048`, eight) passes, as does the 1.7B's `k = 2048`
+  and `k = 6144`.
+- `grid_blocks <= 16 × SMs` — half a wave, where a wave is 32 one-warp blocks per SM at this
+  kernel's 64 registers (1088 blocks on this card). Far above the largest measured winner
+  (`ffn_gate` at 192 blocks, 2.8 per SM, 1.36×) and far below the measured loss (the head, 4748
+  blocks, 70 per SM).
+
+**The arithmetic is fp32 and reassociated, and that is the whole of the change.** A slice runs the
+sequential kernel's own additions from 0.0 — so on a 2048-long `k` the first slice *is* the
+sequential kernel's first 256 accumulations, bit for bit — and the reduce joins the eight partials
+in slice order: the same operations in the same order within a slice, a new association between
+them, one answer per binary and input. Against the sequential kernel over the probe's 151936
+outputs: max |Δ| 1.83e-3, max relative 6.05e-4 (both on near-zero outputs), max |Δ| / rms(output)
+**3.29e-6** — last-place rounding of a 2048-term fp32 sum, three orders of magnitude below the
+**1.56e-2** the int8-activation path measures on the same probe. What holds it is the token, not the
+bit.
+
+**What holds it, measured.** End to end on the 1.7B over eight greedy decode steps, the two arms of
+the kill switch differ by max |Δ| 6.1e-5, max |Δ| / rms 1.5e-5, and not one token over sixteen
+steps; the pre-split binary produces the same sixteen tokens. The 27-test token-identity gate passes
+on `cpu` and `cuda` for both 0.6B checkpoints — and the two arms of it that decode token by token
+(`test_the_greedy_sequence_matches_llama_cpp` at sixteen steps and
+`test_the_quantized_answer_is_what_llama_cpp_gets_from_the_same_file` at eight, both on `cuda`) are
+checks of this kernel rather than bystanders: the 0.6B's `attn_output` is `k = 2048` with a 32-block
+grid, one split GEMM per layer per decode step. The prefill-logits arms (`m >= 2` batches) do not
+reach it, and neither do the f16 tests, whose weights never enter `gemm_quant` at all. The four
+prefill digest shapes (1.7B `m = 64`/`96`/`512`, 0.6B `m = 192`) are byte-identical between the
+split build and the pre-split one, max |Δ| exactly 0.0, as they should be: they take the row kernel,
+which this change does not touch.
+
+Two arms of the suite changed with the kernel, and both are the rounding class rather than a token.
+`test_the_incremental_path_agrees_with_the_batched_one` chunks the prompt at four cuts and compares
+against one batched prefill: cuts 1 and 4 each chunk a *single token*, which is `m == 1` and the
+split's condition, and those two cuts now assert `worst <= 1e-3 × spread` (measured 5.63e-5 and
+3.81e-5 against a spread of ~25) while cuts 2 and 3 — two- and three-token chunks — keep
+`worst == 0.0` verbatim, so a future change that widens the split past `m == 1` fails loudly. No
+other test in the suite moved.
+
+**The kill switch** is `POCKETLLM_CUDA_DECODE_SPLIT=0`, read once when the backend is constructed;
+the default is on. With it off every shape above is byte-identical to the pre-split kernel — all
+four cuts at 0.0, all four digests unchanged — which is what makes it a bisect aid rather than a
+second behaviour.
+
+End-to-end (`Qwen3-1.7B-Q4_K_M.gguf`, `cuda`, five interleaved A/B rounds against the pre-split
+binary built from the same tree, on a host idle at `start_load` 3.3; the llama.cpp column is the
+PrismML build at 842b188, `-ngl 99 -sm none`, medians of the same five rounds):
+
+| | before | after | ratio | llama.cpp | ours/llama after |
+|---|---:|---:|---:|---:|---:|
+| `pp512` t/s | 1033.9 | 1031.3 | 1.00× | 9668.9 | 0.107 |
+| `tg128` t/s | 68.9 | 106.8 | **1.55×** | 264.4 | 0.404 |
+
+Prefill is unmoved to the decimal, which is the shape of the change: the split's dispatch never
+fires above `m == 1`. Decode closes a third of the remaining gap to llama.cpp — 0.259× of its rate
+before this change (the row-tile section's table above), 0.404× after — and what is left is the
+`dp4a` activation path this change does not take, priced at 2.05× by the probe and deferred.
+
 ### The horizontal reduce, and why the lane pairing is load-bearing
 
 `dot_Rrows_q8k` ends each row with one horizontal reduce, and the tree it builds has to be the one
