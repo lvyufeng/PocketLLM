@@ -882,11 +882,17 @@ is easy to fall into again:
   in the kernel's own comment) and vectorizes the nibble runs. The decode work the int8 path was meant
   to remove had already been removed; prefill was left with nothing to win. **Price every candidate
   against the shipped kernel, never a reconstruction of it.**
-- **At `m == 1` there is no row tile to amortize the activation quantization.** The int8 kernel pays an
-  amax scan and an 8-bit codec per super-block per step, and its per-thread nibble unpack (`qw`) is
-  *not* removed unless the *weights* are repacked to int8. So decode int8 does strictly more work than
-  fp32 at the decode shape — hence 0.41×. Decode int8 cannot win without a q8_1 **weight** repack, and
-  none exists.
+- **At `m == 1` there is no row tile to amortize the activation quantization**, so the int8 kernel pays
+  an amax scan and an 8-bit codec per super-block per step. That alone does not explain 0.41×, though:
+  the kernel was built in the **plain one-column shape**, while the shipped decode path is
+  `gemm_quant_split_kernel<8>` — the k-split that divides a column's super-blocks eight ways to fill a
+  starved grid, and the thing decode actually runs is ~2.2× faster than a plain one-column kernel at
+  `m == 1` (measured in the next subsection). The deficit is the kernel's *shape*, not its weight-load
+  path.
+- **The obvious remaining hypothesis — a q8_1 weight repack — was tested and is dead.** Decoding every
+  q4_K super-block to int8 once at load removes the per-thread nibble unpack outright, and the repacked
+  int8 kernel still loses to the shipped split path by 3.6×. The unpack was never the difference; see
+  the next subsection for the measurement.
 - Two bugs found on the way, both fixed and reflected above: the nibble unpack sat inside the `R`-row
   loop (re-doing the decode `R` times), and the activation quantizer divided per element instead of
   multiplying by a reciprocal.
@@ -896,6 +902,48 @@ steps match exactly), and the 27-test token gate passes with the flags both off 
 checkpoints. It is a capability that does not pay, so it is not in the tree; this note is the record so
 the next attempt starts from the measurement instead of the probe. The 1.7B's step-5 divergence under
 one quantizer form is the same near-tie the decode-split section above documents (#690).
+
+### The q8_1 weight repack was the one untried piece, and it is a dead end — the split already won decode
+
+The bullet above left one hypothesis standing: decode int8 loses because its per-thread nibble unpack
+is not removed unless the *weights* are repacked. That was tested directly. A probe
+(`/mnt/data1/perf2080ti-bench/probe8.cu`) repacks each q4_K super-block once, at load, to 256 int8
+weights plus the eight `sd`/`md` pairs — the unpack is gone — and runs an int8 `__dp4a` kernel over
+that buffer against the shipped decode path. Interleaved, same binary, same loop, `m == 1`, the 1.7B's
+28 layers × 7 projections (the log is `probe8`, GPU1, host load ~28, so **ratios only**):
+
+| variant | ms | vs `split8` |
+|---|---:|---:|
+| `split8` (shipped decode, `gemm_quant_split_kernel<8>`) | 3.449 | 1.00× |
+| plain one-column fp32 | 7.549 | 0.46× |
+| int8 over repacked weights | 12.321 | **0.28×** |
+
+The repack does not just fail to close the gap — it leaves the int8 kernel **3.6× slower than the
+shipped path, before its footprint is paid**. And the footprint is the other half of the answer: the
+repacked format is `256 int8 + 8 float sd + 8 float md = 1.25` bytes per weight against q4_K's
+`0.5625`, a **2.22×** blow-up (819 MiB → 1820 MiB for these nineteen tensors), and even a tight repack
+that keeps the packed 12-byte scale/min runs is 1.86×. Nothing about it pays.
+
+Two numbers settle the arithmetic. **`split8` against the plain kernel is exact to 6.2e-06**
+(`max|d| / rms`) — the split is a reassociation of the same sum, which is why it can ship — while
+**int8 against `split8` is 5.7e-04**, the non-exact class the activation quant brings and one this
+path never needed to enter. The "price the candidate against the shipped kernel" lesson applies to
+decode as much as prefill: my int8 decode kernel is plain-structured, and the shipped decode is the
+split, so the 0.28× is a shape mismatch, not a weight-format one.
+
+Prefill is unchanged by the repack and was **not** re-measured this round. The row tile already hoists
+the unpack out of its `R`-row loop, so removing it further saves nothing there, and the 1.00× prefill
+in the table is the activation-quant tax, which a weight repack is orthogonal to.
+
+One harness bug made the first numbers in this probe fake, and the shape of it is worth keeping: the
+split was launched with the slice passed as a *kernel argument* fixed at `0` instead of read from
+`blockIdx.y`, so all eight slice-blocks computed slice 0 and raced on one partial slot. The split did
+one-eighth the work and the `max|d|` between it and the plain kernel was `14.65` — a kernel that
+disagrees with the exact one by more than its own output is not fast, it is broken. **Check that a
+split kernel reads `grid.y`, not a scalar argument, before trusting a split timing.**
+
+So the q8_1 repack is not "the missing piece" — it is measured, and it loses. The decode half was
+already solved by the split; the int8 direction is closed, not deferred.
 
 ### The decode GEMM's grid was `ceil(n / 32)` blocks; the split gives each column eight of them
 
