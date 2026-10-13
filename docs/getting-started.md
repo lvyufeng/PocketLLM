@@ -58,7 +58,7 @@ runtime, because "no backend for this device" is unhelpful and "qnn: needs libQn
 actionable:
 
 ```
-reference  cpu       available                     eager only        17 ops
+reference  cpu       available                     eager only        18 ops
 cpu        cpu       available                     eager only        16 ops
 mps        mps       missing torch>=2.2 with an MPS device  eager only        16 ops
 cuda       cuda      available                     stream_capture    17 ops

@@ -187,6 +187,11 @@ def sample_args(op: str, session, quant: str | None = None) -> tuple[list, dict]
         ], {"eps": 1e-5}
     if op in {"silu_mul", "add", "mul"}:
         return [t(rand(_TOKENS, _HIDDEN)), t(rand(_TOKENS, _HIDDEN))], {}
+    if op == "reshape":
+        # A 2-D to 3-D split -- the shape a real model uses to put heads back on
+        # a projection -- so the sample exercises a rank change and not a
+        # no-op flatten.  The element count is preserved by construction.
+        return [t(rand(_TOKENS * _HEADS, _HEAD_DIM))], {"shape": (_TOKENS, _HEADS, _HEAD_DIM)}
     if op == "softmax":
         return [t(rand(_TOKENS, _VOCAB))], {"axis": -1}
     if op == "rope":

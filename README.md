@@ -45,7 +45,7 @@ this page is the design those pieces are being built toward.
 
 | Piece | State |
 |---|---|
-| `pocketllm.kernels` — the kernel ABI: descriptors, op schemas, dispatch, graph IR | **Done.** 17 ops declared; stdlib-only, no numpy |
+| `pocketllm.kernels` — the kernel ABI: descriptors, op schemas, dispatch, graph IR | **Done.** 18 ops declared; stdlib-only, no numpy |
 | `pocketllm.backends.reference` — numpy oracle, every op, host memory | **Done.** The normative implementation |
 | `pocketllm.backends.cpu` — host CPU | **Stub.** Selection and declaration only |
 | `pocketllm.backends.{cuda,mps,qnn,horizon,ascend}` | **Stubs.** Each names the runtime it waits for |
@@ -105,7 +105,7 @@ depend on anything being installed. Every check behind it is a filesystem probe,
 runtime:
 
 ```
-reference  cpu       available                     eager only        17 ops
+reference  cpu       available                     eager only        18 ops
 cpu        cpu       available                     eager only        16 ops
 mps        mps       missing torch>=2.2 with an MPS device  eager only        16 ops
 cuda       cuda      available                     stream_capture    17 ops

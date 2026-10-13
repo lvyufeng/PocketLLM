@@ -39,7 +39,7 @@ kernel**: every backend except `reference` is a declaration with a session that 
 contract, over the same ctypes bridge, and never touches the kernel ABI.
 
 **These are two separate answers to two separate questions, and the trap is reading either one as the
-other.** `pocketllm.kernels` declares 17 ops; the C engine implements 12 of them over its own backend
+other.** `pocketllm.kernels` declares 18 ops; the C engine implements 12 of them over its own backend
 interface, which is a *different* interface from `pocketllm.backends` and shares no code with it. A
 statement about `pocketllm devices` — which lists the *Python* backends and their stubs — says
 nothing about what `src/` can do, and `pocketllm devices` on this host does not know the C core

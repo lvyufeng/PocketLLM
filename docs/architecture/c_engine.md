@@ -84,7 +84,7 @@ to `pocketllm.backends.reference`, applied one level down.
 
 ### The C surface is a strict subset of the ABI, on purpose
 
-The ABI declares 17 ops. The engine implements 12 of them as ops — `rms_norm`, `gemm`, `gemm_quant`,
+The ABI declares 18 ops. The engine implements 12 of them as ops — `rms_norm`, `gemm`, `gemm_quant`,
 `embedding`, `embedding_quant`, `silu_mul`, `rope`, `attention`, `argmax`, `softmax`,
 `logits_temperature`, `topk_sample` — and the rest are either *inlined into the graph* or *not
 needed yet*. Neither case is a missing kernel, and the distinction matters when reading the

@@ -32,6 +32,7 @@ EXPECTED_OPS = frozenset(
         "silu_mul",
         "add",
         "mul",
+        "reshape",
         "softmax",
         "embedding",
         "logits_temperature",
@@ -100,6 +101,44 @@ def test_optional_and_variadic_are_consistent() -> None:
         for spec in schema.declarations():
             if spec.variadic:
                 assert spec.optional, f"{schema.name}.{spec.name} is variadic but not optional"
+
+
+def test_reshape_splits_a_projection_into_heads() -> None:
+    """The shape a model actually uses: 2-D projection -> 3-D ``(tokens, heads, d)``.
+
+    ``rope`` requires 3-D and ``gemm`` produces 2-D, and the ABI has no other op
+    that changes rank, so this call is what makes a transformer expressible.
+    """
+    reshape = OPS.get("reshape")
+    x = TensorDesc((6, 4), dtype=DType.F32)
+    (y,) = reshape.infer([x], {"shape": (2, 3, 4)})
+    assert y.shape == (2, 3, 4)
+    assert y.dtype is DType.F32
+
+
+def test_reshape_infers_a_single_minus_one() -> None:
+    reshape = OPS.get("reshape")
+    (y,) = reshape.infer([TensorDesc((6, 4), dtype=DType.F32)], {"shape": (-1, 3, 4)})
+    assert y.shape == (2, 3, 4)
+
+
+def test_reshape_refuses_two_inferred_dimensions() -> None:
+    """Two ``-1``s have many answers; picking one would be a guess, not semantics."""
+    reshape = OPS.get("reshape")
+    with pytest.raises(ShapeError):
+        reshape.infer([TensorDesc((6, 4), dtype=DType.F32)], {"shape": (-1, -1, 4)})
+
+
+def test_reshape_refuses_a_shape_that_loses_elements() -> None:
+    reshape = OPS.get("reshape")
+    with pytest.raises(ShapeError):
+        reshape.infer([TensorDesc((6, 4), dtype=DType.F32)], {"shape": (5, 4)})
+
+
+def test_reshape_requires_the_shape_attribute() -> None:
+    reshape = OPS.get("reshape")
+    with pytest.raises(ShapeError):
+        reshape.infer([TensorDesc((6, 4), dtype=DType.F32)])
 
 
 def test_gemm_infers_output_shape_and_type() -> None:

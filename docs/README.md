@@ -36,7 +36,7 @@ device, and `EngineArgs` has no `tensor_parallel_size` to set.
 
 | Piece | State |
 |---|---|
-| [`pocketllm.kernels`](architecture/kernel_abi_v1.md) — descriptors, op schemas, dispatch, graph IR | **Done.** 19 ops declared; stdlib-only |
+| [`pocketllm.kernels`](architecture/kernel_abi_v1.md) — descriptors, op schemas, dispatch, graph IR | **Done.** 18 ops declared; stdlib-only |
 | `pocketllm.backends.reference` — numpy oracle | **Done.** Normative: implements every declared op |
 | `pocketllm.backends.cpu` | **Stub.** Declaration and selection only |
 | `pocketllm.backends.{cuda,mps,qnn,horizon,ascend}` | **Stubs**, each naming the runtime it waits for |
