@@ -209,11 +209,13 @@ resolved wrongly** (a digit's logit and a garbage token's within a hair), the sa
 but a sharper expression: one token, no repetition build-up, and it resumes. `cache_1024 w8` is the build
 that targets it (width is the natural lever for a numerical near-tie), but the ~25% run-to-run variance and
 the prompt-varying token made it a **bet, not a guarantee** — the intermittent path points at the decode
-side too, so a single clean `w8` run would not prove the slip gone. **The bet has now been drawn**: the
-`w8` build exists, runs at **20.5 t/s** under `bpu_first` ([its ladder row](#measured-ladder)), and its
-50-prompt capture carries the glitch **zero** times — while still leaving the `1..N` enumeration
-unmeasured, so the caveat narrows to that battery
-([the 8B at `w8`](#the-8b-at-w8-the-width-lever-falls-short)).
+side too, so a single clean `w8` run would not prove the slip gone. **The bet has now been drawn, and it
+is settled on the enumeration as well**: the `w8` build exists, runs at **20.5 t/s** under `bpu_first`
+([its ladder row](#measured-ladder)), its 50-prompt capture carries the glitch **zero** times
+([the 8B at `w8`](#the-8b-at-w8-the-width-lever-falls-short)), and the `1..N` battery run at `w8`
+emits the corrupted token **zero** times in twenty-seven runs across the 1.7B, 4B and 8B
+([the battery at `w8`](#the-1n-battery-at-w8-the-slip-is-gone-and-the-8b-fails-a-different-way)).
+The battery does find a different 8B failure at the same cache — that section carries it.
 
 The raw per-length run is the evidence for "state-dependent, not index-fixed":
 
@@ -287,6 +289,57 @@ that are running clean are neither ours nor the corrupting sizes, and the one ge
 (our 8B at `cache_4096`) is the one still compiling.** What it does settle is narrower and worth stating
 plainly: the corruption is not peculiar to the 8B — the 4B makes it too — and it is absent wherever the
 cache is large.
+
+#### The `1..N` battery at `w8`: the slip is gone, and the 8B fails a different way
+
+The survey's `cache_1024` rows are all `w4`, so it says nothing about the rebuilds the width argument
+predicts should clear the near-tie — and every `w8` graph on this page is `cache_1024`. The same battery
+has now been run on them (2026-10-13, `bpu_first` pool, one process per run, the 25-second stall
+watchdog, greedy, three runs a cell):
+
+| graph | `1..200` | `1..400` | `France?` | byte-identical |
+|---|---|---|---|---|
+| ours 1.7B `w8` | truncate at **167**, ordered 1…167 | truncate at **36** | closes, 1631 chars, recurs 2× | 3/3 each cell |
+| ours 4B `w8` | truncate at **42** | truncate at **83** | closes, 3030 chars, recurs 1× | 3/3 each cell |
+| ours 8B `w8` | 1 truncate (a repeated `35, 36` at the 36th, then clean to 135) / 1 hang / 1 never closes | 2 never close (**recurs 5–6×**) / 1 hang | closes, 989 chars, recurs 1× | **0/3** — all three differ |
+
+**The corrupted token does not appear at `w8` — not once, in twenty-seven runs.** No
+`.bunifuFlatButton`, no `个人`, no token `95234`; and every list that reached its enumeration is strictly
+ordered up to the point the window cut it — the 1.7B to 167, the 4B to 42 and to 83, the 8B to 135. The
+width argument's prediction holds at both sizes where the `w4` slipped: the **4B** `w8` writes 1…42 and
+1…83 with no `2一` where its `w4` sibling slipped at the 24th number, and the **8B** `w8` never emits
+the garbage token its `w4` sibling emitted in six of six `cache_4096` runs. The single anomaly in the
+whole battery is benign and of another kind: one 8B `1..200` run repeats the pair `35, 36` at the 36th
+entry — a **duplication**, not a substitution — and the list resumes and runs on to 135.
+
+**Width paid at the 1.7B and the 4B, and the 8B is where it stops paying.** Those two graphs are clean
+*and byte-identical three of three* in every cell, the determinism the `w4` cells show. The 8B `w8` is
+neither: **five of its nine runs fail** — two killed by the stall watchdog (the
+[#650 lost wake-up](#the-intermittent-hang-a-lost-wake-up-inside-the-delegates-decode-path)) and three
+that never close the reasoning block at all.
+
+**The 8B's failure is a rumination, not the slip.** In those three runs the model argues with its own
+instruction *inside* ` thinking` and never emits a number — *"the user's instruction says not to add any
+other text, so the assistant must list all numbers"*, carried as an argument rather than a token cycle
+(the most-repeated 40-character window recurs 4–6×, against 1–3× in every run that closed) — and the
+window ends it mid-sentence. It is the shape the 1.7B `w4` showed at `cache_1024`
+([the loop table](#the-loop-at-w8-the-same-cache-closes-it-on-wider-weights)), and unlike that one it is
+**not** closed by width at this size. It is also not a mode: the three `1..200` runs are three different
+outcomes, where the page's other `cache_1024` failures were byte-identical draws off one another.
+
+**What that means for the graph the accuracy table prefers.** The 8B `w8` — the one build at this size
+that [beats its `w4` siblings against truth](#the-8b-at-w8-the-width-lever-falls-short) — is **not
+deployable for long generations behind a `cache_1024` window**: five of nine attempts either hang or
+never answer, and its three `France?` runs are not byte-identical (one inserts a flag emoji into an
+otherwise identical answer). The failure lives in the *reasoning block*, so a short greedy prompt cannot
+expose it — the ladder's nine identical runs on `The capital of France is` are real and say nothing about
+this. The lever the page's own data points at is the **cache**, not the width: our 8B `w4` at
+`cache_4096` completes both enumerations
+([the decisive cell](#the-decisive-cell-our-8b-at-the-vendors-cache-still-corrupts)) and the 1.7B sweep
+closes the loop already at `2048`. One rebuild — an 8B `w8` at `cache_2048` or `4096` — would buy it;
+the caveat that comes with the price is that `cache_4096` is where our 8B `w4` corrupted *most* (six of
+six runs, and a shorter `1..400` prefix than at `1024`), so the cache answers the rumination while
+leaving the surface it fixes untested at `w8`/`4096` in the other direction.
 
 #### The decisive cell: our 8B at the vendor's cache still corrupts
 
@@ -2143,9 +2196,12 @@ directions:
   the `w4` `cache_1024` capture, 13 in the `cache_4096` one — appears **zero** times here (no token
   `95234`, no text hit, across all 49 completed rows), the first our-build 8B capture clean on the
   corpus (the shipped 8B's capture was already clean; the paragraph below carries the same count).
-  But the `1..N` enumeration battery was **not** re-run at `w8`, and the page's own caution applies:
-  the slip is intermittent and prompt-moved, so a clean corpus narrows the bet rather than settling
-  it.
+  The `1..N` enumeration battery has since been re-run at `w8` and the slip is **absent** there too —
+  0 occurrences in 27 runs across the 1.7B, 4B and 8B
+  ([the battery at `w8`](#the-1n-battery-at-w8-the-slip-is-gone-and-the-8b-fails-a-different-way)) —
+  so the corrupted token is gone from the enumeration as well as the corpus. What that battery does
+  find is the 8B's *other* long-generation failure, five runs of nine: the graph is not deployable
+  behind a `cache_1024` window on long prompts even though its slip is gone.
 
 **The 4B closes the table, and it is the one row still paired the confounded way.** The 4B is the last
 size with a shipped-and-ours pair, so the provenance gap now rests on **all four** sizes rather than
