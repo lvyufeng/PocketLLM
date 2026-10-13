@@ -859,6 +859,44 @@ at `m = 192`, each return one digest per arm over three runs, and the two arms a
 `q4_K` takes the row path with the rest of the projections; the repacked `q6_K` branch is exercised by
 the 29 `q6_K` tensors each checkpoint carries, which this backend repacks at load.
 
+### The int8 activation path was built and measured, and it does not pay — do not re-attempt it blind
+
+An int8 activation path in llama.cpp's MMQ shape — per-32-group `int8` activation codes, `__dp4a` over
+q4_K's 0..15 nibbles, the group's `sd`/`md` folded out of the inner loop as
+`sx * (sd * dot - md * sumq)` — was implemented for both directions behind
+`POCKETLLM_CUDA_DECODE_INT8` and `POCKETLLM_CUDA_PREFILL_INT8` (default off), integrated into the
+engine, and **not shipped**. The integrated result, interleaved A/B on the same binary at
+`Qwen3-1.7B-Q4_K_M.gguf`, `cuda`:
+
+| | flags off (shipped fp32) | flags on (int8) | ratio |
+|---|---:|---:|---:|
+| `pp512` t/s | 1043 | 1042 | **1.00×** |
+| `tg128` t/s | 107.2 | 43.9 | **0.41×** |
+
+Prefill is neutral and decode is **2.4× slower**. The reason is worth recording, because the same trap
+is easy to fall into again:
+
+- **A probe measured 1.7×, and the probe was wrong.** That number divided by a `row8` *reconstructed
+  in the probe*, not by the engine's shipped `gemm_quant_row_kernel`. The shipped kernel already hoists
+  the q4_K header decode into one vector `uint4` load (measured 16.1 ms → 8.3 ms at the raised issue,
+  in the kernel's own comment) and vectorizes the nibble runs. The decode work the int8 path was meant
+  to remove had already been removed; prefill was left with nothing to win. **Price every candidate
+  against the shipped kernel, never a reconstruction of it.**
+- **At `m == 1` there is no row tile to amortize the activation quantization.** The int8 kernel pays an
+  amax scan and an 8-bit codec per super-block per step, and its per-thread nibble unpack (`qw`) is
+  *not* removed unless the *weights* are repacked to int8. So decode int8 does strictly more work than
+  fp32 at the decode shape — hence 0.41×. Decode int8 cannot win without a q8_1 **weight** repack, and
+  none exists.
+- Two bugs found on the way, both fixed and reflected above: the nibble unpack sat inside the `R`-row
+  loop (re-doing the decode `R` times), and the activation quantizer divided per element instead of
+  multiplying by a reciprocal.
+
+The code was **correct** — flags-off is byte-identical to `main` (prefill logits digests and decode
+steps match exactly), and the 27-test token gate passes with the flags both off and on, on both
+checkpoints. It is a capability that does not pay, so it is not in the tree; this note is the record so
+the next attempt starts from the measurement instead of the probe. The 1.7B's step-5 divergence under
+one quantizer form is the same near-tie the decode-split section above documents (#690).
+
 ### The decode GEMM's grid was `ceil(n / 32)` blocks; the split gives each column eight of them
 
 At `m == 1` the packed GEMM's grid *is* its output width — one warp per 32 columns — so the 1.7B's
