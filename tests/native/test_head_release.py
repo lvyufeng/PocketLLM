@@ -86,11 +86,23 @@ def _header(path: pathlib.Path):
 
 def _tie_state(path: pathlib.Path) -> bool | None:
     """True when tied, False when the file carries a separate head, None when
-    the file is unreadable."""
+    the file is unreadable or is not a checkpoint this test can classify.
+
+    The question is whether the head and the embedding table are one buffer, so
+    a file that has no `token_embd.weight` at all -- the draft exports (dflash,
+    dspark) on the model hosts -- is neither tied nor untied here: reading it as
+    "tied" picked it for the tied test, where `_head_bytes` then had no table to
+    measure and the test died with a `KeyError` instead of skipping.  The gate
+    is the tensor `_head_bytes` reads, not the file's name or architecture, so a
+    checkpoint that has what the test needs is still selected regardless of how
+    it is spelled."""
     parsed = _header(path)
     if parsed is None:
         return None
-    return "output.weight" not in parsed.tensors_by_name
+    tensors = parsed.tensors_by_name
+    if "token_embd.weight" not in tensors:
+        return None
+    return "output.weight" not in tensors
 
 
 def _pick(tied: bool) -> pathlib.Path | None:

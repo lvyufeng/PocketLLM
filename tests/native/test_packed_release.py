@@ -113,9 +113,20 @@ print(json.dumps({"ids": ids, "after_open": after_open, "after_decode": after_de
 '''
 
 #: What a run that could not reach the board's runtime looks like.  These turn a
-#: failed probe into a skip -- the device or the CANN runtime is the reason, not
-#: the code -- and anything else is a failure with the child's own message.
-UNAVAILABLE = ("no backend named", "is not built", "aclInit", "aclrtSetDevice", "aclrtCreateContext")
+#: failed probe into a skip -- the device, the CANN runtime or the build's own
+#: backend set is the reason, not the code -- and anything else is a failure with
+#: the child's own message.  "is not in this build" is `registry.cpp`'s refusal,
+#: spelled the way it spells it: a CPU-only build opens `ascend` with
+#: "backend 'ascend' is not in this build; it provides 'cpu' and 'cuda'", which
+#: says the artifact is absent rather than that the probe misbehaved.
+UNAVAILABLE = (
+    "no backend named",
+    "is not built",
+    "is not in this build",
+    "aclInit",
+    "aclrtSetDevice",
+    "aclrtCreateContext",
+)
 
 
 def _model_dirs() -> list[pathlib.Path]:
