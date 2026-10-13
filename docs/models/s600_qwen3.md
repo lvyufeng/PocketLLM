@@ -2203,6 +2203,62 @@ directions:
   find is the 8B's *other* long-generation failure, five runs of nine: the graph is not deployable
   behind a `cache_1024` window on long prompts even though its slip is gone.
 
+**Why it sits below the floor, decomposed from the captures.** This is the one S600 accuracy cell the
+rest of the page's lattice does not explain, so it is worth ruling the candidates out one at a time.
+All four of the build-side ones are ruled out, and each by a number already in the artifacts.
+
+- **Not the `cache_1024` window.** The 8B does truncate more than the smaller sizes — 11 of its 49
+  answers run past 900 tokens and the longest is 997, against 4 of 50 at 0.6B — but **no comparison
+  here ended because the board ran out**: every divergence sits at token 109 or earlier (`s600_tok`
+  is never null), and truncation happens *after* `</think>` while every divergence happens inside the
+  reasoning block. Cutting the answer's tail cannot move a prefix measured at the block's head.
+- **Not a widened tail.** Our `w8` carries **1** wide-margin split (≥5 logits) in 49; its own `w4`
+  sibling carried **4** in 46, out to **22.9**. The rebuild removed the confident-disagreement tail
+  rather than growing one, and the single survivor is a 5.15.
+- **Not a uniform step earlier.** The paired sign is two-sided: 28 shorter, 6 equal, **15 longer**,
+  net −271. A uniform drift cannot produce 15 wins.
+- **A five-prompt tail, and it is the floor's tail, not our hole.** The five worst —
+  `code_03` (−76), `fact_03` (−71), `arith_01` (−69), `fact_06` (−62), `instr_06` (−44) — sum to
+  **−322**, more than the entire net deficit: drop them and the `w8` **beats** the floor by **+51**.
+  On the 24 prompts where the floor is below its own median, our `w8` nets **+164** at a median Δ of
+  exactly **0**; the whole deficit is the other 25 (−435, median Δ −11). Those five are prompts where
+  the floor stays glued to truth for 63–119 tokens while ours steps off at 14–43.
+
+**The deeper answer is that our `w8` stops improving at this size while the floor does not.** Read
+against truth at every size on the same 49 prompts (the `f16`-anchored rows, matched so that a stall
+cannot flatter either side):
+
+| size | ours `w8` Σ | floor Σ | ratio |
+|---|---|---|---|
+| 0.6B | 958 | 977 | 0.98 |
+| 1.7B | 1,163 | 945 | 1.23 |
+| 4B | 1,637 | 1,534 | 1.07 |
+| **8B** | **1,619** | **1,890** | **0.86** |
+
+Our curve rises and then flattens and turns over — **+205, +474, −18** — while the floor's keeps
+climbing — −32, **+589, +356**. Paired on the same prompts the 4B and the 8B `w8` graphs are a
+**coin-flip** apart (median Δ **0**, 23 shorter, 24 longer), so the 8B is not a *worse build* than the
+4B one: the two sit at the same level, and the floor is what crossed it. That is also why the
+classification the page's other rows use does not fit here. It is not the `0.6B` coin-flip shape (the
+median Δ against the floor is −3, not 0), nor the 8B `w4` uniform drift (15 of 49 are wins), nor the
+1.7B/4B widened tail (2% wide splits, the lowest of any our-build row at this size). It is a coin-flip
+comparison whose sign was decided by five prompts, and the side that won them was the floor's.
+
+**And it is not the answer content.** All 46 scoring `w8` divergences fall **inside** the ` thinking`
+block — none after it — so the table is measuring how long a *reasoning stream* stays token-identical
+to truth's, not whether the answer is right. `fact_03`'s split is at token 28 of a block that goes on
+to say *"Shakespeare wrote Hamlet, right? Yeah, William Shakespeare is the author"*: correct, and
+scored as a divergence. At this size our stream holds identity for a median of 28 tokens against the
+floor's 34, on blocks whose median length is 364.
+
+**No build lever is indicated, and the one unmeasured lever is out of reach.** The captures locate no
+build-side cause to fix — the deficit is the floor's five prompts — and the lever that would be the
+candidate is already pulled: `w4`→`w8` was +890 at this size. A further step to `w16` does not fit
+this board. The file is essentially all weights (9,078,659,624 B for 8.19 B parameters, ≈8.9 bits
+each), so doubling the width doubles it, to ≈18.2 GB of file plus the 1.39 GB of load overhead this
+graph measured — **≈19.6 GB against the pool's 19.33 GB**. Nothing here justifies a build until that
+arithmetic changes.
+
 **The 4B closes the table, and it is the one row still paired the confounded way.** The 4B is the last
 size with a shipped-and-ours pair, so the provenance gap now rests on **all four** sizes rather than
 three — but it is paired the *same* way as the others, ours at `cache_1024` against the vendor's
