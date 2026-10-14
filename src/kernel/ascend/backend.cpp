@@ -221,6 +221,19 @@
 #include "quant/blocks.h"
 #include "runtime/status.h"
 
+/* The Ascend host is aarch64, and the A55's fp16 convert (`vcvt_f16_f32`, four
+ * floats per instruction) is the difference between 215 and 482 Mweights/s on
+ * the plane build -- measured on the board, and bit-identical to the software
+ * conversion below (round-to-nearest-even both, checked over 2M values with no
+ * mismatch).  Guarded so a non-NEON build still compiles; the plane build is
+ * host code and never runs on the device. */
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#define POCKETLLM_HAVE_NEON_F16 1
+#else
+#define POCKETLLM_HAVE_NEON_F16 0
+#endif
+
 namespace pocketllm {
 namespace kernel {
 
@@ -266,6 +279,46 @@ constexpr int kNumStages = 10;
 const char *const kStageNames[kNumStages] = {
     "to_f16",    "to_f32",         "sdma_up",   "sdma_down", "tensor_create",
     "tensor_destroy", "ws_get",    "ws_alloc",  "op_enqueue", "op_sync"};
+
+/* The prologue phases: the one-time *host* build that turns packed GGUF blocks
+ * into the device fp16 plane (`cube_for`, `dense_table_for`).  It is wall time
+ * on the single thread that builds the model and is deliberately not one of the
+ * ten stage slots -- those split a *decode step*, while this happens once and
+ * dominates a short run's wall.  Named, it stops the gap between the profile's
+ * total and the process's own wall from reading as a mystery. */
+std::unordered_map<std::string, std::pair<double, long>> &build_phases() {
+  /* Deliberately leaked rather than a plain function-local static: the map is
+   * read from `StageStats`'s destructor at process exit, and a static here is
+   * constructed *after* `profiler()`'s (the first op runs before the first
+   * plane build) and so destroyed *before* it -- which would leave the dump
+   * walking a freed container.  One allocation for the life of the process is
+   * the cheap fix, and this is a profiling path. */
+  static auto *m = new std::unordered_map<std::string, std::pair<double, long>>();
+  return *m;
+}
+
+void build_phase_add(const std::string &name, double ms) {
+  auto &p = build_phases()[name];
+  p.first += ms;
+  p.second += 1;
+}
+
+struct BuildClock {
+  const char *label;
+  bool on = false;
+  double t0 = 0.0;
+  explicit BuildClock(const char *l) : label(l) {
+    if (profile_on()) {
+      on = true;
+      t0 = now_ms();
+    }
+  }
+  ~BuildClock() {
+    if (on) {
+      build_phase_add(label, now_ms() - t0);
+    }
+  }
+};
 struct StageStats {
   double ms[kNumStages] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   long calls[kNumStages] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -306,6 +359,21 @@ struct StageStats {
                   total > 0 ? 100.0 * ms[i] / total : 0.0, calls[i]);
     }
     std::printf("  %-15s %10.1f ms\n", "TOTAL", total);
+    /* The prologue: the one-time host build of the device plane, which the ten
+     * stage slots above do not see (it is not inside an op scope).  Printed so
+     * the gap between this total and the process's own wall is named. */
+    double build_total = 0;
+    for (const auto &kv : build_phases()) {
+      build_total += kv.second.first;
+    }
+    if (build_total > 0) {
+      std::printf("\n[pocketllm ascend profile] one-time prologue (host build, outside op scopes)\n");
+      for (const auto &kv : build_phases()) {
+        std::printf("  %-16s %10.1f ms  %8ld calls\n", kv.first.c_str(), kv.second.first,
+                    kv.second.second);
+      }
+      std::printf("  %-16s %10.1f ms\n", "PROLOGUE", build_total);
+    }
     std::printf("\n[pocketllm ascend profile] by op\n");
     for (const auto &kv : ops) {
       std::printf("  %-16s %10.1f ms  %8ld calls  %8.3f ms/call\n", kv.first.c_str(), kv.second.first,
@@ -505,6 +573,112 @@ float f16_to_f32(uint16_t h) {
   float value;
   std::memcpy(&value, &bits, sizeof(value));
   return value;
+}
+
+/* Decode one whole 256-weight q4_K super-block at once.  This is the *same
+ * arithmetic* as `quant::dequant_q4_k` called 256 times -- the expression is
+ * `(d * scale) * q - dmin * minimum` in both, associated left-to-right, so the
+ * two agree bit for bit -- but the per-block constants (`d`, `dmin`, and the
+ * eight scale/min pairs, each of which the per-element decoder re-derives from
+ * the packed `scales[12]` for every one of the 256 weights) are read and unpacked
+ * **once** instead of 256 times.
+ *
+ * That difference is the whole plane build.  `dequant_q4_k` is written for a
+ * packed GEMM that consumes a weight the instant it is decoded and never wants a
+ * row in memory; the plane build is the opposite shape -- it materializes every
+ * weight -- and paying the per-weight header unpack there measured 6.8 s of a
+ * 28 s 0.6B run on the four A55 cores.  Measured single-threaded on the board,
+ * this form is ~5.3x the per-element one (545 vs 103 Mweights/s). */
+void dequant_q4_k_block(const uint8_t *block, float *out) {
+  const float d = quant::as_half(block, 0);
+  const float dmin = quant::as_half(block, 2);
+  for (int g = 0; g < 8; ++g) {
+    int scale = 0;
+    int minimum = 0;
+    quant::get_scale_min_k4(block + 4, g, &scale, &minimum);
+    const float a = d * static_cast<float>(scale);
+    const float b = dmin * static_cast<float>(minimum);
+    const uint8_t *run = block + 16 + (g / 2) * 32;
+    float *dst = out + g * 32;
+    if (g & 1) {
+      for (int i = 0; i < 32; ++i) {
+        dst[i] = a * static_cast<float>(run[i] >> 4) - b;
+      }
+    } else {
+      for (int i = 0; i < 32; ++i) {
+        dst[i] = a * static_cast<float>(run[i] & 0x0F) - b;
+      }
+    }
+  }
+}
+
+/* The q6_K counterpart, for the same reason.  The scales are 16 signed bytes
+ * indexed by `half * 8 + i / 16 + 2 * sub`, so this walks the two 128-weight
+ * halves and reads `d` once.  The value is
+ * `d * scale * (q - 32)` in both forms -- the sub-block `q` assembly is the one
+ * `quant::q6_k_raw_value` does, reproduced here so the two decoders cannot drift
+ * (both are transcriptions of the same file layout, and only one of them may be
+ * wrong). */
+void dequant_q6_k_block(const uint8_t *block, float *out) {
+  const float d = quant::as_half(block, 208);
+  for (int half = 0; half < 2; ++half) {
+    for (int sub = 0; sub < 4; ++sub) {
+      const int base = half * 128 + sub * 32;
+      for (int i = 0; i < 32; ++i) {
+        const int ql = quant::as_byte(block, half * 64 + (sub % 2) * 32 + i);
+        const int qh = quant::as_byte(block, 128 + half * 32 + i);
+        const int high = ((qh >> (2 * sub)) & 3) << 4;
+        const int low = sub < 2 ? (ql & 0x0F) : (ql >> 4);
+        const int q = low | high;
+        const int scale = quant::as_int8(block, 192 + half * 8 + i / 16 + 2 * sub);
+        out[base + i] = d * static_cast<float>(scale) * static_cast<float>(q - 32);
+      }
+    }
+  }
+}
+
+/* One block of `type_id` decoded whole, dispatching the two layouts above. */
+void dequant_block_into(int type_id, const uint8_t *block, float *out) {
+  if (type_id == quant::kGgmlQ4K) {
+    dequant_q4_k_block(block, out);
+  } else {
+    dequant_q6_k_block(block, out);
+  }
+}
+
+/* Convert an `[n, k]` row-major f32 weight to the `[k, n]` fp16 plane the cube's
+ * B operand wants: each source row becomes a destination column.  A naive walk
+ * writes one element per output cache line (stride `n`); walking the source in
+ * `kConvertTile`-square tiles keeps both operands resident, which measured 482
+ * vs 355 Mweights/s over the untiled form -- and 215 for the software convert.
+ * `POCKETLLM_HAVE_NEON_F16` picks the four-wide `vcvt_f16_f32`; the scalar path
+ * is bit-identical to it. */
+constexpr int64_t kConvertTile = 64;
+
+void f32_to_f16_transposed(const float *src, int64_t n, int64_t k, uint16_t *dst) {
+  for (int64_t rb = 0; rb < n; rb += kConvertTile) {
+    const int64_t r_end = std::min(n, rb + kConvertTile);
+    for (int64_t cb = 0; cb < k; cb += kConvertTile) {
+      const int64_t c_end = std::min(k, cb + kConvertTile);
+      for (int64_t r = rb; r < r_end; ++r) {
+        const float *row = src + r * k;
+        int64_t c = cb;
+#if POCKETLLM_HAVE_NEON_F16
+        for (; c + 4 <= c_end; c += 4) {
+          uint16_t tmp[4];
+          vst1_u16(tmp, vreinterpret_u16_f16(vcvt_f16_f32(vld1q_f32(row + c))));
+          dst[(c + 0) * n + r] = tmp[0];
+          dst[(c + 1) * n + r] = tmp[1];
+          dst[(c + 2) * n + r] = tmp[2];
+          dst[(c + 3) * n + r] = tmp[3];
+        }
+#endif
+        for (; c < c_end; ++c) {
+          dst[c * n + r] = f32_to_f16(row[c]);
+        }
+      }
+    }
+  }
 }
 
 /* ---- host scratch for a device region ----------------------------------- */
@@ -1684,12 +1858,7 @@ class AscendBackend final : public Backend {
     for (int64_t n0 = 0; n0 < n; n0 += cube_chunk_n()) {
       const int64_t nc = std::min(cube_chunk_n(), n - n0);
       std::vector<uint16_t> b_h(static_cast<std::size_t>(k * nc));
-      for (int64_t r = 0; r < nc; ++r) {
-        for (int64_t c = 0; c < k; ++c) {
-          b_h[static_cast<std::size_t>(c * nc + r)] =
-              f32_to_f16(w_f32[static_cast<std::size_t>((n0 + r) * k + c)]);
-        }
-      }
+      f32_to_f16_transposed(w_f32.data() + n0 * k, nc, k, b_h.data());
       /* Chunks are stored back-to-back, so chunk `i`'s plane starts at the sum
        * of the earlier chunks' `k * nc` elements -- the same walk `run_cube_weight`
        * does with `woff`. */
@@ -2005,18 +2174,23 @@ class AscendBackend final : public Backend {
     std::vector<uint8_t> host(static_cast<std::size_t>(total));
     copy_to_host(host.data(), blocks, total);
     std::vector<float> dense(static_cast<std::size_t>(n * k));
-    for (int64_t row = 0; row < n; ++row) {
-      for (int64_t b = 0; b < blocks_per_row; ++b) {
-        const uint8_t *block = host.data() + (row * blocks_per_row + b) * block_bytes;
-        for (int64_t i = 0; i < quant::kBlockWeights; ++i) {
-          dense[static_cast<std::size_t>(row * k + b * quant::kBlockWeights + i)] =
-              quant::dequant_block(type_id, block, static_cast<int>(i));
+    {
+      BuildClock _b("decode_cube");
+      for (int64_t row = 0; row < n; ++row) {
+        for (int64_t b = 0; b < blocks_per_row; ++b) {
+          const uint8_t *block = host.data() + (row * blocks_per_row + b) * block_bytes;
+          dequant_block_into(type_id, block,
+                             dense.data() + row * k + b * quant::kBlockWeights);
         }
       }
     }
     /* Decode once, straight into the transposed fp16 plane the cube wants -- no
      * intermediate f32 device buffer and no per-token re-transpose. */
-    CubeWeight wq = build_cube_weight_from_f32(dense, n, k);
+    CubeWeight wq;
+    {
+      BuildClock _b("transpose_cube");
+      wq = build_cube_weight_from_f32(dense, n, k);
+    }
     /* Re-check under the lock rather than hold it across the decode above: the
      * decode is the expensive part (a host walk over every block, then the
      * transpose) and it does not touch shared state, so two callers for the same
@@ -2055,17 +2229,21 @@ class AscendBackend final : public Backend {
     std::vector<uint8_t> host(static_cast<std::size_t>(total));
     copy_to_host(host.data(), blocks, total);
     std::vector<float> dense(static_cast<std::size_t>(vocab * d));
-    for (int64_t row = 0; row < vocab; ++row) {
-      for (int64_t b = 0; b < blocks_per_row; ++b) {
-        const uint8_t *block = host.data() + (row * blocks_per_row + b) * block_bytes;
-        for (int64_t i = 0; i < quant::kBlockWeights; ++i) {
-          dense[static_cast<std::size_t>(row * d + b * quant::kBlockWeights + i)] =
-              quant::dequant_block(type_id, block, static_cast<int>(i));
+    {
+      BuildClock _b("decode_table");
+      for (int64_t row = 0; row < vocab; ++row) {
+        for (int64_t b = 0; b < blocks_per_row; ++b) {
+          const uint8_t *block = host.data() + (row * blocks_per_row + b) * block_bytes;
+          dequant_block_into(type_id, block,
+                             dense.data() + row * d + b * quant::kBlockWeights);
         }
       }
     }
     DeviceBuffer device = allocate(vocab * d * 4);
-    copy_to_device(device, dense.data(), vocab * d * 4);
+    {
+      BuildClock _b("upload_table");
+      copy_to_device(device, dense.data(), vocab * d * 4);
+    }
     /* Same emplace-and-release-the-loser contract as `cube_for`: the decode does
      * not touch shared state, so two callers may both build; the loser frees its
      * copy rather than leaking it. */
