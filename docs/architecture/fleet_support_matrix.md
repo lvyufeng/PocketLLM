@@ -142,15 +142,21 @@ The 8B is this board's ceiling.
 
 ### Orange Pi — Ascend 310B (marginal decode, `--steps 8` vs `32`)
 
-| Model | Prefill | Decode | One-time plane build |
-|---|---|---|---|
-| Qwen3-0.6B | 0.065 s/token | **0.129 s/token** (7.8 t/s) | ~24.2 s |
-| Qwen3-1.7B | 0.065 s/token | **0.39 s/token** (2.6 t/s) | ~85.6 s |
-| Qwen3-4B | 0.129 s/token | **0.640 s/token** (1.6 t/s) | ~202 s |
-| Qwen3-8B | — | **1.55 s/token** (0.65 t/s; release on) | ~430 s |
+| Model | Prefill | Decode | One-time plane build | `--steps 8` wall |
+|---|---|---|---|---|
+| Qwen3-0.6B | 0.065 s/token | **0.129 s/token** (7.8 t/s) | 6.1 s | 13.1 s |
+| Qwen3-1.7B | 0.065 s/token | **0.39 s/token** (2.6 t/s) | 16.0 s | 28.4 s |
+| Qwen3-4B | 0.129 s/token | **0.640 s/token** (1.6 t/s) | 44.0 s | 65.8 s |
+| Qwen3-8B | — | **1.55 s/token** (0.65 t/s; release on) | — | 244.1 s |
 
-The wall is almost entirely the **one-time plane build**, not decode. Batching is the throughput
-lever: aggregate 1.42 → 8.16 t/s over B=1…16, with a step of `0.1378 + 0.0641·(B−1)` s. The bound is
+The plane build was **2.7× faster** as of 2026-10-14 (was ~24.2 / ~85.6 / ~202 / ~430 s): the weights
+are now decoded a whole super-block at a time and the plane is transposed with the A55's
+`vcvt_f16_f32`, so the `--steps 8` wall roughly halved-to-thirded at every size (28.4 → 13.1 s, 92.9 →
+28.4 s, 228.5 → 65.8 s, 528.8 → 244.1 s), byte-identical output. See
+[ascend_310b.md](ascend_310b.md#current-state-the-canonical-numbers-after-the-series). The wall is now
+split between the prologue and decode rather than being almost entirely the prologue. Decode is still
+the throughput question, and batching is its lever: aggregate 1.42 → 8.16 t/s over B=1…16, with a step of
+`0.1378 + 0.0641·(B−1)` s. The bound is
 **interior m=B kernel work, not op-launch count**, which is why the fused attention kernel was
 declined — see [the batched-decode bound](ascend_310b_batch_decode_bound.md) and
 [ascend_310b.md](ascend_310b.md#current-state-the-canonical-numbers-after-the-series).
