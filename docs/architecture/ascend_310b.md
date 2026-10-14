@@ -1526,10 +1526,13 @@ and nothing else still took 3.6 s to disappear, and eighteen variants — explic
 `aclrtSetOpWaitTimeout(1)`, `aclrtSetOpExecuteTimeOut(1)`, `aclrtSetOpExecuteTimeOutV2`, and
 `aclrtSynchronizeDeviceWithTimeout(1000)` and `(0)` — all landed inside **3.556–3.606 s**, a 50 ms
 spread. Setting the knobs before `aclInit` changed nothing either. `aclInit` alone costs 46 ms to exit;
-it is `aclrtSetDevice` that arms the tax. In the tool the same tail is ~4.9 s, so ~1.6 s of it *is* our
-own userspace teardown on top of the ~3.3 s the attach costs — which is why `std::_Exit(0)` at the end
-of `main` saves a real **1.77 s** at 0.6B, 0.90 s at 1.7B and 0.98 s at 4B. Those saves are unchanged
-in the kernel-side part, which no userspace change reaches.
+it is `aclrtSetDevice` that arms the tax. With the process's teardown skipped (`std::_Exit` at the end
+of `main`, which `pocketllm-run` now does) the tail left in the tool is **3.21 / 3.23 / 4.00 s** at
+0.6B / 1.7B / 4B — a flat ACL floor plus, at 4B, the free of its 8 GiB of planes. Keeping the
+destructors adds this process's own teardown on top, which itself measures as one more of the same
+bands (3.07 s at 0.6B). So the saving a caller sees is band-dependent rather than a constant:
+**3.02 / 0.39 / 2.41 s** across the three checkpoints in one session, and 1.77 / 0.90 / 0.98 s in
+another — the difference between the two sessions is which band each arm landed in, not the work.
 
 **The wall is therefore a staircase, not a line.** `--steps` at fixed 5-token prefill, two runs each:
 
