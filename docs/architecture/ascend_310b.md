@@ -1450,15 +1450,22 @@ the 5-token prompt minus that prompt's own prefill.
 
 | checkpoint | decode, marginal | prefill (5→100 tok) | one-time plane build | `--steps 8` wall |
 |---|---|---|---|---|
-| Qwen3-0.6B | **0.129 s/token** | 0.065 s/token | 3.3 s | 10.0 s |
-| Qwen3-1.7B | **0.390 s/token** | 0.065 s/token | 8.1 s | 19.2 s |
-| Qwen3-4B | **0.640 s/token** | 0.129 s/token | 21.7 s | 43.8 s |
+| Qwen3-0.6B | **0.129 s/token** | 0.065 s/token | 2.1 s | 12.8 s ⚠ |
+| Qwen3-1.7B | **0.390 s/token** | 0.065 s/token | 5.4 s | 18.9 s |
+| Qwen3-4B | **0.640 s/token** | 0.129 s/token | 14.4 s | 41.2 s |
 | Qwen3-8B | **1.55 s/token** | — | — | — |
 
-**The plane-build column was re-measured on 2026-10-14 and is 4–8× the number it was** — the
-`--steps 8` walls are 10.0 / 19.2 / 43.8 s against the earlier 24.5 / 85.9 / 208.9 s, and the output
-is byte-identical to the earlier binary at every size. The decode and prefill columns are unchanged
-(the work touches neither). Two changes, and why the cost was invisible for so long:
+⚠ **The 0.6B wall is not comparable to the other rows, and neither is the column across
+sessions** — the process wall is quantized in ~3.07 s bands and the 0.6B sits near the *bottom*
+band's edge, so the same binary reports 9.7 or 12.8 s for the same work. The plane-build column is
+the reproducible one (it reproduced 3.3 / 8.1 / 21.7 s exactly before the register transpose below,
+one session later). See [the wall is quantized](#the-process-wall-is-quantized-in-307-s-bands).
+
+**The plane-build column was re-measured twice on 2026-10-14.** First it went 4–8× down — the
+`--steps 8` walls read 10.0 / 19.2 / 43.8 s against the earlier 24.5 / 85.9 / 208.9 s, output
+byte-identical at every size. Then the transpose described below took the prologue another 1.5× down
+(3.3 → 2.1 s at 0.6B, 8.1 → 5.4 s at 1.7B, 21.7 → 14.4 s at 4B), which moved the 1.7B and 4B walls
+by one and two bands. The decode and prefill columns are unchanged — no work below touches either.
 
 `cube_for` and `dense_table_for` decoded each weight with `quant::dequant_block` **once per weight**,
 so every one of a super-block's 256 weights re-derived the block header — two fp16 loads, the
@@ -1477,24 +1484,72 @@ The measured prologue split at 0.6B, from the `one-time prologue` table the prof
 was previously outside every op scope, which is why the per-stage total read 1.7 s against a 28.4 s
 wall):
 
-| phase (0.6B) | before | serial fix | threaded |
-|---|---|---|---|
-| `transpose_cube` — f32→f16 + transposed upload | 7922 ms | 4132 ms | **2217 ms** |
-| `decode_cube` — packed block → f32 | 6834 ms | 1204 ms | **662 ms** |
-| `decode_table` — the embedding gather table | 1707 ms | 672 ms | **289 ms** |
-| `upload_table` | 125 ms | 125 ms | 125 ms |
-| **PROLOGUE** | **16588 ms** | **6133 ms** | **3293 ms** |
+| phase (0.6B) | before | serial fix | threaded | register transpose |
+|---|---|---|---|---|
+| `transpose_cube` — f32→f16 + transposed upload | 7922 ms | 4132 ms | 2217 ms | **1060 ms** |
+| `decode_cube` — packed block → f32 | 6834 ms | 1204 ms | 662 ms | 662 ms |
+| `decode_table` — the embedding gather table | 1707 ms | 672 ms | 289 ms | 289 ms |
+| `upload_table` | 125 ms | 125 ms | 125 ms | 125 ms |
+| **PROLOGUE** | **16588 ms** | **6133 ms** | **3293 ms** | **2140 ms** |
 
-The threaded prologue is 8.1 s at 1.7B and 21.7 s at 4B. The gain over the serial build is ~1.9×
-rather than 4× because it is now partly bound by the host↔device copies, not the decode. The
-`--steps 8` wall is still dominated by the plane build at 8B, and is now roughly a third prologue,
-two thirds decode-to-8-tokens at 0.6B. The build is a plain *host CPU* cost with `transpose_cube` the
-largest single phase left, so the next step for a workload that runs the same checkpoint repeatedly is
-to **persist the plane to disk** and skip the build entirely on the second run; nothing on the board
-does that today. (Its size is the fp16 plane, ~1.2 GiB at 0.6B.) The decode rates move with the checkpoint exactly as the weight count predicts
-(0.6B → 1.7B is 2.8× the weights, 0.129 → 0.390 is 3.0×; 1.7B → 4B is 2.35×, 0.390 → 0.640 is 1.6×
-because the 4B's layer count rises to 36 and its prefill-heavy head is a smaller share of a slower
-step).
+The register transpose is the last column and is the subject of the next subsection; the three
+columns before it are the series described below. The threaded prologue was 8.1 s at 1.7B and 21.7 s
+at 4B, and is now 5.4 s and 14.4 s. The threading step's own gain is ~1.9× (6133 → 3293 ms) rather
+than the 4× of the board's core count, because the build is now partly bound by the host↔device
+copies, not the decode. The build is a plain *host CPU* cost
+with `transpose_cube` still the largest single phase left, so the next step for a workload that runs
+the same checkpoint repeatedly is to **persist the plane to disk** and skip the build entirely on the
+second run; nothing on the board does that today. (Its size is the fp16 plane, ~1.2 GiB at 0.6B.) The
+decode rates move with the checkpoint exactly as the weight count predicts (0.6B → 1.7B is 2.8× the
+weights, 0.129 → 0.390 is 3.0×; 1.7B → 4B is 2.35×, 0.390 → 0.640 is 1.6× because the 4B's layer
+count rises to 36 and its prefill-heavy head is a smaller share of a slower step).
+
+**The transpose is done in registers now, and that is the change to `transpose_cube`.** The old
+kernel converted four `f32` at a time with `vcvt_f16_f32` and then scattered the four halves with
+four scalar stores to `dst[c*n + r]` — four destinations, four cache lines, per four weights. The new
+one walks eight source rows at a time, converts them, and transposes the 8×8 block *in the vector
+registers* with the standard three-stage `vtrnq` butterfly (16-bit lanes, then 32-bit, then 64-bit),
+so a destination row leaves as one 16-byte `vst1q_u16` of eight contiguous halves instead of eight
+two-byte stores. The values are the same round-to-nearest-even conversions — the two kernels are
+checked bit-identical, not assumed to be — and only the order the halves reach memory differs. It is
+2.10× at 0.6B, 1.86× at 1.7B, 1.73× at 4B: the ratio falls as the weight grows because the larger
+planes are closer to the bandwidth ceiling, where the stores were never the bound. An isolated
+microbenchmark put the same pair at 356 → 734 Mweights/s on a `1024×3072` tensor.
+
+### The process wall is quantized in 3.07 s bands
+
+A short `pocketllm-run` on this board has a **fixed process-exit tail of about 3.25 s that is armed by
+`aclrtSetDevice` and cannot be removed.** It is not the ACL/device teardown in this repository's
+destructors, and it is not an op timeout: a standalone probe that called `aclInit` and `aclrtSetDevice`
+and nothing else still took 3.6 s to disappear, and eighteen variants — explicit
+`aclrtResetDevice`+`aclFinalize`, no release at all, `std::_Exit(0)` straight after `SetDevice`,
+`aclrtSetOpWaitTimeout(1)`, `aclrtSetOpExecuteTimeOut(1)`, `aclrtSetOpExecuteTimeOutV2`, and
+`aclrtSynchronizeDeviceWithTimeout(1000)` and `(0)` — all landed inside **3.556–3.606 s**, a 50 ms
+spread. Setting the knobs before `aclInit` changed nothing either. `aclInit` alone costs 46 ms to exit;
+it is `aclrtSetDevice` that arms the tax. In the tool the same tail is ~4.9 s, so ~1.6 s of it *is* our
+own userspace teardown on top of the ~3.3 s the attach costs — which is why `std::_Exit(0)` at the end
+of `main` saves a real **1.77 s** at 0.6B, 0.90 s at 1.7B and 0.98 s at 4B. Those saves are unchanged
+in the kernel-side part, which no userspace change reaches.
+
+**The wall is therefore a staircase, not a line.** `--steps` at fixed 5-token prefill, two runs each:
+
+| steps | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| wall (s) | 9.67 | 9.72 | 9.73 | 12.77 | 12.80 | 15.87 | 18.94 |
+
+Steps 1, 2 and 4 are the *same* wall to within 80 ms even though each does 133 ms more decode —
+the extra work hides inside the band. Every band edge adds **3.07 s** (9.72 → 12.79 → 15.87 → 18.94),
+which is the fixed ACL tax, not anything the step did. So a short run's wall carries a ~3 s quantum
+that swamps any host-side win smaller than a band, and it is the reason the canonical table's wall
+column cannot be compared across sessions: the same binary on the same work reads 9.7 or 12.8 s
+depending on which side of an edge it lands.
+
+**The consequence for measuring.** A change that moved the *work* by 1227 ms at 0.6B — `model_loaded`
+5303 → 4089 ms, `main_end` 7781 → 6536 ms, measured by stamping the phases in the tool — left the wall
+inside 0.04 s of where it was, because both arms sat in the same band. The prologue table and a
+`main_end` stamp are the instruments that resolve it; the wall is not. That also means the plane cache
+mooted at the end of the previous subsection is worth less on the 0.6B short run than its build cost —
+a cache that saves a second cannot save a band, though it still pays at 4B and for repeated runs.
 
 **Decode is not one rate — it rises with context.** The marginal is a function of where the window
 sits, because every decode step attends to a KV cache that has grown by one. On the 0.6B, holding the
