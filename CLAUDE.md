@@ -15,11 +15,19 @@ The tree has two implementations of the same thing, at different levels of done,
 statement of what runs is the point of this section** — the status table in `README.md` is the
 authority and is checked against `pocketllm devices` and the registry rather than maintained by hand.
 
-**The C core (`src/`) runs Qwen3-0.6B and Qwen3-1.7B, in f16 and in `q4_k_m`.** `libpocketllm.so`
-reads a GGUF, tokenizes with the checkpoint's own BPE, walks the Qwen3 graph, and decodes greedily —
-on widened `f32`/`f16` weights, and on packed `q4_k`/`q6_k` that `src/quant/blocks.h` decodes inside
-the kernel and never expands. Verified token-for-token against llama.cpp on `cpu` and on one `cuda`
-card, for both checkpoints. The same core's **Ascend backend** (`src/kernel/ascend/`) runs the
+**The C core (`src/`) runs Qwen3-0.6B and Qwen3-1.7B, in f16 and in the K-quant rung of the width
+ladder — `q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k`.** `libpocketllm.so` reads a GGUF, tokenizes with the
+checkpoint's own BPE, walks the Qwen3 graph, and decodes greedily — on widened `f32`/`f16` weights,
+and on those five packed formats, which `src/quant/blocks.h` decodes inside the kernel and never
+expands. Verified token-for-token against llama.cpp on `cpu` and on one `cuda` card, for both
+checkpoints and for a file of each of the three formats beyond `q4_k_m`; each of the five is also
+checked block for block against llama.cpp's own decode of the same file, which is how the Python
+`q3_k` decoder's four-bit scale reading was found and fixed. The IQ rungs (`iq2_*`, `iq3_*`,
+`iq4_*`, `iq1_m`) are decoded in Python and refused at load by name; the ternary packs are
+addressable and not decoded. The three newer formats take the exact per-weight decode path rather
+than a packed kernel — `q4_k`'s AVX2 and int8-activation kernels are written for its own group
+arithmetic — so they are correct and roughly an order of magnitude slower; their packed kernels are
+the follow-up. The same core's **Ascend backend** (`src/kernel/ascend/`) runs the
 ladder on a board — Qwen3-0.6B through 8B on an Orange Pi AIpro, at the quantizer's own floor. Its
 evidence is softer than the `cpu`/`cuda` rows: the board has **no logits surface**, so the
 comparison is token agreement rather than token-for-token, and its weight scheme differs from the

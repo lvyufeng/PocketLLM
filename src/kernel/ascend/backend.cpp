@@ -638,12 +638,21 @@ void dequant_q6_k_block(const uint8_t *block, float *out) {
   }
 }
 
-/* One block of `type_id` decoded whole, dispatching the two layouts above. */
+/* One block of `type_id` decoded whole.  The two layouts above are the formats
+ * whose plane build has a hoisted decoder; every other k-quant of the ladder
+ * (`q2_k`, `q3_k`, `q5_k`) goes through the file-format decoder one weight at a
+ * time.  The plane is dense f32 either way, so the slow path costs build time
+ * and never accuracy -- and the alternative, a `q6_K` block read with a `q2_K`
+ * layout, is the kind of wrong that produces plausible text. */
 void dequant_block_into(int type_id, const uint8_t *block, float *out) {
   if (type_id == quant::kGgmlQ4K) {
     dequant_q4_k_block(block, out);
-  } else {
+  } else if (type_id == quant::kGgmlQ6K) {
     dequant_q6_k_block(block, out);
+  } else {
+    for (int i = 0; i < quant::kBlockWeights; ++i) {
+      out[i] = quant::dequant_block(type_id, block, i);
+    }
   }
 }
 

@@ -149,8 +149,9 @@ Both are the C behaviour by choice and both are pinned by
 
 ### The packed weights
 
-`src/quant/blocks.h` decodes `q4_k` and `q6_k` one weight at a time, and it is the one header the CPU
-and the CUDA kernels *share* — the exception to the independence above, and a deliberate one. What
+`src/quant/blocks.h` decodes the K-quant rung — `q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k` — one weight
+at a time, and it is the one header the CPU and the CUDA kernels *share* — the exception to the
+independence above, and a deliberate one. What
 those two kernels owe each other is correctness of an *algorithm*, and two implementations of an
 algorithm can only disagree by one of them being wrong. A bit layout is not an algorithm; it is a
 property of the file, and a second transcription of it would be a third place for the layout to be

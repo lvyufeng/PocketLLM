@@ -36,8 +36,8 @@ the gap has since been built, measured (decode **0.41×**, i.e. a loss) and clos
 |---|---|---|---|
 | Runtime | CUDA runtime + torch | Horizon OpenExplorer `libhbrt4.so` | CANN 8.3.RC2, `libascendcl.so` |
 | Path | eager kernels | **AOT**: host compiles a `.hbm`, board runs it | aclnn/ACL + AscendC custom ops |
-| Weight format | GGUF `f16` / `q4_k_m` | `leap_llm` symmetric per-channel int4 | GGUF `q4_k`/`q6_k`, faithfully decoded |
-| Qwen3-0.6B | ✅ f16, q4_k_m | ✅ w8 | ✅ q4_k_m |
+| Weight format | GGUF `f16` / the k-quant rung `q2_k`–`q6_k` | `leap_llm` symmetric per-channel int4 | GGUF `q4_k`/`q6_k`, faithfully decoded |
+| Qwen3-0.6B | ✅ f16, q4_k_m, q2_k/q3_k/q5_k | ✅ w8 | ✅ q4_k_m |
 | Qwen3-1.7B | ✅ q4_k_m, f16 | ✅ w4, w8 | ✅ q4_k_m |
 | Qwen3-4B | ✅ q4_k_m, f16 | ✅ w4, w8 | ✅ q4_k_m |
 | Qwen3-8B | ✅ q4_k_m, f16 | w4 (87.7% of the pool, **not deployable for long generation**); w8 fits (54.2%) but is still not the deployable long-gen graph | ✅ q4_k_m, release on (fits; 0.65 t/s, no swap in the fit probe) |
