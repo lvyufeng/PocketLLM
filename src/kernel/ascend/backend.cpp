@@ -713,9 +713,24 @@ void decode_packed_rows(const std::vector<uint8_t> &host, int64_t n, int64_t blo
  * writes one element per output cache line (stride `n`); walking the source in
  * `kConvertTile`-square tiles keeps both operands resident, which measured 482
  * vs 355 Mweights/s over the untiled form -- and 215 for the software convert.
- * `POCKETLLM_HAVE_NEON_F16` picks the four-wide `vcvt_f16_f32`; the scalar path
- * is bit-identical to it. */
+ * The tile is then walked `kTransposeBlock` source rows at a time and the
+ * block is transposed *in registers*, so a destination row is written by one
+ * 16-byte `vst1q_u16` instead of by eight two-byte stores to eight different
+ * cache lines.  That is the whole of the change: the values are the same
+ * round-to-nearest-even `vcvt_f16_f32` results, only the order they reach
+ * memory differs, and the two kernels are checked bit-identical rather than
+ * assumed to be.  It measured 734 vs 356 Mweights/s on a `1024 x 3072` weight
+ * and 750 vs 507 on a `2560 x 4096` one (the second is closer to
+ * bandwidth-bound, so the gap narrows as the weight grows).
+ *
+ * `POCKETLLM_HAVE_NEON_F16` picks the NEON paths; the scalar path is
+ * bit-identical to them. */
 constexpr int64_t kConvertTile = 64;
+
+/* Eight, because the three-stage butterfly below is the 8x8 one: 16-bit lanes
+ * across row pairs, then 32-bit, then 64-bit, which is exactly the depth
+ * AArch64's `vtrnq_*` gives before the element size runs out. */
+constexpr int64_t kTransposeBlock = 8;
 
 /* The serial transpose of one row range [r0, r1).  Split out so the threaded
  * wrapper can hand each thread its own range: thread ranges partition the
@@ -727,7 +742,75 @@ void f32_to_f16_transposed_rows(const float *src, int64_t r0, int64_t r1, int64_
     const int64_t r_end = std::min(r1, rb + kConvertTile);
     for (int64_t cb = 0; cb < k; cb += kConvertTile) {
       const int64_t c_end = std::min(k, cb + kConvertTile);
-      for (int64_t r = rb; r < r_end; ++r) {
+      int64_t r = rb;
+#if POCKETLLM_HAVE_NEON_F16
+      /* Eight source rows in flight, so the eight halves a destination row
+       * wants are already in registers together. */
+      for (; r + kTransposeBlock <= r_end; r += kTransposeBlock) {
+        int64_t c = cb;
+        for (; c + kTransposeBlock <= c_end; c += kTransposeBlock) {
+          uint16x8_t rows[8];
+          for (int i = 0; i < 8; ++i) {
+            const float *p = src + (r + i) * k + c;
+            rows[i] = vcombine_u16(vreinterpret_u16_f16(vcvt_f16_f32(vld1q_f32(p))),
+                                   vreinterpret_u16_f16(vcvt_f16_f32(vld1q_f32(p + 4))));
+          }
+          /* The 8x8 transpose, as the usual three-stage butterfly: each stage
+           * interleaves one more level of the index, so after the third the
+           * eight vectors are the eight destination rows. */
+          const uint16x8x2_t e01 = vtrnq_u16(rows[0], rows[1]);
+          const uint16x8x2_t e23 = vtrnq_u16(rows[2], rows[3]);
+          const uint16x8x2_t e45 = vtrnq_u16(rows[4], rows[5]);
+          const uint16x8x2_t e67 = vtrnq_u16(rows[6], rows[7]);
+          /* Stage one splits 16-bit lanes into even and odd, which carry
+           * source columns 0,2,4,6 and 1,3,5,7 -- so the even and the odd half
+           * are carried through the remaining stages separately, and come out
+           * as the even and the odd destination rows.  `lo_*` holds source rows
+           * 0-3 and `hi_*` rows 4-7, which is what the last stage's 64-bit
+           * interleave joins. */
+          const uint32x4x2_t lo_even = vtrnq_u32(vreinterpretq_u32_u16(e01.val[0]),
+                                                 vreinterpretq_u32_u16(e23.val[0]));
+          const uint32x4x2_t lo_odd = vtrnq_u32(vreinterpretq_u32_u16(e01.val[1]),
+                                                vreinterpretq_u32_u16(e23.val[1]));
+          const uint32x4x2_t hi_even = vtrnq_u32(vreinterpretq_u32_u16(e45.val[0]),
+                                                 vreinterpretq_u32_u16(e67.val[0]));
+          const uint32x4x2_t hi_odd = vtrnq_u32(vreinterpretq_u32_u16(e45.val[1]),
+                                                vreinterpretq_u32_u16(e67.val[1]));
+          const uint16x8_t cols[8] = {
+              vreinterpretq_u16_u64(vtrn1q_u64(vreinterpretq_u64_u32(lo_even.val[0]),
+                                               vreinterpretq_u64_u32(hi_even.val[0]))),
+              vreinterpretq_u16_u64(vtrn1q_u64(vreinterpretq_u64_u32(lo_odd.val[0]),
+                                               vreinterpretq_u64_u32(hi_odd.val[0]))),
+              vreinterpretq_u16_u64(vtrn1q_u64(vreinterpretq_u64_u32(lo_even.val[1]),
+                                               vreinterpretq_u64_u32(hi_even.val[1]))),
+              vreinterpretq_u16_u64(vtrn1q_u64(vreinterpretq_u64_u32(lo_odd.val[1]),
+                                               vreinterpretq_u64_u32(hi_odd.val[1]))),
+              vreinterpretq_u16_u64(vtrn2q_u64(vreinterpretq_u64_u32(lo_even.val[0]),
+                                               vreinterpretq_u64_u32(hi_even.val[0]))),
+              vreinterpretq_u16_u64(vtrn2q_u64(vreinterpretq_u64_u32(lo_odd.val[0]),
+                                               vreinterpretq_u64_u32(hi_odd.val[0]))),
+              vreinterpretq_u16_u64(vtrn2q_u64(vreinterpretq_u64_u32(lo_even.val[1]),
+                                               vreinterpretq_u64_u32(hi_even.val[1]))),
+              vreinterpretq_u16_u64(vtrn2q_u64(vreinterpretq_u64_u32(lo_odd.val[1]),
+                                               vreinterpretq_u64_u32(hi_odd.val[1])))};
+          for (int i = 0; i < 8; ++i) {
+            /* Destination row `c + i`, one 16-byte store of eight contiguous
+             * halves: `r` is the contiguous axis of the plane. */
+            vst1q_u16(dst + static_cast<std::size_t>(c + i) * n + r, cols[i]);
+          }
+        }
+        /* Fewer than eight columns left in this tile: the eight rows are still
+         * in hand, so they are written column by column. */
+        for (; c < c_end; ++c) {
+          for (int i = 0; i < 8; ++i) {
+            dst[c * n + r + i] = f32_to_f16(src[(r + i) * k + c]);
+          }
+        }
+      }
+#endif
+      /* Fewer than eight rows left in this tile, and every row of a non-NEON
+       * build: the original four-wide walk. */
+      for (; r < r_end; ++r) {
         const float *row = src + r * k;
         int64_t c = cb;
 #if POCKETLLM_HAVE_NEON_F16
