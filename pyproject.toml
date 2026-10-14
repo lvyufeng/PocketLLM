@@ -32,9 +32,6 @@ dependencies = ["numpy>=1.24"]
 reference = []
 cuda = ["torch>=2.0,<2.7"]
 mps = ["torch>=2.2"]
-# The optional shared operator library.  A CUDA backend may wrap it; nothing in
-# the core imports it, and it is absent from every other install.
-cuda-kernels = ["relic-core"]
 dev = ["pytest>=7.0"]
 docs = ["mkdocs-material==9.7.7"]
 

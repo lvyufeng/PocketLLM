@@ -12,7 +12,7 @@ than degraded.
 ## What the ABI is not
 
 It is not a tensor framework and not a thin wrapper over one. It imports **nothing** -- no numpy, no
-torch, no `relic_core`, no I/O. A tensor is *described*, not constructed by a library; a device is a
+torch, no I/O. A tensor is *described*, not constructed by a library; a device is a
 name; an op is a record. `tests/test_package_boundaries.py` enforces this on every module under
 `python/pocketllm/kernels/`, and `pocketllm.kernels` is the only package in the tree with that rule.
 

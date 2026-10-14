@@ -46,12 +46,11 @@ GGUF_TERNARY_TYPE_NAMES = frozenset(GGUF_TERNARY_FILE_TYPE_IDS)
 # behaviour, not the file's: `read_tensor` decodes these honestly, while it
 # refuses a ternary tensor by name.
 #
-# `iq4_nl` was this category's only member when the set was introduced in #390,
-# and Xing4.0-29B-A4B's released GGUF is 243 tensors of it.  #393 gave it a
-# kernel -- `iq4nl_block_dot_256` in relic-core's `cuda_kernel_impl.cu` -- so it
-# graduated into `GGUF_DENSE_TYPE_IDS` above and the set is empty.  It is kept
-# rather than deleted because the category recurs, and because empty-and-
-# deliberate is a different statement from a name that was forgotten.
+# `iq4_nl` was this category's only member when the set was introduced in #390.
+# #393 gave it a kernel, so it graduated into `GGUF_DENSE_TYPE_IDS` above and the
+# set is empty.  It is kept rather than deleted because the category recurs, and
+# because empty-and-deliberate is a different statement from a name that was
+# forgotten.
 GGUF_LOADER_TYPE_NAMES: frozenset[str] = frozenset()
 
 #: Weights one raw-block kernel call consumes for `iq4_nl`.  The runtime's other

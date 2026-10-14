@@ -145,7 +145,7 @@ policy:
 | `reference` | `cpu` | none | numpy -- **implemented** |
 | `cpu` | `cpu` | AOT optional | numpy; later BLAS/oneDNN, arm64 KleidiAI |
 | `mps` | `mps` | none | `torch>=2.2` with MPS |
-| `cuda` | `cuda` | `STREAM_CAPTURE` / `STEP` | `torch`; optionally `relic_core` |
+| `cuda` | `cuda` | `STREAM_CAPTURE` / `STEP` | `torch` |
 | `qnn` | `qnn` | `AOT_COMPILE` / `GRAPH` | QNN SDK, `qai_appbuilder` |
 | `horizon` | `horizon` | `AOT_COMPILE` / `GRAPH` | Horizon OpenExplorer, `libhbrt4.so` |
 | `ascend` | `ascend` | `STREAM_CAPTURE` / `STEP` | CANN, `libascendcl.so` |

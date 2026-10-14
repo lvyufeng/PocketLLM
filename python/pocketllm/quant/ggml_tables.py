@@ -13,12 +13,10 @@ The header is resolved in two steps, in order:
 2. the copy vendored at ``loader/gguf/vendor/ggml-common.h``, whose sha256 is
    pinned below.  This is what a normal install uses.
 
-There is deliberately no third step.  The header used to fall back to
-``relic_core``'s copy, which made the kernel library a hidden dependency of the
-loader -- the exact coupling vendoring exists to remove.  A phone or edge
-install has no ``relic_core``, and a lookup that silently works on the
-developer's machine and fails there is worse than one that fails loudly on both.
-``POCKETLLM_GGML_COMMON`` is how a non-default revision is named.
+There is deliberately no third step.  A fallback that silently works on the
+developer's machine and fails on a phone is worse than one that fails loudly on
+both, so the vendored copy is the only default.  ``POCKETLLM_GGML_COMMON`` is
+how a non-default revision is named.
 
 Why a header at all, rather than Python literals: a codebook transcribed into
 source is a second statement of a fact that already has an owner, and a

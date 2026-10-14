@@ -71,11 +71,10 @@ completely about where the bytes are.
 
 ## `xing4_0`
 
-**Status: planned, not written.** The previous tree carried a
-runtime for Xing4.0-29B-A4B — MLA attention, 64 routed experts activated top-4 plus one shared, and
-four residual streams per block mixed by a matrix hyper-connection — and it was CUDA-shaped in the
-wrong places: it called `relic_core.kernels.cuda_loader.load_cuda_kernel()` directly from the model
-code, which is the coupling this rebuild exists to remove.
+**Status: planned, not written.** Xing4.0-29B-A4B is MLA attention, 64 routed experts activated
+top-4 plus one shared, and four residual streams per block mixed by a matrix hyper-connection. Its
+earlier runtime was CUDA-shaped in the wrong places: it loaded kernels directly from the model code,
+which is the coupling this rebuild exists to remove.
 
 Porting it means rebuilding it as an architecture against the ABI rather than moving the files: a
 graph of declared ops, a weight table, a cache plan. Whether the ABI's vocabulary is sufficient for
@@ -85,11 +84,3 @@ the same commit*, not to reach around the ABI.
 
 No model page for it exists here, and none will until it runs: a page that describes a checkpoint
 this tree cannot execute is a promise, not documentation.
-
-## Where the old model pages went
-
-The previous tree's model pages — Xing4.0-29B-A4B, Ternary-Bonsai-2-27B, DeepSeek-V4 on GGUF Q2 —
-recorded measurements taken against runtimes that have been rewritten. Their numbers belong with that
-code, which is preserved on the `legacy` branch and, for the multi-card half, in
-[RelicLLM](https://github.com/lvyufeng/RelicLLM). They are not carried forward: a number with no live
-code behind it is still evidence about a checkpoint, but it is not documentation for this tree.

@@ -2,12 +2,11 @@
 
 This is the backend the current tree already half-is, so its declaration is the
 most complete one -- and the one with an explicit open question attached.  The
-kernels could come from ``relic_core`` (the shared torch operator library) or
-this backend could grow its own; if it wraps ``relic_core``, then
-``relic_core.kernels.ops``'s own resolver is superseded by
-:mod:`pocketllm.kernels.dispatch` and the two must not both exist.  That choice is
-recorded in docs rather than guessed at here, so the declaration below is
-deliberately at the "what", not the "how".
+kernels could be wrapped from an external operator library or this backend could
+grow its own; a wrapped library's own resolver must not coexist with
+:mod:`pocketllm.kernels.dispatch`, which supersedes it.  That choice is recorded
+in docs rather than guessed at here, so the declaration below is deliberately at
+the "what", not the "how".
 
 CUDA is the only backend in this tree that declares a *capture* path: a decode
 step is a fixed-shape sequence, which is exactly what a stream capture wants.

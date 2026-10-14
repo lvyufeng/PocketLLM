@@ -28,7 +28,7 @@ available on the development host because torch is installed; it still has no ke
 | `reference` | `cpu` | none | **numpy — implemented** |
 | `cpu` | `cpu` | AOT optional | numpy; later BLAS, KleidiAI on arm64 |
 | `mps` | `mps` | none | `torch>=2.2` with MPS, macOS on Apple Silicon |
-| `cuda` | `cuda` | `STREAM_CAPTURE` / `STEP` | `torch`; optionally `relic_core` |
+| `cuda` | `cuda` | `STREAM_CAPTURE` / `STEP` | `torch`; optionally an external operator library |
 | `qnn` | `qnn` | `AOT_COMPILE` / `GRAPH` | QNN SDK, a Hexagon DSP, `qai_appbuilder` for Android |
 | `horizon` | `horizon` | `AOT_COMPILE` / `GRAPH` | OpenExplorer `libhbrt4.so`, a BPU device |
 | `ascend` | `ascend` | `STREAM_CAPTURE` / `STEP` | CANN `libascendcl.so`, a `/dev/davinci*` node, aarch64 |
@@ -76,21 +76,21 @@ machine that has none. The probe deliberately does not import torch, so it can o
 
 ## cuda — the first backend to write
 
-The whole vocabulary, including formats `relic_core` does not currently consume.
+The whole vocabulary, including the formats no external consumer currently handles.
 `STREAM_CAPTURE` at `STEP` granularity: a decode step is a fixed-shape sequence and the host stays in
 the loop for sampling and the next position, so the capturable set excludes the sampling ops.
 
-**The open question, to answer before any code is written:** does this backend *wrap* `relic_core` or
-*grow its own kernels*? It cannot do both. `relic_core.kernels.ops` has a resolver (`_auto_impl` /
-`_resolve_impl`) and `pocketllm.kernels.dispatch` has another; two resolvers over the same op set is
-exactly the coupling this rebuild exists to remove. Wrapping is fastest to a working card — the sm_75
-kernels exist and are tested — at the cost of demoting `relic_core`'s resolver to "give me the kernel
-for this op" rather than "decide which implementation to use".
+**The open question, to answer before any code is written:** does this backend *wrap* an external
+operator library, or *grow its own kernels*? It cannot do both. A wrapped library has its own
+resolver, and `pocketllm.kernels.dispatch` has another; two resolvers over the same op set is exactly
+the coupling this rebuild exists to remove. Wrapping is fastest to a working card — the sm_75 kernels
+may already exist and be tested — at the cost of demoting the library's resolver to "give me the
+kernel for this op" rather than "decide which implementation to use".
 
 **The sm_75 constraint.** The development cards are RTX 2080 Ti — Turing, compute capability 7.5. No
 bf16 tensor cores, no Ampere-form `cp.async`, no FlashAttention-3. A kernel written for sm_80+ fails
-to load with `no kernel image is available`, which is why the capability is pinned in `relic-core`
-and must stay pinned.
+to load with `no kernel image is available`, which is why the capability is pinned and must stay
+pinned.
 
 ## qnn — the phone NPU, and why the ABI splits compile from run
 
