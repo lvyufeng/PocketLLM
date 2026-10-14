@@ -2,16 +2,17 @@
 
 This page is the short route from a checkout to the point where the tooling can tell you what your
 device can do. PocketLLM is **pre-release**, and it has two halves at different levels of done: the
-C engine under `src/` reads a GGUF, tokenizes and runs Qwen3-0.6B on f16 or on packed `q4_k`/`q6_k`
-weights, and `pocketllm run` drives it through the `ctypes` bridge — while the *Python* package still
-has no backend that implements a kernel, so `pocketllm serve` has nothing to serve from. The
+C engine under `src/` reads a GGUF, tokenizes and runs Qwen3-0.6B and 1.7B on f16 or on packed
+`q4_k`/`q6_k` weights, and both `pocketllm run` and `pocketllm serve` drive it through the `ctypes`
+bridge — while the *Python* package still has no backend that implements a kernel, so the CLI reaches
+the C core rather than a Python graph. The
 [repository README](https://github.com/lvyufeng/PocketLLM#current-status) carries the authoritative
 status table, and [The C engine](architecture/c_engine.md) is the record of what `src/` does.
 
 ## Requirements
 
 - Python >= 3.10
-- **Nothing else** for the base install. No compiler, no CUDA toolkit, no `torch`, no `relic-core`.
+- **Nothing else** for the base install. No compiler, no CUDA toolkit, no `torch`.
   The kernel ABI is stdlib-only and the reference backend is numpy.
 
 A device runtime is an optional extra and is only needed for the backend that uses it:
@@ -21,7 +22,6 @@ A device runtime is an optional extra and is only needed for the backend that us
 | *(base)* | `numpy` | the reference backend, the loader, the quantization decoders |
 | `cuda` | `torch>=2.0,<2.7` | `--backend cuda` |
 | `mps` | `torch>=2.2` | `--backend mps` on Apple Silicon |
-| `cuda-kernels` | `relic-core` | an optional acceleration source a `cuda` backend may wrap |
 
 ## Install
 
@@ -39,10 +39,7 @@ pip install -e ".[dev]"
 
 The install compiles nothing. `pyproject.toml` declares no extension modules and the Python package
 carries no compiled artifact. The engine is a **separate native library** built from the `src/` tree
-in this repository and loaded at runtime, so `pip install` never needs a compiler. Every native
-kernel *inside* a Python backend belongs to
-[relic-core](https://github.com/lvyufeng/relic-core), which is an optional extra here rather than a
-dependency.
+in this repository and loaded at runtime, so `pip install` never needs a compiler.
 
 ## What your device can do
 
@@ -113,11 +110,11 @@ reproducible (the RNG is the host's, not the engine's, so the engine stays a pur
 logits and the draw). `--top-k`, `--top-p` and `--min-p` truncate the distribution; unset, they
 truncate nothing.
 
-`pocketllm serve` parses and validates its arguments — the errors are the errors a working build
-would give — and then exits naming what is absent: no *Python* backend to serve from. It names
-`pocketllm.server.openai.serve`, which is the importable HTTP surface the CLI will call once a
-backend exists, and it does not yet offer the sampling flags, because it has no decode loop to apply
-them in.
+`pocketllm serve` puts the same C core behind OpenAI-compatible HTTP, over the same checkpoint, and
+takes sampling per request (`"temperature"`, `"top_p"`, `"top_k"`, `"min_p"`, `"seed"`) plus `"stop"`
+and `"n"`. It serves **one request at a time** — the adapter serializes behind a lock and declares
+`supports_batch = False` rather than promising overlap the engine cannot provide — and refuses the
+fields with no op behind them by name with a `400`.
 
 ## Verify the source checkout
 
