@@ -1450,15 +1450,15 @@ the 5-token prompt minus that prompt's own prefill.
 
 | checkpoint | decode, marginal | prefill (5→100 tok) | one-time plane build | `--steps 8` wall |
 |---|---|---|---|---|
-| Qwen3-0.6B | **0.129 s/token** | 0.065 s/token | 6.1 s | 13.1 s |
-| Qwen3-1.7B | **0.390 s/token** | 0.065 s/token | 16.0 s | 28.4 s |
-| Qwen3-4B | **0.640 s/token** | 0.129 s/token | 44.0 s | 65.8 s |
-| Qwen3-8B | **1.55 s/token** | — | — | 244.1 s |
+| Qwen3-0.6B | **0.129 s/token** | 0.065 s/token | 3.3 s | 10.0 s |
+| Qwen3-1.7B | **0.390 s/token** | 0.065 s/token | 8.1 s | 19.2 s |
+| Qwen3-4B | **0.640 s/token** | 0.129 s/token | 21.7 s | 43.8 s |
+| Qwen3-8B | **1.55 s/token** | — | — | — |
 
-**The plane-build column was re-measured on 2026-10-14 and is 2.7× the number it was** — the
-`--steps 8` walls are 13.1 / 28.4 / 65.8 / 244.1 s against the earlier 24.5 / 85.9 / 208.9 / 444.0 s,
-and the output is byte-identical to the earlier binary at every size. The decode and prefill columns
-are unchanged (the fix touches neither). What changed, and why it was invisible for so long:
+**The plane-build column was re-measured on 2026-10-14 and is 4–8× the number it was** — the
+`--steps 8` walls are 10.0 / 19.2 / 43.8 s against the earlier 24.5 / 85.9 / 208.9 s, and the output
+is byte-identical to the earlier binary at every size. The decode and prefill columns are unchanged
+(the work touches neither). Two changes, and why the cost was invisible for so long:
 
 `cube_for` and `dense_table_for` decoded each weight with `quant::dequant_block` **once per weight**,
 so every one of a super-block's 256 weights re-derived the block header — two fp16 loads, the
@@ -1466,27 +1466,31 @@ group/run/nibble index arithmetic, and the packed six-bit scale/min unpack. That
 for a packed GEMM, which consumes a weight as it decodes and never wants a row in memory; the plane
 build is the opposite shape, and it was paying the header 256× too often. Decoding a whole block per
 call (`dequant_q4_k_block`/`dequant_q6_k_block`, the same expression and association, verified
-bit-identical over 10.24M weights) took `decode_cube` from 6834 to 1204 ms at 0.6B. Separately,
-`build_cube_weight_from_f32` transposed with a scalar software `f32_to_f16` and a column-major
-scatter; the A55's four-wide `vcvt_f16_f32` (bit-identical to the software round, checked over 2M
-values) walked in 64-square tiles took `transpose_cube` from 7922 to 4132 ms.
+bit-identical over 10.24M weights) took `decode_cube` from 6834 to 1204 ms at 0.6B. `build_cube_weight_from_f32`
+then transposed with a scalar software `f32_to_f16` and a column-major scatter; the A55's four-wide
+`vcvt_f16_f32` (bit-identical to the software round, checked over 2M values) walked in 64-square tiles
+took `transpose_cube` from 7922 to 4132 ms. Finally, since decoding a weight is a pure function of its
+bytes, both loops stride their rows across threads (`POCKETLLM_ASCEND_BUILD_THREADS`, default the
+hardware concurrency; a row writes only its own output, so no lock).
 
 The measured prologue split at 0.6B, from the `one-time prologue` table the profile now prints (it
 was previously outside every op scope, which is why the per-stage total read 1.7 s against a 28.4 s
 wall):
 
-| phase | before | after |
-|---|---|---|
-| `transpose_cube` — f32→f16 + transposed upload | 7922 ms | **4132 ms** |
-| `decode_cube` — packed block → f32 | 6834 ms | **1204 ms** |
-| `decode_table` — the embedding gather table | 1707 ms | **672 ms** |
-| `upload_table` | 125 ms | 125 ms |
-| **PROLOGUE** | **16588 ms** | **6133 ms** |
+| phase (0.6B) | before | serial fix | threaded |
+|---|---|---|---|
+| `transpose_cube` — f32→f16 + transposed upload | 7922 ms | 4132 ms | **2217 ms** |
+| `decode_cube` — packed block → f32 | 6834 ms | 1204 ms | **662 ms** |
+| `decode_table` — the embedding gather table | 1707 ms | 672 ms | **289 ms** |
+| `upload_table` | 125 ms | 125 ms | 125 ms |
+| **PROLOGUE** | **16588 ms** | **6133 ms** | **3293 ms** |
 
-The `--steps 8` wall is still dominated by the plane build at 8B, and is now roughly half prologue,
-half decode-to-8-tokens at 0.6B. It is now a plain *host CPU* cost — `transpose_cube` is the largest
-single phase left — so the obvious next step, for a workload that runs the same checkpoint repeatedly,
-is to **persist the plane to disk** and skip the build entirely on the second run; nothing on the board
+The threaded prologue is 8.1 s at 1.7B and 21.7 s at 4B. The gain over the serial build is ~1.9×
+rather than 4× because it is now partly bound by the host↔device copies, not the decode. The
+`--steps 8` wall is still dominated by the plane build at 8B, and is now roughly a third prologue,
+two thirds decode-to-8-tokens at 0.6B. The build is a plain *host CPU* cost with `transpose_cube` the
+largest single phase left, so the next step for a workload that runs the same checkpoint repeatedly is
+to **persist the plane to disk** and skip the build entirely on the second run; nothing on the board
 does that today. (Its size is the fp16 plane, ~1.2 GiB at 0.6B.) The decode rates move with the checkpoint exactly as the weight count predicts
 (0.6B → 1.7B is 2.8× the weights, 0.129 → 0.390 is 3.0×; 1.7B → 4B is 2.35×, 0.390 → 0.640 is 1.6×
 because the 4B's layer count rises to 36 and its prefill-heavy head is a smaller share of a slower
