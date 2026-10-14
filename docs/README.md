@@ -16,12 +16,30 @@ If the checkpoint does not fit, quantize it; do not reach for a second card.
 </p>
 </div>
 
-!!! warning "This tree is a pre-release skeleton"
+## What it runs
 
-    The interfaces are defined and the parts that need no device are ported and tested. **No device
-    backend ships a working implementation yet**, so nothing runs a model today. `pocketllm run` and
-    `pocketllm serve` parse their arguments and then name the piece that is missing. See
-    [Current status](#current-status) below before installing anything.
+Qwen3 runs on four accelerator classes through one engine. The C core (`src/`, `libpocketllm.so`)
+is where a model actually runs — it reads a GGUF, tokenizes with the checkpoint's own BPE, walks
+the graph and decodes, on `f16` weights and on packed `q4_k`/`q6_k` decoded inside the kernel.
+
+| Device | Path | Qwen3 sizes | Format | Accuracy vs the reference |
+|---|---|---|---|---|
+| **CPU** (AVX2) | C core | 0.6B, 1.7B | `f16`, `q4_k_m` | **token-identical to llama.cpp** |
+| **1× NVIDIA** (sm_75+) | C core, eager kernels | 0.6B, 1.7B | `f16`, `q4_k_m` | **token-identical to llama.cpp** |
+| **RDK S600** (Horizon Nash BPU) | prebuilt `.hbm` via the `xlm` delegate | 0.6B → 8B | `leap_llm` int4 (`w4`/`w8`) | token agreement (prefix); at the quantizer's floor |
+| **Orange Pi AIpro** (Ascend 310B1) | C core, CANN backend | 0.6B → 8B | `q4_k_m` | token agreement; **at the quantizer's floor at every size** |
+
+Two limits carry across the table. The C-core rows are checked **token-for-token against llama.cpp**;
+the two boards expose **no logits surface**, so "aligned to 1e-3" is expressible there only as
+**token agreement** — and their weight schemes differ from the reference's, so a cross-board number
+is a *quantizer-provenance* comparison, not a hardware ranking. The S600 is not a C-core backend: it
+runs a **prebuilt graph** the host compiles ahead of time, so it is listed by the artifact it runs,
+not by an op it implements.
+
+**Reference throughput — Qwen3-1.7B, `q4_k_m`, against llama.cpp:** the CPU path is **1.04× on
+prefill and 1.37× on decode** (ahead on both); the CUDA path is 0.11× / 0.40× and deliberately
+naive. Every number, its method and its provenance is in
+[the fleet support matrix](architecture/fleet_support_matrix.md).
 
 ## The rule
 
@@ -36,51 +54,46 @@ device, and `EngineArgs` has no `tensor_parallel_size` to set.
 
 | Piece | State |
 |---|---|
-| [`pocketllm.kernels`](architecture/kernel_abi_v1.md) — descriptors, op schemas, dispatch, graph IR | **Done.** 19 ops declared; stdlib-only |
+| [`src/`](architecture/c_engine.md) — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B and 1.7B** in `f16` and `q4_k_m`, on `cpu` and one `cuda` card. Greedy is checked token-for-token against llama.cpp; the CPU path is ahead of llama.cpp on both halves |
+| [`src/kernel/ascend/`](architecture/ascend_310b.md) — Ascend 310B backend | **Runs Qwen3-0.6B … 8B** on an Orange Pi AIpro, at the quantizer's own floor |
+| [`pocketllm.kernels`](architecture/kernel_abi_v1.md) — descriptors, op schemas, dispatch, graph IR | **Done.** 17 ops declared; stdlib-only |
 | `pocketllm.backends.reference` — numpy oracle | **Done.** Normative: implements every declared op |
-| `pocketllm.backends.cpu` | **Stub.** Declaration and selection only |
-| `pocketllm.backends.{cuda,mps,qnn,horizon,ascend}` | **Stubs**, each naming the runtime it waits for |
-| [`pocketllm.quant`](architecture/execution.md) — GGML block decoders | **Done.** No `relic-core`; tables vendored |
+| [`pocketllm.quant`](architecture/execution.md) — GGML block decoders | **Done.** Codebook tables vendored in-tree |
 | `pocketllm.loader.gguf` — GGUF reader | **Done.** numpy in, descriptors out |
 | [`pocketllm.engine`](architecture/execution.md) — executor, planner, memory, sessions | **Done**, on the reference backend |
+| `pocketllm.protocol` / `pocketllm.server` — OpenAI-compatible HTTP | **Done.** Driven over the C core by `server/native_backend.py` |
+| `pocketllm.backends.cpu` | **Stub.** Declaration and selection only |
+| `pocketllm.backends.{cuda,mps,qnn,horizon,ascend}` | **Stubs**, each naming the runtime it waits for |
 | [`pocketllm.architectures`](models/architectures.md) — model IR and builders | **Scaffold.** `toy` only |
 | `pocketllm.tokenizer` — GGUF-vocabulary BPE | **Skeleton.** Whitespace works; BPE raises |
-| `pocketllm.protocol` / `pocketllm.server` — OpenAI-compatible HTTP | **Ported.** Testable without a device |
 
-Read [Getting started](getting-started.md) for the install and the four read-only commands that work
-on any host.
+**The Python package does not run a model.** It is the *host side* — the kernel ABI as spec, the
+numpy oracle, the loader, the decoders and the execution layer — and **no Python backend implements
+a kernel**: every backend except `reference` is a declaration. The two halves meet at one place,
+`python/pocketllm/native.py`, the `ctypes` bridge that both `pocketllm run` and `pocketllm serve`
+drive into the C core. Neither is a *Python* backend, which is why the `pocketllm.backends.*` rows
+stay stubs. Read [Getting started](getting-started.md) for the install and the read-only commands
+that work on any host.
 
-### Two trees
+## Why another inference engine
 
-The repository holds a Python tree under `python/`, and `src/` beside it is where the C++ engine
-lands. The Python side is the host: the kernel ABI is its **spec**, and the reference backend, the
-loader and the quantization decoders are the **numeric oracle**. The `src/` side will be the C++17
-engine and the part that actually runs a model — it owns the GGUF read, the tokenizer and the graph
-walk, and the CLI reaches it through a C ABI. Its status row appears here when its first artifact
-builds.
+Most runtimes scale a checkpoint across cards; PocketLLM's job is the opposite one — make **one**
+card, or one phone, sufficient. That single constraint changes the design rather than tuning it:
 
-## Where the code lives now
-
-This repository used to describe the whole multi-GPU stack. The split is by hardware, and this is
-one end of it:
-
-| Repository | What it is |
-|---|---|
-| **PocketLLM** (this one) | single card, edge and mobile — one process owns one device |
-| [RelicLLM](https://github.com/lvyufeng/RelicLLM) | multi-GPU PyTorch runtime and serving shell |
-| [relic-core](https://github.com/lvyufeng/relic-core) | the shared torch operator library, CUDA sm_75 and CPU |
-| [relic-engine](https://github.com/lvyufeng/relic-engine) | frozen archive of the retired C++ engine |
-
-`relic-core` is **not** a dependency here. The one thing this tree used to read from it — the GGML
-codebook header — is vendored in-tree with a provenance note, because a loader that needs a kernel
-library to read a checkpoint cannot run on a phone. A CUDA backend may wrap `relic_core` as an
-optional extra; nothing in the core imports it, and a test enforces that.
+- **A portable kernel ABI, not a framework binding.** `pocketllm.kernels` is descriptors and
+  declarations with no dependency at all — no numpy, no torch. A backend implements it; the engine
+  drives it. That is what lets one C core sit behind a CUDA card, an Ascend NPU and a CPU unchanged.
+- **The ladder is the fit strategy.** A checkpoint that does not fit is quantized until it does.
+  There is no offload path to take and no second device to reach for.
+- **Torch is optional, and it is a backend's business.** The loader, the decoders and the reference
+  backend are numpy, so a phone install reads a `.gguf` without the training stack.
 
 ## Documentation
 
 | Section | What it holds |
 |---|---|
 | [Getting started](getting-started.md) | Install, verify, and what a device with no accelerator can do |
+| [The fleet support matrix](architecture/fleet_support_matrix.md) | What each accelerator class runs, its accuracy, and prefill/decode throughput |
 | [Architecture](architecture/index.md) | The kernel ABI, the backend model, execution, and the device targets |
 | [Models](models/README.md) | The support matrix, and what an architecture is in this tree |
 | [Guides](guides/index.md) | Procedures — the release flow today |
