@@ -23,12 +23,19 @@
  *
  * The layouts, from `ggml-common.h`, in the order the bytes appear:
  *
- *   block_q4_K:  d(fp16) dmin(fp16) scales[12] qs[128]          -- 144 bytes
+ *   block_q2_K:  scales[16] qs[64] d(fp16) dmin(fp16)          -- 84 bytes
+ *   block_q3_K:  hmask[32] qs[64] scales[12] d(fp16)           -- 110 bytes
+ *   block_q4_K:  d(fp16) dmin(fp16) scales[12] qs[128]         -- 144 bytes
+ *   block_q5_K:  d(fp16) dmin(fp16) scales[12] qh[32] qs[128]  -- 176 bytes
  *   block_q6_K:  ql[128] qh[64] scales[16 int8] d(fp16)        -- 210 bytes
  *
- * Both carry 256 weights. `q4_K` splits them into eight groups of 32, each with
- * a 6-bit scale and a 6-bit minimum packed into the twelve `scales` bytes;
- * `q6_K` splits them into sixteen groups of 16, each with an int8 scale.
+ * Every one carries 256 weights. `q4_K` and `q5_K` split them into eight groups
+ * of 32, each with a 6-bit scale and a 6-bit minimum packed together into the
+ * twelve `scales` bytes (`get_scale_min_k4`); `q2_K` splits them into sixteen
+ * groups of 16 and packs that pair into one byte per group, a nibble each;
+ * `q3_K` carries a signed 6-bit scale per 16-weight group plus a separate
+ * high-bit plane; `q6_K` splits them into sixteen groups of 16, each with an
+ * int8 scale.
  */
 
 #ifndef POCKETLLM_QUANT_BLOCKS_H
@@ -56,7 +63,10 @@ namespace quant {
 constexpr int kBlockWeights = 256;
 
 /* Block sizes in bytes, matching `k_quants.py`'s constants of the same names. */
+constexpr int kQ2KBlockBytes = 84;
+constexpr int kQ3KBlockBytes = 110;
 constexpr int kQ4KBlockBytes = 144;
+constexpr int kQ5KBlockBytes = 176;
 constexpr int kQ6KBlockBytes = 210;
 
 /* The byte at `p`, as an index. GGUF is little-endian and so is every host this
@@ -176,24 +186,122 @@ POCKETLLM_HD float dequant_q6_k(const uint8_t *block, int index) {
   return dequant_q6_k_from(block, q6_k_raw_value(block, index), index);
 }
 
+/* One weight of a Q2_K super-block: `d * scale * q - dmin * minimum`.
+ *
+ * The sixteen 16-weight groups share a single byte each of `scales`: its low
+ * nibble is the 4-bit scale and its high nibble the 4-bit minimum, so the pair
+ * is unsigned and the value is never offset -- the minimum carries the centre.
+ *
+ * The `qs` plane is 64 bytes of 2-bit quads, and a group reads all sixteen of
+ * its weights from the same four bytes, at the same bit position: group `g`
+ * starts at `(g / 8) * 32 + (g % 2) * 16` within `qs` -- which itself begins at
+ * byte 16, after the sixteen scale bytes -- and takes the two bits at
+ * `2 * ((g % 8) / 2)`. A decoder that instead indexed `qs` by `g * 16` and
+ * varied the shift would read each group's quads from the wrong four bytes. */
+POCKETLLM_HD float dequant_q2_k(const uint8_t *block, int index) {
+  const int group = index / 16;   /* which of the sixteen 16-weight groups */
+  const int within = index % 16;  /* position inside that group */
+  const int half = group / 8;     /* which 32-byte qs span */
+  const int pair = group % 8;     /* which 16-byte slice within it */
+  const int shift = (pair / 2) * 2;
+  const int byte = 16 + half * 32 + (pair % 2) * 16 + within;
+  const int q = (as_byte(block, byte) >> shift) & 0x03;
+  const int packed = as_byte(block, group);
+  const float d = as_half(block, 80);
+  const float dmin = as_half(block, 82);
+  return d * static_cast<float>(packed & 0x0F) * static_cast<float>(q) -
+         dmin * static_cast<float>(packed >> 4);
+}
+
+/* One weight of a Q3_K super-block: `d * scale * q`, with `q` in [-4, 3].
+ *
+ * The 2-bit quads live in `qs`, and the weight's *third* bit is in `hmask`, one
+ * bit per weight: a weight whose bit is *clear* is the negative one, so
+ * `q = quad - 4` there and `q = quad` otherwise. That is a sign convention and
+ * not an offset bias: `quad` is 0..3 and the high bit selects which side of zero
+ * the weight is on, so `q` spans -4..3.
+ *
+ * Three indexings have to be right at once, and none of them is the obvious
+ * one. `qs` (at byte 32, after `hmask`) interleaves four 32-weight runs across
+ * its 32-byte slices -- weight `w` reads byte `32 + (w / 128) * 32 + (w % 32)`
+ * at bit `2 * ((w % 128) / 32)` -- while `hmask` is indexed by `w % 32` with its
+ * bit at `w / 32`. The scale is a *six*-bit value packed across twelve bytes:
+ * its low four bits are the low nibble of `scales[g]` for `g < 8` and the high
+ * nibble of `scales[g - 8]` for `g >= 8`, and its top two bits are bits
+ * `2 * (g / 4)` of `scales[8 + g % 4]`. The six bits carry a `-32` bias, which
+ * is what makes the scale signed -- reading only the low nibble against a `-8`
+ * bias decodes the first two-thirds of a block's scale range and none of the
+ * rest. */
+POCKETLLM_HD float dequant_q3_k(const uint8_t *block, int index) {
+  const int group = index / 16;
+  const int low4 = group < 8 ? (as_byte(block, 96 + group) & 0x0F)
+                             : (as_byte(block, 96 + group - 8) >> 4);
+  const int high2 = (as_byte(block, 104 + group % 4) >> (2 * (group / 4))) & 0x03;
+  const int run = index % 128;
+  const int quad =
+      (as_byte(block, 32 + (index / 128) * 32 + run % 32) >> (2 * (run / 32))) & 0x03;
+  const int high = (as_byte(block, index % 32) >> (index / 32)) & 1;
+  const float d = as_half(block, 108);
+  return d * static_cast<float>((low4 | (high2 << 4)) - 32) *
+         static_cast<float>(quad - (high ? 0 : 4));
+}
+
+/* One weight of a Q5_K super-block: `d * scale * q - dmin * minimum`, with a
+ * five-bit `q`.
+ *
+ * The layout is Q4_K's with one more bit per weight: `d`, `dmin` and the twelve
+ * packed `(scale, min)` pairs are the same, and `qs` holds the low four bits of
+ * each weight in the same run/high-nibble order. The fifth bit is `qh`, thirty-
+ * two bytes with two bits per weight across the four 32-weight runs: run `p`
+ * takes bit `2p` for the low-nibble group and `2p + 1` for the high-nibble one.
+ * So the group ordinal then is `half * 2 + p` rather than a pair index, and the
+ * scale lookup is `get_scale_min_k4` against that ordinal. */
+POCKETLLM_HD float dequant_q5_k(const uint8_t *block, int index) {
+  const int pair = index / 64;             /* which 64-weight run pair */
+  const int high_nibble = (index % 64) / 32;
+  const int i = index % 32;                /* position inside the 32-weight run */
+  const int group = pair * 2 + high_nibble;
+  const int q = as_byte(block, 48 + pair * 32 + i);
+  const int qh = as_byte(block, 16 + i);
+  const int bit = (qh >> (2 * pair + high_nibble)) & 1;
+  int scale = 0;
+  int minimum = 0;
+  get_scale_min_k4(block + 4, group, &scale, &minimum);
+  const int nibble = high_nibble ? (q >> 4) : (q & 0x0F);
+  const float d = as_half(block, 0);
+  const float dmin = as_half(block, 2);
+  return d * static_cast<float>(scale) * static_cast<float>(nibble + (bit ? 16 : 0)) -
+         dmin * static_cast<float>(minimum);
+}
+
 /* Dispatch for a block a caller only knows by its type id. The ids are GGML's,
- * the same numbers `abi/spec.h` carries; the two the packed GEMM reads are
+ * the same numbers `abi/spec.h` carries; the five the packed GEMM reads are
  * spelled out here rather than shared with `spec.cpp` because that table
  * answers "how many bytes" and this answers "which bit layout", and only the
  * latter is allowed to grow a decoder at a time. */
+constexpr int kGgmlQ2K = 10;
+constexpr int kGgmlQ3K = 11;
 constexpr int kGgmlQ4K = 12;
+constexpr int kGgmlQ5K = 13;
 constexpr int kGgmlQ6K = 14;
 
 /* How many bytes one block of `type_id` occupies, or 0 if this build cannot
  * read it. */
 POCKETLLM_HD int block_bytes_of(int type_id) {
-  if (type_id == kGgmlQ4K) {
-    return kQ4KBlockBytes;
+  switch (type_id) {
+    case kGgmlQ2K:
+      return kQ2KBlockBytes;
+    case kGgmlQ3K:
+      return kQ3KBlockBytes;
+    case kGgmlQ4K:
+      return kQ4KBlockBytes;
+    case kGgmlQ5K:
+      return kQ5KBlockBytes;
+    case kGgmlQ6K:
+      return kQ6KBlockBytes;
+    default:
+      return 0;
   }
-  if (type_id == kGgmlQ6K) {
-    return kQ6KBlockBytes;
-  }
-  return 0;
 }
 
 /* ---- The repacked Q6_K block, and why it exists -------------------------
@@ -250,7 +358,18 @@ static_assert(kQ6KRepackedStride % 16 == 0, "Q6KRepacked stride must be 16-align
 /* One weight out of a block of `type_id`. Calling this with a type
  * `block_bytes_of` refused is a programming error; the callers check first. */
 POCKETLLM_HD float dequant_block(int type_id, const uint8_t *block, int index) {
-  return type_id == kGgmlQ4K ? dequant_q4_k(block, index) : dequant_q6_k(block, index);
+  switch (type_id) {
+    case kGgmlQ2K:
+      return dequant_q2_k(block, index);
+    case kGgmlQ3K:
+      return dequant_q3_k(block, index);
+    case kGgmlQ5K:
+      return dequant_q5_k(block, index);
+    case kGgmlQ6K:
+      return dequant_q6_k(block, index);
+    default:
+      return dequant_q4_k(block, index);
+  }
 }
 
 }  // namespace quant

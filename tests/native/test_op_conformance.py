@@ -526,6 +526,52 @@ def case_gemm_quant_q6_k(rng):
     )
 
 
+def case_gemm_quant_q2_k(rng):
+    """The 2-bit rung: two-bit quads over a 4-bit scale/min packed per group.
+
+    A separate case from `q4_K`'s for the same reason `q6_K` has one -- the two
+    formats share nothing but the block width -- and this one is the format whose
+    header *is* different: `q2_K` puts `d`/`dmin` at bytes 80 and 82, after the
+    scales and the quads, where `q4_K` puts them first.
+    """
+    x = rng.standard_normal((4, 512), dtype=np.float32)
+    blocks = packed_row(rng, rows=32, cols=512, fmt="q2_k")
+    return (
+        {"x": x, "w_blocks": blocks},
+        {"type_id": 10},
+        ref.gemm_quant(x, blocks, w_blocks_fmt="q2_k"),
+    )
+
+
+def case_gemm_quant_q3_k(rng):
+    """The 3-bit rung: quads whose third bit is a separate mask plane.
+
+    The scales are the part to watch: sixteen *six*-bit values packed across
+    twelve bytes with a `-32` bias, not sixteen four-bit values. The case is
+    here so that reading only the low nibble -- which decodes the first
+    two-thirds of a block's scale range and nothing else -- fails by name
+    instead of on a checkpoint.
+    """
+    x = rng.standard_normal((4, 512), dtype=np.float32)
+    blocks = packed_row(rng, rows=32, cols=512, fmt="q3_k")
+    return (
+        {"x": x, "w_blocks": blocks},
+        {"type_id": 11},
+        ref.gemm_quant(x, blocks, w_blocks_fmt="q3_k"),
+    )
+
+
+def case_gemm_quant_q5_k(rng):
+    """The 5-bit rung: `q4_K`'s layout plus one high bit per weight in `qh`."""
+    x = rng.standard_normal((4, 512), dtype=np.float32)
+    blocks = packed_row(rng, rows=32, cols=512, fmt="q5_k")
+    return (
+        {"x": x, "w_blocks": blocks},
+        {"type_id": 13},
+        ref.gemm_quant(x, blocks, w_blocks_fmt="q5_k"),
+    )
+
+
 def case_gemm_quant_large_n_q6_k(rng):
     """The packed product wide enough to cross the cube op's column-chunk bound.
 
@@ -605,6 +651,36 @@ def case_embedding_quant_q6_k(rng):
     )
 
 
+def case_embedding_quant_q2_k(rng):
+    tokens = np.array([4, 1, 3], dtype=np.int32)
+    blocks = packed_row(rng, rows=5, cols=256, fmt="q2_k")
+    return (
+        {"tokens": tokens, "table_blocks": blocks},
+        {"type_id": 10},
+        ref.embedding(tokens, blocks, table_fmt="q2_k"),
+    )
+
+
+def case_embedding_quant_q3_k(rng):
+    tokens = np.array([2, 6, 0], dtype=np.int32)
+    blocks = packed_row(rng, rows=7, cols=512, fmt="q3_k")
+    return (
+        {"tokens": tokens, "table_blocks": blocks},
+        {"type_id": 11},
+        ref.embedding(tokens, blocks, table_fmt="q3_k"),
+    )
+
+
+def case_embedding_quant_q5_k(rng):
+    tokens = np.array([3, 0, 2], dtype=np.int32)
+    blocks = packed_row(rng, rows=4, cols=256, fmt="q5_k")
+    return (
+        {"tokens": tokens, "table_blocks": blocks},
+        {"type_id": 13},
+        ref.embedding(tokens, blocks, table_fmt="q5_k"),
+    )
+
+
 def packed_row(rng, rows: int, cols: int, fmt: str) -> np.ndarray:
     """Random bytes with the geometry of `fmt`'s blocks, shaped as GGUF stores
     the tensor: ``(rows, cols // 256, block_bytes)``.
@@ -635,6 +711,20 @@ def packed_row(rng, rows: int, cols: int, fmt: str) -> np.ndarray:
         # `d` at bytes 0..1 and `dmin` at 2..3, both fp16 and both positive.
         put_half(blocks, 0, rng.uniform(0.01, 0.1, size=shape))
         put_half(blocks, 2, rng.uniform(0.0, 0.05, size=shape))
+    elif fmt == "q5_k":
+        # `q5_K` reuses `q4_K`'s header: `d` at 0..1, `dmin` at 2..3.
+        put_half(blocks, 0, rng.uniform(0.01, 0.1, size=shape))
+        put_half(blocks, 2, rng.uniform(0.0, 0.05, size=shape))
+    elif fmt == "q2_k":
+        # A different header entirely: `d` at 80..81 and `dmin` at 82..83, after
+        # the sixteen scale bytes and the sixty-four quad bytes.
+        put_half(blocks, 80, rng.uniform(0.01, 0.1, size=shape))
+        put_half(blocks, 82, rng.uniform(0.0, 0.05, size=shape))
+    elif fmt == "q3_k":
+        # `d` is the *last* field, at 108..109, and there is no `dmin`: a q3_K
+        # weight is centered by the high-bit plane instead. Leaving these two
+        # bytes random is what writes a NaN about one block in three.
+        put_half(blocks, 108, rng.uniform(0.01, 0.1, size=shape))
     elif fmt == "q6_k":
         # `d` is the *last* field of a q6_k block, at 208..209. Writing it at
         # offset 0 instead -- which is where q4_k's is -- puts a random fp16 in
@@ -956,11 +1046,17 @@ CASES = {
     "gemm_accumulate": case_gemm_accumulate,
     "gemm_quant_q4_k": case_gemm_quant_q4_k,
     "gemm_quant_q6_k": case_gemm_quant_q6_k,
+    "gemm_quant_q2_k": case_gemm_quant_q2_k,
+    "gemm_quant_q3_k": case_gemm_quant_q3_k,
+    "gemm_quant_q5_k": case_gemm_quant_q5_k,
     "gemm_quant_large_n_q4_k": case_gemm_quant_large_n_q4_k,
     "gemm_quant_large_n_q6_k": case_gemm_quant_large_n_q6_k,
     "embedding": case_embedding,
     "embedding_quant_q4_k": case_embedding_quant_q4_k,
     "embedding_quant_q6_k": case_embedding_quant_q6_k,
+    "embedding_quant_q2_k": case_embedding_quant_q2_k,
+    "embedding_quant_q3_k": case_embedding_quant_q3_k,
+    "embedding_quant_q5_k": case_embedding_quant_q5_k,
     "silu_mul": case_silu_mul,
     "silu_mul_large_negative": case_silu_mul_large_negative,
     "rope_start_zero": case_rope_start_zero,
@@ -997,11 +1093,17 @@ OP_OF_CASE = {
     "gemm_accumulate": "gemm",
     "gemm_quant_q4_k": "gemm_quant",
     "gemm_quant_q6_k": "gemm_quant",
+    "gemm_quant_q2_k": "gemm_quant",
+    "gemm_quant_q3_k": "gemm_quant",
+    "gemm_quant_q5_k": "gemm_quant",
     "gemm_quant_large_n_q4_k": "gemm_quant",
     "gemm_quant_large_n_q6_k": "gemm_quant",
     "embedding": "embedding",
     "embedding_quant_q4_k": "embedding_quant",
     "embedding_quant_q6_k": "embedding_quant",
+    "embedding_quant_q2_k": "embedding_quant",
+    "embedding_quant_q3_k": "embedding_quant",
+    "embedding_quant_q5_k": "embedding_quant",
     "silu_mul": "silu_mul",
     "silu_mul_large_negative": "silu_mul",
     "rope_start_zero": "rope",
@@ -1067,10 +1169,16 @@ QUANTIZED_CASES = frozenset(
     {
         "gemm_quant_q4_k",
         "gemm_quant_q6_k",
+        "gemm_quant_q2_k",
+        "gemm_quant_q3_k",
+        "gemm_quant_q5_k",
         "gemm_quant_large_n_q4_k",
         "gemm_quant_large_n_q6_k",
         "embedding_quant_q4_k",
         "embedding_quant_q6_k",
+        "embedding_quant_q2_k",
+        "embedding_quant_q3_k",
+        "embedding_quant_q5_k",
     }
 )
 

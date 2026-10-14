@@ -1421,11 +1421,38 @@ void dot_Rrows_q8k(int type_id, const quant::Q8KBlock *q8, int64_t q8_stride,
 
 #endif /* POCKETLLM_HAVE_AVX2 */
 
+/* One row of a k-quant without a hand-written walk, decoded one weight at a
+ * time through the file-format decoder.
+ *
+ * `q4_K` and `q6_K` have their own kernels -- the decode is hoisted out of the
+ * weight loop because it re-reads a block's header per weight -- and every
+ * other k-quant of the ladder (`q2_k`, `q3_k`, `q5_k`) comes through here.  It
+ * is not the fast path and is not meant to be: it is the *correct* one, and the
+ * op-level conformance test compares it against `backends/reference`, which
+ * decodes the same bit layout with numpy.  The sum is a single serial chain in
+ * block-then-weight order, so its association order is stated rather than left
+ * to the compiler. */
+float dot_row_generic(int type_id, const float *row, const uint8_t *blocks, int64_t k) {
+  const int block_bytes = quant::block_bytes_of(type_id);
+  float total = 0.0F;
+  for (int64_t b = 0; b < k / quant::kBlockWeights; ++b) {
+    const uint8_t *block = blocks + b * block_bytes;
+    const float *r = row + b * quant::kBlockWeights;
+    for (int i = 0; i < quant::kBlockWeights; ++i) {
+      total += r[i] * quant::dequant_block(type_id, block, i);
+    }
+  }
+  return total;
+}
+
 /* One row of `type_id` weights dotted against `row`.  The caller has checked
  * `type_id` against the type table, so the unsupported branch is unreachable;
  * it returns the scalar sum anyway rather than leaving an uninitialized value a
  * future caller could read. */
 float dot_row(int type_id, const float *row, const uint8_t *blocks, int64_t k) {
+  if (type_id != quant::kGgmlQ4K && type_id != quant::kGgmlQ6K) {
+    return dot_row_generic(type_id, row, blocks, k);
+  }
 #if POCKETLLM_HAVE_AVX2
   return dot_row_avx2(type_id, row, blocks, k);
 #else
@@ -1653,7 +1680,13 @@ void gemm_quant(const float *x, const uint8_t *blocks, const float *bias, float 
   constexpr int64_t kStackBlocks = 1024; /* 299 KiB of activation blocks */
   const bool exact = exact_gemm_forced();
   const int64_t total_blocks = m * row_blocks;
-  const bool use_int = !exact && total_blocks > 0;
+  /* The integer path -- an int8 activation against the weight's own integer
+   * route -- is written for `q4_K` and `q6_K`'s group arithmetic, so a format
+   * that is not one of the two takes the exact path instead.  Letting it fall
+   * into the integer walk would read a `q2_K` block with a `q6_K` decoder:
+   * fast, and wrong, which is the one combination a type check exists to stop. */
+  const bool int_capable = type_id == quant::kGgmlQ4K || type_id == quant::kGgmlQ6K;
+  const bool use_int = !exact && total_blocks > 0 && int_capable;
   alignas(64) quant::Q8KBlock stack_q8[kStackBlocks];
   std::unique_ptr<quant::Q8KBlock[]> heap_q8;
   quant::Q8KBlock *q8 = stack_q8;

@@ -134,14 +134,26 @@ def _quant_blocks(name: str, rows: int, row_elems: int) -> np.ndarray:
 
     # The formats whose first two bytes are a single fp16 scale.
     if name in {
-        "iq4_nl", "q8_0", "q4_k", "q5_k", "q6_k", "iq4_xs",
-        "iq2_xxs", "iq2_xs", "iq3_xxs", "q2_k", "q3_k",
+        "iq4_nl", "q8_0", "q4_k", "q5_k", "iq4_xs",
+        "iq2_xxs", "iq2_xs", "iq3_xxs",
     }:
         blocks[..., 0:2] = np.frombuffer(np.float16(0.25).tobytes(), dtype=np.uint8)
     # The formats with a *second* fp16 field at bytes 2:4 (a min, or the high
     # half of a scale); leaving that random can spell an inf.
     if name in {"q4_k", "q5_k", "q6_k"}:
         blocks[..., 2:4] = np.frombuffer(np.float16(0.5).tobytes(), dtype=np.uint8)
+    # The k-quants whose `d` is *not* in the first two bytes: `q2_k` keeps it
+    # after the sixteen scale bytes and the sixty-four quad bytes, and `q3_k`
+    # and `q6_k` keep it last of all.  A random `d` is where the inf and the NaN
+    # come from, so the offsets have to be the format's own -- writing 0.25 into
+    # a `q3_k` block's low scale nibbles leaves the value that matters random.
+    if name == "q2_k":
+        blocks[..., 80:82] = np.frombuffer(np.float16(0.25).tobytes(), dtype=np.uint8)
+        blocks[..., 82:84] = np.frombuffer(np.float16(0.5).tobytes(), dtype=np.uint8)
+    if name == "q3_k":
+        blocks[..., 108:110] = np.frombuffer(np.float16(0.25).tobytes(), dtype=np.uint8)
+    if name == "q6_k":
+        blocks[..., 208:210] = np.frombuffer(np.float16(0.25).tobytes(), dtype=np.uint8)
     # IQ1_M hides its super-scale across four nibbles, so a zero block decodes to
     # zero rather than to something finite; see test_quant_decoders.py.
     if name == "iq1_m":

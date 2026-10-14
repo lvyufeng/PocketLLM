@@ -20,12 +20,13 @@ If the checkpoint does not fit, quantize it; do not reach for a second card.
 
 Qwen3 runs on four accelerator classes through one engine. The C core (`src/`, `libpocketllm.so`)
 is where a model actually runs — it reads a GGUF, tokenizes with the checkpoint's own BPE, walks
-the graph and decodes, on `f16` weights and on packed `q4_k`/`q6_k` decoded inside the kernel.
+the graph and decodes, on `f16` weights and on the packed k-quants, the whole rung of the width
+ladder from `q2_k` through `q6_k`, decoded inside the kernel.
 
 | Device | Path | Qwen3 sizes | Format | Accuracy vs the reference |
 |---|---|---|---|---|
-| **CPU** (AVX2) | C core | 0.6B, 1.7B | `f16`, `q4_k_m` | **token-identical to llama.cpp** |
-| **1× NVIDIA** (sm_75+) | C core, eager kernels | 0.6B, 1.7B | `f16`, `q4_k_m` | **token-identical to llama.cpp** |
+| **CPU** (AVX2) | C core | 0.6B, 1.7B | `f16`, `q4_k_m`, `q2_k`/`q3_k`/`q5_k` | **token-identical to llama.cpp** |
+| **1× NVIDIA** (sm_75+) | C core, eager kernels | 0.6B, 1.7B | `f16`, `q4_k_m`, `q2_k`/`q3_k`/`q5_k` | **token-identical to llama.cpp** |
 | **RDK S600** (Horizon Nash BPU) | prebuilt `.hbm` via the `xlm` delegate | 0.6B → 8B | `leap_llm` int4 (`w4`/`w8`) | token agreement (prefix); at the quantizer's floor |
 | **Orange Pi AIpro** (Ascend 310B1) | C core, CANN backend | 0.6B → 8B | `q4_k_m` | token agreement; **at the quantizer's floor at every size** |
 
@@ -35,6 +36,16 @@ the two boards expose **no logits surface**, so "aligned to 1e-3" is expressible
 is a *quantizer-provenance* comparison, not a hardware ranking. The S600 is not a C-core backend: it
 runs a **prebuilt graph** the host compiles ahead of time, so it is listed by the artifact it runs,
 not by an op it implements.
+
+The C-core rows' format list is where the ladder starts to be real: `q2_k`, `q3_k` and `q5_k` join
+`q4_k` and `q6_k` as formats the engine decodes, each checked **block for block against llama.cpp's
+own decode of the same file** and by a greedy walk against a **fresh llama.cpp prefill at every
+step**. The block-for-block comparison is what caught this tree's Python `q3_k` decoder reading
+ggml's six-bit scales as four.
+
+The three new formats are correctness-complete rather than fast: `q4_k`'s packed AVX2 and
+int8-activation kernels are written for its own group arithmetic, so a `q2_k`/`q3_k`/`q5_k` weight
+is decoded one weight at a time for now. Packing those kernels is the follow-up.
 
 **Reference throughput — Qwen3-1.7B, `q4_k_m`, against llama.cpp:** the CPU path is **1.04× on
 prefill and 1.37× on decode** (ahead on both); the CUDA path is 0.11× / 0.40× and deliberately
@@ -54,7 +65,7 @@ device, and `EngineArgs` has no `tensor_parallel_size` to set.
 
 | Piece | State |
 |---|---|
-| [`src/`](architecture/c_engine.md) — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B and 1.7B** in `f16` and `q4_k_m`, on `cpu` and one `cuda` card. Greedy is checked token-for-token against llama.cpp; the CPU path is ahead of llama.cpp on both halves |
+| [`src/`](architecture/c_engine.md) — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B and 1.7B** in `f16` and the k-quants `q2_k` through `q6_k`, on `cpu` and one `cuda` card. Greedy is checked token-for-token against llama.cpp; the K-quant rows against llama.cpp's own decode block for block; the CPU path is ahead of llama.cpp on both halves |
 | [`src/kernel/ascend/`](architecture/ascend_310b.md) — Ascend 310B backend | **Runs Qwen3-0.6B … 8B** on an Orange Pi AIpro, at the quantizer's own floor |
 | [`pocketllm.kernels`](architecture/kernel_abi_v1.md) — descriptors, op schemas, dispatch, graph IR | **Done.** 17 ops declared; stdlib-only |
 | `pocketllm.backends.reference` — numpy oracle | **Done.** Normative: implements every declared op |

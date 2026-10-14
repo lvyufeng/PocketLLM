@@ -109,31 +109,41 @@ def dequantize_q2_k(blocks: np.ndarray) -> np.ndarray:
 
 
 def dequantize_q3_k(blocks: np.ndarray) -> np.ndarray:
-    """Q3_K: 2-bit quads whose high bit lives in a separate mask plane."""
+    """Q3_K: 2-bit quads plus a separate high-bit plane, and six-bit scales.
+
+    Three indexings have to agree with ``ggml``'s ``dequantize_row_q3_K`` and
+    none of them is the obvious one, so they are stated once here.
+
+    ``qs`` (64 bytes at offset 32) interleaves four 32-weight runs per 32-byte
+    slice: weight ``k`` reads byte ``(k // 128) * 32 + (k % 32)`` at bit
+    ``2 * ((k % 128) // 32)``.  ``hmask`` (32 bytes at offset 0) holds one bit
+    per weight: byte ``k % 32``, bit ``k // 32``, and a *clear* bit means the
+    weight's quad is reduced by four (that is the sign convention, not a bias).
+
+    The twelve ``scales`` bytes hold sixteen *six*-bit values, not sixteen
+    four-bit ones: the low nibble of ``scales[g]`` (for ``g < 8``) or the high
+    nibble of ``scales[g - 8]`` (for ``g >= 8``) is the low four bits, and bits
+    ``2 * (g // 4)`` of ``scales[8 + g % 4]`` are the top two.  The six bits are
+    biased by 32, which is what makes the scale signed.
+    """
     flat, lead = _flat(blocks, Q3_K_BLOCK_BYTES)
     hmask = flat[:, 0:32]
     qs = flat[:, 32:96]
     scales = flat[:, 96:108]
     d = f16_to_f32(flat[:, 108:110])[:, None]
-    out = np.empty((flat.shape[0], 256), dtype=np.float32)
-    for group in range(16):
-        if group < 8:
-            scale = (scales[:, group] & 0x0F).astype(np.int16)
-        else:
-            scale = (scales[:, group - 8] >> 4).astype(np.int16)
-        scale = (scale - 8).astype(np.float32)[:, None]
-        qbytes = qs[:, group * 4:(group + 1) * 4]
-        qlow = np.empty((flat.shape[0], 16), dtype=np.uint8)
-        qlow[:, 0:4] = qbytes & 0x03
-        qlow[:, 4:8] = (qbytes >> 2) & 0x03
-        qlow[:, 8:12] = (qbytes >> 4) & 0x03
-        qlow[:, 12:16] = (qbytes >> 6) & 0x03
-        bits = (
-            (hmask[:, group * 2:group * 2 + 2][:, :, None] >> np.arange(8, dtype=np.uint8)) & 1
-        ).reshape(flat.shape[0], 16)
-        q = qlow.astype(np.int16) - np.where(bits == 0, 4, 0).astype(np.int16)
-        out[:, group * 16:(group + 1) * 16] = d * scale * q.astype(np.float32)
-    return out.reshape(*lead, 256)
+
+    k = np.arange(256, dtype=np.int64)
+    group = k // 16
+    quad = (qs[:, (k // 128) * 32 + k % 32] >> (2 * ((k % 128) // 32))) & 0x03
+    high = (hmask[:, k % 32] >> (k // 32)) & 1
+
+    g = np.arange(16, dtype=np.int64)
+    low4 = np.where((g < 8)[None, :], scales[:, g % 8] & 0x0F, scales[:, g % 8] >> 4)
+    high2 = (scales[:, 8 + g % 4] >> (2 * (g // 4))) & 0x03
+    scale = ((low4.astype(np.int16) | (high2.astype(np.int16) << 4)) - 32).astype(np.float32)
+
+    q = (quad.astype(np.int16) - np.where(high == 0, 4, 0)).astype(np.float32)
+    return (d * scale[:, group] * q).reshape(*lead, 256)
 
 
 def dequantize_q4_k(blocks: np.ndarray) -> np.ndarray:

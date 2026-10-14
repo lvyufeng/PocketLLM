@@ -303,6 +303,24 @@ __device__ void quant_block_accumulate(int type_id, const uint8_t *block, const 
     }
     return;
   }
+  if (type_id != quant::kGgmlQ6K) {
+    /* The k-quants without a hand-written walk -- `q2_k`, `q3_k`, `q5_k` --
+     * decode one weight at a time through the file-format decoder. It recomputes
+     * the block's header per weight, which is exactly the cost the two branches
+     * above exist to remove, so it is the slow path; it is also the one that is
+     * right for a bit layout with no hoist written for it yet. The value and the
+     * `total[rr] +=` order are the ones the CPU's `dot_row_generic` uses, so the
+     * cross-backend comparison in `test_op_conformance.py` is comparing two
+     * sums of the same 256 floats per block and not two decoders. */
+    for (int col = 0; col < quant::kBlockWeights; ++col) {
+      const float wv = quant::dequant_block(type_id, block, col);
+#pragma unroll
+      for (int rr = 0; rr < R; ++rr) {
+        total[rr] += xs[rr * quant::kBlockWeights + col] * wv;
+      }
+    }
+    return;
+  }
   /* Q6_K: two 128-weight halves, four 32-weight runs each, sixteen signed byte
    * scales. The per-weight work is the `ql`/`qh` bit assembly, which stays in
    * the loop; `d * scale` is formed once per 16-weight span. */
