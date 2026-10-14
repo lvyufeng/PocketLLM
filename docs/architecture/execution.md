@@ -131,10 +131,9 @@ addresses them — but no kernel consumes them yet, which is `runtime_id=None` i
 
 ### The vendored header
 
-The loader used to reach into `relic_core.__file__` to find `ggml-common.h`, which meant reading a
-checkpoint required the kernel library to be installed. It is vendored now, with a provenance note
-recording the upstream revision and the MIT license, and `relic_core` is no longer an import of this
-package. Non-`.py` payload needs an explicit line in `pyproject.toml`'s `package-data` and in
+The loader reads `ggml-common.h` from the copy vendored in-tree, with a provenance note recording its
+upstream origin and the MIT license. Reading a checkpoint therefore installs no kernel library.
+Non-`.py` payload needs an explicit line in `pyproject.toml`'s `package-data` and in
 `MANIFEST.in`, or an installed wheel's loader dies at the point it reads a codebook — a failure that
 does not appear in a source checkout at all.
 

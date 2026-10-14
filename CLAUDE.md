@@ -4,14 +4,7 @@ Single-card inference engine: run a large model on **one accelerator** — edge,
 the scope reduces to is *if it does not fit, quantize it* — never offload, never split across devices.
 The width ladder is Q4 → Q2 → IQ2 → IQ1 → ternary.
 
-This repository is one of four:
-
-| Repository | What it is |
-|---|---|
-| **PocketLLM** (this tree) | Single-card / edge / mobile runtime. One process owns one device. |
-| [RelicLLM](https://github.com/lvyufeng/RelicLLM) | Multi-GPU PyTorch runtime and serving shell. |
-| [relic-core](https://github.com/lvyufeng/relic-core) | The shared torch operator library (CUDA sm_75 + CPU host ops). **Optional here, not a dependency.** |
-| relic-engine | The retired `cpp_engine` tree, kept only as a frozen archive. Nothing here builds against it. |
+This is a single-card / edge / mobile runtime: one process owns one device.
 
 `docs/README.md` indexes the documentation — the kernel ABI, the backend model and the device targets
 are documented there.
@@ -130,7 +123,7 @@ and `src/` is the *device side*, the native library that does the work.
 | `python/` | The Python package tree, and the only tree `pip install` builds. Every path below is relative to it. |
 | `python/pocketllm/kernels/` | **The kernel ABI, and the heart of the tree.** Descriptors (`dtypes`, `device`, `buffer`, `tensor`), declarations (`schema`, `ops/*`, `registry`), and the machinery a backend is driven through (`backend`, `dispatch`, `graph`). **Stdlib-only at every level** — no numpy, no torch, no I/O — because if reading a shape needed numpy, a phone build could not be trimmed of numpy. It is also the **spec** the C ABI is derived from. |
 | `python/pocketllm/quant/` | The GGML block decoders. A **leaf**: numpy and the vendored table header, and nothing else in `pocketllm`. Loader and reference backend both need it, and neither may own it. |
-| `python/pocketllm/loader/gguf/` | The GGUF reader and quantized-tensor loader. numpy only — **no torch, no `relic_core`**. `vendor/ggml-common.h` is the vendored codebook table; see below. |
+| `python/pocketllm/loader/gguf/` | The GGUF reader and quantized-tensor loader. numpy only — **no torch**. `vendor/ggml-common.h` is the vendored codebook table; see below. |
 | `python/pocketllm/backends/` | Device implementations, one directory each, plus `registry.py` (the static table and the entry-point discovery), `base.py` (`RuntimeProbe`, `DeclaredBackend`, `UnimplementedSession`) and the conformance harness's subject. `reference/` is implemented; the other six are stubs. |
 | `python/pocketllm/engine/` | Execution: `session.py` (device selection and policy), `planner.py` (regions), `executor.py` (the op-by-op walk), `captured.py`, `memory.py` (the arena and liveness) and `llm.py` (the `LLM`/`AsyncLLM` facade). |
 | `python/pocketllm/architectures/` | The model IR (`ir.py`, `cache.py`, `registry.py`) and the builders. Only `toy` ships. |
@@ -159,11 +152,10 @@ Three invariants the layout exists to protect:
 
 ### The vendored GGML header
 
-`python/pocketllm/loader/gguf/vendor/ggml-common.h` **is** how this tree reads a codebook table. Before the
-rebuild the loader resolved it through `Path(relic_core.__file__).parent / "csrc" / ...`, which made
-reading a checkpoint require the kernel library — unacceptable for a phone install. It is resolved in
-order by `pocketllm.quant.ggml_tables.header_path()`: `$POCKETLLM_GGML_COMMON` → the vendored copy →
-relic-core's, last, with its absence not an error. The vendored copy's sha256 is pinned in
+`python/pocketllm/loader/gguf/vendor/ggml-common.h` **is** how this tree reads a codebook table. Reading
+a checkpoint must not require a kernel library — unacceptable for a phone install. It is resolved in
+order by `pocketllm.quant.ggml_tables.header_path()`: `$POCKETLLM_GGML_COMMON` → the vendored copy,
+and deliberately no further fallback. The vendored copy's sha256 is pinned in
 `ggml_tables.VENDORED_SHA256` and a local edit is refused rather than silently changing what every
 decoder reads.
 
@@ -180,9 +172,9 @@ Ascend machine at all, and neither machine can run a model from this tree today.
 
 ### x86_64 CUDA machine — 4 x RTX 2080 Ti
 
-- **GPUs**: 4 x RTX 2080 Ti, 22528 MiB each, compute capability **7.5 (Turing / sm_75)**. relic-core
-  builds for sm_75; do not drop sm_75-specific kernel paths there. `src/kernel/cuda/` is built for
-  sm_75 too (`POCKETLLM_CUDA_ARCHITECTURES`), and one process uses exactly one of these cards.
+- **GPUs**: 4 x RTX 2080 Ti, 22528 MiB each, compute capability **7.5 (Turing / sm_75)**.
+  `src/kernel/cuda/` is built for sm_75 (`POCKETLLM_CUDA_ARCHITECTURES`), and one process uses
+  exactly one of these cards.
 - **CPU / RAM**: 2 x Xeon E5-2696 v4, 22 cores each (88 hardware threads), ~1 TiB RAM.
 - **OS / Python**: Ubuntu 22.04.5, x86_64, kernel 5.15. Python 3.10.10 (conda).
 - **CUDA**: `nvcc` on `PATH` is **13.0** while `CUDA_HOME` points at **`/usr/local/cuda-12.4`**;
@@ -193,8 +185,8 @@ Ascend machine at all, and neither machine can run a model from this tree today.
   - **Historical trap, now resolved**: a pip-installed torch used to be built against CUDA 12.4
     while `nvcc` was 13.0, and `torch.utils.cpp_extension` hard-fails on that mismatch
     (`The detected CUDA version (13.0) mismatches the version that was used to compile PyTorch
-    (12.4)`). Torch is now `2.13.0+cu130` and the two agree. relic-core still compiles CUDA and
-    would still hit this if torch were ever downgraded.
+    (12.4)`). Torch is now `2.13.0+cu130` and the two agree. The trap would return if torch were
+    ever downgraded.
 - **No NPU here**: no `/dev/davinci*` and no CANN.
 - One relevant `git` note: `origin` is HTTP**S** (`https://github.com/lvyufeng/PocketLLM.git`) and
   there is no SSH key this host can authenticate to GitHub with. `gh` is authenticated separately as

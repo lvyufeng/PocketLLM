@@ -115,7 +115,7 @@ _ALLOWED: dict[str, set[str] | None] = {
 }
 
 #: Runtimes that a base install does not have, so only a backend may import one.
-_OPTIONAL_RUNTIMES = ("torch", "relic_core", "qai_appbuilder")
+_OPTIONAL_RUNTIMES = ("torch", "qai_appbuilder")
 
 
 def _modules() -> list[pathlib.Path]:
@@ -192,7 +192,6 @@ def test_only_the_kernel_abi_is_stdlib_only(path: pathlib.Path) -> None:
     third_party = {
         "numpy",
         "torch",
-        "relic_core",
     }
     violations = [
         f"{path.relative_to(ROOT)}:{lineno} imports {name.split('.')[0]}"
@@ -204,7 +203,7 @@ def test_only_the_kernel_abi_is_stdlib_only(path: pathlib.Path) -> None:
 
 @pytest.mark.parametrize("path", _modules(), ids=lambda p: _dotted(p))
 def test_optional_runtimes_are_imported_only_by_backends(path: pathlib.Path) -> None:
-    """torch, relic_core and the QNN bindings are a backend's business, not the core's.
+    """torch and the QNN bindings are a backend's business, not the core's.
 
     A core module that imported one would make the whole wheel uninstallable on a
     phone, which is the opposite of what this tree is for.  A *backend* module is
@@ -240,7 +239,7 @@ def test_importing_the_package_loads_no_runtime() -> None:
 
     probe = (
         "import sys; import pocketllm; "
-        "leaked = [m for m in ('numpy', 'torch', 'relic_core') if m in sys.modules]; "
+        "leaked = [m for m in ('numpy', 'torch') if m in sys.modules]; "
         "assert not leaked, leaked"
     )
     result = subprocess.run(
@@ -265,7 +264,7 @@ def test_the_cli_imports_with_no_backend_runtime() -> None:
 
     probe = (
         "import sys; import pocketllm.cli; "
-        "leaked = [m for m in ('numpy', 'torch', 'relic_core') if m in sys.modules]; "
+        "leaked = [m for m in ('numpy', 'torch') if m in sys.modules]; "
         "assert not leaked, leaked"
     )
     result = subprocess.run(

@@ -9,10 +9,6 @@ a number taken now would describe the loader rather than the kernels. It will be
 the weights are quantized — a Q4_K GEMM is where the width ladder starts to pay, and that is the
 regime this repository exists for.
 
-The previous tree's reports — the 2080 Ti DeepSeek-V4 study among them — measured runtimes that have
-since been rewritten. They belong with that code, which is preserved on the `legacy` branch, and the
-multi-card half of it is in [RelicLLM](https://lvyufeng.github.io/RelicLLM/).
-
 ## What a report here will need
 
 When there is something to measure, a report in this section carries the conditions the numbers were

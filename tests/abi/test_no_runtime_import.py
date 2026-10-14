@@ -6,8 +6,8 @@ pytest session and some other test importing numpy would mask the leak.
 
 What is being protected: the wheel installs on a phone and an edge board as
 well as on a CUDA host. numpy is allowed in the base install (the loader and the
-reference backend need it), but torch and relic_core are optional dependencies
-of specific backends and must not appear merely from importing the core.
+reference backend need it), but torch is an optional dependency of specific
+backends and must not appear merely from importing the core.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import textwrap
 import pytest
 
 #: Runtimes that are optional: a base install must work without them.
-OPTIONAL_RUNTIMES = ("torch", "relic_core")
+OPTIONAL_RUNTIMES = ("torch",)
 
 
 def _run(source: str) -> str:
@@ -133,7 +133,7 @@ def test_probing_availability_imports_no_optional_runtime() -> None:
         from pocketllm.backends import registry
         for entry in registry.BACKENDS.values():
             registry.raw(entry.name).factory().available()
-        leaked = [m for m in sys.modules if m.split(".")[0] in ("torch", "relic_core", "qai_appbuilder")]
+        leaked = [m for m in sys.modules if m.split(".")[0] in ("torch", "qai_appbuilder")]
         print(",".join(sorted(set(leaked))))
         """
     )
