@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -63,6 +64,51 @@ int usage(const char *argv0) {
                "       %s <checkpoint.gguf> --tokens 1 2 3   # ids, bypassing the tokenizer\n",
                argv0, argv0);
   return 2;
+}
+
+/* Return `code` after skipping the process's exit-time destructors.
+ *
+ * On the Ascend board `aclrtSetDevice` arms a fixed ~3.3 s teardown the process
+ * pays whether or not anything is released: a standalone probe that called
+ * `aclInit` and `aclrtSetDevice` and nothing else still took 3.6 s to
+ * disappear, and explicit `aclrtResetDevice`+`aclFinalize`, `_Exit(0)` right
+ * after `SetDevice`, and the three op-timeout knobs all landed inside a 50 ms
+ * spread of it (see `docs/architecture/ascend_310b.md`, "The process wall is
+ * quantized in 3.07 s bands").  What `_Exit` *does* skip is this process's own
+ * teardown on top of that tax -- the backend's destructor, the model's device
+ * buffers, and, under `POCKETLLM_ASCEND_PROFILE`, the profiler, whose whole
+ * report is printed by a leaked static's destructor.
+ *
+ * Measured on the board, `--steps 8`: 3.02 / 0.39 / 2.41 s at 0.6B / 1.7B / 4B
+ * in one session and 1.77 / 0.90 / 0.98 s in another.  The spread is the band
+ * quantization itself -- which band each arm lands in -- not the work, which is
+ * the reason no single delta is quoted here as *the* saving.
+ *
+ * This is a tool and not the library.  The engine is entered and left inside
+ * one `main`, so "run once, then the process ends" is exactly this tool's
+ * contract -- a serving host that opens and closes sessions in a loop is not
+ * this shape and nothing here moves it.  `POCKETLLM_RUN_KEEP_TEARDOWN=1`
+ * restores the destructors for a run that wants them.
+ *
+ * The Ascend backend's per-op profile is itself an exit-time dump -- it is
+ * printed by a leaked static's destructor -- so a run that asks for the profile
+ * gets the teardown back automatically.  Without that, setting
+ * `POCKETLLM_ASCEND_PROFILE=1` would print nothing and read as a broken flag
+ * rather than as this interaction; the coupling is stated here because it is
+ * the one thing that can silently empty a diagnostic.
+ *
+ * The callers write `return exit_skipping_teardown(0)` and not a bare call
+ * followed by `return 0`: when the teardown is kept the function must fall
+ * through to a real `return`, because an unconditional `std::_Exit` would make
+ * both the knob and the profile a no-op.  `fflush` first, because `_Exit` does
+ * not flush. */
+int exit_skipping_teardown(int code) {
+  if (std::getenv("POCKETLLM_RUN_KEEP_TEARDOWN") != nullptr ||
+      std::getenv("POCKETLLM_ASCEND_PROFILE") != nullptr) {
+    return code;
+  }
+  std::fflush(nullptr);
+  std::_Exit(code);
 }
 
 }  // namespace
@@ -142,7 +188,10 @@ int main(int argc, char **argv) {
                                                          /*parse_special=*/true);
     if (tokens.empty()) {
       std::fprintf(stderr, "the prompt tokenized to nothing\n");
-      return 1;
+      /* After the backend exists, so this exit pays the same teardown the
+       * normal one does; the two `usage` returns above are before it and do
+       * not. */
+      return exit_skipping_teardown(1);
     }
 
     std::fprintf(stderr, "prompt tokenized to %zu token(s):", tokens.size());
@@ -230,9 +279,9 @@ int main(int argc, char **argv) {
 
     std::fprintf(stderr, "]\n");
     std::fputs("\n", stdout);
-    return 0;
+    return exit_skipping_teardown(0);
   } catch (const std::exception &e) {
     std::fprintf(stderr, "%s: %s\n", argv[0], e.what());
-    return 1;
+    return exit_skipping_teardown(1);
   }
 }
