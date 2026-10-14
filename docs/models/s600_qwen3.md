@@ -120,6 +120,7 @@ costs in its row's `ion_carveout`.
 | Qwen3-4B (w4), ours `cache_1024` | 3.00 GiB | 6.35 s | 4339–4571 t/s | **49.9 t/s** (49.99 / 49.96 / 49.86) | 4,254,269,440 B (3.96 GiB) | `balanced` | 39.6% |
 | Qwen3-4B (w8), ours `cache_1024` | 4.69 GiB | 7.34 s | 4163–4491 t/s | **33.1 t/s** (33.07 / 33.10 / 33.04) | 6,073,548,800 B (5.66 GiB) | `balanced` | 56.6% |
 | Qwen3-8B (w8), ours `cache_1024` | 8.46 GiB | 9.41 s | 2909–3030 t/s | **20.5 t/s** (20.45–20.49) | 10,472,783,872 B (9.75 GiB) | **`bpu_first`** | **54.2%** |
+| Qwen3-8B (w8), ours `cache_2048` | 8.49 GiB | 9.40 s | 2580–2681 t/s | **20.2 t/s** (20.20–20.22) | 11,228,610,560 B (10.46 GiB) | **`bpu_first`** | **58.1%** |
 
 Decode falls with size — 88.3 → 70.2 → 42.8 → 29.7 t/s on the shipped graphs — and the memory column
 rises with it, which is the whole of the ladder's shape: the BPU's per-token cost and the pool's
@@ -127,9 +128,12 @@ footprint both track the parameter count. Our own `w4` `cache_1024` builds sit *
 twins on both axes (faster, and smaller in the pool), which is the subject of the note on them below —
 the `w8` rebuilds keep the pool edge but not the rate one, and their own note below covers the bill.
 Every graph's three runs produced **byte-identical text**, so each number is a rate and not a draw —
-the 8B `w8` row included, **nine runs across three loads with a single digest**
-(sha256 `76025885…`). The 8B is where that determinism has measured exceptions, which is why the new
-row is quoted as nine runs: our 8B `w4` `cache_4096` build, re-run under `bpu_first` on this same
+the 8B `w8` `cache_1024` row included, **nine runs across three loads with a single digest**
+(sha256 `76025885…`). The 8B `w8` `cache_2048` row is the exception: its passes 1 and 2 agree and pass
+3 diverges, the same 8B non-determinism the `w4`/`cache_4096` build shows, so that row's rate is a
+three-run range rather than one digest. The 8B is where that determinism has measured exceptions, which
+is why the `cache_1024` row is quoted as nine runs: our 8B `w4` `cache_4096` build, re-run under
+`bpu_first` on this same
 canonical prompt, gave three **non**-identical runs (2026-10-13), and the survey above records the
 shipped 8B diverging once in four `1..200` runs
 ([the caveat](#the-corrupted-token-is-the-build-not-the-cache)).
@@ -299,16 +303,20 @@ watchdog, greedy, three runs a cell):
 
 | graph | `1..200` | `1..400` | `France?` | byte-identical |
 |---|---|---|---|---|
+| ours 0.6B `w8` | truncate at **152**, ordered 1…152 | truncate at **177** | closes, 918 chars, recurs 1× | 3/3 each cell |
 | ours 1.7B `w8` | truncate at **167**, ordered 1…167 | truncate at **36** | closes, 1631 chars, recurs 2× | 3/3 each cell |
 | ours 4B `w8` | truncate at **42** | truncate at **83** | closes, 3030 chars, recurs 1× | 3/3 each cell |
 | ours 8B `w8` | 1 truncate (a repeated `35, 36` at the 36th, then clean to 135) / 1 hang / 1 never closes | 2 never close (**recurs 5–6×**) / 1 hang | closes, 989 chars, recurs 1× | **0/3** — all three differ |
 
-**The corrupted token does not appear at `w8` — not once, in twenty-seven runs.** No
+**The corrupted token does not appear at `w8` — not once, in thirty-six runs, at all four sizes.** No
 `.bunifuFlatButton`, no `个人`, no token `95234`; and every list that reached its enumeration is strictly
-ordered up to the point the window cut it — the 1.7B to 167, the 4B to 42 and to 83, the 8B to 135. The
-width argument's prediction holds at both sizes where the `w4` slipped: the **4B** `w8` writes 1…42 and
-1…83 with no `2一` where its `w4` sibling slipped at the 24th number, and the **8B** `w8` never emits
-the garbage token its `w4` sibling emitted in six of six `cache_4096` runs. The single anomaly in the
+ordered up to the point the window cut it — the 0.6B to 152, the 1.7B to 167, the 4B to 42 and to 83,
+the 8B to 135. The width argument's prediction holds at every size where the `w4` slipped: the **4B**
+`w8` writes 1…42 and 1…83 with no `2一` where its `w4` sibling slipped at the 24th number, and the
+**8B** `w8` never emits the garbage token its `w4` sibling emitted in six of six `cache_4096` runs. The
+0.6B `w8` cell is the newest of the four — its `cache_1024` graph was rebuilt to complete this table
+(the three sizes below it already had one) and its three cells are byte-identical, so the slip is now
+absent at `w8` **across the whole family**, not three of four sizes. The single anomaly in the
 whole battery is benign and of another kind: one 8B `1..200` run repeats the pair `35, 36` at the 36th
 entry — a **duplication**, not a substitution — and the list resumes and runs on to 135.
 
@@ -336,10 +344,13 @@ expose it — the ladder's nine identical runs on `The capital of France is` are
 this. The lever the page's own data points at is the **cache**, not the width: our 8B `w4` at
 `cache_4096` completes both enumerations
 ([the decisive cell](#the-decisive-cell-our-8b-at-the-vendors-cache-still-corrupts)) and the 1.7B sweep
-closes the loop already at `2048`. One rebuild — an 8B `w8` at `cache_2048` or `4096` — would buy it;
+closes the loop already at `2048`. One rebuild — an 8B `w8` at `cache_2048` — would buy it;
 the caveat that comes with the price is that `cache_4096` is where our 8B `w4` corrupted *most* (six of
 six runs, and a shorter `1..400` prefix than at `1024`), so the cache answers the rumination while
-leaving the surface it fixes untested at `w8`/`4096` in the other direction.
+leaving the surface it fixes untested at `w8`/`4096` in the other direction. That rebuild was made and
+measured — [the `cache_2048` result](#the-8b-w8-at-cache_2048-the-cache-closes-the-short-list-not-the-long-one)
+is **negative**: it fits and closes the `1..200` list, but not `1..400`, and it does not lift accuracy.
+No `cache_4096` graph was built.
 
 #### The decisive cell: our 8B at the vendor's cache still corrupts
 
@@ -2226,7 +2237,10 @@ All four of the build-side ones are ruled out, and each by a number already in t
 
 **The deeper answer is that our `w8` stops improving at this size while the floor does not.** Read
 against truth at every size on the same 49 prompts (the `f16`-anchored rows, matched so that a stall
-cannot flatter either side):
+cannot flatter either side). These Σ are the **matched-49** cut — the intersection of the four sizes'
+scoring rows — so they differ from the per-size Σ in the tables above, which carry each row's own
+`n` (the floor at `n = 50`, our `w8` at `n = 49` here and at other `n` elsewhere); the drop of the one
+prompt that not every size scored is what separates a row's own Σ from its value in this curve:
 
 | size | ours `w8` Σ | floor Σ | ratio |
 |---|---|---|---|
@@ -2317,6 +2331,55 @@ the same corpus, our 8B at the vendor's cache has the *same* wide 8B-style defic
 against the shipped graph at the same cache; median Δ **0** against our own `cache_1024` graph), so the
 cache is not an accuracy lever for the 8B either. The full row and the enumeration that came with it are
 [in the survey below](#cache-versus-build-on-the-accuracy-table).
+
+#### The 8B `w8` at `cache_2048`: the cache closes the short list, not the long one
+
+The lever the section above names — the cache, not the width — has now been pulled and measured, and
+the result is **negative**. An 8B `w8` at `cache_2048`
+(`Qwen3-8B_language_chunk_512_cache_2048_w8_nash-p_corenum_4_4.hbm`, **9,110,978,408 B (8.49 GiB)**,
+md5 `b979e2f45671ee1190a538ba0ea66071`, relayed 2080ti→Mac→board and md5-verified at all three ends)
+loads and runs, but it does not buy what the rebuild was for.
+
+**A confounder the build carries, and it is stated, not hidden.** The two 8B `w8` builds differ in
+their **device line as well as their cache**: the `cache_1024` graph was compiled `--device cpu`, the
+`cache_2048` graph `--device cuda:0,cuda:1,cuda:2,cuda:3`. (The `cpu` line is the c1024 build's own
+running command line, recovered from `ps` on the compile host, not an inference; the four-card line is
+this build's. A single `cuda:0` OOM'd the f16 8B at 21.32 GiB, so `cuda:0..3` was required, not
+optional.) So `c1024 → c2048` changes **device and cache together**, and any "the cache buys accuracy"
+claim drawn from the pair has to carry that caveat. The current build's exact invocation is recorded
+in `/mnt/data1/oellm_models/BUILD_8B_C2048_W8.record.txt` (frozen, md5 `2824ecca…`), with the
+confounder in a **separate** companion file so that record's hash stays valid.
+
+- **It fits, comfortably.** Ladder, three passes: load 9.4 s, **carveout after load 10.46 GiB =
+  58.1%** of the 18.00 GiB `bpu_first` pool (the `cache_1024` graph measured 9.75 GiB / 54.2%), decode
+  **20.2 t/s**, prefill 2580–2680 t/s. Footprint is not the constraint here.
+- **It closes the *short* enumeration and not the long one.** On the `1..N` battery the `1..200` cell
+  becomes **two clean runs to 200, byte-identical** (3846 chars) where the `cache_1024` graph
+  truncated at 135, hung once and self-stopped once; but `1..400` still fails (self-stop / hang /
+  truncate at 158), and `France?` is closes / closes / hang. The slip stays absent (0 glitch tokens in
+  all nine runs). The cache moves the ceiling from ~135 to ~200 numbers and no further.
+- **It does not improve accuracy, and the raw direction is negative.** On the same 50-prompt corpus,
+  matched on the 41 prompts both graphs scored, the Σ-prefix **median is 25 against the `cache_1024`
+  graph's 28**, mean **30.2 vs 35.0** — a matched-41 **Δ of −4.7**, with the deficit in the long tail
+  (8 rows ≥40 against the c1024 graph's 15). Per category the `cache_2048` graph is behind on
+  instruction (24.6 vs 42.0), longform (19.0 vs 33.0) and ambiguity (23.3 vs 31.5), ahead only on
+  multilingual. The rebuild did **not** lift the row.
+- **The stall counts differ, but not because of the cache.** The `cache_2048` capture stalled on
+  **8 of 50** prompts against the `cache_1024` capture's **1 of 50** — but that is a cross-session
+  comparison, and a controlled same-session A/B (ten runs each, alternating, same prompt) stalls
+  **0/10 on c1024 and 0/10 on c2048**, while the battery on identical prompts hangs 2/9 (c1024) and
+  3/9 (c2048). The intermittent first-token hang
+  ([#650](#the-intermittent-hang-a-lost-wake-up-inside-the-delegates-decode-path)) is a low-rate
+  stochastic flake on **both** graphs; the 8-vs-1 capture gap is a session artefact, not a `cache_2048`
+  property, and it is not attributed to the rebuild.
+
+**So the 8B `w8` deployability question is closed, and no `cache_4096` build was pursued.** The cache
+is enough to finish a two-hundred-item list and not enough to finish a four-hundred-item one; the
+matched accuracy moved the wrong way; and the floor's own five prompts still decide the sign of the
+size's [matched curve](#the-8b-at-w8-the-width-lever-falls-short) above. The next lever would be
+`cache_4096`, but at this size the remaining degree of freedom is entangled with the device confounder
+recorded here, and the data does not argue for spending the build. The 8B `w8` is not the deployable
+long-generation graph, and that is the recorded outcome.
 
 #### The 1.7B at `w8`: above the floor against truth
 
