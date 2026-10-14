@@ -203,6 +203,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -646,6 +647,67 @@ void dequant_block_into(int type_id, const uint8_t *block, float *out) {
   }
 }
 
+/* How many threads the plane build may use.  Defaults to the hardware
+ * concurrency, because the plane build is the dominant cost of a short run and
+ * it parallelizes with no precision question -- a weight is decoded to a value
+ * that does not depend on any other weight, so a thread sees exactly the bytes a
+ * serial decode would.  `POCKETLLM_ASCEND_BUILD_THREADS=1` forces the serial
+ * walk back (the A/B this was settled by), and any positive value pins the
+ * count.  Capped so a modest board is not oversubscribed, and floored at 1 so
+ * the serial path is still a path. */
+int build_threads() {
+  static const int n = [] {
+    int want = static_cast<int>(std::thread::hardware_concurrency());
+    if (want <= 0) {
+      want = 1;
+    }
+    if (const char *env = std::getenv("POCKETLLM_ASCEND_BUILD_THREADS")) {
+      const int forced = std::atoi(env);
+      if (forced > 0) {
+        want = forced;
+      }
+    }
+    return want;
+  }();
+  return n;
+}
+
+/* Run `body(t, nt)` on `nt` threads, joining before returning.  The rows of the
+ * work are strided across the threads (`t, t + nt, ...`), and every body writes
+ * only what the others do not, so no lock is needed. */
+template <typename Body>
+void run_strided(int nt, Body body) {
+  if (nt <= 1) {
+    body(0, 1);
+    return;
+  }
+  std::vector<std::thread> pool;
+  pool.reserve(static_cast<std::size_t>(nt));
+  for (int t = 0; t < nt; ++t) {
+    pool.emplace_back([t, nt, &body] { body(t, nt); });
+  }
+  for (std::thread &th : pool) {
+    th.join();
+  }
+}
+
+/* Decode an `[n, k]` packed weight to a dense f32 `[n, k]`, block by block, with
+ * the rows strided across `build_threads()` threads.  This is the loop that was
+ * ~99% of the plane build's CPU time; splitting it is why the build is no longer
+ * the wall. */
+void decode_packed_rows(const std::vector<uint8_t> &host, int64_t n, int64_t blocks_per_row,
+                        int64_t block_bytes, int type_id, int64_t k, float *dense) {
+  const int nt = build_threads();
+  run_strided(nt, [&](int t, int count) {
+    for (int64_t row = t; row < n; row += count) {
+      for (int64_t b = 0; b < blocks_per_row; ++b) {
+        const uint8_t *block = host.data() + (row * blocks_per_row + b) * block_bytes;
+        dequant_block_into(type_id, block, dense + row * k + b * quant::kBlockWeights);
+      }
+    }
+  });
+}
+
 /* Convert an `[n, k]` row-major f32 weight to the `[k, n]` fp16 plane the cube's
  * B operand wants: each source row becomes a destination column.  A naive walk
  * writes one element per output cache line (stride `n`); walking the source in
@@ -655,9 +717,14 @@ void dequant_block_into(int type_id, const uint8_t *block, float *out) {
  * is bit-identical to it. */
 constexpr int64_t kConvertTile = 64;
 
-void f32_to_f16_transposed(const float *src, int64_t n, int64_t k, uint16_t *dst) {
-  for (int64_t rb = 0; rb < n; rb += kConvertTile) {
-    const int64_t r_end = std::min(n, rb + kConvertTile);
+/* The serial transpose of one row range [r0, r1).  Split out so the threaded
+ * wrapper can hand each thread its own range: thread ranges partition the
+ * source *rows*, which write disjoint destinations -- source row `r` writes
+ * destination row `r` of the `[k, n]` plane -- so the split needs no lock. */
+void f32_to_f16_transposed_rows(const float *src, int64_t r0, int64_t r1, int64_t n, int64_t k,
+                                uint16_t *dst) {
+  for (int64_t rb = r0; rb < r1; rb += kConvertTile) {
+    const int64_t r_end = std::min(r1, rb + kConvertTile);
     for (int64_t cb = 0; cb < k; cb += kConvertTile) {
       const int64_t c_end = std::min(k, cb + kConvertTile);
       for (int64_t r = rb; r < r_end; ++r) {
@@ -679,6 +746,18 @@ void f32_to_f16_transposed(const float *src, int64_t n, int64_t k, uint16_t *dst
       }
     }
   }
+}
+
+void f32_to_f16_transposed(const float *src, int64_t n, int64_t k, uint16_t *dst) {
+  const int64_t per = (n + build_threads() - 1) / build_threads();
+  run_strided(build_threads(), [&](int t, int count) {
+    const int64_t r0 = static_cast<int64_t>(t) * per;
+    const int64_t r1 = std::min(n, r0 + per);
+    (void)count;
+    if (r0 < r1) {
+      f32_to_f16_transposed_rows(src, r0, r1, n, k, dst);
+    }
+  });
 }
 
 /* ---- host scratch for a device region ----------------------------------- */
@@ -2176,13 +2255,7 @@ class AscendBackend final : public Backend {
     std::vector<float> dense(static_cast<std::size_t>(n * k));
     {
       BuildClock _b("decode_cube");
-      for (int64_t row = 0; row < n; ++row) {
-        for (int64_t b = 0; b < blocks_per_row; ++b) {
-          const uint8_t *block = host.data() + (row * blocks_per_row + b) * block_bytes;
-          dequant_block_into(type_id, block,
-                             dense.data() + row * k + b * quant::kBlockWeights);
-        }
-      }
+      decode_packed_rows(host, n, blocks_per_row, block_bytes, type_id, k, dense.data());
     }
     /* Decode once, straight into the transposed fp16 plane the cube wants -- no
      * intermediate f32 device buffer and no per-token re-transpose. */
@@ -2231,13 +2304,7 @@ class AscendBackend final : public Backend {
     std::vector<float> dense(static_cast<std::size_t>(vocab * d));
     {
       BuildClock _b("decode_table");
-      for (int64_t row = 0; row < vocab; ++row) {
-        for (int64_t b = 0; b < blocks_per_row; ++b) {
-          const uint8_t *block = host.data() + (row * blocks_per_row + b) * block_bytes;
-          dequant_block_into(type_id, block,
-                             dense.data() + row * d + b * quant::kBlockWeights);
-        }
-      }
+      decode_packed_rows(host, vocab, blocks_per_row, block_bytes, type_id, d, dense.data());
     }
     DeviceBuffer device = allocate(vocab * d * 4);
     {
