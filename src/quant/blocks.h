@@ -28,6 +28,8 @@
  *   block_q4_K:  d(fp16) dmin(fp16) scales[12] qs[128]         -- 144 bytes
  *   block_q5_K:  d(fp16) dmin(fp16) scales[12] qh[32] qs[128]  -- 176 bytes
  *   block_q6_K:  ql[128] qh[64] scales[16 int8] d(fp16)        -- 210 bytes
+ *   block_iq2_xxs: d(fp16) qs[64]                              -- 66 bytes
+ *   block_iq2_xs:  d(fp16) qs[64] scales[8]                    -- 74 bytes
  *
  * Every one carries 256 weights. `q4_K` and `q5_K` split them into eight groups
  * of 32, each with a 6-bit scale and a 6-bit minimum packed together into the
@@ -35,7 +37,9 @@
  * groups of 16 and packs that pair into one byte per group, a nibble each;
  * `q3_K` carries a signed 6-bit scale per 16-weight group plus a separate
  * high-bit plane; `q6_K` splits them into sixteen groups of 16, each with an
- * int8 scale.
+ * int8 scale.  The two IQ2 formats cut 256 weights into eight 32-weight
+ * sub-blocks whose weights are not numbers at all but *indices* into a codebook,
+ * so their decoders read a table rather than compute a value.
  */
 
 #ifndef POCKETLLM_QUANT_BLOCKS_H
@@ -44,6 +48,13 @@
 #include <cstdint>
 
 #include "quant/half.h"
+
+/* The two IQ2 codebooks, generated from ggml's table header by
+ * `scripts/gen_iq_tables.py`.  A codebook format has no arithmetic to decode a
+ * block with, so the table is the format, and a copy of a table is the one thing
+ * here that cannot be checked by re-deriving it -- hence a generated file with
+ * the source's sha256 in it rather than a transcription. */
+#include "quant/iq2_grid.h"
 
 /* The CPU translation unit and the CUDA one both include this. `POCKETLLM_HD`
  * is the marker that decides which callable a definition gets: plain `inline`
@@ -68,6 +79,8 @@ constexpr int kQ3KBlockBytes = 110;
 constexpr int kQ4KBlockBytes = 144;
 constexpr int kQ5KBlockBytes = 176;
 constexpr int kQ6KBlockBytes = 210;
+constexpr int kIq2XxsBlockBytes = 66;
+constexpr int kIq2XsBlockBytes = 74;
 
 /* The byte at `p`, as an index. GGUF is little-endian and so is every host this
  * runs on, which is the assumption `half.h` already states for its u16 load. */
@@ -274,8 +287,102 @@ POCKETLLM_HD float dequant_q5_k(const uint8_t *block, int index) {
          dmin * static_cast<float>(minimum);
 }
 
+/* The codebook the pass being compiled can read.
+ *
+ * `iq2_grid.h` declares each table twice, because a host array is not visible
+ * from device code and a `__device__` array is not visible from the host half of
+ * a `__host__ __device__` function -- and these decoders are compiled as both.
+ * `__CUDA_ARCH__` is defined only in the device pass, so it is the selector. */
+POCKETLLM_HD const uint64_t *iq2xxs_grid() {
+#ifdef __CUDA_ARCH__
+  return kIq2xxsGridDevice;
+#else
+  return kIq2xxsGrid;
+#endif
+}
+
+POCKETLLM_HD const uint64_t *iq2xs_grid() {
+#ifdef __CUDA_ARCH__
+  return kIq2xsGridDevice;
+#else
+  return kIq2xsGrid;
+#endif
+}
+
+/* The parity of a seven-bit value.
+ *
+ * An IQ2 weight's sign is one bit of a seven-bit sign index, and ggml spends the
+ * *eighth* bit of the same byte on the parity of those seven -- `ksigns_iq2xs`,
+ * one byte of signs with one extra sign bit for free.  Computing the parity
+ * rather than vendoring that table is one less copy of a fact, and the rule is
+ * the one this tree already pins in `tests/loader/test_vendored_header.py`
+ * (`test_sign_expansion_matches_the_bit_parity_rule`), where the Python decoder
+ * applies it to the same header.
+ *
+ * Written as the standard fold: it is four instructions, and the same source is
+ * compiled by the host compiler and by nvcc, so nothing here needs a builtin. */
+POCKETLLM_HD int parity7(int value) {
+  value ^= value >> 4;
+  value ^= value >> 2;
+  value ^= value >> 1;
+  return value & 1;
+}
+
+/* Whether weight `j` of a codebook entry takes the entry's sign: bit `j` of the
+ * sign index, or its parity when `j` is 7. */
+POCKETLLM_HD bool iq2_is_negative(int sign_index, int j) {
+  const int signs = sign_index | (parity7(sign_index) << 7);
+  return ((signs >> j) & 1) != 0;
+}
+
+/* One weight of an IQ2_XXS super-block.
+ *
+ * The block is eight 32-weight sub-blocks and each sub-block is eight bytes: four
+ * one-byte codebook indices, then a little-endian word whose four 7-bit fields
+ * are their sign indices and whose top nibble is the sub-block's scale.  A
+ * codebook entry holds eight magnitudes of two bits each, byte `j` being weight
+ * `j`, and the sign is applied on top -- the table itself is unsigned.
+ *
+ * So the value is `d * (0.5 + scale_nibble) * 0.25 * magnitude * ±1`, in the
+ * association ggml writes, which is what makes this decoder reproduce
+ * llama.cpp's value bit for bit rather than only to a rounding. */
+POCKETLLM_HD float dequant_iq2_xxs(const uint8_t *block, int index) {
+  const int sub = index / 32;         /* which of the eight sub-blocks */
+  const int part = (index % 32) / 8;  /* which of its four codebook entries */
+  const int j = index % 8;            /* position inside that entry */
+  const uint8_t *chunk = block + 2 + sub * 8;
+  const uint32_t aux1 = static_cast<uint32_t>(as_byte(chunk, 4)) |
+                        (static_cast<uint32_t>(as_byte(chunk, 5)) << 8) |
+                        (static_cast<uint32_t>(as_byte(chunk, 6)) << 16) |
+                        (static_cast<uint32_t>(as_byte(chunk, 7)) << 24);
+  const int sign_index = static_cast<int>(aux1 >> (7 * part)) & 127;
+  const float db = as_half(block, 0) * (0.5F + static_cast<float>(aux1 >> 28)) * 0.25F;
+  const int magnitude =
+      static_cast<int>((iq2xxs_grid()[as_byte(chunk, part)] >> (8 * j)) & 0xFF);
+  return db * static_cast<float>(magnitude) * (iq2_is_negative(sign_index, j) ? -1.0F : 1.0F);
+}
+
+/* One weight of an IQ2_XS super-block.
+ *
+ * Also eight 32-weight sub-blocks, but each codebook index is nine bits and
+ * carries its own seven-bit sign index in the same 16-bit word, and the scales
+ * are a separate eight-byte plane with a nibble per sub-block: the low nibble
+ * scales the sub-block's first two entries and the high nibble its last two. */
+POCKETLLM_HD float dequant_iq2_xs(const uint8_t *block, int index) {
+  const int sub = index / 32;
+  const int part = (index % 32) / 8;
+  const int j = index % 8;
+  const uint8_t *chunk = block + 2 + sub * 8;
+  const int word = as_byte(chunk, part * 2) | (as_byte(chunk, part * 2 + 1) << 8);
+  const int packed = as_byte(block, 66 + sub);
+  const int scale = part < 2 ? (packed & 0x0F) : (packed >> 4);
+  const float db = as_half(block, 0) * (0.5F + static_cast<float>(scale)) * 0.25F;
+  const int magnitude = static_cast<int>((iq2xs_grid()[word & 511] >> (8 * j)) & 0xFF);
+  return db * static_cast<float>(magnitude) * (iq2_is_negative(word >> 9, j) ? -1.0F : 1.0F);
+}
+
 /* Dispatch for a block a caller only knows by its type id. The ids are GGML's,
- * the same numbers `abi/spec.h` carries; the five the packed GEMM reads are
+ * the same numbers `abi/spec.h` carries; the seven the packed GEMM reads are
  * spelled out here rather than shared with `spec.cpp` because that table
  * answers "how many bytes" and this answers "which bit layout", and only the
  * latter is allowed to grow a decoder at a time. */
@@ -284,6 +391,8 @@ constexpr int kGgmlQ3K = 11;
 constexpr int kGgmlQ4K = 12;
 constexpr int kGgmlQ5K = 13;
 constexpr int kGgmlQ6K = 14;
+constexpr int kGgmlIq2Xxs = 16;
+constexpr int kGgmlIq2Xs = 17;
 
 /* How many bytes one block of `type_id` occupies, or 0 if this build cannot
  * read it. */
@@ -299,6 +408,10 @@ POCKETLLM_HD int block_bytes_of(int type_id) {
       return kQ5KBlockBytes;
     case kGgmlQ6K:
       return kQ6KBlockBytes;
+    case kGgmlIq2Xxs:
+      return kIq2XxsBlockBytes;
+    case kGgmlIq2Xs:
+      return kIq2XsBlockBytes;
     default:
       return 0;
   }
@@ -367,6 +480,10 @@ POCKETLLM_HD float dequant_block(int type_id, const uint8_t *block, int index) {
       return dequant_q5_k(block, index);
     case kGgmlQ6K:
       return dequant_q6_k(block, index);
+    case kGgmlIq2Xxs:
+      return dequant_iq2_xxs(block, index);
+    case kGgmlIq2Xs:
+      return dequant_iq2_xs(block, index);
     default:
       return dequant_q4_k(block, index);
   }

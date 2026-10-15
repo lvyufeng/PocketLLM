@@ -15,13 +15,14 @@ offloaded, never split across cards.
 
 Qwen3, on four accelerator classes, through one engine. The C core (`src/`, `libpocketllm.so`) is
 where a model actually runs: it reads a GGUF, tokenizes with the checkpoint's own BPE, walks the
-graph and decodes — on `f16` weights and on the packed k-quants, the whole rung of the width ladder
-from `q2_k` through `q6_k`, decoded inside the kernel and never widened.
+graph and decodes — on `f16` weights and on packed quantized ones, the width ladder's K-quant rung
+(`q2_k` through `q6_k`) and its IQ2 rung (`iq2_xxs`, `iq2_xs`), decoded inside the kernel and never
+widened.
 
 | Device | Path | Qwen3 sizes | Format | Accuracy vs the reference |
 |---|---|---|---|---|
-| **CPU** (AVX2) | C core | 0.6B, 1.7B | `f16`, `q4_k_m`, `q2_k`/`q3_k`/`q5_k` | **token-identical to llama.cpp** |
-| **1× NVIDIA** (sm_75+) | C core, eager kernels | 0.6B, 1.7B | `f16`, `q4_k_m`, `q2_k`/`q3_k`/`q5_k` | **token-identical to llama.cpp** |
+| **CPU** (AVX2) | C core | 0.6B, 1.7B | `f16`, `q4_k_m`, `q2_k`/`q3_k`/`q5_k`, `iq2_xxs`/`iq2_xs` | **token-identical to llama.cpp** |
+| **1× NVIDIA** (sm_75+) | C core, eager kernels | 0.6B, 1.7B | `f16`, `q4_k_m`, `q2_k`/`q3_k`/`q5_k`, `iq2_xxs`/`iq2_xs` | **token-identical to llama.cpp** |
 | **RDK S600** (Horizon Nash BPU) | prebuilt `.hbm` via the `xlm` delegate | 0.6B → 8B | `leap_llm` int4 (`w4`/`w8`) | token agreement (prefix); at the quantizer's floor |
 | **Orange Pi AIpro** (Ascend 310B1) | C core, CANN backend | 0.6B → 8B | `q4_k_m` | token agreement; **at the quantizer's floor at every size** |
 
@@ -32,15 +33,17 @@ reference's, so a cross-board agreement number is a *quantizer-provenance* compa
 hardware ranking. The S600 is not a C-core backend: it runs a **prebuilt graph** the host compiles
 ahead of time, so it is listed by the artifact it executes, not by an op it implements.
 
-The C-core rows' format list is where the width ladder starts to be real: `q2_k`, `q3_k` and `q5_k`
-join `q4_k` and `q6_k` as formats the engine decodes, and each is checked twice — the decoder
-**block for block against llama.cpp's own decode of the same file**, and the engine's greedy walk
-against a **fresh llama.cpp prefill at every step** on a file of that format. The block-for-block
-comparison is what caught this tree's Python `q3_k` decoder reading ggml's six-bit scales as four.
-The three new formats are correctness-complete rather than fast: `q4_k`'s packed AVX2 and int8
-activation kernels are written for its own group arithmetic, so a `q2_k`/`q3_k`/`q5_k` weight is
-decoded one weight at a time for now — 5.3 s against 0.7 s for 26 tokens at 0.6B on this machine.
-Packing those three kernels is the follow-up, and the ladder's IQ rungs behind them.
+The C-core rows' format list is where the width ladder is real: `q2_k`, `q3_k`, `q5_k`, `iq2_xxs`
+and `iq2_xs` join `q4_k` and `q6_k` as formats the engine decodes, and each new one is checked twice
+— the decoder **block for block against llama.cpp's own decode of the same bytes**, and the engine's
+greedy walk against a **fresh llama.cpp prefill at every step** on a file of that format. The
+block-for-block comparison is what caught this tree's Python `q3_k` decoder reading ggml's six-bit
+scales as four, and it is what pins the two codebook formats, whose decode is a table lookup: a
+wrong stride there produces weights that look like weights. The five are correctness-complete rather
+than fast: `q4_k`'s packed AVX2 and int8 activation kernels are written for its own group
+arithmetic, so the others are decoded one weight at a time for now — 5.3 s against 0.7 s for 26
+tokens at 0.6B on this machine. Packing those kernels is the follow-up, and the ladder's IQ3, IQ4
+and IQ1 rungs behind them.
 
 ### Reference performance — Qwen3-1.7B, `q4_k_m`, against llama.cpp
 
@@ -71,7 +74,7 @@ What works, what is a stub, and what has not been written. This table is the hon
 
 | Piece | State |
 |---|---|
-| `src/` — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B and 1.7B in `f16` and the k-quants `q2_k` through `q6_k`** on `cpu` and one `cuda` card — GGUF read, BPE tokenize, forward, greedy decode, and `temperature`/`top-k`/`top-p`/`min-p`/`seed` sampling; every one of the five formats decodes inside the kernel. Greedy is checked token-for-token against llama.cpp on both widths, and the k-quant rows against llama.cpp's own decode of the same file block for block. The sampler is checked against the numpy reference. The CPU path is **ahead of llama.cpp on prefill and decode**; the CUDA path is correctness-complete and slow, with the open lever (int8 activations) measured and closed. Details: [the C engine page](https://lvyufeng.github.io/PocketLLM/architecture/c_engine/) |
+| `src/` — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B and 1.7B in `f16` and the seven packed formats `q2_k` through `q6_k` plus `iq2_xxs`/`iq2_xs`** on `cpu` and one `cuda` card — GGUF read, BPE tokenize, forward, greedy decode, and `temperature`/`top-k`/`top-p`/`min-p`/`seed` sampling; every one of them decodes inside the kernel. Greedy is checked token-for-token against llama.cpp on both widths, and each packed format against llama.cpp's own decode of the same file block for block. The sampler is checked against the numpy reference. The CPU path is **ahead of llama.cpp on prefill and decode**; the CUDA path is correctness-complete and slow, with the open lever (int8 activations) measured and closed. Details: [the C engine page](https://lvyufeng.github.io/PocketLLM/architecture/c_engine/) |
 | `src/kernel/ascend/` — Ascend 310B backend | **Runs Qwen3-0.6B … 8B** on an Orange Pi AIpro, at the quantizer's own floor. |
 | `pocketllm.cli` | **Done** for all six commands — `devices`, `backends`, `architectures`, `ops`, `run`, `serve` |
 | `pocketllm.protocol` / `pocketllm.server` — OpenAI-compatible HTTP | **Done.** Driven over the C core by `server/native_backend.py`; one request at a time, no batch, no cancellation |
@@ -228,11 +231,11 @@ Published at **<https://lvyufeng.github.io/PocketLLM/>**.
 
 - [x] **The C core runs Qwen3-0.6B and 1.7B.** GGUF read, BPE tokenize, dense forward and greedy
       decode, on `cpu` and on one `cuda` card, checked against llama.cpp.
-- [x] **The K-quant rung of the ladder in the C core.** `q2_k`, `q3_k`, `q4_k`, `q5_k` and `q6_k`
-      decode inside the kernel, packed, never widened.
-- [ ] **The ladder's IQ rungs in the C core.** `iq2_xxs`, `iq2_xs`, `iq3_xxs`, `iq4_xs` and
-      `iq1_m` decode in Python and are refused by name at load; the ternary packs are addressable
-      and not decoded.
+- [x] **The K-quant and IQ2 rungs of the ladder in the C core.** `q2_k`, `q3_k`, `q4_k`, `q5_k`,
+      `q6_k`, `iq2_xxs` and `iq2_xs` decode inside the kernel, packed, never widened.
+- [ ] **The ladder's remaining rungs in the C core.** `iq3_xxs`, `iq4_xs`, `iq4_nl` and `iq1_m`
+      decode in Python and are refused by name at load; the ternary packs are addressable and not
+      decoded.
 - [x] **`pocketllm run` and `pocketllm serve`.** Both reach the C core through `native.py`.
 - [x] **The CPU path is ahead of llama.cpp** on prefill and decode at a matched KV depth.
 - [ ] **The Python backends.** `cuda` first; each is a declaration today.

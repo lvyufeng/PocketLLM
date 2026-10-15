@@ -149,9 +149,9 @@ Both are the C behaviour by choice and both are pinned by
 
 ### The packed weights
 
-`src/quant/blocks.h` decodes the K-quant rung — `q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k` — one weight
-at a time, and it is the one header the CPU and the CUDA kernels *share* — the exception to the
-independence above, and a deliberate one. What
+`src/quant/blocks.h` decodes two rungs of the width ladder — the K-quants `q2_k` through `q6_k` and
+the IQ2 pair `iq2_xxs`/`iq2_xs` — one weight at a time, and it is the one header the CPU and the
+CUDA kernels *share* — the exception to the independence above, and a deliberate one. What
 those two kernels owe each other is correctness of an *algorithm*, and two implementations of an
 algorithm can only disagree by one of them being wrong. A bit layout is not an algorithm; it is a
 property of the file, and a second transcription of it would be a third place for the layout to be
@@ -161,8 +161,27 @@ wrong, agreeing with the first exactly where both misread the same nibble.
 kernels are checked against one op at a time on inputs the test authors. That comparison is
 exact — and blind in one direction: if all three read the format the same wrong way, they agree
 perfectly. The authority that closes that hole is llama.cpp, which wrote the format and quantized
-the file, and it is reached end-to-end rather than per op in
-`tests/native/test_quantized_forward.py`.
+the file. It is reached two ways: end-to-end in `tests/native/test_quantized_forward.py` and
+`test_quant_ladder.py`, and **block for block** in `tests/native/test_codebook_decoders.py`, which
+hands real tensor bytes to `ggml_get_type_traits(...)->to_float` and compares every weight. The
+per-block form is what caught this tree's `q3_K` decoder reading ggml's six-bit scales as four.
+
+**The IQ2 formats are codebooks, and a codebook is data.** A K-quant weight is a nibble times a
+scale, so a decoder can be checked by re-deriving it; an `iq2_xxs` or `iq2_xs` weight is an *index*
+into a fixed table of small magnitudes with a sign applied on top, so the table is the format and a
+copy of it is the one thing in this header that cannot be re-derived. The two grids are therefore
+generated rather than transcribed: `scripts/gen_iq_tables.py` writes `src/quant/iq2_grid.h` from the
+same sha256-pinned `ggml-common.h` that the Python decoders read, through the same reader, and
+records that sha256 in the output. A retyped table fails silently — it produces weights that look
+like weights — which is exactly the class of error the generation removes. The generated header
+declares each grid twice, because a host array is not visible from device code and a `__device__`
+array is not visible from the host half of the `__host__ __device__` functions this header compiles
+for both.
+
+The *sign* needs no table. ggml spends the eighth bit of a seven-bit sign index on the parity of the
+other seven (`ksigns_iq2xs`), so the sign of weight `j` is bit `j` of
+`index | (popcount(index) & 1) << 7`, and this tree computes that instead of vendoring a second
+table.
 
 That file also records where llama.cpp is *not* an oracle, and the answer changed when the CPU kernel
 gained its integer path. Both engines now run the same `q4_K` arithmetic — llama.cpp's dot quantizes
