@@ -181,6 +181,24 @@ void conv2d(const float *x, const float *weight, const float *bias, float *out, 
             int64_t height, int64_t width, int64_t out_ch, int64_t kernel, int64_t stride,
             int64_t pad);
 
+/* ``out = a + b``, elementwise over the whole tensor.
+ *
+ * **The LLM never calls this and the vision tower calls it twice.**  Every
+ * residual in the Qwen3 graph is ``gemm(accumulate = true)`` -- the product
+ * writes into the activation it is added to -- and that is a real saving rather
+ * than a shortcut, because it removes a pass over the activation per layer.  A
+ * sum whose operands are *not* a product cannot be folded that way, and the
+ * tower has two of them: the patch embedding, where Qwen3-VL's 3-D convolution
+ * is two 2-D convolutions over the same image whose results are added, and the
+ * learned position embedding, which is added to every patch.  Both are declared
+ * in the ABI already; this is the kernel that makes them reachable.
+ *
+ * A map over elements, parallelized the way `gelu` is and for the same reason:
+ * the grain is a scheduling choice, not a numeric one -- there is no reduction
+ * here at all, so unlike the norms there is no order for the answer to depend
+ * on. */
+void add(const float *a, const float *b, float *out, int64_t n);
+
 /* RoPE, the split-half (NEOX) layout: ``x[i]`` is rotated against
  * ``x[i + d/2]``.
  *

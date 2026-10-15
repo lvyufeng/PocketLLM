@@ -123,12 +123,12 @@ to `pocketllm.backends.reference`, applied one level down.
 
 ### The C surface is a strict subset of the ABI, on purpose
 
-The ABI declares 19 ops. The engine implements 15 of them as ops — `rms_norm`, `layer_norm`, `gemm`,
-`gemm_quant`, `embedding`, `embedding_quant`, `silu_mul`, `gelu`, `conv2d`, `rope`, `attention`,
-`argmax`, `softmax`, `logits_temperature`, `topk_sample` — and the rest are either *inlined into the
-graph* or *not needed yet*.  (`layer_norm` is the one the ABI waited longest for: it is declared, has
-a reference implementation and had no C kernel until a vision tower needed one; `gelu` and then
-`conv2d` joined it for the same reason, one op at a time.)  Neither case
+The ABI declares 19 ops. The engine implements 16 of them as ops — `rms_norm`, `layer_norm`, `gemm`,
+`gemm_quant`, `embedding`, `embedding_quant`, `silu_mul`, `gelu`, `add`, `conv2d`, `rope`,
+`attention`, `argmax`, `softmax`, `logits_temperature`, `topk_sample` — and the rest are either
+*inlined into the graph* or *not needed yet*.  (`layer_norm` is the one the ABI waited longest for: it
+is declared, has a reference implementation and had no C kernel until a vision tower needed one;
+`gelu`, `conv2d` and `add` joined it for the same reason, one op at a time.)  Neither case
 is a missing kernel, and the distinction matters when reading the conformance test, which drives the
 implemented ones and deliberately skips the others.
 
@@ -137,12 +137,18 @@ different memory — a float table and packed bytes — and it exists because Qw
 projection to the embedding, so `token_embd.weight` is both the graph's first op and a weight the
 final matmul contracts against.)
 
-**Inlined, because the graph does it somewhere there is no op.** `add` is `gemm(accumulate=true)`:
-the residual is the product's job, so there is no second pass over the activation. `cache_append` is
-a `copy_device_to_device` in `qwen3.cpp` rather than a kernel — the positions are always contiguous
-and `start_pos`-aligned, so the general scatter the reference op allows (`cache[positions[i]] =
-values[i]` for arbitrary indices) has no caller. `cache_truncate` likewise: `reset()` drops the
-length without clearing rows, because the next append overwrites what it needs.
+**Inlined *and* implemented, for different callers.** `add` is the one op that is both. Every residual
+in the LLM graph is `gemm(accumulate=true)` — the product writes into the activation it is added to,
+which removes a pass over the activation per layer — and nothing about that changed when the op
+landed. A sum whose operands are *not* a product cannot be folded that way, and the vision tower has
+two: Qwen3-VL's 3-D patch convolution is two 2-D convolutions over the same image whose results are
+added, and the learned position embedding is added to every patch. The prompt for the kernel was
+therefore not a graph that could not be expressed but a graph whose sums have no product to hide in.
+
+`cache_append` is a `copy_device_to_device` in `qwen3.cpp` rather than a kernel — the positions are
+always contiguous and `start_pos`-aligned, so the general scatter the reference op allows
+(`cache[positions[i]] = values[i]` for arbitrary indices) has no caller. `cache_truncate` likewise:
+`reset()` drops the length without clearing rows, because the next append overwrites what it needs.
 
 **Not needed yet.** `mul`, `moe_ffn`: no dense Qwen3 path reaches them.
 

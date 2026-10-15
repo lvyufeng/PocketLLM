@@ -197,7 +197,12 @@ def sample_args(op: str, session, quant: str | None = None) -> tuple[list, dict]
             t(np.ones(_HIDDEN, np.float32)),
             t(np.zeros(_HIDDEN, np.float32)),
         ], {"eps": 1e-5}
-    if op in {"silu_mul", "add", "mul"}:
+    if op == "add":
+        # The sum of two activations rather than of a product, which is what the
+        # tower's patch embedding and position embedding both need.  Different
+        # values per operand, so a kernel that added one to itself is caught.
+        return [t(rand(_TOKENS, _HIDDEN)), t(rand(_TOKENS, _HIDDEN) * 3.0 + 1.0)], {}
+    if op in {"silu_mul", "mul"}:
         return [t(rand(_TOKENS, _HIDDEN)), t(rand(_TOKENS, _HIDDEN))], {}
     if op == "gelu":
         return [t(rand(_TOKENS, _HIDDEN))], {}

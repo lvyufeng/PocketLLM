@@ -1346,6 +1346,16 @@ class AscendBackend final : public Backend {
                 "convolution");
   }
 
+  /* The elementwise sum the tower needs twice.  The vendor's custom-op set has
+   * no add -- `silu_mul` fuses its own multiply and the norms fold their scale,
+   * but a bare `a + b` over two activations is not one of theirs -- so this is
+   * refused by name like `gelu`.  Nothing on the board's own path calls it: the
+   * LLM's residuals are `MatmulCubeCustom` with the accumulator turned on. */
+  void add(DeviceBuffer /*a*/, DeviceBuffer /*b*/, DeviceBuffer /*out*/, int64_t /*n*/) override {
+    throw Error("ascend: add is not implemented; this backend's custom-op set has no elementwise "
+                "sum");
+  }
+
   void silu_mul(DeviceBuffer gate, DeviceBuffer up, DeviceBuffer out, int64_t n) override {
     ensure_context();
     OpScope _op("silu_mul");

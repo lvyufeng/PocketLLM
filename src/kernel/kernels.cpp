@@ -1970,6 +1970,16 @@ void conv2d(const float *x, const float *weight, const float *bias, float *out, 
   });
 }
 
+void add(const float *a, const float *b, float *out, int64_t n) {
+  /* Elementwise, with `gelu`'s grain: there is no reduction, so the task size is
+   * a scheduling choice and every element is written from its own two operands. */
+  parallel_for(n, /*min_per_task=*/64, [&](int64_t lo, int64_t hi, int64_t) {
+    for (int64_t i = lo; i < hi; ++i) {
+      out[i] = a[i] + b[i];
+    }
+  });
+}
+
 void rope_neox(float *x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t start_pos,
                const float *cos_table, const float *sin_table) {
   const int64_t half = d / 2;

@@ -795,6 +795,16 @@ __global__ void conv2d_kernel(const float *x, const float *weight, const float *
   out[i] = acc;
 }
 
+/* One thread per element, the same shape as `gelu_kernel`: no reduction, so
+ * nothing about the answer depends on how the work is split. */
+__global__ void add_kernel(const float *a, const float *b, float *out, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  out[i] = a[i] + b[i];
+}
+
 /* One thread per (token, head, pair). The two stores are independent of each
  * other's result -- both read `a` and `b` before either writes -- which is what
  * makes the in-place rotation safe. */
@@ -1350,6 +1360,16 @@ class CudaBackend final : public Backend {
         f(x), f(weight), bias.handle != 0 ? f(bias) : nullptr, w(out), in_ch, height, width, out_ch,
         kernel, stride, pad, out_w, total);
     check(cudaGetLastError(), "conv2d");
+  }
+
+  void add(DeviceBuffer a, DeviceBuffer b, DeviceBuffer out, int64_t n) override {
+    if (n <= 0) {
+      return;
+    }
+    const unsigned threads = 256;
+    add_kernel<<<static_cast<unsigned>((n + threads - 1) / threads), threads>>>(f(a), f(b), w(out),
+                                                                               n);
+    check(cudaGetLastError(), "add");
   }
 
   void rope_neox(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t start_pos,

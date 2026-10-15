@@ -138,6 +138,10 @@ class CpuBackend final : public Backend {
                    width, out_ch, kernel, stride, pad);
   }
 
+  void add(DeviceBuffer a, DeviceBuffer b, DeviceBuffer out, int64_t n) override {
+    kernel::add(f(a), f(b), w(out), n);
+  }
+
   void rope_neox(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t start_pos,
                  DeviceBuffer cos_table, DeviceBuffer sin_table) override {
     kernel::rope_neox(w(x), n_tokens, n_heads, d, start_pos, f(cos_table), f(sin_table));
