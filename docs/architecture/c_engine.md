@@ -116,11 +116,13 @@ to `pocketllm.backends.reference`, applied one level down.
 
 ### The C surface is a strict subset of the ABI, on purpose
 
-The ABI declares 17 ops. The engine implements 12 of them as ops — `rms_norm`, `gemm`, `gemm_quant`,
-`embedding`, `embedding_quant`, `silu_mul`, `rope`, `attention`, `argmax`, `softmax`,
+The ABI declares 17 ops. The engine implements 13 of them as ops — `rms_norm`, `layer_norm`, `gemm`,
+`gemm_quant`, `embedding`, `embedding_quant`, `silu_mul`, `rope`, `attention`, `argmax`, `softmax`,
 `logits_temperature`, `topk_sample` — and the rest are either *inlined into the graph* or *not
-needed yet*. Neither case is a missing kernel, and the distinction matters when reading the
-conformance test, which drives the 12 and deliberately skips the others.
+needed yet*.  (`layer_norm` is the newest and the one the ABI waited longest for: it is declared,
+has a reference implementation and had no C kernel until a vision tower needed one.)  Neither case
+is a missing kernel, and the distinction matters when reading the conformance test, which drives the
+implemented ones and deliberately skips the others.
 
 (`embedding_quant` is a second entry point rather than a flag on `embedding` because the two read
 different memory — a float table and packed bytes — and it exists because Qwen3 ties its output

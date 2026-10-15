@@ -348,6 +348,37 @@ void run_rms_norm(std::ostream &out, Backend &backend, const Request &request) {
   backend.release(dw);
 }
 
+void run_layer_norm(std::ostream &out, Backend &backend, const Request &request) {
+  const Tensor &x = request.require("x");
+  const Tensor &weight = request.require("weight");
+  /* Optional in the ABI, so a request without it is legal and the backend is
+   * handed the null buffer -- which is how "no bias" is spelled on that side. */
+  const Tensor *bias = request.tensor("bias");
+  const float eps = request.float_param("eps", 1e-5F);
+  const int64_t rows = x.shape[0];
+  const int64_t d = x.shape[1];
+  if (weight.shape.size() != 1 || weight.shape[0] != d) {
+    throw pocketllm::Error("layer_norm: the weight must have the row length as its only dimension");
+  }
+  if (bias != nullptr && (bias->shape.size() != 1 || bias->shape[0] != d)) {
+    throw pocketllm::Error("layer_norm: the bias must have the row length as its only dimension");
+  }
+  DeviceBuffer dx = upload(backend, x.floats);
+  DeviceBuffer dw = upload(backend, weight.floats);
+  DeviceBuffer db{};
+  if (bias != nullptr) {
+    db = upload(backend, bias->floats);
+  }
+  run_and_report(out, backend, request, {rows, d}, [&](DeviceBuffer result) {
+    backend.layer_norm(dx, dw, db, result, rows, d, eps);
+  });
+  backend.release(dx);
+  backend.release(dw);
+  if (db.handle != 0) {
+    backend.release(db);
+  }
+}
+
 void run_gemm(std::ostream &out, Backend &backend, const Request &request) {
   const Tensor &x = request.require("x");
   const Tensor &w = request.require("w");
@@ -683,7 +714,8 @@ struct Entry {
 };
 
 const Entry kOps[] = {
-    {"rms_norm", run_rms_norm},   {"gemm", run_gemm},
+    {"rms_norm", run_rms_norm},   {"layer_norm", run_layer_norm},
+    {"gemm", run_gemm},
     {"gemm_quant", run_gemm_quant}, {"embedding", run_embedding},
     {"embedding_quant", run_embedding_quant}, {"silu_mul", run_silu_mul},
     {"rope", run_rope},           {"attention", run_attention},

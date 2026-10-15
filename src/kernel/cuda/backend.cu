@@ -151,6 +151,39 @@ __global__ void rms_norm_kernel(const float *x, const float *weight, float *out,
   }
 }
 
+/* The same one-block-per-row shape as `rms_norm_kernel`, with the reference's
+ * three passes: the mean, the squared deviations from it, then the write.  The
+ * two reductions share `scratch`, so there is a barrier between them -- without
+ * it a thread could still be reading the first total when thread 0 starts
+ * writing the second. */
+__global__ void layer_norm_kernel(const float *x, const float *weight, const float *bias, float *out,
+                                  int64_t rows, int64_t d, float eps) {
+  const int64_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  __shared__ float scratch[256];
+
+  const float *src = x + row * d;
+  float sum = 0.0F;
+  for (int64_t i = threadIdx.x; i < d; i += blockDim.x) {
+    sum += src[i];
+  }
+  const float mean = block_sum(sum, scratch) / static_cast<float>(d);
+  __syncthreads();
+  float sq = 0.0F;
+  for (int64_t i = threadIdx.x; i < d; i += blockDim.x) {
+    const float dev = src[i] - mean;
+    sq += dev * dev;
+  }
+  const float inv = 1.0F / sqrtf(block_sum(sq, scratch) / static_cast<float>(d) + eps);
+  float *dst = out + row * d;
+  for (int64_t i = threadIdx.x; i < d; i += blockDim.x) {
+    const float value = (src[i] - mean) * inv * weight[i];
+    dst[i] = bias != nullptr ? value + bias[i] : value;
+  }
+}
+
 /* One thread per output element; block `y` is the output row, `x` the columns. */
 __global__ void gemm_kernel(const float *x, const float *w, const float *bias, float *out, int64_t m,
                             int64_t n, int64_t k, int accumulate) {
@@ -962,6 +995,17 @@ class CudaBackend final : public Backend {
     rms_norm_kernel<<<static_cast<unsigned>(n_tokens), 256>>>(f(x), f(weight), w(out), n_tokens, d,
                                                               eps);
     check(cudaGetLastError(), "rms_norm");
+  }
+
+  void layer_norm(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out,
+                  int64_t rows, int64_t d, float eps) override {
+    if (rows <= 0) {
+      return;
+    }
+    layer_norm_kernel<<<static_cast<unsigned>(rows), 256>>>(f(x), f(weight),
+                                                            bias.handle != 0 ? f(bias) : nullptr,
+                                                            w(out), rows, d, eps);
+    check(cudaGetLastError(), "layer_norm");
   }
 
   void gemm(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out, int64_t m,

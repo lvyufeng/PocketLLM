@@ -1257,6 +1257,19 @@ class AscendBackend final : public Backend {
     release(dout);
   }
 
+  /* Layer normalization, which this backend has no op for: the vendor's custom
+   * ops include `RmsNormNdCustom` and `RmsNorm1024Custom` and no LayerNorm of any
+   * kind.  The difference is not cosmetic -- a layer norm subtracts the mean, and
+   * its `eps` is added to a *variance* rather than to a mean square -- so running
+   * the RMS op here would answer a different model, quietly.  Refused by name
+   * until the board grows the op or someone writes it against the vendor
+   * headers. */
+  void layer_norm(DeviceBuffer /*x*/, DeviceBuffer /*weight*/, DeviceBuffer /*bias*/,
+                  DeviceBuffer /*out*/, int64_t /*rows*/, int64_t /*d*/, float /*eps*/) override {
+    throw Error("ascend: layer_norm is not implemented; this backend's custom-op set has "
+                "RmsNormNdCustom and no LayerNorm");
+  }
+
   void gemm(DeviceBuffer x, DeviceBuffer w, DeviceBuffer bias, DeviceBuffer out, int64_t m,
             int64_t n, int64_t k, bool accumulate) override {
     ensure_context();

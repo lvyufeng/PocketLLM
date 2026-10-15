@@ -1599,6 +1599,38 @@ void rms_norm(const float *x, const float *weight, float *out, int64_t n_tokens,
   });
 }
 
+void layer_norm(const float *x, const float *weight, const float *bias, float *out, int64_t rows,
+                int64_t d, float eps) {
+  /* Over rows, as `rms_norm` is: a row's `d` floats are its own.  The three
+   * passes are the reference's order -- the mean, the squared deviations from
+   * that mean, then the write -- and the division is by `sqrt(var + eps)` rather
+   * than by a reciprocal multiplied through, which is the `rms_norm` kernel's
+   * shape but not this one's.  `backends/reference` divides; matching it here
+   * keeps the two agreeing to rounding instead of to the tolerance that would
+   * have to absorb a reciprocal's last-bit difference on every element. */
+  parallel_for(rows, /*min_per_task=*/8, [&](int64_t lo, int64_t hi, int64_t) {
+    for (int64_t r = lo; r < hi; ++r) {
+      const float *row = x + r * d;
+      float *dst = out + r * d;
+      float sum = 0.0F;
+      for (int64_t i = 0; i < d; ++i) {
+        sum += row[i];
+      }
+      const float mean = sum / static_cast<float>(d);
+      float sq = 0.0F;
+      for (int64_t i = 0; i < d; ++i) {
+        const float dev = row[i] - mean;
+        sq += dev * dev;
+      }
+      const float inv = 1.0F / std::sqrt(sq / static_cast<float>(d) + eps);
+      for (int64_t i = 0; i < d; ++i) {
+        const float value = (row[i] - mean) * inv * weight[i];
+        dst[i] = bias != nullptr ? value + bias[i] : value;
+      }
+    }
+  });
+}
+
 void gemm(const float *x, const float *w, const float *bias, float *out, int64_t m, int64_t n,
           int64_t k, bool accumulate) {
   /* Over `(r, j)`, flattened: each output element is an independent `dot` over
