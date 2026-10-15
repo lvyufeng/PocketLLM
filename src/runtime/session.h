@@ -111,6 +111,11 @@ class Session {
   std::unique_ptr<Tokenizer> tokenizer_;
   std::unique_ptr<Qwen3Model> model_;
 
+  /* The message every "this session has no model" guard raises: the
+   * architecture and, when the model knows one, the reason this build cannot
+   * run it.  One place, so the four guards cannot drift apart. */
+  std::string no_graph_message() const;
+
   /* The next position the model will write.  It is the KV cache's length, and
    * keeping the two in one object is what stops them drifting. */
   int64_t position_ = 0;

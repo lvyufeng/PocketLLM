@@ -16,6 +16,13 @@
 
 namespace pocketllm {
 
+const char *arch_refusal(const std::string &arch) {
+  if (arch == "qwen3" || arch == "llama") {
+    return nullptr;
+  }
+  return "this build runs the dense transformer graph, which serves 'qwen3' and 'llama'";
+}
+
 namespace {
 
 /* The GGML storage ids this build reads. They are the values in
@@ -426,8 +433,9 @@ void Qwen3Model::materialize_packed_weights() {
 std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
                                              kernel::Backend &backend) {
   const std::string arch = checkpoint.get_string("general.architecture", "");
-  if (arch != "qwen3") {
-    throw Error("this build runs 'qwen3' checkpoints; this one declares architecture '" + arch + "'");
+  if (const char *why = arch_refusal(arch)) {
+    throw Error("this checkpoint declares architecture '" + arch +
+                "', which this build cannot run: " + why);
   }
 
   std::unique_ptr<Qwen3Model> model(new Qwen3Model(backend));
@@ -477,6 +485,9 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
   model->rms_eps_ =
       static_cast<float>(checkpoint.get_float(p + "attention.layer_norm_rms_epsilon", 1e-6));
   model->rope_theta_ = static_cast<float>(checkpoint.get_float(p + "rope.freq_base", 10000.0));
+  /* The one behavioural difference between the two architecture names this graph
+   * serves; everything else is a tensor being present or absent. */
+  model->interleaved_rope_ = arch == "llama";
 
   if (model->n_vocab_ <= 0) {
     /* Not every conversion writes `vocab_size`; the embedding's own shape is
@@ -488,7 +499,7 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
     model->n_vocab_ = static_cast<int64_t>(embd->dimensions[1]);
   }
   if (model->n_embd_ <= 0 || model->n_layer_ <= 0 || model->n_head_ <= 0 || model->head_dim_ <= 0) {
-    throw Error("the checkpoint does not carry a complete set of qwen3 hyperparameters");
+    throw Error("the checkpoint does not carry a complete set of " + arch + " hyperparameters");
   }
   if (model->capacity_ <= 0) {
     model->capacity_ = 4096;
@@ -525,8 +536,17 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
     Layer layer;
     layer.attn_norm = model->bind_dense(checkpoint, base + "attn_norm.weight");
     layer.ffn_norm = model->bind_dense(checkpoint, base + "ffn_norm.weight");
-    layer.q_norm = model->bind_dense(checkpoint, base + "attn_q_norm.weight");
-    layer.k_norm = model->bind_dense(checkpoint, base + "attn_k_norm.weight");
+    /* The per-head QK norm is Qwen3's, and the tensors are *absent* in the other
+     * architecture this graph serves rather than zero or untrained: a `llama`
+     * checkpoint has no `attn_q_norm.weight` at all, and binding one anyway
+     * would fail on the first layer.  `output.weight` above is optional for the
+     * same reason -- the file says whether a piece is there, and the graph asks.
+     * An unbound handle is the zero handle, which `forward` reads as "no norm
+     * on this projection". */
+    if (checkpoint.tensor(base + "attn_q_norm.weight") != nullptr) {
+      layer.q_norm = model->bind_dense(checkpoint, base + "attn_q_norm.weight");
+      layer.k_norm = model->bind_dense(checkpoint, base + "attn_k_norm.weight");
+    }
     layer.wq = model->bind_matrix(checkpoint, base + "attn_q.weight");
     layer.wk = model->bind_matrix(checkpoint, base + "attn_k.weight");
     layer.wv = model->bind_matrix(checkpoint, base + "attn_v.weight");
@@ -847,9 +867,14 @@ kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const int64
 
     /* Per head, over `head_dim`, and shared across every row of the batch, so
      * it runs over all `m` rows at once.  The weight is shared across heads and
-     * tokens, which is why one call can do all of them. */
-    backend_->rms_norm(q_, layer.q_norm, q_, m * n_head_, head_dim_, rms_eps_);
-    backend_->rms_norm(k_, layer.k_norm, k_, m * n_head_kv_, head_dim_, rms_eps_);
+     * tokens, which is why one call can do all of them.  The whole step is
+     * skipped when the checkpoint carries no QK norm: it is one of the two
+     * places the architectures this graph serves differ by a tensor's presence
+     * rather than by a hyperparameter. */
+    if (layer.q_norm.handle != 0) {
+      backend_->rms_norm(q_, layer.q_norm, q_, m * n_head_, head_dim_, rms_eps_);
+      backend_->rms_norm(k_, layer.k_norm, k_, m * n_head_kv_, head_dim_, rms_eps_);
+    }
 
     /* RoPE is per sequence: a sequence's tokens take that sequence's own
      * starting position.  At n_seq == 1 this is the single call the graph made. */
@@ -861,8 +886,18 @@ kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const int64
                                n_s * n_head_ * head_dim_ * 4};
       kernel::DeviceBuffer k_s{k_.handle + static_cast<uintptr_t>(row * kv_width * 4),
                                n_s * kv_width * 4};
-      backend_->rope_neox(q_s, n_s, n_head_, head_dim_, at_pos, rope_cos_, rope_sin_);
-      backend_->rope_neox(k_s, n_s, n_head_kv_, head_dim_, at_pos, rope_cos_, rope_sin_);
+      /* The one place the two architecture names this graph serves differ in
+       * *behaviour* rather than in which tensors the file carries: `qwen3`
+       * rotates the two halves of a head against each other, `llama` rotates
+       * neighbours.  Same tables, same angles, different pairing -- and the
+       * wrong one is not a rounding error but a different model. */
+      if (interleaved_rope_) {
+        backend_->rope_norm(q_s, n_s, n_head_, head_dim_, at_pos, rope_cos_, rope_sin_);
+        backend_->rope_norm(k_s, n_s, n_head_kv_, head_dim_, at_pos, rope_cos_, rope_sin_);
+      } else {
+        backend_->rope_neox(q_s, n_s, n_head_, head_dim_, at_pos, rope_cos_, rope_sin_);
+        backend_->rope_neox(k_s, n_s, n_head_kv_, head_dim_, at_pos, rope_cos_, rope_sin_);
+      }
     }
 
     /* The per-layer slab base.  The layout is `[layer][sequence][position]`, so

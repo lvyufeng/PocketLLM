@@ -1909,6 +1909,37 @@ void rope_neox(float *x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t s
   });
 }
 
+void rope_norm(float *x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t start_pos,
+               const float *cos_table, const float *sin_table) {
+  const int64_t half = d / 2;
+  const int64_t units = n_tokens * n_heads;
+  /* The same decomposition as `rope_neox` -- one task per `(token, head)`, the
+   * `half`-wide loop kept whole inside it -- because the difference between the
+   * two conventions is which elements a pair is made of, not how the work
+   * divides.  Stating that once here is what keeps the two functions readable as
+   * one algorithm with two pairings. */
+  parallel_for(units, /*min_per_task=*/8, [&](int64_t lo, int64_t hi, int64_t) {
+    for (int64_t unit = lo; unit < hi; ++unit) {
+      const int64_t t = unit / n_heads;
+      const int64_t position = start_pos + t;
+      const float *cos_row = cos_table + position * half;
+      const float *sin_row = sin_table + position * half;
+      float *vec = x + unit * d;
+      for (int64_t i = 0; i < half; ++i) {
+        const float c = cos_row[i];
+        const float s = sin_row[i];
+        /* Adjacent elements, where `rope_neox` reads the two halves of the
+         * head: `x[2i]` is the pair's first element and `x[2i + 1]` its second,
+         * and the angle is the `i`-th of the same `d/2` angles. */
+        const float a = vec[2 * i];
+        const float b = vec[2 * i + 1];
+        vec[2 * i] = a * c - b * s;
+        vec[2 * i + 1] = a * s + b * c;
+      }
+    }
+  });
+}
+
 void attention(const float *q, int64_t q_len, int64_t n_heads, const void *k_cache,
                const void *v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
                int64_t q_offset, float scale, float *out, float *scores, KVDtype kv_dtype) {

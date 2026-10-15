@@ -28,8 +28,27 @@ runtime when it is built. `tests/native/llama_oracle.py` compiles `src/tools/ora
 llama.cpp's headers, and that tool drives the low-level API directly rather than shelling out to
 `llama-cli` — which in this build is a chat client, and answers a different question.
 
-Everything else is unbuilt. A checkpoint whose architecture is not `qwen3` opens successfully and
-cannot run; `pocketllm run` and `pocketllm serve` still parse their arguments and exit.
+Everything else is unbuilt. A checkpoint whose architecture is neither `qwen3` nor `llama` opens
+successfully and cannot run; `pocketllm run` and `pocketllm serve` still parse their arguments and
+exit.
+
+**The dense graph serves two architecture names.** `llama` is the same shape as `qwen3`, and every
+difference between them is something the file states rather than something the graph is told: the
+hyperparameters come from the architecture's own metadata prefix, the per-head QK norm is *absent*
+in a `llama` file (the graph binds it when it is there), the head is tied or not according to which
+tensors are present, and the **rotary embedding is the interleaved convention** -- `x[2i]` against
+`x[2i+1]` -- where Qwen's is split-half. That last one is the only behavioural difference and the
+only one that is not visible in a tensor list, so it is a second kernel (`rope_norm` beside
+`rope_neox`) and not a flag: same angles, different pairs, and the wrong pairing is a different
+model. `tests/native/test_llama_arch.py` walks MiniCPM5-1B (24 layers, GQA 16:2, an untied head, no
+QK norm, a `llama-bpe` vocabulary, rope base 5e6) against llama.cpp token for token, twelve steps, on
+`cpu` and on a card.
+
+The tokenizer carries **two pre-tokenizers**, because the vocabularies in this project's scope are
+built on two. They differ in exactly one place -- `\p{N}` against `\p{N}{1,3}`, so a number is cut
+digit by digit or in runs of up to three -- and that place decides ids, so the variant is named by
+the file and an unknown name is refused. `tests/native/test_tokenizer.py` checks both against
+llama.cpp's own tokenizer, over two vocabularies and a 2000-text corpus.
 
 ## The backend interface
 

@@ -109,13 +109,21 @@ Tokenizer::Tokenizer(const GgufReader &checkpoint) {
   /* The pre-tokenizer is a hard requirement, not a hint.  A vocabulary split
    * by the wrong pattern produces different ids and a model that answers
    * wrongly with no other symptom, so an unimplemented one is refused by name
-   * rather than approximated.  `deepseek-r1-qwen`, `kormo` and `f2llmv2` name
-   * the same pattern in llama.cpp; they are refused here only because this
-   * build has not been checked against them. */
+   * rather than approximated.
+   *
+   * Two names are implemented and they are one alternation apart (`\p{N}`
+   * against `\p{N}{1,3}` -- see `pretokenize.h`).  In llama.cpp,
+   * `deepseek-r1-qwen`, `kormo` and `f2llmv2` name Qwen2's pattern and
+   * `llama3`/`llama-v3` name this one; they are refused here only because this
+   * build has not been checked against those checkpoints. */
   pre_type_ = checkpoint.get_string("tokenizer.ggml.pre", "");
-  if (pre_type_ != "qwen2") {
+  if (pre_type_ == "qwen2") {
+    pre_rules_ = PreTokenizer::kQwen2;
+  } else if (pre_type_ == "llama-bpe") {
+    pre_rules_ = PreTokenizer::kLlamaBpe;
+  } else {
     throw Error("unsupported pre-tokenizer '" + pre_type_ +
-                "': this build implements 'qwen2' only");
+                "': this build implements 'qwen2' and 'llama-bpe'");
   }
 
   const std::string model = checkpoint.get_string("tokenizer.ggml.model", "");
@@ -380,7 +388,7 @@ std::vector<int32_t> Tokenizer::encode(const std::string &text, bool add_special
      * rewritten into the byte alphabet the vocabulary is spelled in.  Mapping
      * first would ask the regex about `Ä` where the user wrote an emoji. */
     const std::vector<uint32_t> cpts = cpts_from_utf8(fragment.text);
-    const std::vector<std::size_t> words = qwen2_pretokenize(cpts, {cpts.size()});
+    const std::vector<std::size_t> words = pretokenize(pre_rules_, cpts, {cpts.size()});
 
     std::size_t start = 0;
     for (const std::size_t length : words) {

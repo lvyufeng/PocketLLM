@@ -1480,6 +1480,22 @@ class AscendBackend final : public Backend {
     release(dout);
   }
 
+  /* The interleaved rotary convention, which `rope_neox` above does not cover.
+   *
+   * Refused rather than approximated: the op behind this backend is the CANN
+   * custom op `aclnnRopeCustom`, whose mode is not documented in anything
+   * reachable from the control host, and the two conventions rotate different
+   * element pairs -- so a guess would produce text that reads like a bad model
+   * rather than like a missing op.  A board operator settles it in place by
+   * checking the mode against a `llama`-architecture checkpoint; until then this
+   * backend runs split-half, which is every Qwen3 checkpoint. */
+  void rope_norm(DeviceBuffer /*x*/, int64_t /*n_tokens*/, int64_t /*n_heads*/, int64_t /*d*/,
+                 int64_t /*start_pos*/, DeviceBuffer /*cos_table*/,
+                 DeviceBuffer /*sin_table*/) override {
+    throw Error("ascend: the interleaved rotary convention is not implemented; this backend's "
+                "`aclnnRopeCustom` path is verified for split-half (qwen3) only");
+  }
+
   /* `AttentionStepCustom` keeps its own score row per head in device UB, so it
    * needs no caller-provided scratch at all -- and the graph allocates this
    * much on the strength of this answer, so a good number here is free.  The
@@ -2514,3 +2530,4 @@ std::unique_ptr<Backend> make_ascend_backend() { return std::make_unique<AscendB
 
 }  // namespace kernel
 }  // namespace pocketllm
+

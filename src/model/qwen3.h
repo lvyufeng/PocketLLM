@@ -19,7 +19,9 @@
  *     still normalized, so the other order is not a crash -- it is a different
  *     set of angles applied to the same magnitudes.
  *   - **RoPE is split-half (NEOX).** `x[i]` rotates against `x[i + head_dim/2]`,
- *     not against its neighbour.
+ *     not against its neighbour.  That is `qwen3`'s convention; a `llama`
+ *     checkpoint pairs neighbours instead, and `rope_norm` exists for it (see
+ *     `arch_refusal`).
  *
  * The layout follows the file rather than the papers: a weight is stored
  * `(rows, cols)` with the output axis first, which is how GGUF writes it and
@@ -46,6 +48,31 @@
 #include "kernel/backend.h"
 
 namespace pocketllm {
+
+/* Why this build cannot run a checkpoint of `arch`, or nullptr when it can.
+ *
+ * **One graph, two names.**  `qwen3` and `llama` are the same dense transformer
+ * shape -- RMSNorm, grouped-query attention, SwiGLU -- and every difference
+ * between them is something the file states rather than something the graph has
+ * to be told:
+ *
+ *   - the hyperparameters come from the architecture's own metadata prefix;
+ *   - the per-head QK norm is `qwen3`'s and is simply *absent* in a `llama`
+ *     file, so the graph binds it when it is there (as it already did for the
+ *     tied-or-untied head);
+ *   - **the rotary embedding is the interleaved convention for `llama` and
+ *     split-half for `qwen3`**: the same angles applied to different pairs.  It
+ *     is the one difference that is not about a tensor's presence, and the one
+ *     that would have been silently wrong -- a `llama` file through the Qwen
+ *     kernel answers with fluent nonsense -- which is why `rope_norm` exists
+ *     beside `rope_neox` instead of a flag on it.
+ *
+ * (MiniCPM5-1B is the `llama` checkpoint this was written against: dense, 24
+ * layers, GQA 16:2, an untied head, no QK norm, rope base 5e6.)
+ *
+ * It lives here, beside the graph, rather than in the session that asks: the set
+ * of architectures is a property of the implementation that would run them. */
+const char *arch_refusal(const std::string &arch);
 
 /* How a stored weight is used by `matmul`.
  *
@@ -294,6 +321,11 @@ class Qwen3Model {
    * would be a per-op decision that cannot change.  The name is historical: the
    * layout no longer selects a GEMM (see `model/qwen3.cpp`'s `matmul`). */
   bool panel_gemm_ = false;
+  /* Which rotary convention this checkpoint's architecture uses: `llama`'s
+   * interleaved pairing, or `qwen3`'s split halves.  Set once at load from
+   * `general.architecture`, because it is a property of the file and not of the
+   * call -- see `arch_refusal` for the two names and how they differ. */
+  bool interleaved_rope_ = false;
   /* Is the byte-expanded q6_K layout in use this run? Unlike the q4_K panels it
    * is sent by the *backend*, not the model: only CUDA reads the repacked block,
    * so a CPU session must keep the file layout or `gemm_quant` would walk 210-

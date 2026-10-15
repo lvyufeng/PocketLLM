@@ -125,6 +125,11 @@ class CpuBackend final : public Backend {
     kernel::rope_neox(w(x), n_tokens, n_heads, d, start_pos, f(cos_table), f(sin_table));
   }
 
+  void rope_norm(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t start_pos,
+                 DeviceBuffer cos_table, DeviceBuffer sin_table) override {
+    kernel::rope_norm(w(x), n_tokens, n_heads, d, start_pos, f(cos_table), f(sin_table));
+  }
+
   int64_t attention_scratch(int64_t q_len, int64_t n_heads, int64_t max_span) const override {
     /* `kAttentionRows` rows per concurrent task, not one row for the whole call
      * and not one per task.  This backend used to run the `(query, head)` pairs
