@@ -9,6 +9,9 @@ produces plausible weights and a subtly wrong model.
 from __future__ import annotations
 
 import hashlib
+import pathlib
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -103,3 +106,19 @@ def test_sign_expansion_matches_the_bit_parity_rule() -> None:
         for bit in range(8):
             expected = -8 if (mask >> bit) & 1 else 8
             assert int(grid[0, index, bit]) == expected, (index, bit)
+
+
+def test_the_generated_c_codebook_is_current() -> None:
+    """`src/quant/iq2_grid.h` is what the generator would write right now.
+
+    The C engine cannot read the header as text the way this module does, so its
+    two IQ2 grids are a *copy* -- and a copy that is not re-checked is the one
+    thing in a codebook format that fails silently. The generator writes them
+    from the same pinned source through the same reader, so this is the check
+    that a re-vendored `ggml-common.h` cannot leave the C tables behind.
+    """
+    script = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "gen_iq_tables.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--check"], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr or result.stdout

@@ -26,22 +26,27 @@ namespace {
 constexpr int kTypeF32 = 0;
 constexpr int kTypeF16 = 1;
 
-/* The k-quants the packed kernels decode, which is `src/quant/blocks.h`'s set:
- * the whole K-quant rung of the width ladder, Q2_K through Q6_K. A `q4_k_m`
- * checkpoint -- the format this project's ladder starts at -- is made of q4_k
- * and q6_k plus the f32 norms; a `q2_k`, `q3_k` or `q5_k` file mixes its own
- * type with its neighbours, and all of them are here. Anything else is refused
- * at load with the type's own name in the message, which is how an `iq4_xs` or
- * an `iq1_m` file gets a diagnosis rather than a wrong token. */
+/* The packed formats this build decodes, which is `src/quant/blocks.h`'s set: the
+ * whole K-quant rung of the width ladder (Q2_K through Q6_K) and the IQ2 rung
+ * (IQ2_XXS, IQ2_XS). A `q4_k_m` checkpoint -- the format this project's ladder
+ * starts at -- is made of q4_k and q6_k plus the f32 norms; a file of any of the
+ * other formats mixes its own type with its neighbours (a `q2_k` file carries
+ * `q3_k` and `q6_k` tensors, an `iq2_xs` file carries `q2_k` and `q5_k` ones),
+ * and all of those are here. Anything else is refused at load with the type's own
+ * name in the message, which is how an `iq4_xs` or an `iq1_m` file gets a
+ * diagnosis rather than a wrong token. */
 constexpr int kTypeQ2K = 10;
 constexpr int kTypeQ3K = 11;
 constexpr int kTypeQ4K = 12;
 constexpr int kTypeQ5K = 13;
 constexpr int kTypeQ6K = 14;
+constexpr int kTypeIq2Xxs = 16;
+constexpr int kTypeIq2Xs = 17;
 
 bool has_packed_kernel(int type_id) {
   return type_id == kTypeQ2K || type_id == kTypeQ3K || type_id == kTypeQ4K ||
-         type_id == kTypeQ5K || type_id == kTypeQ6K;
+         type_id == kTypeQ5K || type_id == kTypeQ6K || type_id == kTypeIq2Xxs ||
+         type_id == kTypeIq2Xs;
 }
 
 /* How many positions the cache and the rotary table start with.
@@ -202,8 +207,8 @@ Weight Qwen3Model::bind_matrix(const GgufReader &checkpoint, const std::string &
   }
   if (!has_packed_kernel(info->type_id)) {
     throw Error("tensor '" + name + "' is " + ggml_type_of(info->type_id).name +
-                ", which this build has no kernel for; it reads f32, f16, and the k-quants "
-                "q2_k, q3_k, q4_k, q5_k and q6_k");
+                ", which this build has no kernel for; it reads f32, f16, the k-quants "
+                "q2_k, q3_k, q4_k, q5_k and q6_k, and iq2_xxs and iq2_xs");
   }
   /* The contraction axis has to be a whole number of super-blocks. GGUF
    * guarantees it for a valid file, and the alternative to checking is a
@@ -337,8 +342,8 @@ Weight Qwen3Model::bind_table(const GgufReader &checkpoint, const std::string &n
   if (!has_packed_kernel(info->type_id) || table.cols % 256 != 0) {
     throw Error(std::string("token_embd.weight is ") + ggml_type_of(info->type_id).name +
                 " with " + std::to_string(table.cols) +
-                " columns; this build gathers from f32, f16 and the k-quants q2_k through q6_k, "
-                "whose row is a whole number of 256-weight blocks");
+                " columns; this build gathers from f32, f16, the k-quants q2_k through q6_k and "
+                "iq2_xxs/iq2_xs, whose row is a whole number of 256-weight blocks");
   }
   table.quantized = true;
   table.blocks = bind_packed(checkpoint, name).blocks;

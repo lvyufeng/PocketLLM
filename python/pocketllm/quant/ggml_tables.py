@@ -44,6 +44,7 @@ __all__ = [
     "HEADER_ENV",
     "header_path",
     "header_text",
+    "table_literals",
     "iq1s_grid",
     "iq2s_grid",
     "iq2xs_grid",
@@ -68,8 +69,7 @@ VENDORED_SHA256 = "d09a7116254352959002c50efd0f0a6008bb6109d342f3285c94ad461f877
 _VENDOR_RELATIVE = ("loader", "gguf", "vendor", "ggml-common.h")
 
 _TABLE_RE = r"GGML_TABLE_BEGIN\([^,]+,\s*{name},\s*{size}\)(.*?)GGML_TABLE_END\(\)"
-_HEX_RE = re.compile(r"0x[0-9a-fA-F]+")
-_DECIMAL_RE = re.compile(r"-?\d+")
+_LITERAL_RE = re.compile(r"0x[0-9a-fA-F]+|-?\d+")
 _COMMENT_RE = re.compile(r"//[^\n]*")
 
 
@@ -117,6 +117,18 @@ def _body(name: str, size: str) -> str:
     return _COMMENT_RE.sub("", match.group(1))
 
 
+def table_literals(name: str, size: str) -> list[str]:
+    """One table's entries, in order and as the source spells them.
+
+    Hex for the grids, decimals for the kvalues, and no interpretation: the
+    caller decides.  This is what a table *generated* from the header reads
+    (``scripts/gen_iq_tables.py`` writes the C codebooks from it), so that the
+    generator and the decoders share one reader over one pinned header rather
+    than each parsing the text its own way.
+    """
+    return _LITERAL_RE.findall(_body(name, size))
+
+
 def _readonly(array: np.ndarray) -> np.ndarray:
     array.flags.writeable = False
     return array
@@ -124,7 +136,14 @@ def _readonly(array: np.ndarray) -> np.ndarray:
 
 @lru_cache(maxsize=None)
 def _hex_table(name: str, size: str, expected: int, dtype: str) -> np.ndarray:
-    values = [int(item, 16) for item in _HEX_RE.findall(_body(name, size))]
+    literals = table_literals(name, size)
+    # The two spellings are not interchangeable: a table written in decimal and
+    # read as hex is off by a factor of 16/10 and still parses, which is exactly
+    # the silent-corruption shape this module exists to prevent.  `kvalues_iq4nl`
+    # is decimal, `iq1s_grid` is hex, and both readers refuse the other's source.
+    if any(not item.lower().startswith("0x") for item in literals):
+        raise RuntimeError(f"{name}[{size}] is not written in hex, but is read as hex")
+    values = [int(item, 16) for item in literals]
     if len(values) != expected:
         raise RuntimeError(f"{name} expected {expected} entries, got {len(values)}")
     return _readonly(np.asarray(values, dtype=np.dtype(dtype)))
@@ -132,7 +151,10 @@ def _hex_table(name: str, size: str, expected: int, dtype: str) -> np.ndarray:
 
 @lru_cache(maxsize=None)
 def _decimal_table(name: str, size: str, expected: int, dtype: str) -> np.ndarray:
-    values = [int(item) for item in _DECIMAL_RE.findall(_body(name, size))]
+    literals = table_literals(name, size)
+    if any(item.lower().startswith("0x") for item in literals):
+        raise RuntimeError(f"{name}[{size}] is not written in decimal, but is read as decimal")
+    values = [int(item) for item in literals]
     if len(values) != expected:
         raise RuntimeError(f"{name} expected {expected} entries, got {len(values)}")
     return _readonly(np.asarray(values, dtype=np.dtype(dtype)))
