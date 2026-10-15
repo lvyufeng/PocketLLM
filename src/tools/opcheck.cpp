@@ -594,6 +594,21 @@ void run_conv2d(std::ostream &out, Backend &backend, const Request &request) {
   }
 }
 
+void run_add(std::ostream &out, Backend &backend, const Request &request) {
+  const Tensor &a = request.require("a");
+  const Tensor &b = request.require("b");
+  if (a.shape != b.shape) {
+    throw pocketllm::Error("add: a and b must have the same shape");
+  }
+  DeviceBuffer da = upload(backend, a.floats);
+  DeviceBuffer db = upload(backend, b.floats);
+  run_and_report(out, backend, request, a.shape, [&](DeviceBuffer result) {
+    backend.add(da, db, result, a.elements());
+  });
+  backend.release(da);
+  backend.release(db);
+}
+
 void run_rope(std::ostream &out, Backend &backend, const Request &request) {
   const Tensor &x = request.require("x");
   const Tensor &cos = request.require("cos");
@@ -783,6 +798,7 @@ const Entry kOps[] = {
     {"gemm", run_gemm},
     {"gemm_quant", run_gemm_quant}, {"embedding", run_embedding},
     {"embedding_quant", run_embedding_quant}, {"silu_mul", run_silu_mul},
+    {"add", run_add},
     {"rope", run_rope},           {"attention", run_attention},
     {"argmax", run_argmax},       {"softmax", run_softmax},
     {"logits_temperature", run_logits_temperature}, {"topk_sample", run_topk_sample},

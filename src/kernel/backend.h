@@ -149,6 +149,12 @@ class Backend {
                       int64_t in_ch, int64_t height, int64_t width, int64_t out_ch, int64_t kernel,
                       int64_t stride, int64_t pad) = 0;
 
+  /* ``out = a + b``, elementwise, as `kernels.h` documents it.  The graph this
+   * engine ran before the vision tower had no caller: every residual is
+   * `gemm(accumulate = true)`, and a sum of two activations that is not a
+   * product is what the tower adds. */
+  virtual void add(DeviceBuffer a, DeviceBuffer b, DeviceBuffer out, int64_t n) = 0;
+
   /* RoPE, split-half layout, as `kernels.h` documents it. */
   virtual void rope_neox(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d,
                          int64_t start_pos, DeviceBuffer cos_table, DeviceBuffer sin_table) = 0;

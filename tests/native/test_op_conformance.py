@@ -407,6 +407,10 @@ DEVICE_EXCLUDED_CASES: dict[str, dict[str, str]] = {
         # none of them.  Refused by name, as `gelu` is.
         "conv2d": "ascend: conv2d is not implemented (the custom-op set has no convolution)",
         "conv2d_padded": "ascend: conv2d is not implemented (the custom-op set has no convolution)",
+        # The tower's elementwise sum: the custom-op set fuses its multiplies
+        # into `silu_mul` and its scales into the norms, and has no bare `a + b`.
+        "add": "ascend: add is not implemented (the custom-op set has no elementwise sum)",
+        "add_cancelling": "ascend: add is not implemented (the custom-op set has no elementwise sum)",
         "topk_sample": "ascend: topk_sample not implemented yet",
         "topk_sample_uniform_on_a_boundary": "ascend: topk_sample not implemented yet",
         "topk_sample_min_p": "ascend: topk_sample not implemented yet",
@@ -949,6 +953,31 @@ def case_conv2d_padded(rng):
     return ({"x": x, "w": w}, {"kernel": 3, "stride": 2, "pad": 1}, want)
 
 
+def case_add(rng):
+    """The sum the vision tower needs twice, over the shape its sums take.
+
+    The two operands come from different distributions on purpose: the tower's
+    first sum is two convolutions of the same image, and its second is a learned
+    position embedding added to every patch -- not two halves of one quantity.
+    So a kernel that added `a` to itself, or read the second operand out of the
+    first, agrees with the reference exactly where `a == b` and nowhere else.
+    """
+    a = rng.standard_normal((16, 64), dtype=np.float32)
+    b = rng.standard_normal((16, 64), dtype=np.float32) * 0.25 + 2.0
+    return ({"a": a, "b": b}, {}, ref.add(a, b))
+
+
+def case_add_cancelling(rng):
+    """`b = -a`, so the answer is exactly zero -- and a subtraction is not.
+
+    A kernel that computed `a - b` answers `2a` here, a difference as wide as
+    the inputs themselves, while on the case above it agrees with the reference
+    to within rounding.  This is the case that separates the two.
+    """
+    a = rng.standard_normal((2, 128), dtype=np.float32) * 5.0
+    return ({"a": a, "b": -a}, {}, ref.add(a, -a))
+
+
 def case_silu_mul_large_negative(rng):
     """A gate of -50.  `silu(-50)` is -1e-22 to f32, and a kernel that takes the
     obvious `g / (1 + exp(-g))` overflows `exp(50)` on the way there -- both
@@ -1343,6 +1372,8 @@ CASES = {
     "gelu_large_magnitudes": case_gelu_large_magnitudes,
     "conv2d": case_conv2d,
     "conv2d_padded": case_conv2d_padded,
+    "add": case_add,
+    "add_cancelling": case_add_cancelling,
     "rope_start_zero": case_rope_start_zero,
     "rope_start_pos_offsets": case_rope_start_pos_offsets,
     "rope_small_head_dim": case_rope_small_head_dim,
@@ -1405,6 +1436,8 @@ OP_OF_CASE = {
     "gelu_large_magnitudes": "gelu",
     "conv2d": "conv2d",
     "conv2d_padded": "conv2d",
+    "add": "add",
+    "add_cancelling": "add",
     "rope_start_zero": "rope",
     "rope_start_pos_offsets": "rope",
     "rope_small_head_dim": "rope",
