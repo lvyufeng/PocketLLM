@@ -219,6 +219,7 @@ add_library(pocketllm SHARED
   kernel/cpu/backend.cpp
   kernel/registry.cpp
   model/qwen3.cpp
+  model/qwen3vl_vision.cpp
   ${POCKETLLM_CUDA_SOURCES}
 )
 
@@ -298,6 +299,32 @@ endif()
 target_link_libraries(pocketllm-run PRIVATE pocketllm-kernel-options)
 if(POCKETLLM_ASCEND_SOURCES)
   pocketllm_add_ascend(pocketllm-run)
+endif()
+
+# Run a vision tower over one image and dump its features, for comparison against
+# llama.cpp's `mtmd_encode`.  It links the model and the kernels rather than the
+# ABI, for the reason the tools above do: the ABI's surface is the call the text
+# graph makes, and an image is not part of it yet -- so reaching the tower means
+# reaching past the eight functions, which only a tool in this tree can do.
+add_executable(pocketllm-vision
+  tools/vision.cpp
+  abi/spec.cpp
+  gguf/reader.cpp
+  runtime/status.cpp
+  kernel/kernels.cpp
+  kernel/repack_q4k.cpp
+  kernel/cpu/backend.cpp
+  kernel/registry.cpp
+  model/qwen3vl_vision.cpp
+  ${POCKETLLM_CUDA_SOURCES}
+)
+if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)
+  target_compile_definitions(pocketllm-vision PRIVATE POCKETLLM_WITH_CUDA=1)
+  set_target_properties(pocketllm-vision PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+endif()
+target_link_libraries(pocketllm-vision PRIVATE pocketllm-kernel-options)
+if(POCKETLLM_ASCEND_SOURCES)
+  pocketllm_add_ascend(pocketllm-vision)
 endif()
 
 # Run one kernel over inputs a caller supplies, for checking it against the

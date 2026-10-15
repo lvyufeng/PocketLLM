@@ -51,18 +51,40 @@ head, and two hparams of its own -- `n_deepstack_layers` and a four-element
 collapses to the 1-D rotation this engine already implements, and the measurement says so rather than
 the argument: the sections are `[24, 20, 20, 0]` for a 128-wide head (summing to `head_dim / 2`, so
 every pair rotates), a text token's three section positions are all its own position, and the walk is
-8/8 against llama.cpp on `cpu` and on a card. **Images are not wired**: that needs the vision tower
-(a *separate* GGUF, the `mmproj` file, with its own architecture), the image preprocessing the
-mmproj's hparams describe, and the injection of the tower's features at the placeholder positions --
-`libmtmd`'s `mtmd_encode`/`mtmd_get_output_embd` is the oracle that half would be verified against,
-the same way `ggml_dequant.c` is the oracle for a block decoder.
+8/8 against llama.cpp on `cpu` and on a card.
 
-That tower's ops are landing ahead of it, because each is a kernel this engine was missing rather
-than a change to one it had: `layer_norm`, the tanh `gelu` and a non-causal arm of `attention` are
-in place, and the patch embedding is `conv2d`, checked against `ggml_conv_2d` on the checkpoint's own
-weights by `tests/native/test_conv2d_ggml.py` -- `ggml_conv_2d` being the function llama.cpp builds
-`v.patch_embd` with, so the index order is compared with the library the file was converted for and
-not only with this tree's own reading of it.
+**The other half of the checkpoint runs too.**  It is the `mmproj` -- a *separate* GGUF, architecture
+`clip`, with an architecture of its own and 316 tensors -- and `src/model/qwen3vl_vision.cpp` is that
+graph: the two temporal taps of a 3-D patch convolution summed, the learned position table, twenty-four
+pre-norm blocks with non-causal attention over the whole patch span, the 2x2 merger, and the three
+`deepstack` taps whose count the text graph's `n_deepstack_layers` is.  The ops it needed were each a
+kernel this engine was missing rather than a change to one it had, and they arrived one at a time
+with their own oracles: `layer_norm`, the tanh `gelu`, a non-causal arm of `attention`, `conv2d` (the
+patch embedding, checked against `ggml_conv_2d` on the checkpoint's own weights by
+`tests/native/test_conv2d_ggml.py`) and `add` (the two sums that are not products: the temporal taps,
+and the position table added to every patch).
+
+`tests/native/test_vision_tower.py` checks the tower against llama.cpp's own, through `libmtmd`'s
+`mtmd_encode` and `mtmd_get_output_embd`, on a 768×768 image authored as raw pixels.  It asserts two
+kinds of thing and it is worth telling them apart, because only one of them is tight:
+
+  - **The layout questions are exact.**  The token order, the position table's raster and the rotary
+    are questions with one right answer, and the last of them -- the only piece derived by reading
+    llama.cpp rather than from a tensor's shape -- is checked against `ggml_rope_multi` in the vision
+    mode by `tests/native/ggml_rope_vision.py`, to **1.2e-7**, which is float32 rounding.
+  - **The numbers are compared between two widths.**  llama.cpp builds this tower with the file's f16
+    weights, and ggml's f16-weight product narrows its float32 *activation* to f16 on the way in -- so
+    the reference rounds four matmul inputs per block where this engine keeps f32 throughout.  The
+    measured result over a plane of 1.18M values is a *median* element 5e-5 of the plane's spread from
+    the reference and a 99th percentile of 1.2e-3, with a thin tail of cancellation outliers reaching
+    2.7e-2; the test bounds the robust statistic tightly and the maximum loosely, and says why.
+
+**What is still not wired is the image path, not the tower.**  The preprocessing's resize is not here
+-- the tower takes the checkpoint's own `image_size` square and refuses anything else by name, because
+interpolating the position table is separate arithmetic (a bicubic resample) nothing else in this tree
+needs yet -- and neither is the injection of the tower's features at the text graph's placeholder
+positions, or an ABI entry point that takes an image at all.  `libmtmd` remains the oracle for the
+whole of it.
 
 The tokenizer carries **two pre-tokenizers**, because the vocabularies in this project's scope are
 built on two. They differ in exactly one place -- `\p{N}` against `\p{N}{1,3}`, so a number is cut

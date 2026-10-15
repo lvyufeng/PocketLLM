@@ -52,8 +52,10 @@ norm, an untied head, and its rotary embedding — the interleaved convention, w
 two rope kernels.
 
 They also run **`qwen3vl`**: Qwen3-VL-2B's **text half** is checked the same way (8/8 on `cpu` and on
-a card), which is the prerequisite for the vision path rather than the vision path itself — images
-need the tower that ships beside the model in an `mmproj` file, and that half is not wired.
+a card), and the **vision tower** that ships beside it in the `mmproj` file runs as well — checked
+against llama.cpp's own tower through `libmtmd`, on a 768×768 image, with the token order, the
+position table and the rotary pinned exactly and the numbers compared across the two engines' widths.
+The image path into the text graph is what is still missing.
 
 ### Reference performance — Qwen3-1.7B, `q4_k_m`, against llama.cpp
 
