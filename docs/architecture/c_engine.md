@@ -32,7 +32,8 @@ Everything else is unbuilt. A checkpoint whose architecture is neither `qwen3` n
 successfully and cannot run; `pocketllm run` and `pocketllm serve` still parse their arguments and
 exit.
 
-**The dense graph serves two architecture names.** `llama` is the same shape as `qwen3`, and every
+**The dense graph serves three architecture names.** `llama` and `qwen3vl` are the same shape as
+`qwen3`, and every
 difference between them is something the file states rather than something the graph is told: the
 hyperparameters come from the architecture's own metadata prefix, the per-head QK norm is *absent*
 in a `llama` file (the graph binds it when it is there), the head is tied or not according to which
@@ -40,9 +41,21 @@ tensors are present, and the **rotary embedding is the interleaved convention** 
 `x[2i+1]` -- where Qwen's is split-half. That last one is the only behavioural difference and the
 only one that is not visible in a tensor list, so it is a second kernel (`rope_norm` beside
 `rope_neox`) and not a flag: same angles, different pairs, and the wrong pairing is a different
-model. `tests/native/test_llama_arch.py` walks MiniCPM5-1B (24 layers, GQA 16:2, an untied head, no
+model. `tests/native/test_architecture_names.py` walks MiniCPM5-1B (24 layers, GQA 16:2, an untied head, no
 QK norm, a `llama-bpe` vocabulary, rope base 5e6) against llama.cpp token for token, twelve steps, on
 `cpu` and on a card.
+
+`qwen3vl` is the **text half of a vision model** (Qwen3-VL-2B): Qwen3's tensors again plus a tied
+head, and two hparams of its own -- `n_deepstack_layers` and a four-element
+`rope.dimension_sections`, which its multi-section rotary is built from. For *text* that layout
+collapses to the 1-D rotation this engine already implements, and the measurement says so rather than
+the argument: the sections are `[24, 20, 20, 0]` for a 128-wide head (summing to `head_dim / 2`, so
+every pair rotates), a text token's three section positions are all its own position, and the walk is
+8/8 against llama.cpp on `cpu` and on a card. **Images are not wired**: that needs the vision tower
+(a *separate* GGUF, the `mmproj` file, with its own architecture), the image preprocessing the
+mmproj's hparams describe, and the injection of the tower's features at the placeholder positions --
+`libmtmd`'s `mtmd_encode`/`mtmd_get_output_embd` is the oracle that half would be verified against,
+the same way `ggml_dequant.c` is the oracle for a block decoder.
 
 The tokenizer carries **two pre-tokenizers**, because the vocabularies in this project's scope are
 built on two. They differ in exactly one place -- `\p{N}` against `\p{N}{1,3}`, so a number is cut

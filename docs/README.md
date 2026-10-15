@@ -54,6 +54,10 @@ card, twelve steps each. It differs from `qwen3` in the metadata prefix, an *abs
 norm, an untied head, and its rotary embedding — the interleaved convention, which is why there are
 two rope kernels.
 
+They also run **`qwen3vl`**: Qwen3-VL-2B's **text half** is checked the same way (8/8 on `cpu` and on
+a card). That is the prerequisite for the vision path rather than the vision path itself — images
+need the tower that ships beside the model in an `mmproj` file, and that half is not wired.
+
 **Reference throughput — Qwen3-1.7B, `q4_k_m`, against llama.cpp:** the CPU path is **1.04× on
 prefill and 1.37× on decode** (ahead on both); the CUDA path is 0.11× / 0.40× and deliberately
 naive. Every number, its method and its provenance is in

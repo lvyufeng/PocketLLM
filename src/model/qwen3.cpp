@@ -17,10 +17,22 @@
 namespace pocketllm {
 
 const char *arch_refusal(const std::string &arch) {
-  if (arch == "qwen3" || arch == "llama") {
+  /* `qwen3vl` is the same dense graph again, carrying Qwen3's tensors (including
+   * the per-head QK norm and, here, a tied head) and two hparams of its own:
+   * `n_deepstack_layers` (how many visual feature levels the vision tower hands
+   * the LLM) and `rope.dimension_sections` (the multi-section rotary layout).
+   *
+   * **Text-only it is the 1-D rotation.**  The sections are `[24, 20, 20, 0]` for
+   * a 128-wide head -- summing to `head_dim / 2`, so every pair rotates -- and a
+   * *text* token's three section positions are all its own position, which makes
+   * the section assignment invisible: every pair takes angle `p * theta^(-2i/d)`
+   * whichever section it belongs to.  (With images the three positions differ and
+   * they stop being interchangeable, which is what `n_deepstack_layers` and the
+   * sections are for; that half is not wired yet.) */
+  if (arch == "qwen3" || arch == "llama" || arch == "qwen3vl") {
     return nullptr;
   }
-  return "this build runs the dense transformer graph, which serves 'qwen3' and 'llama'";
+  return "this build runs the dense transformer graph, which serves 'qwen3', 'llama' and 'qwen3vl'";
 }
 
 namespace {

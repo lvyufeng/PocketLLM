@@ -31,11 +31,13 @@ table is the format: `src/quant/iq2_grid.h` is generated from ggml's header by
 ternary packs are addressable and not decoded. The five formats past `q4_k` take the exact
 per-weight decode path rather than a packed kernel — `q4_k`'s AVX2 and int8-activation kernels are
 written for its own group arithmetic — so they are correct and roughly an order of magnitude
-slower; their packed kernels are the follow-up. **The dense graph serves two architecture names**:
-`qwen3` and `llama`, which differ only in what the file states — the metadata prefix, an optional
-per-head QK norm, tied-or-not head, and the **rotary convention** (split-half for Qwen, interleaved
-for `llama`, which is why there are two kernels). The `llama` arm is checked on MiniCPM5-1B against
-llama.cpp token for token, twelve steps, on `cpu` and on the card. The **tokenizer carries two
+slower; their packed kernels are the follow-up. **The dense graph serves three architecture names**:
+`qwen3`, `llama` and `qwen3vl`, which differ only in what the file states — the metadata prefix, an
+optional per-head QK norm, tied-or-not head, and the **rotary convention** (split-half for Qwen,
+interleaved for `llama`, which is why there are two kernels). Both extra arms are checked against
+llama.cpp token for token on `cpu` and on the card: MiniCPM5-1B for `llama`, and **Qwen3-VL-2B's text
+half** for `qwen3vl` (whose multi-section rotary collapses to the 1-D one for text; images are not
+wired). The **tokenizer carries two
 pre-tokenizers** for the same reason, Qwen's and `llama-bpe`'s — one alternation apart (whether a
 number is cut digit by digit or in runs of up to three) — each checked against llama.cpp's own. The
 same core's **Ascend backend**
