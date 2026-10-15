@@ -749,6 +749,52 @@ __global__ void gelu_kernel(const float *x, float *out, int64_t n) {
            (1.0F + tanhf(0.79788456080286535587989211986876F * v * (1.0F + 0.044715F * v * v)));
 }
 
+/* One thread per (patch, out_ch): an output element is a sum over its patch's
+ * whole receptive field, and no two threads write the same element, so no
+ * synchronization is needed and the reduction order is the same one
+ * `kernels.cpp` takes (in_ch, then kernel row, then kernel column) -- the two
+ * backends agree bit for bit and not only to a tolerance.
+ *
+ * A block-per-patch tiling with a shared-memory image tile is the obvious next
+ * step and is not here: the tower calls this once per image, so the launch is
+ * not on a hot path the way the per-token kernels are, and a tiled version would
+ * be a second reduction order to keep in step with the CPU reference. */
+__global__ void conv2d_kernel(const float *x, const float *weight, const float *bias, float *out,
+                              int64_t in_ch, int64_t height, int64_t width, int64_t out_ch,
+                              int64_t kernel, int64_t stride, int64_t pad, int64_t out_w,
+                              int64_t total) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= total) {
+    return;
+  }
+  const int64_t o = i % out_ch;
+  const int64_t p = i / out_ch;
+  const int64_t oy = p / out_w;
+  const int64_t ox = p % out_w;
+  const float *const row = weight + o * (in_ch * kernel * kernel);
+  float acc = bias != nullptr ? bias[o] : 0.0F;
+  for (int64_t ic = 0; ic < in_ch; ++ic) {
+    const float *const plane = x + ic * height * width;
+    const float *const krow = row + ic * kernel * kernel;
+    for (int64_t ky = 0; ky < kernel; ++ky) {
+      const int64_t iy = oy * stride + ky - pad;
+      if (iy < 0 || iy >= height) {
+        continue;
+      }
+      const float *const line = plane + iy * width;
+      const float *const kline = krow + ky * kernel;
+      for (int64_t kx = 0; kx < kernel; ++kx) {
+        const int64_t ix = ox * stride + kx - pad;
+        if (ix < 0 || ix >= width) {
+          continue;
+        }
+        acc += line[ix] * kline[kx];
+      }
+    }
+  }
+  out[i] = acc;
+}
+
 /* One thread per (token, head, pair). The two stores are independent of each
  * other's result -- both read `a` and `b` before either writes -- which is what
  * makes the in-place rotation safe. */
@@ -1288,6 +1334,22 @@ class CudaBackend final : public Backend {
     const unsigned threads = 256;
     gelu_kernel<<<static_cast<unsigned>((n + threads - 1) / threads), threads>>>(f(x), w(out), n);
     check(cudaGetLastError(), "gelu");
+  }
+
+  void conv2d(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out, int64_t in_ch,
+              int64_t height, int64_t width, int64_t out_ch, int64_t kernel, int64_t stride,
+              int64_t pad) override {
+    const int64_t out_w = (width + 2 * pad - kernel) / stride + 1;
+    const int64_t out_h = (height + 2 * pad - kernel) / stride + 1;
+    const int64_t total = out_h * out_w * out_ch;
+    if (total <= 0) {
+      return;
+    }
+    const unsigned threads = 256;
+    conv2d_kernel<<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
+        f(x), f(weight), bias.handle != 0 ? f(bias) : nullptr, w(out), in_ch, height, width, out_ch,
+        kernel, stride, pad, out_w, total);
+    check(cudaGetLastError(), "conv2d");
   }
 
   void rope_neox(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t start_pos,

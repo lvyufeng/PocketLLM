@@ -1928,6 +1928,48 @@ void gelu(const float *x, float *out, int64_t n) {
   });
 }
 
+void conv2d(const float *x, const float *weight, const float *bias, float *out, int64_t in_ch,
+            int64_t height, int64_t width, int64_t out_ch, int64_t kernel, int64_t stride,
+            int64_t pad) {
+  const int64_t out_h = (height + 2 * pad - kernel) / stride + 1;
+  const int64_t out_w = (width + 2 * pad - kernel) / stride + 1;
+  const int64_t k = in_ch * kernel * kernel;
+  /* Over the patches, one output row each.  A patch's output is a sum over its
+   * own receptive field and touches no other patch's output, so this is the
+   * outer-index split `parallel.h` asks for and not a split reduction -- the
+   * answer is bit-identical however many threads take it. */
+  parallel_for(out_h * out_w, /*min_per_task=*/1, [&](int64_t lo, int64_t hi, int64_t) {
+    for (int64_t p = lo; p < hi; ++p) {
+      const int64_t oy = p / out_w;
+      const int64_t ox = p % out_w;
+      for (int64_t o = 0; o < out_ch; ++o) {
+        const float *const row = weight + o * k;
+        float acc = bias != nullptr ? bias[o] : 0.0F;
+        for (int64_t ic = 0; ic < in_ch; ++ic) {
+          const float *const plane = x + ic * height * width;
+          const float *const krow = row + ic * kernel * kernel;
+          for (int64_t ky = 0; ky < kernel; ++ky) {
+            const int64_t iy = oy * stride + ky - pad;
+            if (iy < 0 || iy >= height) {
+              continue;
+            }
+            const float *const line = plane + iy * width;
+            const float *const kline = krow + ky * kernel;
+            for (int64_t kx = 0; kx < kernel; ++kx) {
+              const int64_t ix = ox * stride + kx - pad;
+              if (ix < 0 || ix >= width) {
+                continue;
+              }
+              acc += line[ix] * kline[kx];
+            }
+          }
+        }
+        out[p * out_ch + o] = acc;
+      }
+    }
+  });
+}
+
 void rope_neox(float *x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t start_pos,
                const float *cos_table, const float *sin_table) {
   const int64_t half = d / 2;

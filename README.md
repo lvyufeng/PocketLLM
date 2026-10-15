@@ -88,7 +88,7 @@ What works, what is a stub, and what has not been written. This table is the hon
 | `src/kernel/ascend/` — Ascend 310B backend | **Runs Qwen3-0.6B … 8B** on an Orange Pi AIpro, at the quantizer's own floor. |
 | `pocketllm.cli` | **Done** for all six commands — `devices`, `backends`, `architectures`, `ops`, `run`, `serve` |
 | `pocketllm.protocol` / `pocketllm.server` — OpenAI-compatible HTTP | **Done.** Driven over the C core by `server/native_backend.py`; one request at a time, no batch, no cancellation |
-| `pocketllm.kernels` — the kernel ABI: descriptors, op schemas, dispatch, graph IR | **Done.** 18 ops declared; stdlib-only, no numpy |
+| `pocketllm.kernels` — the kernel ABI: descriptors, op schemas, dispatch, graph IR | **Done.** 19 ops declared; stdlib-only, no numpy |
 | `pocketllm.backends.reference` — numpy oracle, every op, host memory | **Done.** The normative implementation |
 | `pocketllm.quant` — GGML block decoders, vendored tables | **Done.** IQ4_NL, IQ4_XS, IQ1_M, IQ2/IQ3, q2_k–q6_k, q8_0 |
 | `pocketllm.loader.gguf` — GGUF reader | **Done.** numpy in, descriptors out |

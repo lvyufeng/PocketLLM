@@ -1333,6 +1333,19 @@ class AscendBackend final : public Backend {
     throw Error("ascend: gelu is not implemented; this backend's custom-op set has silu_mul only");
   }
 
+  /* The patch embedding, which this backend has no op for either: the vendor's
+   * custom-op set is norms, `silu_mul`, the cube matmul and a causal decode
+   * attention, and a 2-D convolution is none of them.  Refused by name, so a
+   * caller learns the tower cannot run here rather than receiving an image that
+   * was never convolved. */
+  void conv2d(DeviceBuffer /*x*/, DeviceBuffer /*weight*/, DeviceBuffer /*bias*/,
+              DeviceBuffer /*out*/, int64_t /*in_ch*/, int64_t /*height*/, int64_t /*width*/,
+              int64_t /*out_ch*/, int64_t /*kernel*/, int64_t /*stride*/,
+              int64_t /*pad*/) override {
+    throw Error("ascend: conv2d is not implemented; this backend's custom-op set has no "
+                "convolution");
+  }
+
   void silu_mul(DeviceBuffer gate, DeviceBuffer up, DeviceBuffer out, int64_t n) override {
     ensure_context();
     OpScope _op("silu_mul");

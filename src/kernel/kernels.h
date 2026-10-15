@@ -150,6 +150,37 @@ void silu_mul(const float *gate, const float *up, float *out, int64_t n);
  * the last bit of float32. */
 void gelu(const float *x, float *out, int64_t n);
 
+/* The vision tower's patch embedding: a square-kernel 2-D convolution.
+ *
+ * `x` is an `(in_ch, height, width)` image with `width` fastest, `weight` is
+ * `(out_ch, in_ch * kernel * kernel)` row-major with its `k` axis ordered
+ * `in_ch` slowest and the kernel width fastest, and `out` is
+ * `(out_h * out_w, out_ch)` with `out_ch` fastest -- a patch is a row, so the
+ * op after this one can treat a patch as a token.  `bias` may be null.
+ *
+ * **The `k` axis order is ggml's, and it is load-bearing.**  GGUF stores
+ * `v.patch_embd.weight` as `(kernel, kernel, in_ch, out_ch)` with the output
+ * channel outermost, so reading that memory as this shape is a reinterpretation
+ * of the bytes on the mapping and needs no transposition.  It is also what
+ * makes `ggml_conv_2d` a like-for-like oracle for this kernel rather than a
+ * comparison that has to agree on a layout first;
+ * `tests/native/ggml_conv.py` drives both on the checkpoint's own weights.  The
+ * input's order matches ggml's too, `width` fastest then `height` then channel.
+ *
+ * Only the patch axis is not ggml's: ggml's output has `out_w` fastest and this
+ * one has the row slowest, because a patch-major row is the shape every op
+ * downstream wants.  The two are the same numbers under a transpose of the
+ * patch axes, and the test says so with an explicit transpose rather than this
+ * kernel carrying a layout nothing else in the graph uses.
+ *
+ * Padding is zero, and the guard is a `continue` rather than a pre-padded copy
+ * of the image: an edge patch's out-of-range taps contribute nothing, so
+ * materialising zeros only to multiply them would cost more than skipping them.
+ */
+void conv2d(const float *x, const float *weight, const float *bias, float *out, int64_t in_ch,
+            int64_t height, int64_t width, int64_t out_ch, int64_t kernel, int64_t stride,
+            int64_t pad);
+
 /* RoPE, the split-half (NEOX) layout: ``x[i]`` is rotated against
  * ``x[i + d/2]``.
  *

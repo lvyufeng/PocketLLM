@@ -545,6 +545,55 @@ void run_gelu(std::ostream &out, Backend &backend, const Request &request) {
   backend.release(dx);
 }
 
+void run_conv2d(std::ostream &out, Backend &backend, const Request &request) {
+  const Tensor &x = request.require("x");
+  const Tensor &weight = request.require("w");
+  /* Optional in the ABI, so a request without it is legal and the backend is
+   * handed the null buffer, exactly as for `layer_norm`'s. */
+  const Tensor *bias = request.tensor("bias");
+  if (x.shape.size() != 3) {
+    throw pocketllm::Error("conv2d: x must be (in_ch, height, width)");
+  }
+  if (weight.shape.size() != 2) {
+    throw pocketllm::Error("conv2d: w must be (out_ch, in_ch * kernel * kernel)");
+  }
+  const int64_t kernel = request.int_param("kernel", 0);
+  const int64_t stride = request.int_param("stride", 1);
+  const int64_t pad = request.int_param("pad", 0);
+  if (kernel <= 0 || stride <= 0 || pad < 0) {
+    throw pocketllm::Error("conv2d: kernel and stride must be positive and pad non-negative");
+  }
+  const int64_t in_ch = x.shape[0];
+  const int64_t height = x.shape[1];
+  const int64_t width = x.shape[2];
+  const int64_t out_ch = weight.shape[0];
+  if (weight.shape[1] != in_ch * kernel * kernel) {
+    throw pocketllm::Error("conv2d: w's column count must be in_ch * kernel * kernel");
+  }
+  if (bias != nullptr && (bias->shape.size() != 1 || bias->shape[0] != out_ch)) {
+    throw pocketllm::Error("conv2d: the bias must be the output channel count, one dimension");
+  }
+  const int64_t out_h = (height + 2 * pad - kernel) / stride + 1;
+  const int64_t out_w = (width + 2 * pad - kernel) / stride + 1;
+  if (out_h <= 0 || out_w <= 0) {
+    throw pocketllm::Error("conv2d: the kernel does not fit the image at this stride and padding");
+  }
+  DeviceBuffer dx = upload(backend, x.floats);
+  DeviceBuffer dw = upload(backend, weight.floats);
+  DeviceBuffer db{};
+  if (bias != nullptr) {
+    db = upload(backend, bias->floats);
+  }
+  run_and_report(out, backend, request, {out_h * out_w, out_ch}, [&](DeviceBuffer result) {
+    backend.conv2d(dx, dw, db, result, in_ch, height, width, out_ch, kernel, stride, pad);
+  });
+  backend.release(dx);
+  backend.release(dw);
+  if (db.handle != 0) {
+    backend.release(db);
+  }
+}
+
 void run_rope(std::ostream &out, Backend &backend, const Request &request) {
   const Tensor &x = request.require("x");
   const Tensor &cos = request.require("cos");
@@ -730,6 +779,7 @@ struct Entry {
 const Entry kOps[] = {
     {"rms_norm", run_rms_norm},   {"layer_norm", run_layer_norm},
     {"gelu", run_gelu},
+    {"conv2d", run_conv2d},
     {"gemm", run_gemm},
     {"gemm_quant", run_gemm_quant}, {"embedding", run_embedding},
     {"embedding_quant", run_embedding_quant}, {"silu_mul", run_silu_mul},
