@@ -134,6 +134,15 @@ class Backend {
   virtual void rope_neox(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d,
                          int64_t start_pos, DeviceBuffer cos_table, DeviceBuffer sin_table) = 0;
 
+  /* RoPE, interleaved layout -- the same rotation with the other pairing, which
+   * `kernels.h` explains.  A separate entry point rather than a flag on
+   * `rope_neox` because a backend may implement one convention and not the
+   * other: a device that reaches its arithmetic through a vendor op (the
+   * Ascend backend's `aclnnRopeCustom`) has whatever mode that op has, and
+   * saying so is better than passing a flag it silently ignores. */
+  virtual void rope_norm(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d,
+                         int64_t start_pos, DeviceBuffer cos_table, DeviceBuffer sin_table) = 0;
+
   /* How many bytes the scratch for an `attention` call must hold, given that the
    * longest score row in it is `max_span` entries.
    *

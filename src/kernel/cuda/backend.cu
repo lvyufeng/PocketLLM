@@ -729,6 +729,33 @@ __global__ void rope_neox_kernel(float *x, int64_t n_tokens, int64_t n_heads, in
   vec[i + half] = a * s + b * c;
 }
 
+/* The same rotation with the other pairing: adjacent elements, at the same
+ * `d/2` angles.  A second kernel rather than a branch in the first, because the
+ * two address different memory -- `vec[i]`/`vec[i + half]` against
+ * `vec[2i]`/`vec[2i + 1]` -- and neither pattern is a parameter of the other. */
+__global__ void rope_norm_kernel(float *x, int64_t n_tokens, int64_t n_heads, int64_t d,
+                                 int64_t start_pos, const float *cos_table,
+                                 const float *sin_table) {
+  const int64_t half = d / 2;
+  const int64_t total = n_tokens * n_heads * half;
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  const int64_t i = idx % half;
+  const int64_t h = (idx / half) % n_heads;
+  const int64_t t = idx / (half * n_heads);
+  const int64_t position = start_pos + t;
+
+  float *vec = x + (t * n_heads + h) * d;
+  const float c = cos_table[position * half + i];
+  const float s = sin_table[position * half + i];
+  const float a = vec[2 * i];
+  const float b = vec[2 * i + 1];
+  vec[2 * i] = a * c - b * s;
+  vec[2 * i + 1] = a * s + b * c;
+}
+
 /* One block per (query token, head). The block owns a row of `scores`, and the
  * rows are all `score_stride` wide even though the block's own span may be
  * shorter -- a uniform stride is what lets a block find its row with a multiply
@@ -1143,6 +1170,18 @@ class CudaBackend final : public Backend {
     rope_neox_kernel<<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
         w(x), n_tokens, n_heads, d, start_pos, f(cos_table), f(sin_table));
     check(cudaGetLastError(), "rope_neox");
+  }
+
+  void rope_norm(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t start_pos,
+                 DeviceBuffer cos_table, DeviceBuffer sin_table) override {
+    const int64_t total = n_tokens * n_heads * (d / 2);
+    if (total <= 0) {
+      return;
+    }
+    const unsigned threads = 256;
+    rope_norm_kernel<<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
+        w(x), n_tokens, n_heads, d, start_pos, f(cos_table), f(sin_table));
+    check(cudaGetLastError(), "rope_norm");
   }
 
   int64_t attention_scratch(int64_t q_len, int64_t n_heads, int64_t max_span) const override {

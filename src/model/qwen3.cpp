@@ -17,19 +17,10 @@
 namespace pocketllm {
 
 const char *arch_refusal(const std::string &arch) {
-  if (arch == "qwen3") {
+  if (arch == "qwen3" || arch == "llama") {
     return nullptr;
   }
-  if (arch == "llama") {
-    /* llama-3's convention: each pair `(x[2i], x[2i + 1])` rotates by angle `i`.
-     * `rope_neox` rotates `(x[i], x[i + d/2])` instead, and the two are not a
-     * relabelling -- the *partner* of an element differs -- so running a `llama`
-     * file through the Qwen kernel would rotate every head by the wrong angles
-     * and answer with text that looks like a bad model rather than a bug. */
-    return "its rotary embedding uses the interleaved convention (pairing x[2i] with x[2i+1]), "
-           "and this graph implements the split-half one (x[i] with x[i + d/2]) only";
-  }
-  return "this build runs the dense transformer graph, which serves 'qwen3'";
+  return "this build runs the dense transformer graph, which serves 'qwen3' and 'llama'";
 }
 
 namespace {
@@ -494,6 +485,9 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
   model->rms_eps_ =
       static_cast<float>(checkpoint.get_float(p + "attention.layer_norm_rms_epsilon", 1e-6));
   model->rope_theta_ = static_cast<float>(checkpoint.get_float(p + "rope.freq_base", 10000.0));
+  /* The one behavioural difference between the two architecture names this graph
+   * serves; everything else is a tensor being present or absent. */
+  model->interleaved_rope_ = arch == "llama";
 
   if (model->n_vocab_ <= 0) {
     /* Not every conversion writes `vocab_size`; the embedding's own shape is
@@ -892,8 +886,18 @@ kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const int64
                                n_s * n_head_ * head_dim_ * 4};
       kernel::DeviceBuffer k_s{k_.handle + static_cast<uintptr_t>(row * kv_width * 4),
                                n_s * kv_width * 4};
-      backend_->rope_neox(q_s, n_s, n_head_, head_dim_, at_pos, rope_cos_, rope_sin_);
-      backend_->rope_neox(k_s, n_s, n_head_kv_, head_dim_, at_pos, rope_cos_, rope_sin_);
+      /* The one place the two architecture names this graph serves differ in
+       * *behaviour* rather than in which tensors the file carries: `qwen3`
+       * rotates the two halves of a head against each other, `llama` rotates
+       * neighbours.  Same tables, same angles, different pairing -- and the
+       * wrong one is not a rounding error but a different model. */
+      if (interleaved_rope_) {
+        backend_->rope_norm(q_s, n_s, n_head_, head_dim_, at_pos, rope_cos_, rope_sin_);
+        backend_->rope_norm(k_s, n_s, n_head_kv_, head_dim_, at_pos, rope_cos_, rope_sin_);
+      } else {
+        backend_->rope_neox(q_s, n_s, n_head_, head_dim_, at_pos, rope_cos_, rope_sin_);
+        backend_->rope_neox(k_s, n_s, n_head_kv_, head_dim_, at_pos, rope_cos_, rope_sin_);
+      }
     }
 
     /* The per-layer slab base.  The layout is `[layer][sequence][position]`, so

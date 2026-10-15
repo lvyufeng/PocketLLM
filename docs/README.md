@@ -48,6 +48,12 @@ The five new formats are correctness-complete rather than fast: `q4_k`'s packed 
 int8-activation kernels are written for its own group arithmetic, so the others are decoded one
 weight at a time for now. Packing those kernels is the follow-up.
 
+Beyond Qwen3, the same C-core rows run a dense **`llama`-architecture** checkpoint: MiniCPM5-1B
+(1B, `Q4_K_M`, a 2026 model) is checked **token for token against llama.cpp** on `cpu` and on a
+card, twelve steps each. It differs from `qwen3` in the metadata prefix, an *absent* per-head QK
+norm, an untied head, and its rotary embedding — the interleaved convention, which is why there are
+two rope kernels.
+
 **Reference throughput — Qwen3-1.7B, `q4_k_m`, against llama.cpp:** the CPU path is **1.04× on
 prefill and 1.37× on decode** (ahead on both); the CUDA path is 0.11× / 0.40× and deliberately
 naive. Every number, its method and its provenance is in

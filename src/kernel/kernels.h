@@ -137,6 +137,23 @@ void silu_mul(const float *gate, const float *up, float *out, int64_t n);
 void rope_neox(float *x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t start_pos,
                const float *cos_table, const float *sin_table);
 
+/* The other rotary convention.  Not a flag on the one above, because the two
+ * are different *permutations* of the same arithmetic rather than a parameter of
+ * it: what differs is which element an element is rotated against.
+ *
+ * `rope_neox` pairs `(x[i], x[i + d/2])`, which is Qwen's and what llama.cpp
+ * calls NEOX.  This pairs `(x[2i], x[2i + 1])`, the original Llama's, which
+ * llama.cpp hands every `LLAMA`-architecture checkpoint (`get_rope_type`) and
+ * which the 2026 checkpoint this op exists for (MiniCPM5) declares.  Pair `i`
+ * rotates by `position * theta^(-2i/d)` in both, so the tables are the same
+ * shape and the same numbers -- only the pairing moves.
+ *
+ * Everything else about the call is `rope_neox`'s: in place, `(n_tokens,
+ * n_heads, d)`, tokens occupying `start_pos .. start_pos + n_tokens - 1`, and
+ * the KV cache keeps the *rotated* key. */
+void rope_norm(float *x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t start_pos,
+               const float *cos_table, const float *sin_table);
+
 /* ``out[t, h, :] = softmax_s(q[t, h, :] . k[s, h/group, :] * scale) v[s, h/group, :]``
  * over ``s`` in ``[first_key, q_offset + t]``.
  *

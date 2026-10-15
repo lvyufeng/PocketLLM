@@ -45,6 +45,12 @@ arithmetic, so the others are decoded one weight at a time for now — 5.3 s aga
 tokens at 0.6B on this machine. Packing those kernels is the follow-up, and the ladder's IQ3, IQ4
 and IQ1 rungs behind them.
 
+Beyond Qwen3, the same C-core rows run a dense **`llama`-architecture** checkpoint: MiniCPM5-1B
+(1B, `Q4_K_M`, a 2026 model) is checked **token for token against llama.cpp** on `cpu` and on a
+card, twelve steps each. It differs from `qwen3` in the metadata prefix, an *absent* per-head QK
+norm, an untied head, and its rotary embedding — the interleaved convention, which is why there are
+two rope kernels.
+
 ### Reference performance — Qwen3-1.7B, `q4_k_m`, against llama.cpp
 
 | | prefill (`pp512`) | decode (`tg128`/`tg64`) |
