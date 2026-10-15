@@ -419,6 +419,17 @@ DEVICE_EXCLUDED_CASES: dict[str, dict[str, str]] = {
         # than returning the garbage.
         "rope_small_head_dim": "ascend: rope_neox needs d a multiple of 32 (RopeCustom's "
         "16-lane repeat over one split half)",
+        # The interleaved rotary convention, which this backend refuses by name.
+        # Its arithmetic is the CANN custom op `aclnnRopeCustom`, whose mode cannot
+        # be checked from the control host, and the two conventions rotate
+        # different element pairs -- so a guess there reads as a bad model rather
+        # than as a missing op.  The split-half cases above do run on the board.
+        "rope_interleaved_start_zero": "ascend: the interleaved rotary convention is not "
+        "implemented (aclnnRopeCustom's mode is unverified off-board)",
+        "rope_interleaved_start_pos_offsets": "ascend: the interleaved rotary convention is not "
+        "implemented (aclnnRopeCustom's mode is unverified off-board)",
+        "rope_interleaved_small_head_dim": "ascend: the interleaved rotary convention is not "
+        "implemented (aclnnRopeCustom's mode is unverified off-board)",
         # `silu_mul_large_negative` is a gate of -50, whose correct output is
         # -9.6e-21 -- about 1e13 below the smallest positive fp16 subnormal
         # (6e-8).  An fp16 kernel has no way to represent it and returns signed
@@ -834,7 +845,7 @@ def case_rope_start_zero(rng):
     positions = np.arange(tokens)
     return (
         {"x": x, "cos": cos, "sin": sin},
-        {"start_pos": 0},
+        {"start_pos": 0, "layout": "split"},
         ref.rope(x, positions, cos, sin, layout="split"),
     )
 
@@ -854,7 +865,7 @@ def case_rope_start_pos_offsets(rng):
     positions = np.arange(start, start + tokens)
     return (
         {"x": x, "cos": cos, "sin": sin},
-        {"start_pos": start},
+        {"start_pos": start, "layout": "split"},
         ref.rope(x, positions, cos, sin, layout="split"),
     )
 
@@ -868,9 +879,51 @@ def case_rope_small_head_dim(rng):
     positions = np.arange(tokens)
     return (
         {"x": x, "cos": cos, "sin": sin},
-        {"start_pos": 0},
+        {"start_pos": 0, "layout": "split"},
         ref.rope(x, positions, cos, sin, layout="split"),
     )
+
+
+def _rope_case(rng, d: int, heads: int, tokens: int, start: int, layout: str):
+    """One rope case, in whichever pairing."""
+    x = rng.standard_normal((tokens, heads, d), dtype=np.float32)
+    cos, sin = rope_tables(start + tokens, d // 2)
+    positions = np.arange(start, start + tokens)
+    return (
+        {"x": x, "cos": cos, "sin": sin},
+        {"start_pos": start, "layout": layout},
+        ref.rope(x, positions, cos, sin, layout=layout),
+    )
+
+
+def case_rope_interleaved_start_zero(rng):
+    """The pairing every `llama`-architecture checkpoint uses, and the one the
+    ABI's reference *defaults* to (`layout="interleaved"`).
+
+    Same inputs as `rope_start_zero`, so the two cases differ in nothing but the
+    pairing. That is the point: an implementation that reached for the wrong
+    kernel -- or a tool that ignored the attribute -- passes one and fails the
+    other, and the failure names the layout.
+    """
+    return _rope_case(rng, d=128, heads=16, tokens=3, start=0, layout="interleaved")
+
+
+def case_rope_interleaved_start_pos_offsets(rng):
+    """The interleaved decode case: `start_pos = 300` with three tokens.
+
+    The offset is the half worth re-checking in the second pairing, because the
+    table lookup and the pairing are the two things a new kernel gets to write
+    twice -- and only one of them is new here.
+    """
+    return _rope_case(rng, d=128, heads=16, tokens=3, start=300, layout="interleaved")
+
+
+def case_rope_interleaved_small_head_dim(rng):
+    """`d = 4` in the interleaved pairing, where the mistake this catches is
+    concrete: `d/2 = 2`, so the two pairs are `(0, 1)` and `(2, 3)`, and a kernel
+    that paired the halves instead reads `(0, 2)` and `(1, 3)` -- a different
+    rotation that `d = 128` makes harder to see."""
+    return _rope_case(rng, d=4, heads=2, tokens=5, start=0, layout="interleaved")
 
 
 def _attention_case(rng, q_len, heads, kv_heads, d, first_key, q_offset, capacity):
@@ -1128,6 +1181,9 @@ CASES = {
     "rope_start_zero": case_rope_start_zero,
     "rope_start_pos_offsets": case_rope_start_pos_offsets,
     "rope_small_head_dim": case_rope_small_head_dim,
+    "rope_interleaved_start_zero": case_rope_interleaved_start_zero,
+    "rope_interleaved_start_pos_offsets": case_rope_interleaved_start_pos_offsets,
+    "rope_interleaved_small_head_dim": case_rope_interleaved_small_head_dim,
     "attention_single_query": case_attention_single_query,
     "attention_chunk": case_attention_chunk,
     "attention_prefill_q_offset": case_attention_prefill_q_offset,
@@ -1179,6 +1235,9 @@ OP_OF_CASE = {
     "rope_start_zero": "rope",
     "rope_start_pos_offsets": "rope",
     "rope_small_head_dim": "rope",
+    "rope_interleaved_start_zero": "rope",
+    "rope_interleaved_start_pos_offsets": "rope",
+    "rope_interleaved_small_head_dim": "rope",
     "attention_single_query": "attention",
     "attention_chunk": "attention",
     "attention_prefill_q_offset": "attention",

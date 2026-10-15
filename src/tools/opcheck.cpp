@@ -150,6 +150,19 @@ struct Request {
     }
     return fallback;
   }
+
+  /* A parameter the request carried as text: a name rather than a number.  What
+   * comes back is what was written, not what is valid -- the op that reads it
+   * refuses an unknown name, because that is where the set of legal names
+   * lives. */
+  std::string string_param(const std::string &name, const std::string &fallback) const {
+    for (const auto &entry : params) {
+      if (entry.first == name) {
+        return entry.second;
+      }
+    }
+    return fallback;
+  }
 };
 
 std::vector<std::string> words(const std::string &line) {
@@ -500,6 +513,15 @@ void run_rope(std::ostream &out, Backend &backend, const Request &request) {
   const int64_t n_heads = x.shape[1];
   const int64_t d = x.shape[2];
   const int64_t start_pos = request.int_param("start_pos", 0);
+  /* Which pairing.  `split` is what a `qwen3` checkpoint uses, and it was this
+   * tool's only behaviour before there was a second convention; `interleaved` is
+   * what a `llama` one uses (`kernels.h` documents the two).  An unknown name is
+   * refused rather than defaulted: the two are different rotations, so
+   * defaulting would answer a different question with the same shape. */
+  const std::string layout = request.string_param("layout", "split");
+  if (layout != "split" && layout != "interleaved") {
+    throw pocketllm::Error("rope: unknown layout '" + layout + "'");
+  }
   DeviceBuffer dx = upload(backend, x.floats);
   DeviceBuffer dcos = upload(backend, cos.floats);
   DeviceBuffer dsin = upload(backend, sin.floats);
@@ -509,7 +531,11 @@ void run_rope(std::ostream &out, Backend &backend, const Request &request) {
      * the input and the output as separate things the caller can diff, which is
      * the only reason this reads better than mutating. */
     backend.copy_device_to_device(result, dx, n_tokens * n_heads * d * 4);
-    backend.rope_neox(result, n_tokens, n_heads, d, start_pos, dcos, dsin);
+    if (layout == "interleaved") {
+      backend.rope_norm(result, n_tokens, n_heads, d, start_pos, dcos, dsin);
+    } else {
+      backend.rope_neox(result, n_tokens, n_heads, d, start_pos, dcos, dsin);
+    }
   });
   backend.release(dx);
   backend.release(dcos);
