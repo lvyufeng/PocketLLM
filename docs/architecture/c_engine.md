@@ -93,13 +93,34 @@ and with them in place it is 3-4% -- inside the noise the token path already has
 unchanged by any of it: llama.cpp pads a token's embedding with zeros, so there is nothing for the
 injection to add, and this engine simply does not inject.
 
+**An image span's rotary positions are in as well, and they are not the collapse.**  A patch carries a
+position per rotary section -- its index in the sequence, its row and its column -- where a text token
+carries its own index four times.  `forward_embeddings` takes them as `positions[token * 4 + section]`
+and builds one rotary row per token, which is the same trick the tower's own rotary uses and the reason
+neither needed a new op.  Two things about the assignment are the reference's rather than a
+simplification, and both were measured rather than read:
+
+  - **The section a pair belongs to cycles.**  llama.cpp builds this architecture with
+    `GGML_ROPE_TYPE_IMROPE`, the *interleaved* multi-section rotary, where the sections run
+    `0, 1, 2, 0, 1, 2, ...` over the pairs; the block form (`MROPE`) is the other architecture's
+    convention and gives different angles for the same positions.  A text token cannot tell the two
+    apart, because its four positions are equal and every assignment then picks the same number --
+    which is exactly why the text half's walk never asked the question.
+  - **The first component is not decoration.**  llama.cpp keys its cache by position, so a token's
+    first component *is* the row of the cache it writes; a span whose patches shared one would have
+    them overwrite each other.  Keeping it equal to the token's index is both what the convention is
+    and what makes the two engines comparable at all, since this one keys its cache by the token's
+    place in the batch.
+
+`tests/native/test_rope_multi.py` checks it against llama.cpp's own graph over the positions a real
+2x2 patch block would carry, at the same bound the token path is compared at on this checkpoint.
+
 **What is left is the image's own shape.**  The preprocessing's resize is not here -- the tower takes
 the checkpoint's own `image_size` square and refuses anything else by name, because interpolating the
 position table is separate arithmetic (a bicubic resample) nothing else in this tree needs yet -- and
-neither is the image *span*: its tokens take two-dimensional rotary positions from the patch grid
-rather than one, and they attend non-causally, which means the text graph's per-token decode loop has
-to grow the prefill case the tower already has.  There is also no ABI entry point that takes an image
-at all.  `libmtmd` remains the oracle for the whole of it.
+neither is the image *span*'s attention, which is non-causal where the text graph's decode loop is a
+causal prefill.  There is also no ABI entry point that takes an image at all.  `libmtmd` remains the
+oracle for the whole of it.
 
 The tokenizer carries **two pre-tokenizers**, because the vocabularies in this project's scope are
 built on two. They differ in exactly one place -- `\p{N}` against `\p{N}{1,3}`, so a number is cut
