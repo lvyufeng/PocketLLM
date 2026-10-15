@@ -98,6 +98,11 @@ class Backend {
   virtual void rms_norm(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer out, int64_t n_tokens,
                         int64_t d, float eps) = 0;
 
+  /* Layer normalization, as `kernels.h` documents it.  `bias` may be the null
+   * buffer (`handle == 0`), which the ABI declares as optional. */
+  virtual void layer_norm(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out,
+                          int64_t rows, int64_t d, float eps) = 0;
+
   /* ``out[r, j] = sum_k x[r, k] * w[j, k]``, with `w` row-major `(n, k)`.
    * `bias` may be null; `accumulate` adds into `out` instead of overwriting
    * it, which is how the residual connections are expressed. */

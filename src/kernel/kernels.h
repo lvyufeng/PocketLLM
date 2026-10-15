@@ -43,6 +43,25 @@ namespace kernel {
 void rms_norm(const float *x, const float *weight, float *out, int64_t n_tokens, int64_t d,
               float eps);
 
+/* ``out[r, :] = (x[r, :] - mean) / sqrt(var + eps) * weight[:] + bias[:]``, with
+ * the **biased** variance (over `d`, not `d - 1`) -- the convention
+ * `backends/reference` implements, and the one every checkpoint using this norm
+ * was trained with.
+ *
+ * `bias` may be null, which the ABI declares as optional: a vision block always
+ * carries one, a model that wants only the scale does not.
+ *
+ * Separate from `rms_norm` rather than a flag on it, for the reason the ABI
+ * gives: the two add `eps` to different quantities (a mean square against a
+ * variance) and this one needs the mean, which `rms_norm` never computes.  Three
+ * passes over the row -- the mean, the squared deviations from it, then the
+ * write -- matching the reference's order rather than the one-pass
+ * `E[x^2] - mean^2` form, which cancels when the mean is large next to the
+ * spread.  Scalar for now: nothing on the token path calls it yet (the vision
+ * tower will), and the conformance test is what pins it. */
+void layer_norm(const float *x, const float *weight, const float *bias, float *out, int64_t rows,
+                int64_t d, float eps);
+
 /* ``out[r, j] = sum_k x[r, k] * w[j, k]``, with `w` row-major `(n, k)`.
  *
  * `bias` may be null. `accumulate` selects accumulation: when it is true the

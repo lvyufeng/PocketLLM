@@ -89,6 +89,13 @@ class CpuBackend final : public Backend {
     kernel::rms_norm(f(x), f(weight), w(out), n_tokens, d, eps);
   }
 
+  void layer_norm(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out,
+                  int64_t rows, int64_t d, float eps) override {
+    /* The null buffer is the ABI's "no bias"; `handle` is the only thing that
+     * says so, since a zero-length bias and an absent one are the same request. */
+    kernel::layer_norm(f(x), f(weight), bias.handle != 0 ? f(bias) : nullptr, w(out), rows, d, eps);
+  }
+
   void gemm(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out, int64_t m,
             int64_t n, int64_t k, bool accumulate) override {
     kernel::gemm(f(x), f(weight), bias.handle ? f(bias) : nullptr, w(out), m, n, k, accumulate);

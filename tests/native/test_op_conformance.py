@@ -132,6 +132,16 @@ ASCEND_F16_OPS = frozenset({"rms_norm", "silu_mul", "gemm", "attention", "rope"}
 #: little above the 1.2e-5 measured on a standard-normal row.
 SOFTMAX_ATOL = 5e-5
 
+#: The bound for a case whose *inputs* are ill-conditioned rather than whose
+#: kernel is imprecise.  `layer_norm_large_mean` normalizes a row whose mean is
+#: 100 and whose spread is 0.01, so the mean's own last bits are amplified by that
+#: ratio: two correct implementations that sum in different orders land ~0.2%
+#: apart, measured 0.19% on `cpu` and on the card, against the 2e-4 the other
+#: norms are held to.  What the case is *for* is the one-pass `E[x^2] - mean^2`
+#: form, which loses the variance to cancellation here and is off by ~300% --
+#: two orders beyond this bound, so the arithmetic is still pinned.
+ILL_CONDITIONED_RTOL = 2e-2
+
 #: The seed every case draws from.  Fixed so a failure is reproducible from the
 #: test name alone -- the generated request is not checked in, so the inputs have
 #: to be recoverable from the code.
@@ -382,6 +392,12 @@ DEVICE_EXCLUDED_CASES: dict[str, dict[str, str]] = {
     "ascend": {
         # --- ops the backend still throws by name for ---
         "logits_temperature": "ascend: logits_temperature not implemented yet",
+        # The vendor's custom ops carry `RmsNormNdCustom`/`RmsNorm1024Custom` and
+        # no LayerNorm, and the backend refuses it by name rather than running the
+        # RMS one (its `eps` is added to a variance, not a mean square).
+        "layer_norm": "ascend: layer_norm is not implemented (the custom-op set has RmsNorm* only)",
+        "layer_norm_no_bias": "ascend: layer_norm is not implemented (the custom-op set has RmsNorm* only)",
+        "layer_norm_large_mean": "ascend: layer_norm is not implemented (the custom-op set has RmsNorm* only)",
         "topk_sample": "ascend: topk_sample not implemented yet",
         "topk_sample_uniform_on_a_boundary": "ascend: topk_sample not implemented yet",
         "topk_sample_min_p": "ascend: topk_sample not implemented yet",
@@ -469,6 +485,47 @@ def case_rms_norm_single_row(rng):
     x = rng.standard_normal((1, 1), dtype=np.float32)
     weight = rng.standard_normal(1, dtype=np.float32)
     return ({"x": x, "weight": weight}, {"eps": 1e-6}, ref.rms_norm(x, weight, eps=1e-6))
+
+
+def case_layer_norm(rng):
+    """`layer_norm` over the shape the graph uses, with both a weight and a bias.
+
+    The bias is the half `rms_norm` does not have, and it is what a vision block
+    carries (`v.blk.N.ln1.bias`) -- the norm the second architecture this engine
+    was taught needs.
+    """
+    x = rng.standard_normal((3, 256), dtype=np.float32)
+    weight = rng.standard_normal(256, dtype=np.float32)
+    bias = rng.standard_normal(256, dtype=np.float32)
+    return ({"x": x, "weight": weight, "bias": bias}, {}, ref.layer_norm(x, weight, bias))
+
+
+def case_layer_norm_no_bias(rng):
+    """The optional arm: an absent `bias` is the *null buffer*, not a row of zeros.
+
+    The ABI declares it optional, so a backend that read "absent" as "zeros"
+    would pass this and fail nothing -- which is why the case is worth having
+    upstream of the comparison: the tool hands the backend the null buffer, and a
+    backend that dereferenced it would fault rather than quietly agree.
+    """
+    x = rng.standard_normal((2, 64), dtype=np.float32)
+    weight = rng.standard_normal(64, dtype=np.float32)
+    return ({"x": x, "weight": weight}, {}, ref.layer_norm(x, weight))
+
+
+def case_layer_norm_large_mean(rng):
+    """A row whose mean is far from its spread, which is why the kernel takes two
+    passes.
+
+    The one-pass `E[x^2] - mean^2` form loses the variance to cancellation -- both
+    terms are ~10000 and their difference is ~1e-4, at the edge of what a float32
+    holds -- so a kernel written that way answers a confidently wrong
+    normalization while passing every other case in this file.
+    """
+    x = (100.0 + 0.01 * rng.standard_normal((2, 64), dtype=np.float32)).astype(np.float32)
+    weight = rng.standard_normal(64, dtype=np.float32)
+    bias = rng.standard_normal(64, dtype=np.float32)
+    return ({"x": x, "weight": weight, "bias": bias}, {}, ref.layer_norm(x, weight, bias))
 
 
 def case_gemm_square(rng):
@@ -1155,6 +1212,9 @@ def case_topk_sample_all_tied(rng):
 CASES = {
     "rms_norm": case_rms_norm,
     "rms_norm_single_row": case_rms_norm_single_row,
+    "layer_norm": case_layer_norm,
+    "layer_norm_no_bias": case_layer_norm_no_bias,
+    "layer_norm_large_mean": case_layer_norm_large_mean,
     "gemm_square": case_gemm_square,
     "gemm_k_not_multiple_of_four": case_gemm_k_not_multiple_of_four,
     "gemm_bias": case_gemm_bias,
@@ -1209,6 +1269,9 @@ CASES = {
 OP_OF_CASE = {
     "rms_norm": "rms_norm",
     "rms_norm_single_row": "rms_norm",
+    "layer_norm": "layer_norm",
+    "layer_norm_no_bias": "layer_norm",
+    "layer_norm_large_mean": "layer_norm",
     "gemm_square": "gemm",
     "gemm_k_not_multiple_of_four": "gemm",
     "gemm_bias": "gemm",
@@ -1326,6 +1389,8 @@ def _bound(device: str, case: str) -> float:
     """
     if device == "ascend" and OP_OF_CASE[case] in ASCEND_F16_OPS:
         return AS_F16_RTOL
+    if case == "layer_norm_large_mean":
+        return ILL_CONDITIONED_RTOL
     return QUANTIZED_RTOL if case in QUANTIZED_CASES else BACKEND_RTOL
 
 
