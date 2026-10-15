@@ -47,6 +47,24 @@
 
 namespace pocketllm {
 
+/* Why this build cannot run a checkpoint of `arch`, or nullptr when it can.
+ *
+ * The reason is the point.  `llama` is the same dense transformer shape as
+ * `qwen3` -- RMSNorm, grouped-query attention, SwiGLU, and no per-head QK norm
+ * to bind -- and it is one thing away from running, so a user who tries one
+ * should be told *which* thing rather than "no graph".  Measured on MiniCPM5-1B
+ * (a 2026 `llama` checkpoint): with the interleaved convention missing, the
+ * logits agree to 0.93% of the range at a one-token prompt -- position 0, where
+ * every angle is zero and the two conventions are the same rotation -- and
+ * diverge to 12% at two tokens, 21% at four.  That is the signature of the
+ * rotary convention and of nothing else, which is why this refusal is a
+ * sentence about rope and not about the graph.
+ *
+ * It lives here, beside the graph, rather than in the session that asks: the set
+ * of architectures, and the reason for each one that is missing, is a property
+ * of the implementation that would run them. */
+const char *arch_refusal(const std::string &arch);
+
 /* How a stored weight is used by `matmul`.
  *
  * Exactly one of the two handles is live. A tensor this build can widen is read

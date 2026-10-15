@@ -29,7 +29,18 @@ llama.cpp's headers, and that tool drives the low-level API directly rather than
 `llama-cli` — which in this build is a chat client, and answers a different question.
 
 Everything else is unbuilt. A checkpoint whose architecture is not `qwen3` opens successfully and
-cannot run; `pocketllm run` and `pocketllm serve` still parse their arguments and exit.
+cannot run; `pocketllm run` and `pocketllm serve` still parse their arguments and exit. Where the
+model knows *why*, the refusal says so: a `llama` checkpoint -- MiniCPM5-1B among them -- is the same
+dense shape as `qwen3` and is one thing away (its interleaved rotary convention), so that is the
+sentence it gets rather than "no graph". The measurement behind calling the rest of the graph right
+is in `arch_refusal`'s comment in `qwen3.cpp`: 0.93% of the logit range at a one-token prompt, where
+the two conventions are the same identity rotation, against 21% at four tokens.
+
+The tokenizer carries **two pre-tokenizers**, because the vocabularies in this project's scope are
+built on two. They differ in exactly one place -- `\p{N}` against `\p{N}{1,3}`, so a number is cut
+digit by digit or in runs of up to three -- and that place decides ids, so the variant is named by
+the file and an unknown name is refused. `tests/native/test_tokenizer.py` checks both against
+llama.cpp's own tokenizer, over two vocabularies and a 2000-text corpus.
 
 ## The backend interface
 

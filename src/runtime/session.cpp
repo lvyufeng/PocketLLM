@@ -20,6 +20,13 @@ Session::Session(std::string gguf_path, std::string backend_name,
 
 Session::~Session() = default;
 
+std::string Session::no_graph_message() const {
+  const std::string arch = checkpoint_->get_string("general.architecture", "?");
+  const char *why = arch_refusal(arch);
+  return "this checkpoint is architecture '" + arch + "', which this build cannot run" +
+         (why == nullptr ? std::string() : std::string(": ") + why);
+}
+
 std::unique_ptr<Session> Session::open(const std::string &gguf_path, const std::string &backend) {
   /* An empty name means the caller took the default, which the header documents
    * as "cpu".  Anything else is resolved against what this *build* provides.
@@ -53,7 +60,7 @@ std::unique_ptr<Session> Session::open(const std::string &gguf_path, const std::
    * check above already did. */
   std::unique_ptr<kernel::Backend> device_backend;
   std::unique_ptr<Qwen3Model> model;
-  if (checkpoint->get_string("general.architecture", "") == "qwen3") {
+  if (arch_refusal(checkpoint->get_string("general.architecture", "")) == nullptr) {
     device_backend = kernel::make_backend(device);
     model = Qwen3Model::load(*checkpoint, *device_backend);
     /* The model has copied every tensor it needs into the backend's memory, and
@@ -73,9 +80,7 @@ std::unique_ptr<Session> Session::open(const std::string &gguf_path, const std::
 
 std::vector<float> Session::forward(const int32_t *tokens, int64_t n, int64_t *argmax_out) {
   if (model_ == nullptr) {
-    throw Error("this checkpoint is architecture '" +
-                checkpoint_->get_string("general.architecture", "?") +
-                "', which this build has no graph for; only 'qwen3' runs");
+    throw Error(no_graph_message());
   }
   const kernel::DeviceBuffer logits = model_->forward(tokens, n, position_);
   position_ = model_->cache_length();
@@ -109,9 +114,7 @@ std::vector<float> Session::forward(const int32_t *tokens, int64_t n, int64_t *a
 void Session::forward_batch(const int32_t *tokens, const int64_t *n_per_seq, int64_t n_seq,
                             int32_t *out_tokens) {
   if (model_ == nullptr) {
-    throw Error("this checkpoint is architecture '" +
-                checkpoint_->get_string("general.architecture", "?") +
-                "', which this build has no graph for; only 'qwen3' runs");
+    throw Error(no_graph_message());
   }
   if (out_tokens == nullptr || n_seq <= 0) {
     throw Error("forward_batch needs an output and at least one sequence");
@@ -143,9 +146,7 @@ void Session::forward_batch(const int32_t *tokens, const int64_t *n_per_seq, int
 
 void Session::reserve(int64_t positions, int64_t slots) {
   if (model_ == nullptr) {
-    throw Error("this checkpoint is architecture '" +
-                checkpoint_->get_string("general.architecture", "?") +
-                "', which this build has no graph for; only 'qwen3' runs");
+    throw Error(no_graph_message());
   }
   model_->reserve(positions, slots);
   /* The cache now holds no sequence's history; the reservation is the size,

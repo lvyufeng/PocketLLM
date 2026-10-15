@@ -15,8 +15,12 @@ constexpr uint32_t kOutOfRange = 0xFFFFFFFFu;
 
 }  // namespace
 
-std::vector<std::size_t> qwen2_pretokenize(const std::vector<uint32_t> &cpts,
-                                           const std::vector<std::size_t> &offsets) {
+std::vector<std::size_t> pretokenize(PreTokenizer rules, const std::vector<uint32_t> &cpts,
+                                     const std::vector<std::size_t> &offsets) {
+  /* The whole difference between the two alternations, and the reason this is a
+   * parameter rather than a second copy of the scanner. */
+  const std::size_t max_digits = rules == PreTokenizer::kLlamaBpe ? 3 : 1;
+
   std::vector<std::size_t> words;
   words.reserve(offsets.size());
 
@@ -82,10 +86,15 @@ std::vector<std::size_t> qwen2_pretokenize(const std::vector<uint32_t> &cpts,
         }
       }
 
-      /* \p{N} -- one digit per word, not a run: a number is split digit by
-       * digit so that the vocabulary's digit tokens are what the model sees. */
+      /* \p{N} under Qwen2's rule and \p{N}{1,3} under llama-bpe's: one digit
+       * per word, or a run of up to three.  A longer number is cut at the cap,
+       * so `12345` is `123` and `45` -- which is the same thing the regex does,
+       * greedy to three and then again for the remainder. */
       if (flags & kCptNumber) {
-        ++pos;
+        const std::size_t limit = pos + max_digits;
+        while (pos < end && pos < limit && (flags_at(pos) & kCptNumber)) {
+          ++pos;
+        }
         emit_through(pos);
         continue;
       }

@@ -1,14 +1,25 @@
 /* The pre-tokenizer: split mapped text into the words BPE merges within.
  *
- * The regex, in its own notation, is Qwen2's:
+ * Two alternations are implemented, because the vocabularies in this project's
+ * scope are built on different ones and they differ in exactly one place:
  *
- *   (?i:'s|'t|'re|'ve|'m|'ll|'d)
- *   | [^\r\n\p{L}\p{N}]?\p{L}+
- *   | \p{N}
- *   |  ?[^\s\p{L}\p{N}]+[\r\n]*
- *   | \s*[\r\n]+
- *   | \s+(?!\S)
- *   | \s+
+ *   qwen2      (?i:'s|'t|'re|'ve|'m|'ll|'d)
+ *              | [^\r\n\p{L}\p{N}]?\p{L}+
+ *              | \p{N}
+ *              |  ?[^\s\p{L}\p{N}]+[\r\n]*
+ *              | \s*[\r\n]+
+ *              | \s+(?!\S)
+ *              | \s+
+ *
+ *   llama-bpe  the same, with `\p{N}{1,3}` in place of `\p{N}`.
+ *
+ * That one difference is not cosmetic: it decides where a number is cut into
+ * words, so `1234` is four words under `qwen2` and two (`123`, `4`) under
+ * `llama-bpe`, and the digit pieces of a vocabulary are different ids in each.
+ * Running the wrong one produces a sequence that is still integers, still in
+ * range, and wrong -- there is nothing to notice it by -- which is why the
+ * variant is named by the file (`tokenizer.ggml.pre`) and an unknown name is
+ * refused rather than defaulted.
  *
  * This is a hand-written matcher for that one alternation rather than a regex
  * engine, for the same reason llama.cpp does it that way: the pattern is fixed,
@@ -41,8 +52,16 @@ namespace pocketllm {
  * Returns the codepoint length of each word, in order.  The caller turns those
  * lengths back into byte ranges.
  */
-std::vector<std::size_t> qwen2_pretokenize(const std::vector<uint32_t> &cpts,
-                                           const std::vector<std::size_t> &offsets);
+enum class PreTokenizer {
+  /* `\p{N}` -- one digit per word.  Qwen2's and Qwen3's rule. */
+  kQwen2,
+  /* `\p{N}{1,3}` -- a run of up to three digits.  Llama-3's rule, which is what
+   * a file naming `llama-bpe` asks for (MiniCPM5 among them). */
+  kLlamaBpe,
+};
+
+std::vector<std::size_t> pretokenize(PreTokenizer rules, const std::vector<uint32_t> &cpts,
+                                     const std::vector<std::size_t> &offsets);
 
 }  // namespace pocketllm
 

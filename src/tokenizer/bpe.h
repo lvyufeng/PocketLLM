@@ -44,6 +44,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "tokenizer/pretokenize.h"
+
 namespace pocketllm {
 
 class GgufReader;
@@ -119,6 +121,9 @@ class Tokenizer {
   std::vector<SpecialToken> special_tokens_;
   SpecialTokens special_;
   std::string pre_type_;
+  /* The alternation `pre_type_` names, resolved once at construction.  The
+   * string is kept beside it because it is what a message quotes back. */
+  PreTokenizer pre_rules_ = PreTokenizer::kQwen2;
 };
 
 }  // namespace pocketllm

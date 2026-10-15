@@ -33,7 +33,21 @@ import pytest
 
 from pocketllm import native
 
-CHECKPOINT = pathlib.Path("/mnt/data1/models/qwen3-0.6b-f16.gguf")
+#: The checkpoints the tokenizer is checked on. They carry *different
+#: pre-tokenizers* -- `qwen2`, which cuts a number digit by digit, and
+#: `llama-bpe`, which takes up to three digits at a time (`\p{N}` against
+#: `\p{N}{1,3}`) -- so the pair is what holds the choice of alternation to
+#: llama.cpp's and not just the scanner. The corpus below is full of digit runs,
+#: which is the one place the two rules disagree.
+CHECKPOINTS = (
+    pathlib.Path("/mnt/data1/models/qwen3-0.6b-f16.gguf"),
+    pathlib.Path("/mnt/data1/models/minicpm5-1b-q4_k_m.gguf"),
+)
+
+#: The checkpoint the two Qwen3-specific expectations below are written against
+#: (its vocabulary spells `</s>` a particular way, and its ids are its own).
+QWEN3_CHECKPOINT = CHECKPOINTS[0]
+
 #: Where `llama-tokenize` would live if the oracle could use it. It is not
 #: built in this tree's llama.cpp checkout, so the oracle is the library
 #: called through `ctypes` instead -- see `_LlamaOracle`.
@@ -65,12 +79,9 @@ def _escape(text: str) -> str:
 
 needs_engine = pytest.mark.skipif(not native.is_available(), reason="libpocketllm.so is not built")
 needs_tool = pytest.mark.skipif(not _tokenize_tool().is_file(), reason="pocketllm-tokenize is not built")
-needs_checkpoint = pytest.mark.skipif(
-    not CHECKPOINT.is_file(), reason=f"no checkpoint at {CHECKPOINT}"
-)
 needs_llama = pytest.mark.skipif(not LLAMA_LIB.is_file(), reason=f"no llama.cpp at {LLAMA_CPP}")
 
-pytestmark = [needs_engine, needs_tool, needs_checkpoint, needs_llama]
+pytestmark = [needs_engine, needs_tool, needs_llama]
 
 
 class _LlamaOracle:
@@ -202,22 +213,48 @@ class _LlamaOracle:
         return [int(buf[i]) for i in range(n)]
 
 
+@pytest.fixture(scope="module", params=CHECKPOINTS, ids=lambda p: p.stem)
+def checkpoint(request: pytest.FixtureRequest) -> pathlib.Path:
+    """One checkpoint per run of `CHECKPOINTS`; a missing one skips its own arm."""
+    path: pathlib.Path = request.param
+    if not path.is_file():
+        pytest.skip(f"no checkpoint at {path}")
+    return path
+
+
 @pytest.fixture(scope="module")
-def oracle() -> "_LlamaOracle":
+def oracle(checkpoint: pathlib.Path) -> "_LlamaOracle":
     if not LLAMA_LIB.is_file():
         pytest.skip(f"no llama.cpp at {LLAMA_CPP}")
-    instance = _LlamaOracle(LLAMA_LIB, CHECKPOINT)
+    instance = _LlamaOracle(LLAMA_LIB, checkpoint)
     yield instance
     instance.close()
 
 
 @pytest.fixture(scope="module")
-def ours() -> list[str]:
+def qwen3_oracle() -> "_LlamaOracle":
+    """The oracle for the checkpoint the Qwen3-specific expectations are about.
+
+    A second fixture rather than the parametrized one, because those assertions
+    are written against *this* vocabulary's ids and labelling; see the
+    divergence test at the bottom of the file.
+    """
+    if not LLAMA_LIB.is_file():
+        pytest.skip(f"no llama.cpp at {LLAMA_CPP}")
+    if not QWEN3_CHECKPOINT.is_file():
+        pytest.skip(f"no checkpoint at {QWEN3_CHECKPOINT}")
+    instance = _LlamaOracle(LLAMA_LIB, QWEN3_CHECKPOINT)
+    yield instance
+    instance.close()
+
+
+@pytest.fixture(scope="module")
+def ours(checkpoint: pathlib.Path) -> list[str]:
     """The tool's output over `CORPUS`, one id list per line."""
 
     def run(texts: list[str], extra: list[str]) -> list[str]:
         result = subprocess.run(
-            [str(_tokenize_tool()), str(CHECKPOINT), "--lines", *extra],
+            [str(_tokenize_tool()), str(checkpoint), "--lines", *extra],
             input="\n".join(_escape(t) for t in texts) + "\n",
             capture_output=True,
             text=True,
@@ -316,7 +353,7 @@ def test_special_tokens_are_spliced_exactly_as_llama_cpp_does(oracle: "_LlamaOra
 
 
 def test_a_control_looking_token_llama_cpp_promotes_is_known_and_deliberate(
-    oracle: "_LlamaOracle",
+    qwen3_oracle: "_LlamaOracle",
 ) -> None:
     """The one input class this tokenizer deliberately does not match.
 
@@ -337,32 +374,40 @@ def test_a_control_looking_token_llama_cpp_promotes_is_known_and_deliberate(
     fails if a future llama.cpp drops the heuristic -- which is the moment to
     reconsider, and which would otherwise show up as a mysterious failure in
     the special-token corpus above.
+
+    It is pinned to the Qwen3 checkpoint and not to the parametrized fixture,
+    because the divergence is a property of *that* vocabulary's labelling:
+    MiniCPM5 labels its own EOS `</s>` CONTROL, both tokenizers answer its id,
+    and the same assertions there would be comparing a Qwen3 id against a
+    MiniCPM5 answer. (Checked: ours `[1]`, llama.cpp `[1]`.)
     """
     text = "</s>"
-    with native.Engine.open(str(CHECKPOINT)) as engine:
+    with native.Engine.open(str(QWEN3_CHECKPOINT)) as engine:
         asserted = engine.encode(text, add_special=False, parse_special=True)
     assert len(asserted) == 3, "the checkpoint's own type says this is ordinary text"
 
-    theirs = oracle.tokenize(text, False, True)
+    theirs = qwen3_oracle.tokenize(text, False, True)
     assert theirs == [128247], "llama.cpp no longer promotes it -- revisit the divergence"
     assert asserted != theirs
 
 
-def test_the_vocabulary_size_matches_the_oracle(oracle: "_LlamaOracle") -> None:
+def test_the_vocabulary_size_matches_the_oracle(
+    oracle: "_LlamaOracle", checkpoint: pathlib.Path
+) -> None:
     """The vocabularies are the same length, which is the weakest form of the
     check the corpus makes and the only one that holds without a checkpoint
     the engine can tokenize a string with."""
-    with native.Engine.open(str(CHECKPOINT)) as engine:
+    with native.Engine.open(str(checkpoint)) as engine:
         assert len(engine.encode("x")) == len(oracle.tokenize("x", True, False))
 
 
-def test_decode_round_trips_through_the_engine() -> None:
+def test_decode_round_trips_through_the_engine(checkpoint: pathlib.Path) -> None:
     """`decode(encode(text)) == text` for text whose bytes survive the model's
     own vocabulary. The round trip is not the identity in general -- a
     vocabulary can spell a byte sequence more than one way -- but for ordinary
     UTF-8 it is, and a failure here means the byte map and its inverse
     disagree."""
     texts = ["Hello, world!", "café", "日本語", "emoji 🚀", "tabs\tand\ttabs", "line\nbreak"]
-    with native.Engine.open(str(CHECKPOINT)) as engine:
+    with native.Engine.open(str(checkpoint)) as engine:
         for text in texts:
             assert engine.decode(engine.encode(text)) == text, f"round trip failed for {text!r}"
