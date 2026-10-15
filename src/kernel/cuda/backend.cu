@@ -736,6 +736,19 @@ __global__ void silu_mul_kernel(const float *gate, const float *up, float *out, 
   out[i] = (g / (1.0F + expf(-g))) * up[i];
 }
 
+__global__ void gelu_kernel(const float *x, float *out, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  /* The same expression `kernels.cpp` writes, with ggml's constants: the two
+   * backends have to agree with each other and with llama.cpp's, and the only
+   * free variable left is the order the compiler evaluates it in. */
+  const float v = x[i];
+  out[i] = 0.5F * v *
+           (1.0F + tanhf(0.79788456080286535587989211986876F * v * (1.0F + 0.044715F * v * v)));
+}
+
 /* One thread per (token, head, pair). The two stores are independent of each
  * other's result -- both read `a` and `b` before either writes -- which is what
  * makes the in-place rotation safe. */
@@ -1202,6 +1215,15 @@ class CudaBackend final : public Backend {
     silu_mul_kernel<<<static_cast<unsigned>((n + threads - 1) / threads), threads>>>(f(gate), f(up),
                                                                                     w(out), n);
     check(cudaGetLastError(), "silu_mul");
+  }
+
+  void gelu(DeviceBuffer x, DeviceBuffer out, int64_t n) override {
+    if (n <= 0) {
+      return;
+    }
+    const unsigned threads = 256;
+    gelu_kernel<<<static_cast<unsigned>((n + threads - 1) / threads), threads>>>(f(x), w(out), n);
+    check(cudaGetLastError(), "gelu");
   }
 
   void rope_neox(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t start_pos,

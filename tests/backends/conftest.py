@@ -199,6 +199,8 @@ def sample_args(op: str, session, quant: str | None = None) -> tuple[list, dict]
         ], {"eps": 1e-5}
     if op in {"silu_mul", "add", "mul"}:
         return [t(rand(_TOKENS, _HIDDEN)), t(rand(_TOKENS, _HIDDEN))], {}
+    if op == "gelu":
+        return [t(rand(_TOKENS, _HIDDEN))], {}
     if op == "softmax":
         return [t(rand(_TOKENS, _VOCAB))], {"axis": -1}
     if op == "rope":

@@ -135,6 +135,21 @@ void embedding_quant(const int32_t *tokens, int64_t n_tokens, const uint8_t *blo
 /* ``out = silu(gate) * up``, elementwise over the whole tensor. */
 void silu_mul(const float *gate, const float *up, float *out, int64_t n);
 
+/* The tanh-approximated GELU, elementwise:
+ * ``out[i] = 0.5*x*(1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))``.
+ *
+ * **This variant and not the erf one**, because the checkpoint asked for it: a
+ * vision tower whose GGUF says `clip.use_gelu` is built by llama.cpp with
+ * `FFN_GELU`, and that op's CPU implementation is this expression -- the erf
+ * form is a separate op there, reached by a separate flag.  It is also what
+ * `transformers` calls `gelu_pytorch_tanh`, which the Qwen-VL checkpoints name
+ * in their config.  The two differ by ~1e-3 relative near `|x| = 2`, which is a
+ * different model at the fourth digit of an embedding.
+ *
+ * The two constants are `ggml`'s own digits, so the two implementations agree to
+ * the last bit of float32. */
+void gelu(const float *x, float *out, int64_t n);
+
 /* RoPE, the split-half (NEOX) layout: ``x[i]`` is rotated against
  * ``x[i + d/2]``.
  *

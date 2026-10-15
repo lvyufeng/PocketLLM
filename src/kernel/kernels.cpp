@@ -1911,6 +1911,23 @@ void silu_mul(const float *gate, const float *up, float *out, int64_t n) {
   });
 }
 
+void gelu(const float *x, float *out, int64_t n) {
+  /* Elementwise, with `silu_mul`'s grain for the same reason: the op is a map
+   * over `tokens * intermediate` elements and the transcendental dominates, so
+   * the task size is a scheduling choice rather than a numeric one.  `tanh`
+   * saturates in both directions, so unlike silu there is no large-input case to
+   * be careful about -- the limits are 0 and `x` and floating point reaches both
+   * without help. */
+  constexpr float kSqrt2OverPi = 0.79788456080286535587989211986876F;
+  constexpr float kCoefA = 0.044715F;
+  parallel_for(n, /*min_per_task=*/64, [&](int64_t lo, int64_t hi, int64_t) {
+    for (int64_t i = lo; i < hi; ++i) {
+      const float v = x[i];
+      out[i] = 0.5F * v * (1.0F + std::tanh(kSqrt2OverPi * v * (1.0F + kCoefA * v * v)));
+    }
+  });
+}
+
 void rope_neox(float *x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t start_pos,
                const float *cos_table, const float *sin_table) {
   const int64_t half = d / 2;

@@ -163,6 +163,29 @@ def silu_mul(gate, up, **_attrs):
     return (g / (1.0 + np.exp(-g))) * up.astype(np.float32)
 
 
+GELU_COEF_A = 0.044715
+GELU_SQRT_2_OVER_PI = 0.79788456080286535587989211986876
+
+
+def gelu(x, **_attrs):
+    """The tanh-approximated GELU, `0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))`.
+
+    **This variant and not the erf one**, because the checkpoint asked for it:
+    a vision tower whose GGUF says ``clip.use_gelu`` is built by llama.cpp with
+    `FFN_GELU`, whose CPU implementation is this expression (the erf form is a
+    separate op there, reached by a separate flag). It is also the function
+    `transformers` calls ``gelu_pytorch_tanh``, which is what the Qwen-VL
+    checkpoints name in their config. The two differ by ~1e-3 relative near
+    `|x| = 2`, which is a different model at the fourth digit of an embedding.
+
+    The constants are written to the same digits as `ggml`'s, so the two agree to
+    the last bit of float32 rather than to a tolerance.
+    """
+    x32 = x.astype(np.float32)
+    inner = GELU_SQRT_2_OVER_PI * x32 * (1.0 + GELU_COEF_A * x32 * x32)
+    return (0.5 * x32 * (1.0 + np.tanh(inner))).astype(np.float32)
+
+
 def add(a, b, **_attrs):
     return a.astype(np.float32) + b.astype(np.float32)
 
@@ -362,6 +385,7 @@ KERNELS = {
     "rms_norm": rms_norm,
     "layer_norm": layer_norm,
     "silu_mul": silu_mul,
+    "gelu": gelu,
     "add": add,
     "mul": mul,
     "softmax": softmax,

@@ -127,6 +127,10 @@ class CpuBackend final : public Backend {
     kernel::silu_mul(f(gate), f(up), w(out), n);
   }
 
+  void gelu(DeviceBuffer x, DeviceBuffer out, int64_t n) override {
+    kernel::gelu(f(x), w(out), n);
+  }
+
   void rope_neox(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t start_pos,
                  DeviceBuffer cos_table, DeviceBuffer sin_table) override {
     kernel::rope_neox(w(x), n_tokens, n_heads, d, start_pos, f(cos_table), f(sin_table));

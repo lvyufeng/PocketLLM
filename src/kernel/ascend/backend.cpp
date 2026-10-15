@@ -1325,6 +1325,14 @@ class AscendBackend final : public Backend {
     copy_to_host(ids.data(), tokens, n_tokens * 4);
     gather_rows(ids, dtable, vocab, d, out);
   }
+  /* GELU, which this backend has no op for: the vendor's custom ops cover
+   * `silu_mul` and the RMS/gated norms, and a `gelu` would have to be written
+   * against the vendor headers like the rest.  It is the vision tower's
+   * activation, so nothing already on the board's path needs it. */
+  void gelu(DeviceBuffer /*x*/, DeviceBuffer /*out*/, int64_t /*n*/) override {
+    throw Error("ascend: gelu is not implemented; this backend's custom-op set has silu_mul only");
+  }
+
   void silu_mul(DeviceBuffer gate, DeviceBuffer up, DeviceBuffer out, int64_t n) override {
     ensure_context();
     OpScope _op("silu_mul");

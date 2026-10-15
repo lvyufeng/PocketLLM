@@ -536,6 +536,15 @@ void run_silu_mul(std::ostream &out, Backend &backend, const Request &request) {
   backend.release(dup);
 }
 
+void run_gelu(std::ostream &out, Backend &backend, const Request &request) {
+  const Tensor &x = request.require("x");
+  DeviceBuffer dx = upload(backend, x.floats);
+  run_and_report(out, backend, request, x.shape, [&](DeviceBuffer result) {
+    backend.gelu(dx, result, x.elements());
+  });
+  backend.release(dx);
+}
+
 void run_rope(std::ostream &out, Backend &backend, const Request &request) {
   const Tensor &x = request.require("x");
   const Tensor &cos = request.require("cos");
@@ -715,6 +724,7 @@ struct Entry {
 
 const Entry kOps[] = {
     {"rms_norm", run_rms_norm},   {"layer_norm", run_layer_norm},
+    {"gelu", run_gelu},
     {"gemm", run_gemm},
     {"gemm_quant", run_gemm_quant}, {"embedding", run_embedding},
     {"embedding_quant", run_embedding_quant}, {"silu_mul", run_silu_mul},
