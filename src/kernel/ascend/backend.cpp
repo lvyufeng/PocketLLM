@@ -1529,11 +1529,15 @@ class AscendBackend final : public Backend {
 
   void attention(DeviceBuffer q, int64_t q_len, int64_t n_heads, DeviceBuffer k_cache,
                  DeviceBuffer v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
-                 int64_t q_offset, float scale, DeviceBuffer out, DeviceBuffer scores,
+                 int64_t q_offset, bool causal, float scale, DeviceBuffer out, DeviceBuffer scores,
                  KVDtype kv_dtype) override {
     ensure_context();
     OpScope _op("attention");
     (void)scores;  /* the op keeps its score row on the device, not in this buffer */
+    if (!causal) {
+      throw Error("ascend: a non-causal attention call is not implemented; this backend drives "
+                  "AttentionStepCustom, which is a causal decode step");
+    }
     if (first_key != 0) {
       throw Error("ascend: attention with a sliding window (first_key=" +
                   std::to_string(first_key) + ") is not implemented");

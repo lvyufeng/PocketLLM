@@ -1989,13 +1989,92 @@ void rope_norm(float *x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t s
   });
 }
 
+/* The non-causal arm of `attention`: every query row sees the whole
+ * `[first_key, q_offset]` span, because the rows do not advance.
+ *
+ * Three passes over the span per `(row, head)` -- the maximum, the total, then
+ * the weighted sum -- and the later passes recompute the dot and the exponential
+ * rather than holding a row of weights in `scores`.  That is deliberate: the
+ * caller-sized scratch is the *tiled* path's contract, and growing it to
+ * `q_len * n_heads * span` for a shape nothing on the token path produces would
+ * change the sizing rule for every caller.  The cost is a second and third pass
+ * of flops on an op a vision tower calls once per image.
+ *
+ * An f16 cache is refused rather than widened: the tower's keys and values are
+ * f32 buffers it just computed, and the widening path belongs to the decode
+ * cache, which is read one row per token by the tiled kernel. */
+void attention_full(const float *q, int64_t q_len, int64_t n_heads, const void *k_cache,
+                    const void *v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
+                    int64_t q_offset, float scale, float *out, KVDtype kv_dtype) {
+  if (kv_dtype != KVDtype::kF32) {
+    throw Error("attention: a non-causal call needs an f32 cache");
+  }
+  const int64_t group = n_heads / n_head_kv;
+  const int64_t span = q_offset + 1 - first_key;
+  const int64_t units = q_len * n_heads;
+  if (span <= 0 || units <= 0) {
+    return;
+  }
+  const float *k = static_cast<const float *>(k_cache);
+  const float *v = static_cast<const float *>(v_cache);
+  const int64_t stride = n_head_kv * d;
+  parallel_for(units, /*min_per_task=*/1, [&](int64_t lo, int64_t hi, int64_t) {
+    for (int64_t unit = lo; unit < hi; ++unit) {
+      const int64_t kv = (unit % n_heads) / group;
+      const float *qrow = q + unit * d;
+      const float *kbase = k + first_key * stride + kv * d;
+      const float *vbase = v + first_key * stride + kv * d;
+      float *orow = out + unit * d;
+      float best = -INFINITY;
+      for (int64_t s = 0; s < span; ++s) {
+        const float *krow = kbase + s * stride;
+        float dot = 0.0F;
+        for (int64_t i = 0; i < d; ++i) {
+          dot += qrow[i] * krow[i];
+        }
+        best = std::max(best, dot * scale);
+      }
+      float total = 0.0F;
+      for (int64_t s = 0; s < span; ++s) {
+        const float *krow = kbase + s * stride;
+        float dot = 0.0F;
+        for (int64_t i = 0; i < d; ++i) {
+          dot += qrow[i] * krow[i];
+        }
+        total += std::exp(dot * scale - best);
+      }
+      for (int64_t i = 0; i < d; ++i) {
+        orow[i] = 0.0F;
+      }
+      for (int64_t s = 0; s < span; ++s) {
+        const float *krow = kbase + s * stride;
+        float dot = 0.0F;
+        for (int64_t i = 0; i < d; ++i) {
+          dot += qrow[i] * krow[i];
+        }
+        const float weight = std::exp(dot * scale - best) / total;
+        const float *vrow = vbase + s * stride;
+        for (int64_t i = 0; i < d; ++i) {
+          orow[i] += weight * vrow[i];
+        }
+      }
+    }
+  });
+}
+
 void attention(const float *q, int64_t q_len, int64_t n_heads, const void *k_cache,
                const void *v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
-               int64_t q_offset, float scale, float *out, float *scores, KVDtype kv_dtype) {
+               int64_t q_offset, bool causal, float scale, float *out, float *scores,
+               KVDtype kv_dtype) {
   const int64_t group = n_heads / n_head_kv;
   if (group > kAttentionMaxGroup) {
     throw Error("attention: GQA group " + std::to_string(group) + " exceeds kAttentionMaxGroup (" +
                 std::to_string(kAttentionMaxGroup) + "); raise it and rebuild");
+  }
+  if (!causal) {
+    attention_full(q, q_len, n_heads, k_cache, v_cache, n_head_kv, d, first_key, q_offset, scale, out,
+                   kv_dtype);
+    return;
   }
   /* The score row for a query at position `q_offset + q_len - 1` is the widest
    * any row can be, and it is what spaces the rows within a per-task scratch

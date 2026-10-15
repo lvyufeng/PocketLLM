@@ -420,6 +420,10 @@ DEVICE_EXCLUDED_CASES: dict[str, dict[str, str]] = {
         # AscendC kernel moves, so the backend refuses it by name (same edge as
         # `rms_norm_single_row` and `rope_small_head_dim`), not a prefill gap.
         "attention_grouped": "ascend: attention head_dim d=8 is below the 16-lane fp16 repeat",
+        # The tower's mask: this backend drives `AttentionStepCustom`, a causal
+        # decode step, and refuses a call whose rows do not advance.
+        "attention_non_causal": "ascend: a non-causal attention call is not implemented "
+        "(AttentionStepCustom is a causal decode step)",
         # --- cases that do not apply to an fp16/32B-lane kernel ---
         #
         # `rms_norm_single_row` is `d = 1`, which is below the 16-lane vector
@@ -1043,6 +1047,30 @@ def _attention_case(rng, q_len, heads, kv_heads, d, first_key, q_offset, capacit
     return tensors, params, expected
 
 
+def case_attention_non_causal(rng):
+    """The shape a vision tower calls: every query row sees the whole span.
+
+    The C's `causal` flag decides whether the rows *advance* through the cache,
+    and the reference expresses the same thing through `positions` -- so the two
+    sides of this case carry the same information by different routes (every
+    position is `q_offset` on one side, `causal = 0` on the other).  A patch
+    sequence attending over all of itself is exactly a span that does not
+    advance, and it is the one mask the C's `q_offset + t` rule cannot express.
+    """
+    q_len, heads, kv_heads, d, capacity = 6, 16, 8, 128, 6
+    q = rng.standard_normal((q_len, heads, d), dtype=np.float32)
+    k_cache = rng.standard_normal((capacity, kv_heads, d), dtype=np.float32)
+    v_cache = rng.standard_normal((capacity, kv_heads, d), dtype=np.float32)
+    scale = 1.0 / np.sqrt(d)
+    positions = np.full(q_len, capacity - 1, dtype=np.int32)
+    expected = ref.attention(
+        q, k_cache, v_cache, positions, softmax_scale=float(scale), num_kv_heads=kv_heads
+    )
+    tensors = {"q": q, "k_cache": k_cache, "v_cache": v_cache}
+    params = {"first_key": 0, "q_offset": capacity - 1, "causal": 0, "scale": f"{scale:.9g}"}
+    return tensors, params, expected
+
+
 def case_attention_single_query(rng):
     """A decode step: one query, one visible key.  The softmax is over a single
     score, so it is 1.0 and the output is exactly `v` -- which makes any error in
@@ -1286,6 +1314,7 @@ CASES = {
     "attention_grouped": case_attention_grouped,
     "attention_decode_group2": case_attention_decode_group2,
     "attention_decode_group4": case_attention_decode_group4,
+    "attention_non_causal": case_attention_non_causal,
     "argmax": case_argmax,
     "argmax_ties": case_argmax_ties,
     "softmax": case_softmax,
@@ -1345,6 +1374,7 @@ OP_OF_CASE = {
     "attention_grouped": "attention",
     "attention_decode_group2": "attention",
     "attention_decode_group4": "attention",
+    "attention_non_causal": "attention",
     "argmax": "argmax",
     "argmax_ties": "argmax",
     "softmax": "softmax",

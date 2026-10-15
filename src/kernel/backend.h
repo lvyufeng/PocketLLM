@@ -166,9 +166,17 @@ class Backend {
    * is sizing. */
   virtual int64_t attention_scratch(int64_t q_len, int64_t n_heads, int64_t max_span) const = 0;
 
-  /* Causal grouped-query attention over a cache laid out ``[position][head][d]``,
-   * with the query chunk at `q_offset`. `scores` holds what `attention_scratch`
-   * asked for.
+  /* Grouped-query attention over a cache laid out ``[position][head][d]``, with
+   * the query chunk at `q_offset`. `scores` holds what `attention_scratch` asked
+   * for.
+   *
+   * **`causal` is whether the rows advance.**  With it, row `t` of the chunk
+   * ends at `q_offset + t`: a prefill, or a decode step, where the query is at
+   * its own position.  Without it, every row ends at `q_offset` -- the whole
+   * span `[first_key, q_offset]` for all of them, which is a vision tower
+   * attending over a patch sequence.  A backend that implements one and not the
+   * other refuses the other *by name* rather than answering with the wrong mask,
+   * because the wrong mask is fluent, finite and wrong.
    *
    * `kv_dtype` is the element type of `k_cache`/`v_cache`, and only those two:
    * the query, the output and the score scratch stay f32 on every backend. The
@@ -181,7 +189,7 @@ class Backend {
    * `preferred_kv_dtype`, so a backend that cannot must override that too. */
   virtual void attention(DeviceBuffer q, int64_t q_len, int64_t n_heads, DeviceBuffer k_cache,
                          DeviceBuffer v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
-                         int64_t q_offset, float scale, DeviceBuffer out,
+                         int64_t q_offset, bool causal, float scale, DeviceBuffer out,
                          DeviceBuffer scores, KVDtype kv_dtype) = 0;
 
   /* Append `n` rows of the chunk just computed to a K/V cache slab that is

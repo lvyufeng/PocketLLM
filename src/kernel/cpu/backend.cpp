@@ -171,10 +171,10 @@ class CpuBackend final : public Backend {
 
   void attention(DeviceBuffer q, int64_t q_len, int64_t n_heads, DeviceBuffer k_cache,
                  DeviceBuffer v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
-                 int64_t q_offset, float scale, DeviceBuffer out, DeviceBuffer scores,
+                 int64_t q_offset, bool causal, float scale, DeviceBuffer out, DeviceBuffer scores,
                  KVDtype kv_dtype) override {
     kernel::attention(w(q), q_len, n_heads, f(k_cache), f(v_cache), n_head_kv, d, first_key,
-                      q_offset, scale, w(out), w(scores), kv_dtype);
+                      q_offset, causal, scale, w(out), w(scores), kv_dtype);
   }
 
   /* The append is a device-to-device copy either way; only the last step of it
