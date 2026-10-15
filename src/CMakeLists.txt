@@ -327,6 +327,35 @@ if(POCKETLLM_ASCEND_SOURCES)
   pocketllm_add_ascend(pocketllm-vision)
 endif()
 
+# Run the text graph from caller-supplied input embeddings and dump the logits,
+# for comparing against llama.cpp's own embeddings path -- which is the only
+# other implementation of a deepstack.  A tool rather than an ABI call for the
+# same reason as the one above: an image is not part of the ABI's surface yet.
+add_executable(pocketllm-forward-embd
+  tools/forward_embd.cpp
+  abi/spec.cpp
+  gguf/reader.cpp
+  runtime/status.cpp
+  tokenizer/unicode_data.cpp
+  tokenizer/unicode.cpp
+  tokenizer/pretokenize.cpp
+  tokenizer/bpe.cpp
+  kernel/kernels.cpp
+  kernel/repack_q4k.cpp
+  kernel/cpu/backend.cpp
+  kernel/registry.cpp
+  model/qwen3.cpp
+  ${POCKETLLM_CUDA_SOURCES}
+)
+if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)
+  target_compile_definitions(pocketllm-forward-embd PRIVATE POCKETLLM_WITH_CUDA=1)
+  set_target_properties(pocketllm-forward-embd PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+endif()
+target_link_libraries(pocketllm-forward-embd PRIVATE pocketllm-kernel-options)
+if(POCKETLLM_ASCEND_SOURCES)
+  pocketllm_add_ascend(pocketllm-forward-embd)
+endif()
+
 # Run one kernel over inputs a caller supplies, for checking it against the
 # Python reference.  It links the kernel objects and both backends, and no model:
 # an op is checked in isolation, on shapes the caller writes, which is the only

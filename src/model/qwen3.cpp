@@ -500,6 +500,15 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
   /* The one behavioural difference between the two architecture names this graph
    * serves; everything else is a tensor being present or absent. */
   model->interleaved_rope_ = arch == "llama";
+  /* The deepstack levels a vision checkpoint's input carries.  Namespaced like
+   * every other hparam and absent from every architecture with no tower, so a
+   * missing key is zero and the graph's input is `n_embd` wide -- the shape this
+   * engine has always read.  When it is set, `forward_embeddings` is the only
+   * entry point that can fill the extra width. */
+  model->n_deepstack_ = checkpoint.get_int(p + "n_deepstack_layers", 0);
+  if (model->n_deepstack_ < 0) {
+    throw Error("'" + p + "n_deepstack_layers' is negative");
+  }
 
   if (model->n_vocab_ <= 0) {
     /* Not every conversion writes `vocab_size`; the embedding's own shape is
@@ -654,8 +663,19 @@ void Qwen3Model::ensure_capacity(int64_t n, int64_t end_pos, int64_t head_rows) 
   backend_->release(tokens_);
   backend_->release(act_packed_);
   backend_->release(panel_tile_);
+  for (kernel::DeviceBuffer buffer : deepstack_planes_) {
+    backend_->release(buffer);
+  }
+  deepstack_planes_.clear();
 
   x_ = backend_->allocate(n * n_embd_ * 4);
+  /* One plane per deepstack level, `n` rows of `n_embd` each -- sized by the
+   * batch, like every other activation here, and allocated as separate buffers
+   * rather than `assign(count, buffer)`, which would alias them. */
+  deepstack_planes_.resize(static_cast<std::size_t>(n_deepstack_));
+  for (kernel::DeviceBuffer &plane : deepstack_planes_) {
+    plane = backend_->allocate(n * n_embd_ * 4);
+  }
   x_norm_ = backend_->allocate(n * n_embd_ * 4);
   q_ = backend_->allocate(n * n_head_ * head_dim_ * 4);
   k_ = backend_->allocate(n * n_head_kv_ * head_dim_ * 4);
@@ -802,7 +822,22 @@ kernel::DeviceBuffer Qwen3Model::forward(const int32_t *tokens, int64_t n, int64
   }
   const int64_t n_per_seq[1] = {n};
   const int64_t starts[1] = {start_pos};
-  return forward_impl(tokens, n_per_seq, starts, 1);
+  return forward_impl(tokens, /*planes=*/nullptr, n_per_seq, starts, 1);
+}
+
+kernel::DeviceBuffer Qwen3Model::forward_embeddings(const float *planes, int64_t n,
+                                                    int64_t start_pos) {
+  if (n_deepstack_ <= 0) {
+    throw Error("this checkpoint carries no deepstack levels, so its input is the token table "
+                "and `forward` is the entry point");
+  }
+  if (start_pos != cache_length()) {
+    throw Error("forward at position " + std::to_string(start_pos) + " but the cache holds " +
+                std::to_string(cache_length()) + " positions");
+  }
+  const int64_t n_per_seq[1] = {n};
+  const int64_t starts[1] = {start_pos};
+  return forward_impl(/*tokens=*/nullptr, planes, n_per_seq, starts, 1);
 }
 
 kernel::DeviceBuffer Qwen3Model::forward_batch(const int32_t *tokens, const int64_t *n_per_seq,
@@ -818,11 +853,12 @@ kernel::DeviceBuffer Qwen3Model::forward_batch(const int32_t *tokens, const int6
     starts[static_cast<std::size_t>(s)] =
         s < static_cast<int64_t>(seq_len_.size()) ? seq_len_[static_cast<std::size_t>(s)] : 0;
   }
-  return forward_impl(tokens, n_per_seq, starts.data(), n_seq);
+  return forward_impl(tokens, /*planes=*/nullptr, n_per_seq, starts.data(), n_seq);
 }
 
-kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const int64_t *n_per_seq,
-                                              const int64_t *start_pos, int64_t n_seq) {
+kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const float *planes,
+                                              const int64_t *n_per_seq, const int64_t *start_pos,
+                                              int64_t n_seq) {
   /* `m` is the whole batch: the rows every weight-reading GEMM contracts over,
    * so the weights are read once for all sequences.  At n_seq == 1 this is the
    * `n` the graph has always used and every loop below runs once, which is what
@@ -861,10 +897,22 @@ kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const int64
   const int64_t kv_width = n_head_kv_ * head_dim_;
   const int64_t kv_elem = kernel::kv_dtype_size(kv_dtype_);
 
-  /* The whole batch's token ids go to the device once and are gathered on the
-   * device; only the ids cross the bus, not the embedding rows they select. */
-  backend_->copy_to_device(tokens_, tokens, m * 4);
-  embed(tokens_, m, x_);
+  if (planes != nullptr) {
+    /* The caller's planes, uploaded as they are.  Plane 0 is the embedding the
+     * first block reads and each level after it is one block's addition, so the
+     * caller's layout *is* the layout the graph wants and nothing is unpacked
+     * here. */
+    backend_->copy_to_device(x_, planes, m * n_embd_ * 4);
+    for (int64_t level = 0; level < n_deepstack_; ++level) {
+      backend_->copy_to_device(deepstack_planes_[static_cast<std::size_t>(level)],
+                               planes + (level + 1) * m * n_embd_, m * n_embd_ * 4);
+    }
+  } else {
+    /* The whole batch's token ids go to the device once and are gathered on the
+     * device; only the ids cross the bus, not the embedding rows they select. */
+    backend_->copy_to_device(tokens_, tokens, m * 4);
+    embed(tokens_, m, x_);
+  }
 
   for (int64_t il = 0; il < n_layer_; ++il) {
     const Layer &layer = layers_[static_cast<std::size_t>(il)];
@@ -974,6 +1022,15 @@ kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const int64
     matmul(layer.w_up, x_norm_, up_, m, false);
     backend_->silu_mul(gate_, up_, ffn_, m * n_ff_);
     matmul(layer.w_down, ffn_, x_, m, /*accumulate=*/true);
+
+    /* The deepstack level this block hands up, added to the residual it just
+     * wrote.  llama.cpp adds it in the same place, from the same plane of the
+     * input embeddings, and pads a token-path input with zeros -- so a text-only
+     * call reaches this line with nothing to add and the token path is
+     * unchanged. */
+    if (planes != nullptr && il < n_deepstack_) {
+      backend_->add(x_, deepstack_planes_[static_cast<std::size_t>(il)], x_, m * n_embd_);
+    }
   }
 
   /* Each sequence's logits come from its own last token.  At n_seq == 1 that is

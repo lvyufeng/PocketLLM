@@ -79,12 +79,27 @@ kinds of thing and it is worth telling them apart, because only one of them is t
     the reference and a 99th percentile of 1.2e-3, with a thin tail of cancellation outliers reaching
     2.7e-2; the test bounds the robust statistic tightly and the maximum loosely, and says why.
 
-**What is still not wired is the image path, not the tower.**  The preprocessing's resize is not here
--- the tower takes the checkpoint's own `image_size` square and refuses anything else by name, because
-interpolating the position table is separate arithmetic (a bicubic resample) nothing else in this tree
-needs yet -- and neither is the injection of the tower's features at the text graph's placeholder
-positions, or an ABI entry point that takes an image at all.  `libmtmd` remains the oracle for the
-whole of it.
+**The text graph's half of the image path is in as well.**  A `qwen3vl` checkpoint's text graph is
+not fed tokens-only: it carries `n_deepstack_layers` extra feature levels, so its input row is
+`n_embd * (1 + n_deepstack_layers)` wide -- the first `n_embd` is the embedding the first block
+reads, and each of the rest is added to a token's residual after one of the first
+`n_deepstack_layers` blocks.  `Qwen3Model::forward_embeddings` is that entry point, taking the levels
+*plane-major* (which is what the tower emits, so nothing is unpacked on the way in) where llama.cpp's
+row interleaves them per token.  `tests/native/test_deepstack.py` checks it against llama.cpp's own
+embeddings path, with a real prompt in the base plane and synthetic levels above it, in two cases
+whose difference is the point: with the levels zeroed the input is what the *token* path builds, so
+the comparison is the token path's own agreement on a `q4_k_m` checkpoint (2.9% of the logit spread),
+and with them in place it is 3-4% -- inside the noise the token path already has.  A token batch is
+unchanged by any of it: llama.cpp pads a token's embedding with zeros, so there is nothing for the
+injection to add, and this engine simply does not inject.
+
+**What is left is the image's own shape.**  The preprocessing's resize is not here -- the tower takes
+the checkpoint's own `image_size` square and refuses anything else by name, because interpolating the
+position table is separate arithmetic (a bicubic resample) nothing else in this tree needs yet -- and
+neither is the image *span*: its tokens take two-dimensional rotary positions from the patch grid
+rather than one, and they attend non-causally, which means the text graph's per-token decode loop has
+to grow the prefill case the tower already has.  There is also no ABI entry point that takes an image
+at all.  `libmtmd` remains the oracle for the whole of it.
 
 The tokenizer carries **two pre-tokenizers**, because the vocabularies in this project's scope are
 built on two. They differ in exactly one place -- `\p{N}` against `\p{N}{1,3}`, so a number is cut

@@ -14,10 +14,12 @@
  * not depend on a llama.cpp checkout: `libpocketllm.so` is the deliverable and
  * this is a test instrument, so the dependency lives with the test.
  *
- * Two modes:
+ * Three modes:
  *
  *   `oracle <model> <token>...`              the logits for the last token
  *   `oracle <model> <token>... --steps N`    N greedily generated tokens
+ *   `oracle <model> --embeddings FILE`       the logits of a forward whose input
+ *                                            embeddings are the caller's
  *
  * The second exists because `llama-cli` is a *chat client*: given a prompt it
  * wraps it in the checkpoint's chat template and answers a different question
@@ -75,6 +77,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -85,8 +89,9 @@ namespace {
 int usage(const char *argv0) {
   std::fprintf(stderr,
                "usage: %s <model.gguf> <token> [<token> ...] [--steps N] "
-               "[--flash-attn on|off|auto] [--kv-type f16|f32]\n",
-               argv0);
+               "[--flash-attn on|off|auto] [--kv-type f16|f32]\n"
+               "       %s <model.gguf> --embeddings <planes.bin>\n",
+               argv0, argv0);
   return 2;
 }
 
@@ -105,6 +110,98 @@ int32_t argmax(const float *logits, int32_t n) {
   return best;
 }
 
+/* The whole file as float32, or a message naming it. */
+std::vector<float> read_floats(const std::string &path) {
+  std::FILE *file = std::fopen(path.c_str(), "rb");
+  if (file == nullptr) {
+    throw std::runtime_error("cannot open '" + path + "'");
+  }
+  std::vector<float> values;
+  float chunk[8192];
+  std::size_t read = 0;
+  while ((read = std::fread(chunk, sizeof(float), 8192, file)) > 0) {
+    values.insert(values.end(), chunk, chunk + read);
+  }
+  std::fclose(file);
+  return values;
+}
+
+/* One forward from caller-supplied input embeddings, and the logits of its last
+ * token.
+ *
+ * The file holds `n_tokens` rows of `n_embd_inp` floats in llama.cpp's own
+ * layout: a token's row is its embedding, followed by the deepstack levels the
+ * first blocks add.  `n_embd_inp` is `n_embd` for every architecture with no
+ * deepstack and `n_embd * (1 + n_deepstack_layers)` for a vision checkpoint --
+ * which is what makes this the oracle for the engine's `forward_embeddings`: the
+ * two agree about the *arithmetic* and differ only in the order of the plane
+ * axis, so a caller transposes one into the other and nothing else has to move.
+ */
+int run_embeddings(llama_context *ctx, const llama_model *model, const std::string &path,
+                   int32_t n_vocab) {
+  const int32_t row = llama_model_n_embd_inp(model);
+  std::vector<float> data = read_floats(path);
+  if (row <= 0 || data.empty() || data.size() % static_cast<std::size_t>(row) != 0) {
+    std::fprintf(stderr, "'%s' is %zu floats, not a whole number of rows of %d\n", path.c_str(),
+                 data.size(), row);
+    return 2;
+  }
+  const int32_t n_tokens = static_cast<int32_t>(data.size() / static_cast<std::size_t>(row));
+
+  /* The batch is built field by field, and that is not a style choice.
+   *
+   * `llama_batch_init` allocates *one* position per token, which is right for a
+   * token batch -- a ubatch broadcasts that one position across every rotary
+   * section -- and wrong for this one.  An embeddings batch's positions are read
+   * as `pos[section * n_tokens + token]`, so a model with four sections needs
+   * four per token and the convenience constructor's array is three quarters of
+   * a row too short.  Reading past it is not a crash: it is uninitialized memory
+   * that behaves like a plausible position, which is the failure a comparison
+   * would never notice.  `tools/mtmd/mtmd-helper.cpp` builds its own batch for
+   * exactly this reason.
+   *
+   * Four sections always, because a model with one position per token reads only
+   * section 0 and ignores the rest.  Every section gets the token's own index,
+   * which is what a token batch's broadcast amounts to -- so this input means
+   * what a text batch means, and the deepstack is the only difference left. */
+  constexpr int32_t kSections = 4;
+  std::vector<llama_pos> pos(static_cast<std::size_t>(n_tokens) * kSections);
+  std::vector<int32_t> n_seq_id(static_cast<std::size_t>(n_tokens), 1);
+  std::vector<llama_seq_id> seq_id_0(1, 0);
+  std::vector<llama_seq_id *> seq_ids(static_cast<std::size_t>(n_tokens), seq_id_0.data());
+  std::vector<int8_t> logit_flags(static_cast<std::size_t>(n_tokens), 0);
+  for (int32_t i = 0; i < n_tokens; ++i) {
+    for (int32_t section = 0; section < kSections; ++section) {
+      pos[static_cast<std::size_t>(section) * n_tokens + i] = i;
+    }
+    logit_flags[static_cast<std::size_t>(i)] = (i == n_tokens - 1) ? 1 : 0;
+  }
+  llama_batch batch = {};
+  batch.n_tokens = n_tokens;
+  batch.embd = data.data();
+  batch.pos = pos.data();
+  batch.n_seq_id = n_seq_id.data();
+  batch.seq_id = seq_ids.data();
+  batch.logits = logit_flags.data();
+  if (llama_decode(ctx, batch) != 0) {
+    std::fprintf(stderr, "llama_decode failed on the embeddings batch\n");
+    return 1;
+  }
+  const float *logits = llama_get_logits_ith(ctx, n_tokens - 1);
+  if (logits == nullptr) {
+    std::fprintf(stderr, "llama.cpp produced no logits for the embeddings batch\n");
+    return 1;
+  }
+  std::printf("{\"n_tokens\": %d, \"n_embd_inp\": %d, \"n_vocab\": %d, \"logits\": [", n_tokens,
+              row, n_vocab);
+  for (int32_t i = 0; i < n_vocab; ++i) {
+    std::printf("%s%.9g", i ? ", " : "", static_cast<double>(logits[i]));
+  }
+  std::printf("]}\n");
+  std::fflush(stdout);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -114,6 +211,7 @@ int main(int argc, char **argv) {
 
   const char *model_path = argv[1];
   std::vector<llama_token> tokens;
+  std::string embeddings_path;
   int steps = 0;
   /* The full-softmax convention by default -- see the file header for what the
    * two conventions disagree about and why the CPU path needs this one. */
@@ -145,11 +243,13 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "--flash-attn takes on, off or auto, not '%s'\n", mode.c_str());
         return 2;
       }
+    } else if (std::string(argv[i]) == "--embeddings" && i + 1 < argc) {
+      embeddings_path = argv[++i];
     } else {
       tokens.push_back(static_cast<llama_token>(std::strtol(argv[i], nullptr, 10)));
     }
   }
-  if (tokens.empty()) {
+  if (tokens.empty() && embeddings_path.empty()) {
     return usage(argv[0]);
   }
 
@@ -201,6 +301,16 @@ int main(int argc, char **argv) {
   }
 
   const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+  /* The embeddings mode replaces the token batch entirely: the caller's rows are
+   * the graph's input, so there is nothing to tokenize and nothing to generate. */
+  if (!embeddings_path.empty()) {
+    if (!tokens.empty()) {
+      std::fprintf(stderr, "--embeddings takes no tokens: the two are different inputs\n");
+      return 2;
+    }
+    return run_embeddings(ctx, model, embeddings_path, n_vocab);
+  }
 
   /* The prompt in one batch, exactly as the logits mode does it. Only the last
    * position's logits are needed, and `llama_batch_get_one` marks the final
