@@ -592,6 +592,10 @@ void run_attention(std::ostream &out, Backend &backend, const Request &request) 
   const int64_t n_head_kv = k_cache.shape[1];
   const int64_t first_key = request.int_param("first_key", 0);
   const int64_t q_offset = request.int_param("q_offset", 0);
+  /* The rows advance by default -- a prefill or a decode step -- and a request
+   * that says otherwise is asking for every row to see the whole span, which is
+   * what a vision tower's attention is. */
+  const bool causal = request.int_param("causal", 1) != 0;
   const float scale = request.float_param("scale", 1.0F / std::sqrt(static_cast<float>(d)));
 
   DeviceBuffer dq = upload(backend, q.floats);
@@ -635,7 +639,8 @@ void run_attention(std::ostream &out, Backend &backend, const Request &request) 
   const int64_t span = q_offset + q_len - first_key;
   DeviceBuffer scores = backend.allocate(backend.attention_scratch(q_len, n_heads, span));
   run_and_report(out, backend, request, {q_len, n_heads, d}, [&](DeviceBuffer result) {
-    backend.attention(dq, q_len, n_heads, dk, dv, n_head_kv, d, first_key, q_offset, scale, result,
+    backend.attention(dq, q_len, n_heads, dk, dv, n_head_kv, d, first_key, q_offset, causal, scale,
+                      result,
                       scores, kv_dtype);
   });
   backend.release(dq);

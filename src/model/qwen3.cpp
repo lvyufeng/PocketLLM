@@ -964,7 +964,7 @@ kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const int64
       kernel::DeviceBuffer a_s{attn_.handle + static_cast<uintptr_t>(row * n_head_ * head_dim_ * 4),
                                n_s * n_head_ * head_dim_ * 4};
       backend_->attention(q_s, n_s, n_head_, layer_k, layer_v, n_head_kv_, head_dim_,
-                          /*first_key=*/0, at_pos, scale, a_s, scores_, kv_dtype_);
+                          /*first_key=*/0, at_pos, /*causal=*/true, scale, a_s, scores_, kv_dtype_);
     }
 
     matmul(layer.wo, attn_, x_, m, /*accumulate=*/true);

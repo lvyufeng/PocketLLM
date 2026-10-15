@@ -880,6 +880,70 @@ __global__ void attention_kernel(const float *q, int64_t n_heads, const float *k
   }
 }
 
+/* The non-causal arm of `attention`: every query row sees the whole
+ * `[first_key, q_offset]` span, and there is no score scratch -- the three
+ * passes recompute the dot and the exponential, exactly as the CPU arm does, so
+ * `attention_scratch`'s contract stays the causal one.  One thread per
+ * `(row, head)` and the span walked serially: this is the eager backend's
+ * ordinary shape, and the tiled kernel above cannot absorb it because its tiling
+ * is built on the spans *advancing* with the row, which is precisely what they
+ * do not do here.  A tower calls it once per image rather than once per token. */
+__global__ void attention_full_kernel(const float *q, const float *k_cache, const float *v_cache,
+                                      int64_t q_len, int64_t n_heads, int64_t n_head_kv, int64_t d,
+                                      int64_t first_key, int64_t q_offset, float scale, float *out) {
+  const int64_t unit = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (unit >= q_len * n_heads) {
+    return;
+  }
+  const int64_t group = n_heads / n_head_kv;
+  const int64_t kv = (unit % n_heads) / group;
+  const float *qrow = q + unit * d;
+  float *orow = out + unit * d;
+  const int64_t span = q_offset + 1 - first_key;
+  if (span <= 0) {
+    for (int64_t i = 0; i < d; ++i) {
+      orow[i] = 0.0F;
+    }
+    return;
+  }
+  const int64_t cache_row = n_head_kv * d;
+  const float *khead = k_cache + first_key * cache_row + kv * d;
+  const float *vhead = v_cache + first_key * cache_row + kv * d;
+  float best = -INFINITY;
+  for (int64_t s = 0; s < span; ++s) {
+    const float *krow = khead + s * cache_row;
+    float dot = 0.0F;
+    for (int64_t i = 0; i < d; ++i) {
+      dot += qrow[i] * krow[i];
+    }
+    best = fmaxf(best, dot * scale);
+  }
+  float total = 0.0F;
+  for (int64_t s = 0; s < span; ++s) {
+    const float *krow = khead + s * cache_row;
+    float dot = 0.0F;
+    for (int64_t i = 0; i < d; ++i) {
+      dot += qrow[i] * krow[i];
+    }
+    total += expf(dot * scale - best);
+  }
+  for (int64_t i = 0; i < d; ++i) {
+    orow[i] = 0.0F;
+  }
+  for (int64_t s = 0; s < span; ++s) {
+    const float *krow = khead + s * cache_row;
+    float dot = 0.0F;
+    for (int64_t i = 0; i < d; ++i) {
+      dot += qrow[i] * krow[i];
+    }
+    const float weight = expf(dot * scale - best) / total;
+    const float *vrow = vhead + s * cache_row;
+    for (int64_t i = 0; i < d; ++i) {
+      orow[i] += weight * vrow[i];
+    }
+  }
+}
+
 /* One block for the whole vector. The logits are 151936 floats -- 600 KB, a
  * single pass over what is already in L2 -- so a grid-wide reduction would cost
  * more in a second launch than it saves.
@@ -1287,13 +1351,26 @@ class CudaBackend final : public Backend {
 
   void attention(DeviceBuffer q, int64_t q_len, int64_t n_heads, DeviceBuffer k_cache,
                  DeviceBuffer v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
-                 int64_t q_offset, float scale, DeviceBuffer out, DeviceBuffer scores,
+                 int64_t q_offset, bool causal, float scale, DeviceBuffer out, DeviceBuffer scores,
                  KVDtype kv_dtype) override {
     if (q_len <= 0) {
       return;
     }
     if (kv_dtype != KVDtype::kF32) {
       throw Error("cuda attention: the cache is f32 here -- see preferred_kv_dtype");
+    }
+    if (!causal) {
+      /* The non-causal arm reads no score scratch at all -- see its kernel -- so
+       * `scores` is unused here, which the compiler is told rather than left to
+       * notice. */
+      (void)scores;
+      const int64_t units = q_len * n_heads;
+      const unsigned threads = 256;
+      attention_full_kernel<<<static_cast<unsigned>((units + threads - 1) / threads), threads>>>(
+          f(q), f(k_cache), f(v_cache), q_len, n_heads, n_head_kv, d, first_key, q_offset, scale,
+          w(out));
+      check(cudaGetLastError(), "attention_full");
+      return;
     }
     /* The stride every block indexes its row with, and it has to be the number
      * `attention_scratch` was asked about. Both sides compute it the same way

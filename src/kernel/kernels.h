@@ -228,9 +228,20 @@ void float_to_kv_row(const float *src, int64_t d, void *row);
 /* `k_cache`/`v_cache` are `KVDtype` elements wide -- f32 or f16 -- while `q`,
  * `out` and `scores` are always f32. See `Backend::attention` for why the cache
  * is the one operand whose width is worth trading. */
+/* `causal` decides whether the rows *advance*: with it, row `t` of the chunk
+ * ends at `q_offset + t` (a prefill or a decode step); without it, every row
+ * ends at `q_offset` -- the whole span `[first_key, q_offset]` for all of them,
+ * which is what a vision tower's attention over a patch sequence is.
+ *
+ * The non-causal arm does not use `scores`: it recomputes the dot and the
+ * exponential in its third pass rather than holding a row of weights, so
+ * `attention_scratch`'s contract is the causal one in both cases.  That arm is a
+ * plain three-pass loop over `(row, head)` -- the tower calls it once per image,
+ * not once per token, and the tiled path below is built on the spans advancing,
+ * which is exactly what they do not do here. */
 void attention(const float *q, int64_t q_len, int64_t n_heads, const void *k_cache,
                const void *v_cache, int64_t n_head_kv, int64_t d, int64_t first_key,
-               int64_t q_offset, float scale, float *out, float *scores,
+               int64_t q_offset, bool causal, float scale, float *out, float *scores,
                KVDtype kv_dtype = KVDtype::kF32);
 
 /* How many *query rows of one head* one attention task scores in a single walk
