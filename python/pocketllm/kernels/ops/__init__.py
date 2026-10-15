@@ -10,9 +10,9 @@ adding a reference implementation in the same commit.
 from __future__ import annotations
 
 from ..registry import OPS
-from . import attention, cache, elementwise, embedding, gemm, moe, norm, rope, sample
+from . import attention, cache, elementwise, embedding, gemm, moe, norm, rope, sample, vision
 
-_FAMILIES = (gemm, attention, moe, rope, norm, elementwise, embedding, sample, cache)
+_FAMILIES = (gemm, attention, moe, rope, norm, elementwise, embedding, sample, cache, vision)
 
 
 def declare_all() -> None:

@@ -201,6 +201,16 @@ def sample_args(op: str, session, quant: str | None = None) -> tuple[list, dict]
         return [t(rand(_TOKENS, _HIDDEN)), t(rand(_TOKENS, _HIDDEN))], {}
     if op == "gelu":
         return [t(rand(_TOKENS, _HIDDEN))], {}
+    if op == "conv2d":
+        # A 3-channel 12x16 image with a 4x4 kernel at stride 4: twelve patches on
+        # a 3x4 grid, so the output is not square and a stride or kernel read off
+        # the wrong axis would be a shape error as well as a wrong number.  Three
+        # input channels because that is the tower's own count.
+        return [t(rand(3, 12, 16)), t(rand(5, 3 * 4 * 4)), t(rand(5))], {
+            "kernel": 4,
+            "stride": 4,
+            "pad": 0,
+        }
     if op == "softmax":
         return [t(rand(_TOKENS, _VOCAB))], {"axis": -1}
     if op == "rope":

@@ -78,7 +78,7 @@ device, and `EngineArgs` has no `tensor_parallel_size` to set.
 |---|---|
 | [`src/`](architecture/c_engine.md) — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B and 1.7B** in `f16` and the seven packed formats `q2_k` through `q6_k` plus `iq2_xxs`/`iq2_xs`, on `cpu` and one `cuda` card. Greedy is checked token-for-token against llama.cpp; each packed format against llama.cpp's own decode block for block; the CPU path is ahead of llama.cpp on both halves |
 | [`src/kernel/ascend/`](architecture/ascend_310b.md) — Ascend 310B backend | **Runs Qwen3-0.6B … 8B** on an Orange Pi AIpro, at the quantizer's own floor |
-| [`pocketllm.kernels`](architecture/kernel_abi_v1.md) — descriptors, op schemas, dispatch, graph IR | **Done.** 18 ops declared; stdlib-only |
+| [`pocketllm.kernels`](architecture/kernel_abi_v1.md) — descriptors, op schemas, dispatch, graph IR | **Done.** 19 ops declared; stdlib-only |
 | `pocketllm.backends.reference` — numpy oracle | **Done.** Normative: implements every declared op |
 | [`pocketllm.quant`](architecture/execution.md) — GGML block decoders | **Done.** Codebook tables vendored in-tree |
 | `pocketllm.loader.gguf` — GGUF reader | **Done.** numpy in, descriptors out |

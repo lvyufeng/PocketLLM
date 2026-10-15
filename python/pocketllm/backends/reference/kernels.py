@@ -186,6 +186,57 @@ def gelu(x, **_attrs):
     return (0.5 * x32 * (1.0 + np.tanh(inner))).astype(np.float32)
 
 
+def conv2d(x, w, bias=None, *, kernel, stride, pad, **_attrs):
+    """The patch embedding: a square 2-D convolution, as a gather plus a product.
+
+    The weight is ``(out_ch, in_ch * kernel * kernel)`` with ``k`` indexed
+    ``in_ch`` slowest and the kernel width fastest -- the GGUF layout read
+    straight off the mapping, and the same row-major ``(n, k)`` shape ``gemm``
+    takes, so the same bytes are usable by both ops with no transposition.  The
+    output is ``(out_h * out_w, out_ch)``, patch-major with the channel fastest,
+    so a patch is a row and the next op can treat it as a token.
+
+    Written as an explicit gather and an ``einsum`` rather than through a
+    convolution primitive because this is the *reference*: every index a kernel
+    could swap is written down, and the loops are the four indices the semantics
+    names.  The C kernel is the independent statement of the same thing, and the
+    two are compared on identical input.
+    """
+    x32 = np.asarray(x, dtype=np.float32)
+    w32 = np.asarray(w, dtype=np.float32)
+    in_ch, height, width = x32.shape
+    out_ch, k = w32.shape
+    if k != in_ch * kernel * kernel:
+        raise ValueError(
+            f"conv2d: w has {k} columns, but {in_ch} channels and a "
+            f"{kernel}x{kernel} kernel need {in_ch * kernel * kernel}"
+        )
+    out_h = (height + 2 * pad - kernel) // stride + 1
+    out_w = (width + 2 * pad - kernel) // stride + 1
+    if out_h <= 0 or out_w <= 0:
+        raise ValueError(
+            f"conv2d: a {kernel}x{kernel} kernel at stride {stride} with padding {pad} "
+            f"does not fit a {height}x{width} image"
+        )
+    # [patch, in_ch * kernel_h * kernel_w], the `k` axis ordered ic slowest.
+    cols = np.zeros((out_h * out_w, k), dtype=np.float32)
+    for ic in range(in_ch):
+        for ky in range(kernel):
+            ys = np.arange(out_h) * stride + ky - pad
+            ys_ok = (ys >= 0) & (ys < height)
+            for kx in range(kernel):
+                xs = np.arange(out_w) * stride + kx - pad
+                xs_ok = (xs >= 0) & (xs < width)
+                block = np.zeros((out_h, out_w), dtype=np.float32)
+                if ys_ok.any() and xs_ok.any():
+                    block[np.ix_(ys_ok, xs_ok)] = x32[ic][np.ix_(ys[ys_ok], xs[xs_ok])]
+                cols[:, ic * kernel * kernel + ky * kernel + kx] = block.reshape(-1)
+    y = np.einsum("pk,nk->pn", cols, w32, optimize=True)
+    if bias is not None:
+        y = y + np.asarray(bias, dtype=np.float32)[None, :]
+    return y.astype(np.float32, copy=False)
+
+
 def add(a, b, **_attrs):
     return a.astype(np.float32) + b.astype(np.float32)
 
@@ -386,6 +437,7 @@ KERNELS = {
     "layer_norm": layer_norm,
     "silu_mul": silu_mul,
     "gelu": gelu,
+    "conv2d": conv2d,
     "add": add,
     "mul": mul,
     "softmax": softmax,

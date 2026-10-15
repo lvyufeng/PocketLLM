@@ -57,6 +57,13 @@ mmproj's hparams describe, and the injection of the tower's features at the plac
 `libmtmd`'s `mtmd_encode`/`mtmd_get_output_embd` is the oracle that half would be verified against,
 the same way `ggml_dequant.c` is the oracle for a block decoder.
 
+That tower's ops are landing ahead of it, because each is a kernel this engine was missing rather
+than a change to one it had: `layer_norm`, the tanh `gelu` and a non-causal arm of `attention` are
+in place, and the patch embedding is `conv2d`, checked against `ggml_conv_2d` on the checkpoint's own
+weights by `tests/native/test_conv2d_ggml.py` -- `ggml_conv_2d` being the function llama.cpp builds
+`v.patch_embd` with, so the index order is compared with the library the file was converted for and
+not only with this tree's own reading of it.
+
 The tokenizer carries **two pre-tokenizers**, because the vocabularies in this project's scope are
 built on two. They differ in exactly one place -- `\p{N}` against `\p{N}{1,3}`, so a number is cut
 digit by digit or in runs of up to three -- and that place decides ids, so the variant is named by
@@ -116,12 +123,12 @@ to `pocketllm.backends.reference`, applied one level down.
 
 ### The C surface is a strict subset of the ABI, on purpose
 
-The ABI declares 18 ops. The engine implements 14 of them as ops — `rms_norm`, `layer_norm`, `gemm`,
-`gemm_quant`, `embedding`, `embedding_quant`, `silu_mul`, `gelu`, `rope`, `attention`, `argmax`,
-`softmax`, `logits_temperature`, `topk_sample` — and the rest are either *inlined into the graph* or *not
-needed yet*.  (`layer_norm` is the newest and the one the ABI waited longest for: it is declared,
-has a reference implementation and had no C kernel until a vision tower needed one; `gelu` joined it
-for the same reason, one op later.)  Neither case
+The ABI declares 19 ops. The engine implements 15 of them as ops — `rms_norm`, `layer_norm`, `gemm`,
+`gemm_quant`, `embedding`, `embedding_quant`, `silu_mul`, `gelu`, `conv2d`, `rope`, `attention`,
+`argmax`, `softmax`, `logits_temperature`, `topk_sample` — and the rest are either *inlined into the
+graph* or *not needed yet*.  (`layer_norm` is the one the ABI waited longest for: it is declared, has
+a reference implementation and had no C kernel until a vision tower needed one; `gelu` and then
+`conv2d` joined it for the same reason, one op at a time.)  Neither case
 is a missing kernel, and the distinction matters when reading the conformance test, which drives the
 implemented ones and deliberately skips the others.
 
@@ -137,9 +144,7 @@ and `start_pos`-aligned, so the general scatter the reference op allows (`cache[
 values[i]` for arbitrary indices) has no caller. `cache_truncate` likewise: `reset()` drops the
 length without clearing rows, because the next append overwrites what it needs.
 
-**Not needed yet.** `layer_norm` — Qwen3 is all RMSNorm, and the only `layer_norm` string in `src/`
-is the metadata key `attention.layer_norm_rms_epsilon`, which is an RMS epsilon. `mul`, `moe_ffn`: no
-dense Qwen3 path reaches them.
+**Not needed yet.** `mul`, `moe_ffn`: no dense Qwen3 path reaches them.
 
 ### The sampling ops are the exception to the backend split
 

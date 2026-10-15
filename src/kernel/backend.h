@@ -138,6 +138,17 @@ class Backend {
   /* The tanh-approximated GELU, as `kernels.h` documents it. */
   virtual void gelu(DeviceBuffer x, DeviceBuffer out, int64_t n) = 0;
 
+  /* The vision tower's patch embedding, as `kernels.h` documents it: a
+   * square-kernel 2-D convolution with `weight` in GGUF's
+   * `(out_ch, in_ch * kernel^2)` order and `out` patch-major.
+   *
+   * A backend whose arithmetic goes through a vendor op with no convolution in
+   * it refuses this by name -- the same shape of refusal `gelu` gets -- rather
+   * than answering with an image the tower never described. */
+  virtual void conv2d(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out,
+                      int64_t in_ch, int64_t height, int64_t width, int64_t out_ch, int64_t kernel,
+                      int64_t stride, int64_t pad) = 0;
+
   /* RoPE, split-half layout, as `kernels.h` documents it. */
   virtual void rope_neox(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d,
                          int64_t start_pos, DeviceBuffer cos_table, DeviceBuffer sin_table) = 0;

@@ -131,6 +131,13 @@ class CpuBackend final : public Backend {
     kernel::gelu(f(x), w(out), n);
   }
 
+  void conv2d(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out,
+              int64_t in_ch, int64_t height, int64_t width, int64_t out_ch, int64_t kernel,
+              int64_t stride, int64_t pad) override {
+    kernel::conv2d(f(x), f(weight), bias.handle != 0 ? f(bias) : nullptr, w(out), in_ch, height,
+                   width, out_ch, kernel, stride, pad);
+  }
+
   void rope_neox(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d, int64_t start_pos,
                  DeviceBuffer cos_table, DeviceBuffer sin_table) override {
     kernel::rope_neox(w(x), n_tokens, n_heads, d, start_pos, f(cos_table), f(sin_table));

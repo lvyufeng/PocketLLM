@@ -402,6 +402,11 @@ DEVICE_EXCLUDED_CASES: dict[str, dict[str, str]] = {
         # GELU, and the backend refuses it by name rather than substituting.
         "gelu": "ascend: gelu is not implemented (the custom-op set has silu_mul only)",
         "gelu_large_magnitudes": "ascend: gelu is not implemented (the custom-op set has silu_mul only)",
+        # The patch embedding: the vendor's custom-op set is norms, `silu_mul`,
+        # the cube matmul and a causal decode attention, and a 2-D convolution is
+        # none of them.  Refused by name, as `gelu` is.
+        "conv2d": "ascend: conv2d is not implemented (the custom-op set has no convolution)",
+        "conv2d_padded": "ascend: conv2d is not implemented (the custom-op set has no convolution)",
         "topk_sample": "ascend: topk_sample not implemented yet",
         "topk_sample_uniform_on_a_boundary": "ascend: topk_sample not implemented yet",
         "topk_sample_min_p": "ascend: topk_sample not implemented yet",
@@ -909,6 +914,41 @@ def case_gelu_large_magnitudes(rng):
     return ({"x": x}, {}, ref.gelu(x))
 
 
+def case_conv2d(rng):
+    """The patch embedding, at a scale of the tower's own geometry.
+
+    `kernel == stride` with the kernel dividing the image is the tower's shape
+    (16 and 768); 8 and 24 is the same relationship at a size a conformance run
+    can afford -- the tower's own is ~1.8 GFLOP per image and answers the same
+    question about index order.  Three input channels and a bias, because the
+    tower reads RGB and `v.patch_embd.bias` exists: a kernel that ignored either
+    the channel axis or the bias would still agree on a one-channel, unbiased
+    case.  Nine patches against sixteen output channels, so the two axes of the
+    output are neither equal nor a multiple of each other.
+    """
+    x = rng.standard_normal((3, 24, 24), dtype=np.float32)
+    w = rng.standard_normal((16, 3 * 8 * 8), dtype=np.float32)
+    bias = rng.standard_normal(16, dtype=np.float32)
+    want = ref.conv2d(x, w, bias, kernel=8, stride=8, pad=0)
+    return ({"x": x, "w": w, "bias": bias}, {"kernel": 8, "stride": 8, "pad": 0}, want)
+
+
+def case_conv2d_padded(rng):
+    """An odd kernel at an odd stride with padding, where taps fall off the edge.
+
+    `pad = 1` puts part of every border patch's receptive field outside the
+    image, which the kernel has to read as zero -- an implementation that clamped
+    an out-of-range tap to the edge pixel instead of dropping it parts from the
+    reference by a whole pixel's worth of weight at the border and nowhere else.
+    The image is 7x7 and the output grid 4x4, so a stride read as 1 would give
+    the wrong shape as well as the wrong numbers.
+    """
+    x = rng.standard_normal((2, 7, 7), dtype=np.float32)
+    w = rng.standard_normal((5, 2 * 3 * 3), dtype=np.float32)
+    want = ref.conv2d(x, w, kernel=3, stride=2, pad=1)
+    return ({"x": x, "w": w}, {"kernel": 3, "stride": 2, "pad": 1}, want)
+
+
 def case_silu_mul_large_negative(rng):
     """A gate of -50.  `silu(-50)` is -1e-22 to f32, and a kernel that takes the
     obvious `g / (1 + exp(-g))` overflows `exp(50)` on the way there -- both
@@ -1301,6 +1341,8 @@ CASES = {
     "silu_mul_large_negative": case_silu_mul_large_negative,
     "gelu": case_gelu,
     "gelu_large_magnitudes": case_gelu_large_magnitudes,
+    "conv2d": case_conv2d,
+    "conv2d_padded": case_conv2d_padded,
     "rope_start_zero": case_rope_start_zero,
     "rope_start_pos_offsets": case_rope_start_pos_offsets,
     "rope_small_head_dim": case_rope_small_head_dim,
@@ -1361,6 +1403,8 @@ OP_OF_CASE = {
     "silu_mul_large_negative": "silu_mul",
     "gelu": "gelu",
     "gelu_large_magnitudes": "gelu",
+    "conv2d": "conv2d",
+    "conv2d_padded": "conv2d",
     "rope_start_zero": "rope",
     "rope_start_pos_offsets": "rope",
     "rope_small_head_dim": "rope",
