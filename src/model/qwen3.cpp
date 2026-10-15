@@ -497,9 +497,30 @@ std::unique_ptr<Qwen3Model> Qwen3Model::load(const GgufReader &checkpoint,
   model->rms_eps_ =
       static_cast<float>(checkpoint.get_float(p + "attention.layer_norm_rms_epsilon", 1e-6));
   model->rope_theta_ = static_cast<float>(checkpoint.get_float(p + "rope.freq_base", 10000.0));
+  /* The multi-section rotary's partition, or nothing.  Named `dimension_sections`
+   * by the file and absent from every architecture whose rotary is the ordinary
+   * one-dimensional kind -- and absent means the four stay zero, which is what
+   * `build_rope_for_tokens` reads as "no sections". */
+  if (const GgufValue *value = checkpoint.find(p + "rope.dimension_sections")) {
+    if (const GgufArray *sections = std::get_if<GgufArray>(value)) {
+      if (sections->ints.size() != 4) {
+        throw Error("'" + p + "rope.dimension_sections' has " +
+                    std::to_string(sections->ints.size()) + " entries, not 4");
+      }
+      for (int i = 0; i < 4; ++i) {
+        model->rope_sections_[i] = sections->ints[static_cast<std::size_t>(i)];
+      }
+    }
+  }
   /* The one behavioural difference between the two architecture names this graph
    * serves; everything else is a tensor being present or absent. */
   model->interleaved_rope_ = arch == "llama";
+  /* And the second one, for the multi-section rotary: `qwen3vl` interleaves its
+   * sections where every other multi-section model this tree could grow runs them
+   * in blocks.  The naming is llama.cpp's -- `GGML_ROPE_TYPE_IMROPE` -- and this
+   * is the one place the mode is decided, so the table builder reads a flag
+   * rather than re-deriving it from a name. */
+  model->imrope_ = arch == "qwen3vl" || arch == "qwen3vlmoe";
   /* The deepstack levels a vision checkpoint's input carries.  Namespaced like
    * every other hparam and absent from every architecture with no tower, so a
    * missing key is zero and the graph's input is `n_embd` wide -- the shape this
@@ -647,6 +668,99 @@ void Qwen3Model::grow_rope_table(int64_t positions) {
   position_capacity_ = grown;
 }
 
+void Qwen3Model::build_rope_for_tokens(const int64_t *positions, int64_t n) {
+  /* The multi-section rotary, as llama.cpp's `ggml_rope_multi` defines it.
+   *
+   * The pairs are partitioned into sections -- four of them, from the file's own
+   * `rope.dimension_sections` -- and a pair takes its angle from *its section's*
+   * position.  A text token passes its own index four times, which is why this
+   * collapses to the ordinary one-dimensional rotation and why the token path
+   * needs none of it (the docs have said so since the text half landed, and the
+   * 8/8 walk is the measurement).  An image patch passes a row and a column --
+   * the same column twice, in llama.cpp's (t, y, x, z) naming -- and *that* is
+   * the whole reason the section machinery exists.
+   *
+   * **Which section a pair belongs to is the checkpoint's, and for `qwen3vl` it
+   * cycles.**  llama.cpp builds this architecture with `GGML_ROPE_TYPE_IMROPE`,
+   * where the section runs `0, 1, 2, 0, 1, 2, ...` over the pairs -- with the
+   * positions interleaved rather than laid out in blocks -- and falls back to a
+   * fourth section for the pairs past
+   * `3 * (sections[0] + sections[1] + sections[2])`.  The block form (plain
+   * `MROPE`) is the other architecture's convention, and the two give different
+   * angles for the same positions; a text token cannot tell them apart, because
+   * its four positions are equal and every assignment then picks the same
+   * number.  Measured against `ggml_rope_multi` in both modes, this is the one
+   * `qwen3vl` needs.
+   *
+   * Two details are the reference's rather than a simplification:
+   *
+   *   - **The ramp is shared.**  Every section's running angle is multiplied by
+   *     the same scale at every pair, so pair `p` of section `s` is
+   *     `position[s] * scale^p` -- unlike the vision tower's rotary, whose
+   *     sections each restart their ramp at their own boundary.  A section
+   *     therefore does not begin where the previous one stopped.
+   *   - **The exponent is over `head_dim`**, because that is what the reference
+   *     passes as `n_dims` when the file declares no `rope.dimension_count` --
+   *     and this checkpoint does not, so the whole head rotates and all four
+   *     sections are reachable.  (Had it been half the head, the third section
+   *     would have started past the last rotating pair and gone unused, the way
+   *     the vision tower's does.)
+   *
+   * The angle is accumulated by repeated multiplication rather than recomputed
+   * as a power, so the table carries the reference's own rounding and not a
+   * cleaner number that happens to be nearby. */
+  const int64_t half = head_dim_ / 2;
+  const float scale = std::pow(rope_theta_, -2.0F / static_cast<float>(head_dim_));
+  const int64_t sections[4] = {rope_sections_[0], rope_sections_[1], rope_sections_[2],
+                               rope_sections_[3]};
+  const int64_t total = sections[0] + sections[1] + sections[2] + sections[3];
+  const int64_t after_row = sections[0];
+  const int64_t after_column = sections[0] + sections[1];
+  const int64_t after_extra = after_column + sections[2];
+
+  std::vector<float> cos_table(static_cast<std::size_t>(n * half));
+  std::vector<float> sin_table(static_cast<std::size_t>(n * half));
+  for (int64_t token = 0; token < n; ++token) {
+    float running[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+    for (int section = 0; section < 4; ++section) {
+      const int64_t value = positions != nullptr ? positions[token * 4 + section] : token;
+      running[section] = static_cast<float>(value);
+    }
+    for (int64_t pair = 0; pair < half; ++pair) {
+      int which = 0;
+      if (total > 0) {
+        const int64_t sector = pair % total;
+        if (imrope_) {
+          /* llama.cpp's interleaved assignment, branch for branch. */
+          if (sector % 3 == 1 && sector < 3 * sections[1]) {
+            which = 1;
+          } else if (sector % 3 == 2 && sector < 3 * sections[2]) {
+            which = 2;
+          } else if (sector % 3 == 0 && sector < 3 * sections[0]) {
+            which = 0;
+          } else {
+            which = 3;
+          }
+        } else if (sector >= after_extra) {
+          which = 3;
+        } else if (sector >= after_column) {
+          which = 2;
+        } else if (sector >= after_row) {
+          which = 1;
+        }
+      }
+      const float theta = running[which];
+      cos_table[static_cast<std::size_t>(token * half + pair)] = std::cos(theta);
+      sin_table[static_cast<std::size_t>(token * half + pair)] = std::sin(theta);
+      for (int section = 0; section < 4; ++section) {
+        running[section] *= scale;
+      }
+    }
+  }
+  backend_->copy_to_device(mrope_cos_, cos_table.data(), n * half * 4);
+  backend_->copy_to_device(mrope_sin_, sin_table.data(), n * half * 4);
+}
+
 void Qwen3Model::ensure_capacity(int64_t n, int64_t end_pos, int64_t head_rows) {
   backend_->release(x_);
   backend_->release(x_norm_);
@@ -667,6 +781,8 @@ void Qwen3Model::ensure_capacity(int64_t n, int64_t end_pos, int64_t head_rows) 
     backend_->release(buffer);
   }
   deepstack_planes_.clear();
+  backend_->release(mrope_cos_);
+  backend_->release(mrope_sin_);
 
   x_ = backend_->allocate(n * n_embd_ * 4);
   /* One plane per deepstack level, `n` rows of `n_embd` each -- sized by the
@@ -676,6 +792,12 @@ void Qwen3Model::ensure_capacity(int64_t n, int64_t end_pos, int64_t head_rows) 
   for (kernel::DeviceBuffer &plane : deepstack_planes_) {
     plane = backend_->allocate(n * n_embd_ * 4);
   }
+  /* One rotary row per token, for the embeddings path.  Sized to the batch like
+   * everything else here, and allocated whether or not this batch takes that
+   * path, so a session that runs a prompt and then an image does not allocate in
+   * the middle of one. */
+  mrope_cos_ = backend_->allocate(n * (head_dim_ / 2) * 4);
+  mrope_sin_ = backend_->allocate(n * (head_dim_ / 2) * 4);
   x_norm_ = backend_->allocate(n * n_embd_ * 4);
   q_ = backend_->allocate(n * n_head_ * head_dim_ * 4);
   k_ = backend_->allocate(n * n_head_kv_ * head_dim_ * 4);
@@ -822,11 +944,11 @@ kernel::DeviceBuffer Qwen3Model::forward(const int32_t *tokens, int64_t n, int64
   }
   const int64_t n_per_seq[1] = {n};
   const int64_t starts[1] = {start_pos};
-  return forward_impl(tokens, /*planes=*/nullptr, n_per_seq, starts, 1);
+  return forward_impl(tokens, /*planes=*/nullptr, /*positions=*/nullptr, n_per_seq, starts, 1);
 }
 
-kernel::DeviceBuffer Qwen3Model::forward_embeddings(const float *planes, int64_t n,
-                                                    int64_t start_pos) {
+kernel::DeviceBuffer Qwen3Model::forward_embeddings(const float *planes, const int64_t *positions,
+                                                    int64_t n, int64_t start_pos) {
   if (n_deepstack_ <= 0) {
     throw Error("this checkpoint carries no deepstack levels, so its input is the token table "
                 "and `forward` is the entry point");
@@ -835,9 +957,15 @@ kernel::DeviceBuffer Qwen3Model::forward_embeddings(const float *planes, int64_t
     throw Error("forward at position " + std::to_string(start_pos) + " but the cache holds " +
                 std::to_string(cache_length()) + " positions");
   }
+  const int64_t sections = rope_sections_[0] + rope_sections_[1] + rope_sections_[2] +
+                           rope_sections_[3];
+  if (positions != nullptr && sections == 0) {
+    throw Error("this checkpoint declares no `rope.dimension_sections`, so its rotary has one "
+                "position per token and per-token positions are not a thing it can be told");
+  }
   const int64_t n_per_seq[1] = {n};
   const int64_t starts[1] = {start_pos};
-  return forward_impl(/*tokens=*/nullptr, planes, n_per_seq, starts, 1);
+  return forward_impl(/*tokens=*/nullptr, planes, positions, n_per_seq, starts, 1);
 }
 
 kernel::DeviceBuffer Qwen3Model::forward_batch(const int32_t *tokens, const int64_t *n_per_seq,
@@ -853,12 +981,13 @@ kernel::DeviceBuffer Qwen3Model::forward_batch(const int32_t *tokens, const int6
     starts[static_cast<std::size_t>(s)] =
         s < static_cast<int64_t>(seq_len_.size()) ? seq_len_[static_cast<std::size_t>(s)] : 0;
   }
-  return forward_impl(tokens, /*planes=*/nullptr, n_per_seq, starts.data(), n_seq);
+  return forward_impl(tokens, /*planes=*/nullptr, /*positions=*/nullptr, n_per_seq, starts.data(),
+                      n_seq);
 }
 
 kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const float *planes,
-                                              const int64_t *n_per_seq, const int64_t *start_pos,
-                                              int64_t n_seq) {
+                                              const int64_t *positions, const int64_t *n_per_seq,
+                                              const int64_t *start_pos, int64_t n_seq) {
   /* `m` is the whole batch: the rows every weight-reading GEMM contracts over,
    * so the weights are read once for all sequences.  At n_seq == 1 this is the
    * `n` the graph has always used and every loop below runs once, which is what
@@ -907,6 +1036,7 @@ kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const float
       backend_->copy_to_device(deepstack_planes_[static_cast<std::size_t>(level)],
                                planes + (level + 1) * m * n_embd_, m * n_embd_ * 4);
     }
+    build_rope_for_tokens(positions, m);
   } else {
     /* The whole batch's token ids go to the device once and are gathered on the
      * device; only the ids cross the bus, not the embedding rows they select. */
@@ -937,11 +1067,21 @@ kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const float
     }
 
     /* RoPE is per sequence: a sequence's tokens take that sequence's own
-     * starting position.  At n_seq == 1 this is the single call the graph made. */
+     * starting position.  At n_seq == 1 this is the single call the graph made.
+     *
+     * The embeddings path is different in kind rather than in degree.  Its table
+     * already holds one row per *token* -- built from a position per rotary
+     * section, which is what an image patch needs -- so it is applied from row 0
+     * and the cache position has nothing to do with the angle.  The cache
+     * position still drives the KV append below, which is why the two are
+     * separate variables rather than one. */
+    const kernel::DeviceBuffer table_cos = planes != nullptr ? mrope_cos_ : rope_cos_;
+    const kernel::DeviceBuffer table_sin = planes != nullptr ? mrope_sin_ : rope_sin_;
     for (int64_t s = 0; s < n_seq; ++s) {
       const int64_t n_s = n_per_seq[static_cast<std::size_t>(s)];
       const int64_t row = cum[static_cast<std::size_t>(s)];
       const int64_t at_pos = start_pos[static_cast<std::size_t>(s)];
+      const int64_t rope_at = planes != nullptr ? 0 : at_pos;
       kernel::DeviceBuffer q_s{q_.handle + static_cast<uintptr_t>(row * n_head_ * head_dim_ * 4),
                                n_s * n_head_ * head_dim_ * 4};
       kernel::DeviceBuffer k_s{k_.handle + static_cast<uintptr_t>(row * kv_width * 4),
@@ -952,11 +1092,11 @@ kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const float
        * neighbours.  Same tables, same angles, different pairing -- and the
        * wrong one is not a rounding error but a different model. */
       if (interleaved_rope_) {
-        backend_->rope_norm(q_s, n_s, n_head_, head_dim_, at_pos, rope_cos_, rope_sin_);
-        backend_->rope_norm(k_s, n_s, n_head_kv_, head_dim_, at_pos, rope_cos_, rope_sin_);
+        backend_->rope_norm(q_s, n_s, n_head_, head_dim_, rope_at, table_cos, table_sin);
+        backend_->rope_norm(k_s, n_s, n_head_kv_, head_dim_, rope_at, table_cos, table_sin);
       } else {
-        backend_->rope_neox(q_s, n_s, n_head_, head_dim_, at_pos, rope_cos_, rope_sin_);
-        backend_->rope_neox(k_s, n_s, n_head_kv_, head_dim_, at_pos, rope_cos_, rope_sin_);
+        backend_->rope_neox(q_s, n_s, n_head_, head_dim_, rope_at, table_cos, table_sin);
+        backend_->rope_neox(k_s, n_s, n_head_kv_, head_dim_, rope_at, table_cos, table_sin);
       }
     }
 

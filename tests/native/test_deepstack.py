@@ -85,31 +85,40 @@ def engine_tool_path() -> pathlib.Path:
     return repository_root() / "build" / "pocketllm-forward-embd"
 
 
-def _oracle_logits(rows: np.ndarray, tmp: pathlib.Path) -> np.ndarray:
-    """llama.cpp's logits for an embeddings batch, one row per token."""
+def _oracle_logits(rows: np.ndarray, tmp: pathlib.Path,
+                   positions: pathlib.Path | None = None) -> np.ndarray:
+    """llama.cpp's logits for an embeddings batch, one row per token.
+
+    `positions`, when given, is the file `oracle.cpp --positions` takes: four
+    sections consecutive within a token.  Without it every section gets the
+    token's own index, which is what a text batch means.
+    """
     if not oracle_tool_path().is_file():
         compile_tool()
     path = tmp / "embeddings.bin"
     path.write_bytes(np.ascontiguousarray(rows, dtype=np.float32).tobytes())
+    command = [str(oracle_tool_path()), str(CHECKPOINT), "--embeddings", str(path)]
+    if positions is not None:
+        command += ["--positions", str(positions)]
     result = subprocess.run(
-        [str(oracle_tool_path()), str(CHECKPOINT), "--embeddings", str(path)],
-        capture_output=True,
-        text=True,
+        command, capture_output=True, text=True
     )
     if result.returncode != 0:
         raise RuntimeError(f"the oracle refused the embeddings batch: {result.stderr.strip()}")
     return np.array(json.loads(result.stdout)["logits"], dtype=np.float64)
 
 
-def _engine_logits(planes: np.ndarray, tmp: pathlib.Path) -> np.ndarray:
+def _engine_logits(planes: np.ndarray, tmp: pathlib.Path,
+                   positions: pathlib.Path | None = None) -> np.ndarray:
     """This engine's logits for the same numbers, in its own plane-major layout."""
     path = tmp / "planes.bin"
     out = tmp / "logits.bin"
     path.write_bytes(np.ascontiguousarray(planes, dtype=np.float32).tobytes())
+    command = [str(engine_tool_path()), str(CHECKPOINT), str(path), str(out)]
+    if positions is not None:
+        command += ["--positions", str(positions)]
     result = subprocess.run(
-        [str(engine_tool_path()), str(CHECKPOINT), str(path), str(out)],
-        capture_output=True,
-        text=True,
+        command, capture_output=True, text=True
     )
     if result.returncode != 0:
         raise RuntimeError(f"pocketllm-forward-embd failed: {result.stderr.strip()}")

@@ -176,9 +176,22 @@ class Qwen3Model {
    * input row interleaves the levels per token -- the two are a transpose of the
    * plane axis, and stating it here means no caller has to unpack anything.
    *
+   * **`positions` is four integers per token.**  A `qwen3vl` text graph is a
+   * multi-section rotary model: its pairs are partitioned into sections, and each
+   * section takes its angle from *its own* position, so an image patch can carry
+   * two coordinates where a text token carries its own index four times.
+   * `positions[token * 4 + section]` is section 0..3 as llama.cpp names them --
+   * (t, y, x, z) -- and passing null means "every section is the token's own
+   * index", which is exactly what a text batch means.
+   *
+   * A checkpoint that declares no sections ignores it entirely: its rotary is
+   * the ordinary one-dimensional kind and a null `positions` is the only legal
+   * value.
+   *
    * Only the single-sequence path takes embeddings; a batch of them is not a
    * shape anything asks for yet and is refused by name. */
-  kernel::DeviceBuffer forward_embeddings(const float *planes, int64_t n, int64_t start_pos);
+  kernel::DeviceBuffer forward_embeddings(const float *planes, const int64_t *positions, int64_t n,
+                                          int64_t start_pos);
 
   /* How many deepstack levels this checkpoint's input carries, from its own
    * metadata.  Zero for every architecture that has none. */
@@ -315,8 +328,31 @@ class Qwen3Model {
    * runs exactly once with sequence 0's own start position, and the op stream
    * is the one the graph has always issued. */
   kernel::DeviceBuffer forward_impl(const int32_t *tokens, const float *planes,
+                                    const int64_t *positions,
                                     const int64_t *n_per_seq, const int64_t *start_pos,
                                     int64_t n_seq);
+  /* Build `mrope_cos_`/`mrope_sin_`: one rotary row per token, from a position
+   * per section.  A null `positions` means every section is the token's own
+   * index. */
+  void build_rope_for_tokens(const int64_t *positions, int64_t n);
+  /* The four run the multi-section rotary from: section `s`'s pairs take their
+   * angle from position `s`, each with the same frequency ramp.  All zero for a
+   * checkpoint whose rotary is the ordinary one-dimensional kind, which is every
+   * architecture but `qwen3vl`. */
+  int64_t rope_sections_[4] = {0, 0, 0, 0};
+  /* Which of the two multi-section assignments this checkpoint's rotary uses.
+   * `qwen3vl` is the *interleaved* one -- llama.cpp maps `QWEN3VL` and
+   * `QWEN3VLMOE` to `GGML_ROPE_TYPE_IMROPE` -- where the section a pair belongs
+   * to cycles rather than running in blocks.  The two agree on every token whose
+   * four positions are equal, which is why a text batch cannot tell them apart
+   * and why this is a flag only the image span reads. */
+  bool imrope_ = false;
+  /* The per-token rotary table the embeddings path builds, beside the
+   * position-indexed one the token path uses.  Separate buffers because the two
+   * are indexed by different things -- a position and a token -- and a session
+   * that ran a prompt and then an image would otherwise reindex the one the other
+   * path still reads. */
+  kernel::DeviceBuffer mrope_cos_, mrope_sin_;
   void build_rope_table();
   void grow_rope_table(int64_t positions);
 

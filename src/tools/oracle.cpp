@@ -138,7 +138,7 @@ std::vector<float> read_floats(const std::string &path) {
  * axis, so a caller transposes one into the other and nothing else has to move.
  */
 int run_embeddings(llama_context *ctx, const llama_model *model, const std::string &path,
-                   int32_t n_vocab) {
+                   const std::string &positions_path, int32_t n_vocab) {
   const int32_t row = llama_model_n_embd_inp(model);
   std::vector<float> data = read_floats(path);
   if (row <= 0 || data.empty() || data.size() % static_cast<std::size_t>(row) != 0) {
@@ -170,9 +170,35 @@ int run_embeddings(llama_context *ctx, const llama_model *model, const std::stri
   std::vector<llama_seq_id> seq_id_0(1, 0);
   std::vector<llama_seq_id *> seq_ids(static_cast<std::size_t>(n_tokens), seq_id_0.data());
   std::vector<int8_t> logit_flags(static_cast<std::size_t>(n_tokens), 0);
+  /* The caller's positions if it has any: `n_tokens * 4` int32 with the four
+   * sections consecutive within a token, which is the layout the engine's own
+   * tool takes, written here into the section-blocked one this batch needs.  A
+   * token whose sections disagree -- a patch with a row and a column -- is the
+   * whole reason the mode exists; without a file every section gets the token's
+   * index, which is what a text batch means. */
+  std::vector<int32_t> given;
+  if (!positions_path.empty()) {
+    std::FILE *file = std::fopen(positions_path.c_str(), "rb");
+    if (file == nullptr) {
+      std::fprintf(stderr, "cannot open '%s'\n", positions_path.c_str());
+      return 2;
+    }
+    int32_t chunk[8192];
+    std::size_t read = 0;
+    while ((read = std::fread(chunk, sizeof(int32_t), 8192, file)) > 0) {
+      given.insert(given.end(), chunk, chunk + read);
+    }
+    std::fclose(file);
+    if (given.size() != static_cast<std::size_t>(n_tokens) * kSections) {
+      std::fprintf(stderr, "'%s' is %zu integers, and %d tokens need four each\n",
+                   positions_path.c_str(), given.size(), n_tokens);
+      return 2;
+    }
+  }
   for (int32_t i = 0; i < n_tokens; ++i) {
     for (int32_t section = 0; section < kSections; ++section) {
-      pos[static_cast<std::size_t>(section) * n_tokens + i] = i;
+      pos[static_cast<std::size_t>(section) * n_tokens + i] =
+          given.empty() ? i : given[static_cast<std::size_t>(i) * kSections + section];
     }
     logit_flags[static_cast<std::size_t>(i)] = (i == n_tokens - 1) ? 1 : 0;
   }
@@ -212,6 +238,7 @@ int main(int argc, char **argv) {
   const char *model_path = argv[1];
   std::vector<llama_token> tokens;
   std::string embeddings_path;
+  std::string positions_path;
   int steps = 0;
   /* The full-softmax convention by default -- see the file header for what the
    * two conventions disagree about and why the CPU path needs this one. */
@@ -245,6 +272,8 @@ int main(int argc, char **argv) {
       }
     } else if (std::string(argv[i]) == "--embeddings" && i + 1 < argc) {
       embeddings_path = argv[++i];
+    } else if (std::string(argv[i]) == "--positions" && i + 1 < argc) {
+      positions_path = argv[++i];
     } else {
       tokens.push_back(static_cast<llama_token>(std::strtol(argv[i], nullptr, 10)));
     }
@@ -309,7 +338,12 @@ int main(int argc, char **argv) {
       std::fprintf(stderr, "--embeddings takes no tokens: the two are different inputs\n");
       return 2;
     }
-    return run_embeddings(ctx, model, embeddings_path, n_vocab);
+    return run_embeddings(ctx, model, embeddings_path, positions_path, n_vocab);
+  }
+  if (!positions_path.empty()) {
+    std::fprintf(stderr, "--positions is for the embeddings mode; a token batch takes positions "
+                         "from the cache\n");
+    return 2;
   }
 
   /* The prompt in one batch, exactly as the logits mode does it. Only the last
