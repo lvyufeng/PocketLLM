@@ -157,6 +157,37 @@ class Qwen3Model {
    * call. It is *not* host memory: read it with the backend's `copy_to_host`. */
   kernel::DeviceBuffer forward(const int32_t *tokens, int64_t n, int64_t start_pos);
 
+  /* Run `n` tokens from *caller-supplied input embeddings* rather than from the
+   * token table, and return the last one's logits.
+   *
+   * This is the door a vision model comes in through.  A `qwen3vl` checkpoint
+   * carries `n_deepstack_layers` extra feature levels, and the text graph's input
+   * width is `n_embd * (1 + n_deepstack_layers)` rather than `n_embd`: the first
+   * `n_embd` of a token's row is the embedding the first block reads, and each of
+   * the remaining levels is added to that token's residual *after* one of the
+   * first `n_deepstack_layers` blocks.  An image token's base row is the vision
+   * tower's merged features; a text token's is its token-table row, and llama.cpp
+   * pads that with zeros -- which is the same as not injecting at all, so the
+   * token path around this one is unchanged.
+   *
+   * `planes` is **plane-major**: `n_planes()` buffers of `n * n_embd` floats, one
+   * after another, in the order plane 0 (the base) then the levels.  That is the
+   * layout `Qwen3VlVision::encode` produces, and it is *not* llama.cpp's, whose
+   * input row interleaves the levels per token -- the two are a transpose of the
+   * plane axis, and stating it here means no caller has to unpack anything.
+   *
+   * Only the single-sequence path takes embeddings; a batch of them is not a
+   * shape anything asks for yet and is refused by name. */
+  kernel::DeviceBuffer forward_embeddings(const float *planes, int64_t n, int64_t start_pos);
+
+  /* How many deepstack levels this checkpoint's input carries, from its own
+   * metadata.  Zero for every architecture that has none. */
+  int64_t n_deepstack_layers() const { return n_deepstack_; }
+
+  /* The width of one input row: `n_embd * (1 + n_deepstack_layers())`.  What a
+   * caller of `forward_embeddings` has to supply per token. */
+  int64_t n_embd_inp() const { return n_embd_ * (1 + n_deepstack_); }
+
   /* The Stage-1 batch decode.  `n_seq` sequences run in one pass, each
    * contributing `n_per_seq[s]` tokens (the decode path contributes one per
    * sequence), and the weight-reading GEMMs run once at `m = sum(n_per_seq)`
@@ -283,8 +314,9 @@ class Qwen3Model {
    * copy that can drift from the batched one: at n_seq == 1 every loop below
    * runs exactly once with sequence 0's own start position, and the op stream
    * is the one the graph has always issued. */
-  kernel::DeviceBuffer forward_impl(const int32_t *tokens, const int64_t *n_per_seq,
-                                    const int64_t *start_pos, int64_t n_seq);
+  kernel::DeviceBuffer forward_impl(const int32_t *tokens, const float *planes,
+                                    const int64_t *n_per_seq, const int64_t *start_pos,
+                                    int64_t n_seq);
   void build_rope_table();
   void grow_rope_table(int64_t positions);
 
@@ -294,6 +326,10 @@ class Qwen3Model {
    * shape is the model's (n_embd, n_head, ...) and reallocating them per
    * forward would touch the allocator several times per token. */
   kernel::DeviceBuffer x_, x_norm_, q_, k_, v_, attn_, gate_, up_, ffn_, last_, logits_;
+  /* One `m * n_embd` buffer per deepstack level, holding the caller's planes for
+   * the batch in flight.  Empty when the checkpoint has no levels, which is every
+   * checkpoint but `qwen3vl`. */
+  std::vector<kernel::DeviceBuffer> deepstack_planes_;
   kernel::DeviceBuffer scores_;
   kernel::DeviceBuffer tokens_;
   kernel::DeviceBuffer rope_cos_, rope_sin_;
@@ -357,6 +393,10 @@ class Qwen3Model {
 
   int64_t n_embd_ = 0, n_layer_ = 0, n_head_ = 0, n_head_kv_ = 0, head_dim_ = 0, n_ff_ = 0;
   int64_t n_vocab_ = 0, capacity_ = 0;
+  /* How many deepstack levels the input carries.  Zero for every architecture
+   * that has none, and the reason `forward_embeddings` exists at all: it is the
+   * only thing that makes the graph's input wider than its hidden state. */
+  int64_t n_deepstack_ = 0;
   float rms_eps_ = 1e-6F;
   float rope_theta_ = 10000.0F;
 

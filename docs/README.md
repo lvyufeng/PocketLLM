@@ -58,7 +58,10 @@ They also run **`qwen3vl`**: Qwen3-VL-2B's **text half** is checked the same way
 a card), and the **vision tower** that ships beside it in the `mmproj` file runs as well — checked
 against llama.cpp's own tower through `libmtmd`, on a 768×768 image, with the token order, the
 position table and the rotary pinned exactly and the numbers compared across the two engines' widths.
-The image path into the text graph is what is still missing.
+The text graph's half of the path is in too — its input widens by the tower's deepstack levels and
+`forward_embeddings` feeds them, checked against llama.cpp's own embeddings path. What is missing is
+the image's own shape: the preprocessing's resize, the image span's 2-D rotary positions and
+non-causal attention, and an ABI entry point that takes an image.
 
 **Reference throughput — Qwen3-1.7B, `q4_k_m`, against llama.cpp:** the CPU path is **1.04× on
 prefill and 1.37× on decode** (ahead on both); the CUDA path is 0.11× / 0.40× and deliberately
