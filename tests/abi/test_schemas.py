@@ -30,6 +30,7 @@ EXPECTED_OPS = frozenset(
         "rms_norm",
         "layer_norm",
         "silu_mul",
+        "gelu",
         "add",
         "mul",
         "softmax",

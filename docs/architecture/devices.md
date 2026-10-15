@@ -9,7 +9,7 @@ milestone — the shape is complete and the pending work is visible.
 
 ```console
 $ pocketllm devices
-reference  cpu       available                     eager only        17 ops
+reference  cpu       available                     eager only        18 ops
 cpu        cpu       available                     eager only        16 ops
 mps        mps       missing torch>=2.2 with an MPS device  eager only        16 ops
 cuda       cuda      available                     stream_capture    17 ops

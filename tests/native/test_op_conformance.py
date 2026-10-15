@@ -398,6 +398,10 @@ DEVICE_EXCLUDED_CASES: dict[str, dict[str, str]] = {
         "layer_norm": "ascend: layer_norm is not implemented (the custom-op set has RmsNorm* only)",
         "layer_norm_no_bias": "ascend: layer_norm is not implemented (the custom-op set has RmsNorm* only)",
         "layer_norm_large_mean": "ascend: layer_norm is not implemented (the custom-op set has RmsNorm* only)",
+        # The vision tower's activation: the vendor's set has `silu_mul` and no
+        # GELU, and the backend refuses it by name rather than substituting.
+        "gelu": "ascend: gelu is not implemented (the custom-op set has silu_mul only)",
+        "gelu_large_magnitudes": "ascend: gelu is not implemented (the custom-op set has silu_mul only)",
         "topk_sample": "ascend: topk_sample not implemented yet",
         "topk_sample_uniform_on_a_boundary": "ascend: topk_sample not implemented yet",
         "topk_sample_min_p": "ascend: topk_sample not implemented yet",
@@ -872,6 +876,35 @@ def case_silu_mul(rng):
     return ({"gate": gate, "up": up}, {}, ref.silu_mul(gate, up))
 
 
+def case_gelu(rng):
+    """The vision tower's activation, over a width its MLP uses.
+
+    `ref.gelu` is the **tanh** form -- `clip.use_gelu` is what the tower's GGUF
+    says, and llama.cpp builds that with `FFN_GELU`, whose CPU implementation is
+    `0.5x(1+tanh(sqrt(2/pi)(x+0.044715x^3)))`.  The erf form is a different op
+    there and parts from this one by ~1e-3 relative near `|x| = 2`.
+    """
+    x = rng.standard_normal((3, 1024), dtype=np.float32) * 2.0
+    return ({"x": x}, {}, ref.gelu(x))
+
+
+def case_gelu_large_magnitudes(rng):
+    """The two limits the tanh form reaches on its own, plus the range where the
+    three GELU approximations disagree.
+
+    `-60` maps to 0 and `+60` to itself; a `tanh` that overflowed, or the
+    *quick* approximation (`x * sigmoid(1.702x)`, a third function) would part
+    from the reference in the middle of this row and nowhere else.
+    """
+    x = np.concatenate(
+        [
+            np.array([-60.0, -20.0, -10.0, -1.0, 0.0, 1.0, 10.0, 20.0, 60.0], dtype=np.float32),
+            rng.standard_normal(7, dtype=np.float32),
+        ]
+    ).reshape(1, 16)
+    return ({"x": x}, {}, ref.gelu(x))
+
+
 def case_silu_mul_large_negative(rng):
     """A gate of -50.  `silu(-50)` is -1e-22 to f32, and a kernel that takes the
     obvious `g / (1 + exp(-g))` overflows `exp(50)` on the way there -- both
@@ -1238,6 +1271,8 @@ CASES = {
     "embedding_quant_iq2_xs": case_embedding_quant_iq2_xs,
     "silu_mul": case_silu_mul,
     "silu_mul_large_negative": case_silu_mul_large_negative,
+    "gelu": case_gelu,
+    "gelu_large_magnitudes": case_gelu_large_magnitudes,
     "rope_start_zero": case_rope_start_zero,
     "rope_start_pos_offsets": case_rope_start_pos_offsets,
     "rope_small_head_dim": case_rope_small_head_dim,
@@ -1295,6 +1330,8 @@ OP_OF_CASE = {
     "embedding_quant_iq2_xs": "embedding_quant",
     "silu_mul": "silu_mul",
     "silu_mul_large_negative": "silu_mul",
+    "gelu": "gelu",
+    "gelu_large_magnitudes": "gelu",
     "rope_start_zero": "rope",
     "rope_start_pos_offsets": "rope",
     "rope_small_head_dim": "rope",

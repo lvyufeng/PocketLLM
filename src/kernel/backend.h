@@ -135,6 +135,9 @@ class Backend {
 
   virtual void silu_mul(DeviceBuffer gate, DeviceBuffer up, DeviceBuffer out, int64_t n) = 0;
 
+  /* The tanh-approximated GELU, as `kernels.h` documents it. */
+  virtual void gelu(DeviceBuffer x, DeviceBuffer out, int64_t n) = 0;
+
   /* RoPE, split-half layout, as `kernels.h` documents it. */
   virtual void rope_neox(DeviceBuffer x, int64_t n_tokens, int64_t n_heads, int64_t d,
                          int64_t start_pos, DeviceBuffer cos_table, DeviceBuffer sin_table) = 0;

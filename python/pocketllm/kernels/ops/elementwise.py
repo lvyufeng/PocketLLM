@@ -45,4 +45,13 @@ _SOFTMAX = OpSchema(
     semantics="normalize exp(x) along the last axis",
 )
 
-SCHEMAS = (_ADD, _MUL, _SOFTMAX)
+_GELU = OpSchema(
+    name="gelu",
+    args=(ArgSpec("x", Kind.TENSOR, shape=("m", "n")),),
+    returns=(ArgSpec("out", Kind.TENSOR, shape=("m", "n")),),
+    dtypes=_FLOAT,
+    shape_rule=lambda shapes, attrs: [shapes["x"]],
+    semantics="out = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))",
+)
+
+SCHEMAS = (_ADD, _MUL, _SOFTMAX, _GELU)
