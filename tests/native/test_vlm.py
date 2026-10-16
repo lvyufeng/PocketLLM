@@ -49,15 +49,28 @@ and each elimination is worth more than the bound it replaces:
     `mtmd_helper_image_get_decoder_pos`, including the row/column order and the
     `span_start` base.
   - **The tower.**  `--planes` removes it and the gap barely moves.
+  - **The rotary itself.**  The engine's per-token table was recovered angle by
+    angle and compared with `ggml_rope_multi`'s: every pair agrees to 6e-8, which is
+    float32 rounding.  Same section assignment, same ramp, same base.  (Getting
+    there took two attempts, and the first reported 199% -- a comparison measured
+    against a misaligned input, which is the failure mode this file's own history
+    warns about.  The angles are recoverable without ggml exposing its cache: feed
+    the rotation a vector that is 1 in both members of every pair, and
+    `atan2(out[p+half] - out[p], out[p+half] + out[p])` is the angle.)
 
 What is left, and it is a *lead rather than a diagnosis*: the span batch's
 activation **diverges with depth**.  Dumping its last row per block gives 3.5e3 at
 block 0, 2.0e4 at block 12, 3.7e5 at block 20 and 6.2e6 at block 27, where the
 reference's final hidden for the same batch is 1.8e4 -- a factor of 340, growing
 exponentially from about block 13.  The plain token path does not do that (it
-reaches 7.3e3 by block 7, the same order as the reference), so the fault is in
-something only the span batch does: its per-token rotary table, its positions, or
-the 576-row append interacting with the attention window.
+reaches 7.3e3 by block 7, the same order as the reference).
+
+So the fault is in something only the span batch does, and the next probe is the
+one that has not been run: the span batch's **Q, K and V as the engine actually
+produces them**, post-projection and post-rotary, against llama.cpp's for the same
+block -- rather than the table the rotary is run from, which is now known good.
+The 576-row append interacting with the attention window is the other candidate,
+and both are decided by the same comparison.
 
 The case below asserts the facts that *are* settled (the token flow, and the span's
 position count) and records that the logits do not yet match, rather than pretending
