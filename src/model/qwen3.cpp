@@ -970,6 +970,18 @@ kernel::DeviceBuffer Qwen3Model::forward_embeddings(const float *planes, const i
   return forward_impl(/*tokens=*/nullptr, planes, positions, n_per_seq, starts, 1, non_causal);
 }
 
+kernel::DeviceBuffer Qwen3Model::forward_positions(const int32_t *tokens, const int64_t *positions,
+                                                   int64_t n, int64_t start_pos) {
+  if (start_pos != cache_length()) {
+    throw Error("forward at position " + std::to_string(start_pos) + " but the cache holds " +
+                std::to_string(cache_length()) + " positions");
+  }
+  const int64_t n_per_seq[1] = {n};
+  const int64_t starts[1] = {start_pos};
+  return forward_impl(tokens, /*planes=*/nullptr, positions, n_per_seq, starts, 1,
+                      /*non_causal=*/false);
+}
+
 kernel::DeviceBuffer Qwen3Model::forward_batch(const int32_t *tokens, const int64_t *n_per_seq,
                                                int64_t n_seq) {
   if (n_seq <= 0) {
@@ -1040,6 +1052,14 @@ kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const float
                                planes + (level + 1) * m * n_embd_, m * n_embd_ * 4);
     }
     build_rope_for_tokens(positions, m);
+  } else if (positions != nullptr) {
+    /* A token batch whose positions are not its cache slots: an image span makes
+     * the two differ for everything after it.  The gather is still a gather --
+     * the only thing this branch changes is where the rotary angles come from --
+     * so both must happen or `x_` keeps whatever the previous call left in it. */
+    backend_->copy_to_device(tokens_, tokens, m * 4);
+    embed(tokens_, m, x_);
+    build_rope_for_tokens(positions, m);
   } else {
     /* The whole batch's token ids go to the device once and are gathered on the
      * device; only the ids cross the bus, not the embedding rows they select. */
@@ -1078,13 +1098,14 @@ kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const float
      * and the cache position has nothing to do with the angle.  The cache
      * position still drives the KV append below, which is why the two are
      * separate variables rather than one. */
-    const kernel::DeviceBuffer table_cos = planes != nullptr ? mrope_cos_ : rope_cos_;
-    const kernel::DeviceBuffer table_sin = planes != nullptr ? mrope_sin_ : rope_sin_;
+    const bool per_token_rope = positions != nullptr;
+    const kernel::DeviceBuffer table_cos = per_token_rope ? mrope_cos_ : rope_cos_;
+    const kernel::DeviceBuffer table_sin = per_token_rope ? mrope_sin_ : rope_sin_;
     for (int64_t s = 0; s < n_seq; ++s) {
       const int64_t n_s = n_per_seq[static_cast<std::size_t>(s)];
       const int64_t row = cum[static_cast<std::size_t>(s)];
       const int64_t at_pos = start_pos[static_cast<std::size_t>(s)];
-      const int64_t rope_at = planes != nullptr ? 0 : at_pos;
+      const int64_t rope_at = per_token_rope ? 0 : at_pos;
       kernel::DeviceBuffer q_s{q_.handle + static_cast<uintptr_t>(row * n_head_ * head_dim_ * 4),
                                n_s * n_head_ * head_dim_ * 4};
       kernel::DeviceBuffer k_s{k_.handle + static_cast<uintptr_t>(row * kv_width * 4),

@@ -117,6 +117,12 @@ class Qwen3VlVision {
   int64_t image_size() const { return image_size_; }
   /* How many image tokens one image becomes: the merged patch count. */
   int64_t n_tokens() const { return n_tokens_; }
+  /* How many merged cells an image is across, which is both the grid the rotary
+   * positions are indexed by and the number of *positions* the span consumes --
+   * llama.cpp's multi-section rotary gives a span `max(nx, ny)` of them for
+   * `nx * ny` tokens, so an image is much cheaper in positions than in tokens and
+   * the text after it continues from `start_of_span + this`. */
+  int64_t merged_side() const { return merged_side_; }
   /* Floats per token per plane, from `projection_dim`. */
   int64_t projection_dim() const { return projection_dim_; }
   /* How many planes one image produces: the base features and one per deepstack

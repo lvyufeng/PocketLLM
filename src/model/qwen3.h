@@ -157,6 +157,24 @@ class Qwen3Model {
    * call. It is *not* host memory: read it with the backend's `copy_to_host`. */
   kernel::DeviceBuffer forward(const int32_t *tokens, int64_t n, int64_t start_pos);
 
+  /* `forward`, with each token's rotary positions given rather than taken from
+   * its cache position.
+   *
+   * The two are the same thing for a text prompt and *not* for a sequence that
+   * has an image in it: an image span is 576 tokens that occupy 24 positions --
+   * llama.cpp's multi-section rotary gives the span's patches one temporal
+   * position and their row and column for the rest -- so the text after it
+   * continues from `start_of_span + 24` while the cache has 576 more rows in it.
+   * A caller driving `mtmd`'s chunk-by-chunk flow needs both numbers and this is
+   * how it says so; `positions` is the same `token * 4 + section` layout
+   * `forward_embeddings` takes.
+   *
+   * A checkpoint with no `rope.dimension_sections` has one position per token and
+   * treats all four the same way, so a caller may pass its own index in all four
+   * or null -- there is nothing for the section machinery to do. */
+  kernel::DeviceBuffer forward_positions(const int32_t *tokens, const int64_t *positions, int64_t n,
+                                         int64_t start_pos);
+
   /* Run `n` tokens from *caller-supplied input embeddings* rather than from the
    * token table, and return the last one's logits.
    *
