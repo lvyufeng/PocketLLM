@@ -269,8 +269,18 @@ def test_the_composition_is_what_is_missing(tmp_path: pathlib.Path) -> None:
     reference = run_oracle(MMPROJ, TEXT_MODEL, picture, PROMPT)
     want = reference["logits"]
 
-    # The tower's own features, written where `--planes` can read them: this is the
-    # bisect, and producing it here keeps the case to one image and one reference.
+    # The engine's *own* tower features, written where `--planes` can read them.
+    #
+    # **What this bisect does and does not rule out, stated carefully because an
+    # earlier revision of this comment overstated it.**  `pocketllm-vision` runs the
+    # tower, so the features come from this engine and not from llama.cpp's; they
+    # are close to the reference's (the tower's own case measures them at 2.7e-2 of
+    # the spread) but they are not the reference's.  So this removes the tower's
+    # *graph* from the comparison -- a second run of it, with different planes, no
+    # longer changes the answer -- and it does **not** remove the tower's output
+    # error.  Feeding llama.cpp's own features is a different experiment, and it was
+    # run by hand: the gap barely moved (0.794 against 0.754), which is what makes
+    # the tower's error not the explanation.
     planes, _ = _engine_planes(tmp_path, picture)
     got, _ = _engine(tmp_path, picture, name="bisect", planes=planes)
 
@@ -279,8 +289,8 @@ def test_the_composition_is_what_is_missing(tmp_path: pathlib.Path) -> None:
     assert worst <= 0.05 * spread, (
         f"the engine and the reference disagree by {worst:.4g} over a logit spread of "
         f"{spread:.4g} ({worst / spread:.1%}), correlation {np.corrcoef(want, got)[0, 1]:.3f}, "
-        "with the tower replaced by the reference's own features -- so the remaining "
-        "difference is in the composition of the three calls and not in the tower"
+        "with the tower's graph taken out of the path -- so what remains is in how the "
+        "three calls compose"
     )
 
 
