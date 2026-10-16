@@ -32,12 +32,38 @@ existing case.
 The other half of the disagreement is **not** a bug and is still open.  Feeding the
 engine llama.cpp's *own* image planes -- `--planes`, which takes the tower out of
 the picture -- still disagrees with the reference, so what is missing is in how the
-three calls compose: their positions, their caches or their masks.  The case below
-therefore asserts the facts that *are* settled (the token flow, and the span's
-position count) and records that the logits do not yet match, rather than
-pretending to a bound the path does not meet.  When the composition lands this is
-the file whose assertions tighten, and `test_the_composition_is_what_is_missing`
-is the one that turns into a logits comparison.
+three calls compose.
+
+Four candidates have since been eliminated by measurement rather than by argument,
+and each elimination is worth more than the bound it replaces:
+
+  - **The mask.**  Flipping the span's causal flag moves the engine by ~28% of the
+    spread and the *wrong way* (the shipped causal arm agrees better), against a
+    ~70% gap.  The engine's causal arm is also entry-for-entry identical to the
+    reference's `(y, x)`-lexicographic rule on this grid.
+  - **The cell count.**  The span does append 576 cache rows -- an append of one
+    row would fit a 512-position window and it does not; the boundary is between
+    512 (fails) and 576 (succeeds).  So the engine's own 576-row append is the
+    right layout and the "it should share one slot" reading was wrong.
+  - **The positions.**  The span's four components are element-wise identical to
+    `mtmd_helper_image_get_decoder_pos`, including the row/column order and the
+    `span_start` base.
+  - **The tower.**  `--planes` removes it and the gap barely moves.
+
+What is left, and it is a *lead rather than a diagnosis*: the span batch's
+activation **diverges with depth**.  Dumping its last row per block gives 3.5e3 at
+block 0, 2.0e4 at block 12, 3.7e5 at block 20 and 6.2e6 at block 27, where the
+reference's final hidden for the same batch is 1.8e4 -- a factor of 340, growing
+exponentially from about block 13.  The plain token path does not do that (it
+reaches 7.3e3 by block 7, the same order as the reference), so the fault is in
+something only the span batch does: its per-token rotary table, its positions, or
+the 576-row append interacting with the attention window.
+
+The case below asserts the facts that *are* settled (the token flow, and the span's
+position count) and records that the logits do not yet match, rather than pretending
+to a bound the path does not meet.  When the composition lands this is the file
+whose assertions tighten, and `test_the_composition_is_what_is_missing` is the one
+that turns into a logits comparison.
 """
 
 from __future__ import annotations

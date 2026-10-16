@@ -111,6 +111,19 @@ simplification, and both were measured rather than read:
     them overwrite each other.  Keeping it equal to the token's index is both what the convention is
     and what makes the two engines comparable at all, since this one keys its cache by the token's
     place in the batch.
+  - **The fourth component is zero, and it is not inert.**  A *text* token is `(p, p, p, 0)`, not
+    `(p, p, p, p)`: `llama-batch.cpp` broadcasts one position into the first three sections and
+    `llm_graph_input_pos::set_input` zeroes the fourth, and a span's patches are `(t, row, col, 0)`
+    because `mtmd_helper_image_get_decoder_pos` emits that.  On this checkpoint's `[24, 20, 20, 0]`
+    sections **two of the 64 rotating pairs** -- the ones past the last declared section, which fall
+    through to the fourth under `GGML_ROPE_TYPE_IMROPE` -- read that component, so an index there
+    rotates them by an angle the reference never uses.
+
+    The last of those was found by comparing against a third implementation after
+    `test_rope_multi.py` and `test_image_span.py` had both passed for a while: each fed the *same*
+    wrong fourth component to both engines, which made the comparison agree on an answer that matched
+    neither.  Two implementations that share a convention are not a check on it, and a docstring that
+    called the section unreachable is what let it stand.
 
 `tests/native/test_rope_multi.py` checks it against llama.cpp's own graph over the positions a real
 2x2 patch block would carry, at the same bound the token path is compared at on this checkpoint.

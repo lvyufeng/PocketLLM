@@ -723,8 +723,22 @@ void Qwen3Model::build_rope_for_tokens(const int64_t *positions, int64_t n) {
   for (int64_t token = 0; token < n; ++token) {
     float running[4] = {0.0F, 0.0F, 0.0F, 0.0F};
     for (int section = 0; section < 4; ++section) {
+      /* A *text* token is `(p, p, p, 0)`, and the fourth component is load-bearing
+       * on a checkpoint whose declared sections do not cover the whole head: under
+       * `GGML_ROPE_TYPE_IMROPE` the pairs past the last section fall through to the
+       * fourth, so a token's own index there would rotate pairs the reference
+       * leaves at zero.  This checkpoint's sections are `[24, 20, 20, 0]`, so
+       * sectors 61 and 62 -- two of its 64 rotating pairs -- are exactly those.
+       * The reference's own construction is `llama-batch.cpp`'s broadcast of one
+       * position into the first three sections followed by
+       * `llm_graph_input_pos::set_input`'s zeroing of the fourth; both read rather
+       * than assumed.
+       *
+       * A checkpoint with no sections at all takes the ordinary 1-D table above
+       * and never reaches here, so this is invisible to every model in this tree
+       * that is not a multi-section one. */
       const int64_t value = positions != nullptr ? positions[token * 4 + section] : token;
-      running[section] = static_cast<float>(value);
+      running[section] = static_cast<float>(section == 3 ? 0 : value);
     }
     for (int64_t pair = 0; pair < half; ++pair) {
       int which = 0;

@@ -61,23 +61,38 @@ PATCH_ID = 785
 def _positions() -> np.ndarray:
     """`(n_tokens, 4)` int32, the four sections consecutive within a token.
 
-    Section order is llama.cpp's `(t, y, x, z)`.  A text token repeats its index in
-    all four, which is the same rotation as the one-dimensional table the token
-    path uses; a patch carries its index as the first component, its row and its
-    column next, and repeats the column in the fourth slot -- unused because this
-    file gives that section no pairs, which is exactly the sort of thing a test
-    should not rely on silently: were it to gain pairs, this case would start
-    measuring them.
+    Section order is llama.cpp's `(t, y, x, z)`.  These are *inputs to both
+    engines*, which is why the values here are a convention this file is free to
+    choose: llama.cpp is handed this array verbatim through its embeddings path and
+    the engine through `forward_embeddings`, so the case compares two
+    implementations of one rotation rather than two readings of one layout.
+
+    What the file must *not* do is describe this array as the layout llama.cpp
+    would produce on its own, and an earlier revision of this docstring did.  The
+    real conventions, both measured: a **patch** carries `(t, row, col, 0)` --
+    `mtmd_helper_image_get_decoder_pos` emits a zero fourth component -- and a
+    **text token** carries `(p, p, p, 0)`, because `llama-batch.cpp` broadcasts one
+    position into the first three sections and `llm_graph_input_pos::set_input`
+    zeroes the fourth.
+
+    That distinction is not cosmetic.  The docstring also used to say the fourth
+    section "has no pairs", and on this checkpoint's `[24, 20, 20, 0]` sections it
+    has exactly two of the 64: the pairs past the last declared section fall
+    through to the fourth component under `GGML_ROPE_TYPE_IMROPE`.  So the fourth
+    value genuinely rotates, which is why `tests/native/test_image_span.py` and the
+    engine's own text path both had a real defect until they were corrected to
+    zero it, and why the case below is written with the zero rather than with a
+    repeated index.
     """
     rows: list[list[int]] = []
     for index in range(len(TEXT_BEFORE)):
-        rows.append([index, index, index, index])
+        rows.append([index, index, index, 0])
     for y, x in PATCH_GRID:
         at = len(rows)
-        rows.append([at, y, x, x])
+        rows.append([at, y, x, 0])
     for _ in TEXT_AFTER:
         at = len(rows)
-        rows.append([at, at, at, at])
+        rows.append([at, at, at, 0])
     return np.array(rows, dtype=np.int32)
 
 
