@@ -160,16 +160,12 @@ disagreement to the bottom split it in two, and the first half was a real bug:
   `tests/native/test_vlm.py`'s first case runs the path twice and compares the two, which needs no
   oracle, no geometry and no tolerance.
 
-- **What is left is the composition, and it is now located rather than merely open.**  With the
-  tower's *graph* taken out of the path (`--planes`, fed the engine's own features so that a second
-  run of the tower no longer changes the answer) the logits are 75% of the spread apart, correlation
-  0.14; feeding llama.cpp's own `mtmd_encode` features instead moves that only to 79% / 0.10 -- no
-  closer -- so the tower's numerics are not the explanation either.  What *does* match, measured: the token sequence
-  (583 tokens for the prompt used, the same ids, `<|vision_start|>` and `<|vision_end|>` around the
-  span), the span's positions (`t = start`, `y = start + row`, `x = start + col`, and **24** positions
-  for 576 tokens where the text after it continues from position 30 --
-  `mtmd_image_tokens_get_decoder_pos`'s convention), and the fact that the span's cache rows and its
-  positions are two different numbers.
+- **The image path's one real defect, and how it was found.**  The gap it produced was 75% of the
+  logit spread at correlation 0.14, and the search for it eliminated thirteen candidates by
+  measurement before the cause turned out to be a cache bug with nothing to do with images.  The
+  eliminations are worth keeping because each is a place the next reader does not have to look, and
+  the tensor comparison that finally pointed at the answer is worth keeping because it is what
+  distinguished "the composition is wrong" from "a buffer is empty".
 
   **A tensor-by-tensor comparison against llama.cpp localises the fault to block 0's attention
   output.**  For the span batch, every input to that attention agrees to float32 noise -- the
@@ -178,26 +174,36 @@ disagreement to the bottom split it in two, and the first half was a real bug:
   off**, in all 576 rows including the first.  The control that makes that conclusive is the
   text-before batch (six tokens), which agrees at every node and every block: the graph, the weights,
   the qk-norms, the rotary, the cache writes and the attention op are all correct on the token path.
-  So the span's queries read the wrong **key set**, and the only step between correct V and wrong
-  attention output is the call itself.
+  So the span's queries read the right keys and got the wrong **values** -- which is what an empty
+  buffer in the key set looks like, and it is exactly what the cause below turned out to be.
 
-  Five candidates have been eliminated by measurement along the way, and each elimination is a place
-  the next reader does not have to look: the **mask** (flipping the span's causal flag moves the
-  engine ~28% of the spread and the wrong way, and the engine's causal arm is entry-for-entry
-  identical to the reference's `(y, x)`-lexicographic rule on this grid); the **cell count** (the span
-  does append 576 cache rows -- `n_ctx` 512 fails and 576 succeeds -- so the engine's layout is right);
-  the **positions** (element-wise identical, row/column order and base included); the **rotary table**
-  (every pair agrees with `ggml_rope_multi` to 6e-8, angles recovered pair by pair); and the **tower**.
+  Thirteen candidates were eliminated by measurement along the way, each one a place the next reader
+  does not have to look; the ones worth naming are the **mask** (flipping the span's causal flag moves
+  the engine ~28% of the spread and the wrong way, and the engine's causal arm is entry-for-entry
+  identical to the reference's `(y, x)`-lexicographic rule on this grid); the **key set and
+  visibility** (per-row set comparison: 0 of 576 span rows differ, 166176/166176 inside the span and
+  169632/169632 with the text before it); the **cell count** (the span does append 576 cache rows --
+  `n_ctx` 512 fails and 576 succeeds -- so the engine's layout is right); the **positions** (element-wise
+  identical, row/column order and base included); the **rotary table** (every pair agrees with
+  `ggml_rope_multi` to 6e-8, angles recovered pair by pair); the **tower** (feeding llama.cpp's own
+  `mtmd_encode` features moves the gap from 0.75 to 0.79 -- no closer); and the **span's inputs**, which
+  the tensor comparison below then showed to be bit-correct anyway.
 
-  What the reference does differently and the engine cannot express is now the working hypothesis: a
-  span slot's **write row and its position label are separate** in llama.cpp -- 576 distinct slots all
-  labelled `t = span_start`, with the text after at `span_start + 24` -- while `forward_impl` passes
-  one integer for both (`6, 7, ... 581`, then `582`).  A batch labelled that way is one llama.cpp
-  *refuses to build* (`for M-RoPE, it is required that X < Y`), and the engine's attention takes a
-  cache **row range**, which cannot express "the keys are the rows labelled at most 6" when all 576
-  span slots share a label.  `test_vlm.py`'s third case asserts the gap as an `xfail` with the
-  measurement in its message, so the tree records where the path stops instead of accepting a bound
-  that an unrelated answer would pass.
+  **The cause was none of them, and it is fixed.**  `ensure_kv`
+  released both KV slabs and reallocated them empty whenever a batch needed more positions than they
+  held -- main's comment said so in as many words, "released and reallocated, not copied" -- so every
+  row below the growth point became a key of zero.  A vision prompt crosses the initial 256-position
+  capacity *inside its image span*, which is why the six `<|vision_start|>` tokens the prompt had just
+  written vanished from the span's key set, and why the tensor comparison found every input to block 0's
+  attention bit-correct while its output was 86% of scale off: that is what reading zeroed keys looks
+  like.  Carrying the rows across the growth moves the logits from **correlation 0.103 to 0.994** and
+  `test_vlm.py`'s third case from an `xfail` to a pass.
+
+  The same defect is reachable from a plain text session -- any decode past 256 positions takes that
+  path, and the failure is silent, because a model that has lost its context and a model that is
+  repeating look the same from outside.  Nothing in this tree crossed 256; the token-path walk is
+  twelve steps.  It is recorded here rather than only in the fix's message because it is the reason
+  every narrower case passed while the whole path did not.
 
 One consequence is worth stating because it cost a wrong conclusion once: the bisect above only means
 something if the bisect *channel* works.  The first attempt at it fed the engine a planes file it could
