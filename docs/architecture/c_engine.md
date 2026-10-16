@@ -160,20 +160,54 @@ disagreement to the bottom split it in two, and the first half was a real bug:
   `tests/native/test_vlm.py`'s first case runs the path twice and compares the two, which needs no
   oracle, no geometry and no tolerance.
 
-- **What is left is the composition, and it is still open.**  With the tower replaced by llama.cpp's
-  own image planes -- so that the tower is out of the picture entirely -- the logits are 70% of the
-  spread apart, correlation 0.13.  What *does* match, measured: the token sequence (583 tokens for the
-  prompt used, the same ids, `<|vision_start|>` and `<|vision_end|>` around the span), the span's
-  positions (`t = start`, `y = start + row`, `x = start + col`, and **24** positions for 576 tokens
-  where the text after it continues from position 30 -- `mtmd_image_tokens_get_decoder_pos`'s
-  convention), and the fact that the span's cache rows and its positions are two different numbers.
-  `test_vlm.py`'s third case asserts the gap as an `xfail` with the measurement in its message, so the
-  tree records where the path stops instead of accepting a bound that an unrelated answer would pass.
+- **What is left is the composition, and it is now located rather than merely open.**  With the
+  tower's *graph* taken out of the path (`--planes`, fed the engine's own features so that a second
+  run of the tower no longer changes the answer) the logits are 75% of the spread apart, correlation
+  0.14; feeding llama.cpp's own `mtmd_encode` features instead moves that only to 79% / 0.10 -- no
+  closer -- so the tower's numerics are not the explanation either.  What *does* match, measured: the token sequence
+  (583 tokens for the prompt used, the same ids, `<|vision_start|>` and `<|vision_end|>` around the
+  span), the span's positions (`t = start`, `y = start + row`, `x = start + col`, and **24** positions
+  for 576 tokens where the text after it continues from position 30 --
+  `mtmd_image_tokens_get_decoder_pos`'s convention), and the fact that the span's cache rows and its
+  positions are two different numbers.
+
+  **A tensor-by-tensor comparison against llama.cpp localises the fault to block 0's attention
+  output.**  For the span batch, every input to that attention agrees to float32 noise -- the
+  activation is bit-identical to the reference's `embd`, the post-norm is 4.8e-07, Q is 8.3e-07, K
+  after the rotary 1.5e-04 and V 2.4e-07 -- while the attention output is **86% of its own scale
+  off**, in all 576 rows including the first.  The control that makes that conclusive is the
+  text-before batch (six tokens), which agrees at every node and every block: the graph, the weights,
+  the qk-norms, the rotary, the cache writes and the attention op are all correct on the token path.
+  So the span's queries read the wrong **key set**, and the only step between correct V and wrong
+  attention output is the call itself.
+
+  Five candidates have been eliminated by measurement along the way, and each elimination is a place
+  the next reader does not have to look: the **mask** (flipping the span's causal flag moves the
+  engine ~28% of the spread and the wrong way, and the engine's causal arm is entry-for-entry
+  identical to the reference's `(y, x)`-lexicographic rule on this grid); the **cell count** (the span
+  does append 576 cache rows -- `n_ctx` 512 fails and 576 succeeds -- so the engine's layout is right);
+  the **positions** (element-wise identical, row/column order and base included); the **rotary table**
+  (every pair agrees with `ggml_rope_multi` to 6e-8, angles recovered pair by pair); and the **tower**.
+
+  What the reference does differently and the engine cannot express is now the working hypothesis: a
+  span slot's **write row and its position label are separate** in llama.cpp -- 576 distinct slots all
+  labelled `t = span_start`, with the text after at `span_start + 24` -- while `forward_impl` passes
+  one integer for both (`6, 7, ... 581`, then `582`).  A batch labelled that way is one llama.cpp
+  *refuses to build* (`for M-RoPE, it is required that X < Y`), and the engine's attention takes a
+  cache **row range**, which cannot express "the keys are the rows labelled at most 6" when all 576
+  span slots share a label.  `test_vlm.py`'s third case asserts the gap as an `xfail` with the
+  measurement in its message, so the tree records where the path stops instead of accepting a bound
+  that an unrelated answer would pass.
 
 One consequence is worth stating because it cost a wrong conclusion once: the bisect above only means
 something if the bisect *channel* works.  The first attempt at it fed the engine a planes file it could
 not read and reported the resulting zeros as evidence that the composition was at fault -- which was,
-by then, a claim about the instrument rather than about the engine.
+by then, a claim about the instrument rather than about the engine.  The same failure recurred at the
+next level up: comparing the two engines' per-block tensors requires (a) driving both from the same
+inputs, (b) reading a node row-by-row with its own stride -- the `embd` node is a 2048-wide view of an
+8192-wide row, and reading it flat fabricates an 18.68 disagreement -- and (c) not assuming that a
+`cb_eval` node's *record* order is its pipeline order, since `Qcur` is recorded pre-norm and `Kcur`
+post-rotary.
 
 That is where the image path stops today.  The preprocessing's resize is also not here -- the tower
 takes the checkpoint's own `image_size` square and refuses anything else by name, because
