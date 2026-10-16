@@ -215,11 +215,33 @@ inputs, (b) reading a node row-by-row with its own stride -- the `embd` node is 
 `cb_eval` node's *record* order is its pipeline order, since `Qcur` is recorded pre-norm and `Kcur`
 post-rotary.
 
-That is where the image path stops today.  The preprocessing's resize is also not here -- the tower
-takes the checkpoint's own `image_size` square and refuses anything else by name, because
-interpolating the position table is separate arithmetic (a bicubic resample) nothing else in this tree
-needs yet -- and there is no ABI entry point that takes an image at all.  `libmtmd` remains the oracle
-for the whole of it.
+**The preprocessing is in as well, and it is two resamplers rather than one.**  The tower's front end
+used to refuse anything but the checkpoint's own `image_size` square; it now takes any shape, because
+the reference does.  Two separate pieces of arithmetic were missing and they are deliberately different
+from each other:
+
+  - **Choosing a size is `calc_size_preserved_ratio`**, not an aspect fit.  The input is rounded onto
+    the `patch * merge` grid and *then* clamped by the checkpoint's own pixel limits, so `800x600`
+    becomes `800x608`, `3000x2000` becomes `2496x1664`, and `64x64` grows to `96x96`.  What makes it a
+    contract rather than a convenience is that the token count is `(nx / 32) * (ny / 32)`: a different
+    target size is a different prompt, not an approximate one.
+  - **The pixels go through `resize_bilinear` with `align_corners`** and a cast to `uint8_t` rather
+    than a rounding, while **the learned position table goes through
+    `F.interpolate(mode="bilinear", align_corners=False, antialias=True)`** -- a triangle filter whose
+    support grows with the downscale factor, with accumulated weights instead of a constant divisor.
+    The table is a weight with one row per patch of the training grid, so an image of another size needs
+    it resampled; llama.cpp does that rather than refusing the image, and it reaches for a different
+    kernel than it uses for the pixels.  Both are transcribed in `src/model/image_preprocess.cpp`.
+
+Twelve shapes were checked against the reference's own token counts for the size rule, and the
+end-to-end comparison at `800x600` -- whose target is neither an aspect fit nor a multiple of the input,
+so the resampler is exercised on every pixel -- agrees with llama.cpp at correlation 0.988 and a
+matching argmax.  Past the checkpoint's own grid the position table is what carries the agreement:
+`1024x1024` matches at 0.994 with the same argmax.
+
+What the image path still does not have is an **ABI entry point that takes an image**: all of it is
+reachable through `pocketllm-vlm` and the C++ model classes, and nothing above that takes a picture
+yet.  `libmtmd` remains the oracle for the whole of it.
 
 The tokenizer carries **two pre-tokenizers**, because the vocabularies in this project's scope are
 built on two. They differ in exactly one place -- `\p{N}` against `\p{N}{1,3}`, so a number is cut

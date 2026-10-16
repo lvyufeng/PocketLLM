@@ -113,9 +113,13 @@ class Qwen3VlVision {
   Qwen3VlVision(const Qwen3VlVision &) = delete;
   Qwen3VlVision &operator=(const Qwen3VlVision &) = delete;
 
-  /* The square image side this tower accepts, from the checkpoint. */
+  /* The square image side the tower's position table was stored for, from the
+   * checkpoint.  An input may be any size: `encode` resizes to a grid this tower can
+   * consume, and `tokens_for` says how many tokens that size produces. */
   int64_t image_size() const { return image_size_; }
-  /* How many image tokens one image becomes: the merged patch count. */
+  /* How many image tokens one image becomes: the merged patch count.  This is the
+   * count for `image_size()` square input; an image of another shape produces a
+   * different one, which `tokens_for` gives. */
   int64_t n_tokens() const { return n_tokens_; }
   /* How many merged cells an image is across, which is both the grid the rotary
    * positions are indexed by and the number of *positions* the span consumes --
@@ -123,6 +127,23 @@ class Qwen3VlVision {
    * `nx * ny` tokens, so an image is much cheaper in positions than in tokens and
    * the text after it continues from `start_of_span + this`. */
   int64_t merged_side() const { return merged_side_; }
+  /* What an arbitrary input shape becomes after preprocessing, and how many tokens
+   * and positions that is.  A caller sizing a buffer or a prompt has to know both,
+   * and the token count is not a function of the pixel count alone -- see
+   * `resize_target`. */
+  void prices_for(int64_t width, int64_t height, int64_t *target_width, int64_t *target_height,
+                  int64_t *tokens) const;
+  /* `n_tokens` for an input of this shape, without resizing it. */
+  int64_t tokens_for(int64_t width, int64_t height) const {
+    int64_t target_width = 0;
+    int64_t target_height = 0;
+    int64_t tokens = 0;
+    prices_for(width, height, &target_width, &target_height, &tokens);
+    return tokens;
+  }
+  /* The pixel limits the preprocessing takes from the checkpoint. */
+  int64_t image_min_pixels() const { return image_min_pixels_; }
+  int64_t image_max_pixels() const { return image_max_pixels_; }
   /* Floats per token per plane, from `projection_dim`. */
   int64_t projection_dim() const { return projection_dim_; }
   /* How many planes one image produces: the base features and one per deepstack
@@ -141,12 +162,17 @@ class Qwen3VlVision {
    * per layer.  The correspondence between the two layouts is a transpose of the
    * plane axis and nothing else.
    *
-   * `rgb` is `height * width * 3` bytes, row-major, top-to-bottom.  `height` and
-   * `width` must both be `image_size()` -- see the file header on the position
-   * table -- and anything else is refused by name.  The pixels are normalized
-   * here with the checkpoint's own `image_mean`/`image_std`, exactly as
-   * llama.cpp's preprocessing does after its resize: `(value / 255 - mean[c]) /
-   * std[c]`. */
+   * `rgb` is `height * width * 3` bytes, row-major, top-to-bottom, at **any** size:
+   * the image is resized to a grid this tower can consume by `preprocess_image`,
+   * with the checkpoint's own pixel limits and the reference's bilinear kernel, and
+   * `out` then holds `n_planes() * tokens_for(width, height) * projection_dim()`
+   * floats.  The two steps are worth separating in the caller's mind because a
+   * different target size is a different number of tokens and so a different prompt
+   * -- `tokens_for` is how a caller knows how much room to leave.
+   *
+   * The pixels are normalized here with the checkpoint's own `image_mean`/
+   * `image_std`, exactly as llama.cpp's preprocessing does after its resize:
+   * `(value / 255 - mean[c]) / std[c]`. */
   void encode(const uint8_t *rgb, int64_t height, int64_t width, float *out);
 
  private:
@@ -155,8 +181,8 @@ class Qwen3VlVision {
   void allocate_activations();
   /* The merge permutation and the rotary tables, both of which depend only on
    * the patch grid and are therefore built once, at load. */
-  void build_merge_index();
-  void build_rope_tables();
+  void build_merge_index(int64_t grid_w, int64_t grid_h);
+  void build_rope_tables(int64_t grid_w, int64_t grid_h);
 
   kernel::Backend *backend_ = nullptr;
   int64_t n_embd_ = 0;
@@ -167,11 +193,34 @@ class Qwen3VlVision {
   int64_t patch_size_ = 0;
   int64_t merge_ = 0;
   int64_t image_size_ = 0;
+  /* The checkpoint's own pixel limits for an input image.  The preprocessing uses
+   * them to pick a size the tower can take, and they are read rather than defaulted
+   * because they decide the token count of anything that is not already 768 square. */
+  int64_t image_min_pixels_ = 0;
+  int64_t image_max_pixels_ = 0;
   int64_t projection_dim_ = 0;
   int64_t grid_side_ = 0;   /* image_size / patch_size */
   int64_t merged_side_ = 0; /* grid_side / merge */
   int64_t n_patches_ = 0;   /* grid_side^2 */
   int64_t n_tokens_ = 0;    /* merged_side^2, what the text graph sees */
+  /* The largest grid the checkpoint's pixel limit allows, which is what the
+   * activations are sized for: `encode` takes any input shape and resizes it onto a
+   * grid, so the buffers have to hold the biggest of those rather than the one
+   * `image_size` implies. */
+  int64_t max_patches_ = 0;
+  int64_t max_side_ = 0; /* the pixel width that `max_patches_` is the grid of */
+  /* The grid the merge permutation and the rotary tables were last built for.  They
+   * are a function of the grid, so a caller encoding images of different shapes pays
+   * a rebuild per change and one encoding one shape pays once. */
+  int64_t active_grid_w_ = -1;
+  int64_t active_grid_h_ = -1;
+  /* The learned position table on the host, kept because an image of another size
+   * needs it *interpolated* onto that size's patch grid and interpolation is a
+   * computation over the table rather than a property of it.  The device copy the
+   * gather reads is rebuilt whenever the grid changes; this is the source. */
+  std::vector<float> position_table_host_;
+  /* The interpolated table for the active grid, on the device. */
+  kernel::DeviceBuffer position_table_resampled_;
   int64_t merged_width_ = 0; /* merge^2 * n_embd, the width the merger reads */
   float eps_ = 0.0F;
   float image_mean_[3] = {0.5F, 0.5F, 0.5F};

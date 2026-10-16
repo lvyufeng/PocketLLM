@@ -158,7 +158,14 @@ def _engine(tmp_path: pathlib.Path, picture: np.ndarray, *, name: str,
     )
     if result.returncode != 0:
         raise RuntimeError(f"pocketllm-vlm failed: {result.stdout}{result.stderr}")
-    reported = dict(line.split() for line in result.stdout.splitlines() if line.strip())
+    # Keyed by the first field with the rest as a list, not a two-column `dict`:
+    # the tool prints `target 768 768` as well as `n_tokens 583`, and a parse that
+    # insists on exactly two columns turns a new line of output into a test failure.
+    reported = {
+        parts[0]: parts[1:]
+        for parts in (line.split() for line in result.stdout.splitlines())
+        if parts
+    }
     logits = np.frombuffer(out.read_bytes(), dtype="<f4").astype(np.float64)
     return logits, reported
 
@@ -210,7 +217,7 @@ def test_the_composition_carries_the_reference_layout(tmp_path: pathlib.Path) ->
     reference = run_oracle(MMPROJ, TEXT_MODEL, picture, PROMPT)
     _, reported = _engine(tmp_path, picture, name="layout")
 
-    assert int(reported["n_tokens"]) == n_tokens(reference), (
+    assert int(reported["n_tokens"][0]) == n_tokens(reference), (
         f"the engine walked {reported.get('n_tokens')} tokens and the reference "
         f"{n_tokens(reference)}"
     )
@@ -223,7 +230,7 @@ def test_the_composition_carries_the_reference_layout(tmp_path: pathlib.Path) ->
     # Six text tokens before the span and one `<|vision_end|>` after it, and the
     # span between them counted in *positions*: the engine's last position is the
     # one number that says it kept the two apart.
-    assert int(reported["n_positions"]) == 6 + n_pos(reference) + 1, (
+    assert int(reported["n_positions"][0]) == 6 + n_pos(reference) + 1, (
         f"the engine's last position is {reported.get('n_positions')}, and six text tokens "
         f"plus {n_pos(reference)} span positions plus one after it is 31"
     )

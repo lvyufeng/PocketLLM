@@ -38,6 +38,7 @@
  * arm refuses an f16 cache rather than widening it.
  */
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -151,6 +152,9 @@ int main(int argc, char **argv) {
                                  : mmproj.get_int("clip.vision.projection_dim", 0);
     const std::size_t plane_floats =
         static_cast<std::size_t>(geom_planes * geom_tokens * geom_dim);
+    /* The input's shape, which the tower resizes from and the span length follows. */
+    int64_t width = 0;
+    int64_t height = 0;
     std::vector<float> planes;
     if (!planes_path.empty()) {
       /* The bisect path: features from a file instead of from the tower. */
@@ -160,23 +164,42 @@ int main(int argc, char **argv) {
                                " bytes, and " + std::to_string(plane_floats) +
                                " floats were expected");
       }
+      /* A planes file carries the features for one *specific* grid, and this tool
+       * reads it at the checkpoint's own `image_size` grid -- there is no shape in the
+       * file to read.  So the bisect is for images of that size; a resize would make
+       * the span longer than the file has rows for. */
+      width = std::atoll(positional[3].c_str());
+      height = std::atoll(positional[4].c_str());
+      const int64_t given_w = width;
+      const int64_t given_h = height;
+      if (vision != nullptr &&
+          vision->tokens_for(given_w, given_h) != geom_tokens) {
+        throw pocketllm::Error("--planes carries features for the " +
+                               std::to_string(geom_tokens) +
+                               "-token grid, and a " + std::to_string(given_w) + "x" +
+                               std::to_string(given_h) + " image is " +
+                               std::to_string(vision->tokens_for(given_w, given_h)) +
+                               " tokens; give an image of the checkpoint's own size");
+      }
       planes.resize(plane_floats);
       std::memcpy(planes.data(), raw.data(), raw.size());
     } else {
-      const int64_t width = std::atoll(positional[3].c_str());
-      const int64_t height = std::atoll(positional[4].c_str());
-      const int64_t geom_image = mmproj.get_int("clip.vision.image_size", 0);
-      if (width != geom_image || height != geom_image) {
-        throw pocketllm::Error("this tower takes " + std::to_string(geom_image) + "x" +
-                               std::to_string(geom_image) +
-                               " images and this one is " + std::to_string(width) + "x" +
-                               std::to_string(height) + "; resample it first");
-      }
+      width = std::atoll(positional[3].c_str());
+      height = std::atoll(positional[4].c_str());
+      /* Any size: the tower preprocesses, choosing a target with the checkpoint's
+       * own pixel limits and resampling with the reference's kernel.  `prices_for`
+       * says what this shape becomes, which is what the span's token count is. */
+      (void) mmproj.get_int("clip.vision.image_size", 0);
       const std::vector<uint8_t> rgb = read_bytes(positional[2]);
       if (static_cast<int64_t>(rgb.size()) != width * height * 3) {
         throw pocketllm::Error("'" + positional[2] + "' is not width * height * 3 bytes");
       }
-      planes.resize(plane_floats);
+      /* Sized from `tokens_for`, not from the checkpoint's own square: the tower
+       * resizes, so a 512x512 input produces 256 tokens where `image_size` implies
+       * 576, and a buffer sized to the wrong one is a write past the end. */
+      const int64_t tokens = vision->tokens_for(width, height);
+      planes.assign(static_cast<std::size_t>(vision->n_planes() * tokens * vision->projection_dim()),
+                    0.0F);
       vision->encode(rgb.data(), height, width, planes.data());
     }
 
@@ -208,8 +231,18 @@ int main(int argc, char **argv) {
      * offset by it -- `mtmd_image_tokens_get_decoder_pos`, as measured.  The
      * column is the fast axis, which is the same order the merge gives the
      * tokens. */
-    const int64_t span = geom_tokens;
-    const int64_t side = geom_side;
+    int64_t target_w = 0;
+    int64_t target_h = 0;
+    int64_t span = geom_tokens;
+    if (vision != nullptr) {
+      /* The tower resizes, so the span's length is a property of the *input* shape:
+       * a 512x512 image is 256 tokens where a 768x768 one is 576. */
+      vision->prices_for(width, height, &target_w, &target_h, &span);
+    }
+    /* The merged grid is square here because `resize_target` rounds both axes onto
+     * the same step; `side` is its extent, which is how the positions below are
+     * indexed. */
+    const int64_t side = static_cast<int64_t>(std::llround(std::sqrt(static_cast<double>(span))));
     const int64_t span_start = model->cache_length();
     std::vector<int64_t> span_positions(static_cast<std::size_t>(span) * 4);
     for (int64_t i = 0; i < span; ++i) {
@@ -275,6 +308,12 @@ int main(int argc, char **argv) {
     const int64_t total = static_cast<int64_t>(tokens_before.size()) + span +
                           static_cast<int64_t>(tokens_after.size());
     std::printf("n_tokens %lld\n", static_cast<long long>(total));
+    /* The image span's own length, which is a property of the *input* shape: the
+     * tower resizes, so a caller comparing against the reference has to know what
+     * the preprocessing chose rather than what the checkpoint stores. */
+    std::printf("n_image_tokens %lld\n", static_cast<long long>(span));
+    std::printf("target %lld %lld\n", static_cast<long long>(target_w),
+                static_cast<long long>(target_h));
     std::printf("n_positions %lld\n", static_cast<long long>(after_base + static_cast<int64_t>(tokens_after.size())));
     std::printf("n_vocab %lld\n", static_cast<long long>(model->n_vocab()));
     std::printf("argmax %lld\n", static_cast<long long>(best));
