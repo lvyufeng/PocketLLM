@@ -115,28 +115,38 @@ simplification, and both were measured rather than read:
 `tests/native/test_rope_multi.py` checks it against llama.cpp's own graph over the positions a real
 2x2 patch block would carry, at the same bound the token path is compared at on this checkpoint.
 
-**An image span's attention is non-causal, and it is a property of the batch.**  Every patch attends
-to every patch, where the text graph's decode loop is a causal prefill.  `forward_embeddings` takes
-that as a flag -- `non_causal` -- rather than as a range inside a batch, which is not this engine's
-simplification but the reference's shape: llama.cpp exposes it as a *context* flag
-(`llama_set_causal_attn`) that mtmd sets around the decode of one image chunk, so a caller that drives
-a prompt chunk, an image chunk and a prompt chunk as three calls is expressing exactly that.  The
-op-level arm it reaches is the one #716 added, and it is the same arm the tower calls.
+**An image span's attention is a property of the batch -- and for this architecture it is *causal*.**
+An image's tokens are a batch of their own in the reference's flow, so that is the granularity the
+flag takes: `forward_embeddings` says `non_causal` for a whole call rather than for a range inside one,
+which is llama.cpp's shape too (its `llama_set_causal_attn` is a context flag, set around the decode
+of one image chunk).  **Which way `qwen3vl` wants it was read off the wrong place at first and then
+measured**: mtmd's rule is `mtmd_decode_use_non_causal`, which answers true for the Gemma projectors
+only, so a `qwen3vl_merger` span is decoded *causally* -- each patch sees the tokens before it and not
+the ones after.  The non-causal arm remains the arm the tower's own attention uses (a ViT does attend
+to its whole patch grid, and that is what #716 added it for), and a projector whose span wanted it
+would ask for it here; `tests/native/test_image_span.py` pins the *arm's* arithmetic against
+llama.cpp's with the flag forced on for both sides, which is a statement about the arm and not about
+this architecture.
 
-`tests/native/test_image_span.py` is the case: a 3x3 patch grid, its tokens' rows, its per-section
-positions and the non-causal flag in one call, against llama.cpp's own graph.  It asserts a bound the
-module justifies rather than the token path's, because the residue between the two engines is larger
-for an image span (9.0% of the logit spread, against 2.9% for a prompt) -- and it is the *convention*
-the case is for: measured on the same input, the four combinations of the two engines' mask give 60%
-and 109% where they disagree against 3.7% where they agree.  A non-causal call needs an f32 cache --
-that arm refuses f16 rather than widening it -- which on the CPU means `POCKETLLM_CPU_KV_F32=1`; the
-test sets it, and so must a caller that runs an image span there.
+A non-causal call needs an f32 cache -- that arm refuses f16 rather than widening it -- which on the
+CPU means `POCKETLLM_CPU_KV_F32=1`.
 
-**What is left is the image's own shape.**  The preprocessing's resize is not here -- the tower takes
-the checkpoint's own `image_size` square and refuses anything else by name, because interpolating the
-position table is separate arithmetic (a bicubic resample) nothing else in this tree needs yet -- and
-there is no ABI entry point that takes an image at all.  `libmtmd` remains the oracle for the whole of
-it.
+**And the pieces are not yet composed into a working path.**  Each one is checked against llama.cpp on
+its own -- the tower's features, the text graph's wider input and its injection, the per-section
+positions, the mask -- and an end-to-end attempt does not agree with it.  What *does* match, measured:
+the token sequence (584 tokens for the prompt used, the same ids, `<|vision_start|>` and
+`<|vision_end|>` around the span), and the span's positions (`t = start`, `y = start + row`,
+`x = start + col`, `24` positions for `576` tokens, `mtmd_image_tokens_get_decoder_pos`'s convention).
+What does not: feeding the engine llama.cpp's *own* embedding planes, so that the tower is out of the
+picture entirely, still gives logits 0.67 of the spread apart and uncorrelated with it.  So the tower
+is not the part that is wrong, and what is missing is in how the three calls -- the text before, the
+span, the text after -- compose: their positions, their caches, or their masks.
+
+That is where the image path stops today.  The preprocessing's resize is also not here -- the tower
+takes the checkpoint's own `image_size` square and refuses anything else by name, because
+interpolating the position table is separate arithmetic (a bicubic resample) nothing else in this tree
+needs yet -- and there is no ABI entry point that takes an image at all.  `libmtmd` remains the oracle
+for the whole of it.
 
 The tokenizer carries **two pre-tokenizers**, because the vocabularies in this project's scope are
 built on two. They differ in exactly one place -- `\p{N}` against `\p{N}{1,3}`, so a number is cut

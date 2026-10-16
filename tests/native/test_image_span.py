@@ -7,8 +7,7 @@ case that has all three at once: its tokens carry a *position per rotary section
 than as tokens, because their rows are the vision tower's features.
 
 `test_rope_multi.py` isolates the first of those and `test_deepstack.py` the
-third; this one is the shape the driver will actually call, and it is the only
-place the mask is exercised.
+third; this one is the only place the mask is exercised.
 
 **The batch is the span, and that is the reference's shape rather than a
 convenience.**  llama.cpp exposes non-causal attention as a *context* flag
@@ -18,6 +17,13 @@ that drives a prompt chunk, an image chunk and a prompt chunk as three calls --
 which is how `mtmd` works and how the engine's `forward_embeddings` is meant to be
 driven -- is expressing exactly that, and the cache carries the prompt before the
 span into its window.
+
+**What this case pins is the arm, not the architecture.**  `mtmd_decode_use_non_causal`
+answers true for the Gemma projectors only, so a `qwen3vl` span is decoded
+*causally* in the reference; the flag here is forced on for **both** engines, which
+is what makes this a comparison of two implementations of the same arm rather than
+of what one checkpoint does.  (The arm is not idle for that: it is what the vision
+tower's own attention uses.)
 
 Both caches are f32: the span's arm refuses an f16 one rather than widening it, and
 the oracle is pinned to f32 for the reason `llama_oracle.py` gives, so the two
