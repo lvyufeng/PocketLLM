@@ -94,7 +94,12 @@ int main(int argc, char **argv) {
       return 2;
     }
 
-    const int64_t plane = model->n_tokens() * model->projection_dim();
+    /* Sized from the *input's* shape, not from the checkpoint's own: `encode` resizes
+     * to the grid this shape needs, and a buffer sized for `n_tokens()` (the
+     * checkpoint's square) is a write past the end for any other one.  The tool takes
+     * any size for that reason; `tokens_for` is the same call the encoder makes. */
+    const int64_t tokens = model->tokens_for(width, height);
+    const int64_t plane = tokens * model->projection_dim();
     std::vector<float> features(static_cast<std::size_t>(model->n_planes() * plane));
     model->encode(rgb.data(), height, width, features.data());
 
