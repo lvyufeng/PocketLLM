@@ -35,6 +35,7 @@
 #include <string.h>
 
 #include "llama.h"
+#include "mtmd-helper.h"
 #include "mtmd.h"
 
 static const char *g_dump_embeddings = NULL;
@@ -60,106 +61,6 @@ static void *read_file(const char *path, long *size) {
   fclose(file);
   *size = length;
   return bytes;
-}
-
-/* One image chunk, as an embeddings batch: llama.cpp's own layout, one position
- * per rotary section, and the non-causal flag the chunk asks for. */
-static int decode_image_chunk(mtmd_context *ctx, struct llama_context *lctx,
-                              const mtmd_input_chunk *chunk, llama_pos *n_past) {
-  const mtmd_image_tokens *image = mtmd_input_chunk_get_tokens_image(chunk);
-  if (image == NULL) {
-    fprintf(stderr, "the tokenizer produced an image chunk with no tokens\n");
-    return 1;
-  }
-  if (mtmd_encode(ctx, image) != 0) {
-    fprintf(stderr, "mtmd_encode failed\n");
-    return 1;
-  }
-  float *embd = mtmd_get_output_embd(ctx);
-  if (embd == NULL) {
-    fprintf(stderr, "mtmd_get_output_embd returned null\n");
-    return 1;
-  }
-  const int32_t n_tokens = (int32_t) mtmd_image_tokens_get_n_tokens(image);
-  fprintf(stderr, "image chunk: n_tokens=%d n_pos=%d mrope=%d non_causal=%d\n", n_tokens,
-          (int) mtmd_input_chunk_get_n_pos(chunk), (int) mtmd_decode_use_mrope(ctx),
-          (int) mtmd_decode_use_non_causal(ctx, chunk));
-  for (int32_t i = 0; i < 3; ++i) {
-    const struct mtmd_decoder_pos p = mtmd_image_tokens_get_decoder_pos(image, *n_past, (size_t) i);
-    fprintf(stderr, "  span[%d] = (t %d, y %d, x %d, z %d)\n", i, (int) p.t, (int) p.y, (int) p.x,
-            (int) p.z);
-  }
-  const int32_t n_embd = llama_model_n_embd_inp(llama_get_model(lctx));
-  if (g_dump_embeddings != NULL) {
-    FILE *out = fopen(g_dump_embeddings, "wb");
-    if (out == NULL) {
-      perror(g_dump_embeddings);
-      return 1;
-    }
-    const size_t count = (size_t) n_tokens * (size_t) n_embd;
-    if (fwrite(embd, sizeof(float), count, out) != count) {
-      fprintf(stderr, "short write to %s\n", g_dump_embeddings);
-      return 1;
-    }
-    fclose(out);
-  }
-  const int32_t n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1;
-
-  const size_t sections = (size_t) n_pos_per_embd;
-  llama_pos *pos = malloc(sizeof(llama_pos) * (size_t) n_tokens * sections);
-  int32_t *n_seq_id = malloc(sizeof(int32_t) * (size_t) n_tokens);
-  llama_seq_id *seq_id_0 = malloc(sizeof(llama_seq_id));
-  llama_seq_id **seq_ids = malloc(sizeof(llama_seq_id *) * (size_t) n_tokens);
-  int8_t *logit_flags = calloc((size_t) n_tokens, sizeof(int8_t));
-  if (pos == NULL || n_seq_id == NULL || seq_id_0 == NULL || seq_ids == NULL ||
-      logit_flags == NULL) {
-    fprintf(stderr, "out of memory\n");
-    return 1;
-  }
-  seq_id_0[0] = 0;
-  for (int32_t i = 0; i < n_tokens; ++i) {
-    const struct mtmd_decoder_pos decoded =
-        mtmd_image_tokens_get_decoder_pos(image, *n_past, (size_t) i);
-    const llama_pos values[4] = {decoded.t, decoded.y, decoded.x, decoded.z};
-    for (int32_t section = 0; section < n_pos_per_embd; ++section) {
-      pos[(size_t) section * n_tokens + i] = values[section];
-    }
-    n_seq_id[i] = 1;
-    seq_ids[i] = seq_id_0;
-    logit_flags[(size_t) i] = (i == n_tokens - 1) ? 1 : 0;
-  }
-  struct llama_batch batch = {0};
-  batch.n_tokens = n_tokens;
-  batch.embd = embd;
-  batch.pos = pos;
-  batch.n_seq_id = n_seq_id;
-  batch.seq_id = seq_ids;
-  batch.logits = logit_flags;
-
-  const bool non_causal = mtmd_decode_use_non_causal(ctx, chunk);
-  if (non_causal) {
-    llama_set_causal_attn(lctx, false);
-  }
-  const int32_t decoded_status = llama_decode(lctx, batch);
-  if (non_causal) {
-    llama_set_causal_attn(lctx, true);
-  }
-  if (decoded_status != 0) {
-    fprintf(stderr, "llama_decode failed on the image chunk\n");
-    free(pos);
-    free(n_seq_id);
-    free(seq_id_0);
-    free(seq_ids);
-    free(logit_flags);
-    return 1;
-  }
-  free(pos);
-  free(n_seq_id);
-  free(seq_id_0);
-  free(seq_ids);
-  free(logit_flags);
-  *n_past += mtmd_input_chunk_get_n_pos(chunk);
-  return 0;
 }
 
 int main(int argc, char **argv) {
@@ -204,13 +105,23 @@ int main(int argc, char **argv) {
   lparams.n_ctx = 4096;
   lparams.n_batch = 4096;
   lparams.n_ubatch = 4096;
-  lparams.n_threads = 1;
-  lparams.n_threads_batch = 1;
   lparams.offload_kqv = false;
   lparams.no_perf = true;
   lparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+  /* **Every pin here is load-bearing, and the cost of skipping one is measured.**
+   * The same prompt through `mtmd_helper_eval_chunks` answers differently under
+   * each of them: with llama.cpp's default f16 KV cache rather than f32 the logits
+   * move by 2.4 over a spread of 47 and the argmax changes, which is why an oracle
+   * and a probe that differ only in these lines are not comparable -- an earlier
+   * revision of this file measured 10.5% against the helper and the number was
+   * mostly the settings, not the composition.  The engine contracts in f32 and
+   * refuses to widen (its non-causal arm takes an f32 cache as it stands), so the
+   * reference is pinned to the same width; `llama_oracle.py` gives the long form
+   * of the argument for the text graph. */
   lparams.type_k = GGML_TYPE_F32;
   lparams.type_v = GGML_TYPE_F32;
+  lparams.n_threads = 1;
+  lparams.n_threads_batch = 1;
   struct llama_context *lctx = llama_init_from_model(model, lparams);
   if (lctx == NULL) {
     fprintf(stderr, "could not create a context\n");
@@ -227,33 +138,74 @@ int main(int argc, char **argv) {
     return 3;
   }
 
+  /* **The reference is the library's own composition.**  This used to hand-roll
+   * the three batches, and it was 10.5% of the logit spread away from
+   * `mtmd_helper_eval_chunks` for the same prompt -- the text chunks went in
+   * through `llama_batch_get_one`, which does not start at `n_past`, and the
+   * image chunk's multi-section positions were laid out as
+   * `pos[i + section * n_tokens]` (right for an embeddings batch, wrong for the
+   * token batches either side of it).  An oracle that disagrees with the
+   * reference by 10% is not an oracle; the helper *is* the reference's own flow,
+   * so it is what this calls.  The per-chunk memory query stays, because the
+   * layout facts below are the ones the composition has to reproduce. */
   llama_pos n_past = 0;
   int64_t n_tokens = 0;
   const size_t n_chunks = mtmd_input_chunks_size(chunks);
-  for (size_t i = 0; i < n_chunks; ++i) {
-    const mtmd_input_chunk *chunk = mtmd_input_chunks_get(chunks, i);
-    if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-      if (decode_image_chunk(ctx, lctx, chunk, &n_past) != 0) {
+  const int32_t evaluated = mtmd_helper_eval_chunks(ctx, lctx, chunks, /*n_past=*/0, /*seq_id=*/0,
+                                                   /*n_batch=*/4096, /*logits_last=*/true,
+                                                   &n_past);
+  if (evaluated != 0) {
+    fprintf(stderr, "mtmd_helper_eval_chunks returned %d\n", evaluated);
+    return 3;
+  }
+  n_tokens = (int64_t) mtmd_helper_get_n_tokens(chunks);
+
+  if (g_dump_embeddings != NULL) {
+    /* The tower's features, for a case that wants to feed the engine the
+     * *reference's own* image embeddings and so take the tower out of the
+     * comparison.  `mtmd_encode_chunk` is the public entry point the helper uses
+     * internally, and calling it after the evaluation is harmless: it re-encodes
+     * the tower and rewrites the same buffer. */
+    for (size_t i = 0; i < n_chunks; ++i) {
+      const mtmd_input_chunk *chunk = mtmd_input_chunks_get(chunks, i);
+      if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        continue;
+      }
+      if (mtmd_encode_chunk(ctx, chunk) != 0) {
+        fprintf(stderr, "mtmd_encode_chunk returned non-zero\n");
         return 3;
       }
-      n_tokens += (int64_t) mtmd_input_chunk_get_n_tokens(chunk);
-    } else {
-      size_t n_text = 0;
-      const llama_token *tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_text);
-      fprintf(stderr, "text chunk %zu:", i);
-      for (size_t t = 0; t < n_text; ++t) {
-        fprintf(stderr, " %d", (int) tokens[t]);
+      const float *embd = mtmd_get_output_embd(ctx);
+      const int32_t n_image = (int32_t) mtmd_image_tokens_get_n_tokens(
+          mtmd_input_chunk_get_tokens_image(chunk));
+      const int32_t width_in = (int32_t) llama_model_n_embd_inp(llama_get_model(lctx));
+      FILE *out = fopen(g_dump_embeddings, "wb");
+      if (out == NULL) {
+        perror(g_dump_embeddings);
+        return 2;
       }
-      fprintf(stderr, "\n");
-      struct llama_batch text_batch =
-          llama_batch_get_one((llama_token *) tokens, (int32_t) n_text);
-      if (llama_decode(lctx, text_batch) != 0) {
-        fprintf(stderr, "llama_decode failed on a text chunk\n");
-        return 3;
+      /* llama.cpp's own order: one token's row interleaves the deepstack levels,
+       * which is the transpose of the engine's plane-major layout. */
+      const size_t count = (size_t) n_image * (size_t) width_in;
+      if (fwrite(embd, sizeof(float), count, out) != count) {
+        fprintf(stderr, "short write to %s\n", g_dump_embeddings);
+        return 2;
       }
-      n_past += (llama_pos) n_text;
-      n_tokens += (int64_t) n_text;
+      fclose(out);
     }
+  }
+
+  /* The cache state the composition has to reproduce, measured rather than
+   * reasoned about.  It is the finding that a composition error hides in: after
+   * the image chunk `n_past` has advanced by the span's 24 positions while the
+   * cache's own `pos_max` has moved by ONE -- the 576 span tokens share the slot
+   * at `n_past`, because they all carry the same `t` and llama.cpp's slot search
+   * finds the cell already holding that position.  An engine that appends 576
+   * rows instead is not off by an offset, it is a different computation. */
+  {
+    llama_memory_t mem = llama_get_memory(lctx);
+    fprintf(stderr, "final: n_past=%d pos_min=%d pos_max=%d\n", (int) n_past,
+            (int) llama_memory_seq_pos_min(mem, 0), (int) llama_memory_seq_pos_max(mem, 0));
   }
 
   const float *logits = llama_get_logits_ith(lctx, -1);

@@ -72,11 +72,22 @@ def _span_positions() -> np.ndarray:
     The first component is the token's index, which is both what the convention
     is and what keeps the two engines comparable: llama.cpp keys its cache by
     position, so that component *is* the cache row a token writes.
+
+    **The fourth component is zero, and that is measured rather than chosen.**
+    `mtmd_helper_image_get_decoder_pos` -- the authority both engines are being
+    compared through -- emits `(t, y, x, 0)` for every span token, and
+    `llm_graph_input_pos::set_input` zeroes the fourth section for a text token
+    too.  This case used to write the column into it, which is what the engine did
+    as well: with both sides agreeing on a wrong convention the comparison passed,
+    and it took a third opinion to see it.  The fourth section is not inert either
+    -- on a checkpoint whose declared sections end before the head does, the
+    remaining pairs fall through to it -- so a shared mistake there is not
+    self-cancelling, it is two implementations of the same different model.
     """
     rows: list[list[int]] = []
     for y in range(GRID):
         for x in range(GRID):
-            rows.append([len(rows), y, x, x])
+            rows.append([len(rows), y, x, 0])
     return np.array(rows, dtype=np.int32)
 
 

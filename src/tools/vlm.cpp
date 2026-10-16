@@ -234,9 +234,20 @@ int main(int argc, char **argv) {
     const int64_t after_base = span_start + side;
     std::vector<int64_t> after_positions(static_cast<std::size_t>(tokens_after.size()) * 4);
     for (std::size_t i = 0; i < tokens_after.size(); ++i) {
-      for (int section = 0; section < 4; ++section) {
+      /* A *text* token is `(p, p, p, 0)`, and the fourth component is not
+       * decorative: under `GGML_ROPE_TYPE_IMROPE` two of this checkpoint's 64
+       * rotating pairs -- sectors 61 and 62, the ones past all three declared
+       * sections -- fall through to the fourth section, so putting `p` there
+       * instead of 0 rotates those pairs by an angle the reference never uses.
+       * The reference zeroes it in `llm_graph_input_pos::set_input`, after
+       * broadcasting `p` into the first three; both halves of that are read
+       * rather than assumed.  `tests/native/test_rope_multi.py`'s docstring used
+       * to call the fourth section unreachable, which holds for the vision
+       * tower's own graph and not for this one. */
+      for (int section = 0; section < 3; ++section) {
         after_positions[i * 4 + static_cast<std::size_t>(section)] = after_base + static_cast<int64_t>(i);
       }
+      after_positions[i * 4 + 3] = 0;
     }
     const pocketllm::kernel::DeviceBuffer logits_device =
         model->forward_positions(tokens_after.data(), after_positions.data(),
