@@ -89,7 +89,7 @@ row interleaves them per token.  `tests/native/test_deepstack.py` checks it agai
 embeddings path, with a real prompt in the base plane and synthetic levels above it, in two cases
 whose difference is the point: with the levels zeroed the input is what the *token* path builds, so
 the comparison is the token path's own agreement on a `q4_k_m` checkpoint (2.9% of the logit spread),
-and with them in place it is 3-4% -- inside the noise the token path already has.  A token batch is
+and with them in place it is 4.8% -- inside the noise the token path already has.  A token batch is
 unchanged by any of it: llama.cpp pads a token's embedding with zeros, so there is nothing for the
 injection to add, and this engine simply does not inject.
 
@@ -115,12 +115,28 @@ simplification, and both were measured rather than read:
 `tests/native/test_rope_multi.py` checks it against llama.cpp's own graph over the positions a real
 2x2 patch block would carry, at the same bound the token path is compared at on this checkpoint.
 
+**An image span's attention is non-causal, and it is a property of the batch.**  Every patch attends
+to every patch, where the text graph's decode loop is a causal prefill.  `forward_embeddings` takes
+that as a flag -- `non_causal` -- rather than as a range inside a batch, which is not this engine's
+simplification but the reference's shape: llama.cpp exposes it as a *context* flag
+(`llama_set_causal_attn`) that mtmd sets around the decode of one image chunk, so a caller that drives
+a prompt chunk, an image chunk and a prompt chunk as three calls is expressing exactly that.  The
+op-level arm it reaches is the one #716 added, and it is the same arm the tower calls.
+
+`tests/native/test_image_span.py` is the case: a 3x3 patch grid, its tokens' rows, its per-section
+positions and the non-causal flag in one call, against llama.cpp's own graph.  It asserts a bound the
+module justifies rather than the token path's, because the residue between the two engines is larger
+for an image span (9.0% of the logit spread, against 2.9% for a prompt) -- and it is the *convention*
+the case is for: measured on the same input, the four combinations of the two engines' mask give 60%
+and 109% where they disagree against 3.7% where they agree.  A non-causal call needs an f32 cache --
+that arm refuses f16 rather than widening it -- which on the CPU means `POCKETLLM_CPU_KV_F32=1`; the
+test sets it, and so must a caller that runs an image span there.
+
 **What is left is the image's own shape.**  The preprocessing's resize is not here -- the tower takes
 the checkpoint's own `image_size` square and refuses anything else by name, because interpolating the
 position table is separate arithmetic (a bicubic resample) nothing else in this tree needs yet -- and
-neither is the image *span*'s attention, which is non-causal where the text graph's decode loop is a
-causal prefill.  There is also no ABI entry point that takes an image at all.  `libmtmd` remains the
-oracle for the whole of it.
+there is no ABI entry point that takes an image at all.  `libmtmd` remains the oracle for the whole of
+it.
 
 The tokenizer carries **two pre-tokenizers**, because the vocabularies in this project's scope are
 built on two. They differ in exactly one place -- `\p{N}` against `\p{N}{1,3}`, so a number is cut

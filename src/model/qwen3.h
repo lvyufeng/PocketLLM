@@ -188,10 +188,22 @@ class Qwen3Model {
    * the ordinary one-dimensional kind and a null `positions` is the only legal
    * value.
    *
+   * **`non_causal` says the batch is an image span**, whose tokens all attend to
+   * each other rather than to a prefix.  It is a property of the *batch* and not
+   * of a range inside it, which is not a simplification: llama.cpp has the same
+   * shape (`llama_set_causal_attn`, set around the decode of one image chunk),
+   * and a caller that drives a prompt chunk, an image chunk and a prompt chunk
+   * as three calls is expressing exactly that.  The batch's window is then the
+   * whole of `[0, start_pos + n - 1]` for every row.
+   *
+   * A non-causal call needs an f32 cache -- the arm refuses f16 rather than
+   * widening it -- so on the CPU, whose cache is otherwise f16, the session has
+   * to have asked for one (`POCKETLLM_CPU_KV_F32`).
+   *
    * Only the single-sequence path takes embeddings; a batch of them is not a
    * shape anything asks for yet and is refused by name. */
   kernel::DeviceBuffer forward_embeddings(const float *planes, const int64_t *positions, int64_t n,
-                                          int64_t start_pos);
+                                          int64_t start_pos, bool non_causal);
 
   /* How many deepstack levels this checkpoint's input carries, from its own
    * metadata.  Zero for every architecture that has none. */
@@ -329,8 +341,8 @@ class Qwen3Model {
    * is the one the graph has always issued. */
   kernel::DeviceBuffer forward_impl(const int32_t *tokens, const float *planes,
                                     const int64_t *positions,
-                                    const int64_t *n_per_seq, const int64_t *start_pos,
-                                    int64_t n_seq);
+                                    const int64_t *n_per_seq, const int64_t *start_pos, int64_t n_seq,
+                                    bool non_causal);
   /* Build `mrope_cos_`/`mrope_sin_`: one rotary row per token, from a position
    * per section.  A null `positions` means every section is the token's own
    * index. */
