@@ -131,16 +131,36 @@ this architecture.
 A non-causal call needs an f32 cache -- that arm refuses f16 rather than widening it -- which on the
 CPU means `POCKETLLM_CPU_KV_F32=1`.
 
-**And the pieces are not yet composed into a working path.**  Each one is checked against llama.cpp on
-its own -- the tower's features, the text graph's wider input and its injection, the per-section
-positions, the mask -- and an end-to-end attempt does not agree with it.  What *does* match, measured:
-the token sequence (584 tokens for the prompt used, the same ids, `<|vision_start|>` and
-`<|vision_end|>` around the span), and the span's positions (`t = start`, `y = start + row`,
-`x = start + col`, `24` positions for `576` tokens, `mtmd_image_tokens_get_decoder_pos`'s convention).
-What does not: feeding the engine llama.cpp's *own* embedding planes, so that the tower is out of the
-picture entirely, still gives logits 0.67 of the spread apart and uncorrelated with it.  So the tower
-is not the part that is wrong, and what is missing is in how the three calls -- the text before, the
-span, the text after -- compose: their positions, their caches, or their masks.
+**The pieces compose, and one of them was broken in a way a single call cannot see.**  Each is checked
+against llama.cpp on its own -- the tower's features, the text graph's wider input and its injection,
+the per-section positions, the mask -- and an end-to-end attempt did not agree with it.  Following that
+disagreement to the bottom split it in two, and the first half was a real bug:
+
+- **The token batch with explicit positions skipped its token gather.**  `forward_positions` is the
+  entry point for a batch whose rotary positions are not its cache slots -- what the text *after* an
+  image is -- and it built the rotary table without ever running the embedding gather, so the
+  activation kept whatever the previous call had left in it.  The symptom was not a wrong answer but an
+  *unstable* one: the same command line gave the right logits three runs in four and all zeros the
+  fourth, because the buffer it read was freshly allocated and sometimes happened to be clean.  That is
+  invisible to a case that makes one call -- a buffer that starts out zeroed produces no complaint --
+  and invisible to `test_image_span.py`, which drives the *embeddings* branch rather than the token one.
+  `tests/native/test_vlm.py`'s first case runs the path twice and compares the two, which needs no
+  oracle, no geometry and no tolerance.
+
+- **What is left is the composition, and it is still open.**  With the tower replaced by llama.cpp's
+  own image planes -- so that the tower is out of the picture entirely -- the logits are 70% of the
+  spread apart, correlation 0.13.  What *does* match, measured: the token sequence (583 tokens for the
+  prompt used, the same ids, `<|vision_start|>` and `<|vision_end|>` around the span), the span's
+  positions (`t = start`, `y = start + row`, `x = start + col`, and **24** positions for 576 tokens
+  where the text after it continues from position 30 -- `mtmd_image_tokens_get_decoder_pos`'s
+  convention), and the fact that the span's cache rows and its positions are two different numbers.
+  `test_vlm.py`'s third case asserts the gap as an `xfail` with the measurement in its message, so the
+  tree records where the path stops instead of accepting a bound that an unrelated answer would pass.
+
+One consequence is worth stating because it cost a wrong conclusion once: the bisect above only means
+something if the bisect *channel* works.  The first attempt at it fed the engine a planes file it could
+not read and reported the resulting zeros as evidence that the composition was at fault -- which was,
+by then, a claim about the instrument rather than about the engine.
 
 That is where the image path stops today.  The preprocessing's resize is also not here -- the tower
 takes the checkpoint's own `image_size` square and refuses anything else by name, because

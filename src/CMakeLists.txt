@@ -356,6 +356,37 @@ if(POCKETLLM_ASCEND_SOURCES)
   pocketllm_add_ascend(pocketllm-forward-embd)
 endif()
 
+# Run a whole vision-language eval: a prompt with one image, and the next token's
+# logits.  The pieces are the tower, the text graph's wider input, its
+# multi-section rotary and its non-causal span; this is the call that composes
+# them, and it is a tool rather than an ABI entry point because an image is not
+# part of the ABI's surface yet.
+add_executable(pocketllm-vlm
+  tools/vlm.cpp
+  abi/spec.cpp
+  gguf/reader.cpp
+  runtime/status.cpp
+  tokenizer/unicode_data.cpp
+  tokenizer/unicode.cpp
+  tokenizer/pretokenize.cpp
+  tokenizer/bpe.cpp
+  kernel/kernels.cpp
+  kernel/repack_q4k.cpp
+  kernel/cpu/backend.cpp
+  kernel/registry.cpp
+  model/qwen3.cpp
+  model/qwen3vl_vision.cpp
+  ${POCKETLLM_CUDA_SOURCES}
+)
+if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)
+  target_compile_definitions(pocketllm-vlm PRIVATE POCKETLLM_WITH_CUDA=1)
+  set_target_properties(pocketllm-vlm PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+endif()
+target_link_libraries(pocketllm-vlm PRIVATE pocketllm-kernel-options)
+if(POCKETLLM_ASCEND_SOURCES)
+  pocketllm_add_ascend(pocketllm-vlm)
+endif()
+
 # Run one kernel over inputs a caller supplies, for checking it against the
 # Python reference.  It links the kernel objects and both backends, and no model:
 # an op is checked in isolation, on shapes the caller writes, which is the only
