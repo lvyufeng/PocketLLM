@@ -944,11 +944,13 @@ kernel::DeviceBuffer Qwen3Model::forward(const int32_t *tokens, int64_t n, int64
   }
   const int64_t n_per_seq[1] = {n};
   const int64_t starts[1] = {start_pos};
-  return forward_impl(tokens, /*planes=*/nullptr, /*positions=*/nullptr, n_per_seq, starts, 1);
+  return forward_impl(tokens, /*planes=*/nullptr, /*positions=*/nullptr, n_per_seq, starts, 1,
+                      /*non_causal=*/false);
 }
 
 kernel::DeviceBuffer Qwen3Model::forward_embeddings(const float *planes, const int64_t *positions,
-                                                    int64_t n, int64_t start_pos) {
+                                                    int64_t n, int64_t start_pos,
+                                                    bool non_causal) {
   if (n_deepstack_ <= 0) {
     throw Error("this checkpoint carries no deepstack levels, so its input is the token table "
                 "and `forward` is the entry point");
@@ -965,7 +967,7 @@ kernel::DeviceBuffer Qwen3Model::forward_embeddings(const float *planes, const i
   }
   const int64_t n_per_seq[1] = {n};
   const int64_t starts[1] = {start_pos};
-  return forward_impl(/*tokens=*/nullptr, planes, positions, n_per_seq, starts, 1);
+  return forward_impl(/*tokens=*/nullptr, planes, positions, n_per_seq, starts, 1, non_causal);
 }
 
 kernel::DeviceBuffer Qwen3Model::forward_batch(const int32_t *tokens, const int64_t *n_per_seq,
@@ -982,12 +984,13 @@ kernel::DeviceBuffer Qwen3Model::forward_batch(const int32_t *tokens, const int6
         s < static_cast<int64_t>(seq_len_.size()) ? seq_len_[static_cast<std::size_t>(s)] : 0;
   }
   return forward_impl(tokens, /*planes=*/nullptr, /*positions=*/nullptr, n_per_seq, starts.data(),
-                      n_seq);
+                      n_seq, /*non_causal=*/false);
 }
 
 kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const float *planes,
                                               const int64_t *positions, const int64_t *n_per_seq,
-                                              const int64_t *start_pos, int64_t n_seq) {
+                                              const int64_t *start_pos, int64_t n_seq,
+                                              bool non_causal) {
   /* `m` is the whole batch: the rows every weight-reading GEMM contracts over,
    * so the weights are read once for all sequences.  At n_seq == 1 this is the
    * `n` the graph has always used and every loop below runs once, which is what
@@ -1151,8 +1154,16 @@ kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const float
                                n_s * n_head_ * head_dim_ * 4};
       kernel::DeviceBuffer a_s{attn_.handle + static_cast<uintptr_t>(row * n_head_ * head_dim_ * 4),
                                n_s * n_head_ * head_dim_ * 4};
+      /* A non-causal batch is an image span: the chunk's offset is the *end* of
+       * the span and every row sees all of it, where the causal arm advances each
+       * row's own end.  The cache holds `[0, at_pos + n_s - 1]`, so that whole
+       * range is the window.  (The scratch is sized for the causal arm's span;
+       * the non-causal arm reads none of it, which is what `attention_scratch`'s
+       * comment says it may do.) */
+      const int64_t window_end = non_causal ? at_pos + n_s - 1 : at_pos;
       backend_->attention(q_s, n_s, n_head_, layer_k, layer_v, n_head_kv_, head_dim_,
-                          /*first_key=*/0, at_pos, /*causal=*/true, scale, a_s, scores_, kv_dtype_);
+                          /*first_key=*/0, window_end, /*causal=*/!non_causal, scale, a_s, scores_,
+                          kv_dtype_);
     }
 
     matmul(layer.wo, attn_, x_, m, /*accumulate=*/true);

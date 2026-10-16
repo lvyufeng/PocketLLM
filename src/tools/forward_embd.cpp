@@ -9,7 +9,7 @@
  *
  * Usage:
  *   pocketllm-forward-embd <checkpoint.gguf> <planes.bin> <logits.bin>
- *                           [--positions FILE] [--device NAME]
+ *                           [--positions FILE] [--non-causal] [--device NAME]
  *
  * `planes.bin` is **plane-major**: `n_planes` blocks of `n_tokens * n_embd` f32
  * with plane 0 first.  That is `Qwen3VlVision::encode`'s layout and this model's,
@@ -22,6 +22,11 @@
  * names them.  Without it every section is the token's own index, which is what a
  * text batch means; with it a token can carry a row and a column, which is what
  * an image patch does.
+ *
+ * `--non-causal` says the batch is an image span, whose tokens all attend to
+ * each other.  It takes no argument because it is a property of the call rather
+ * than of a range inside it -- see `Qwen3Model::forward_embeddings` -- and it
+ * needs an f32 cache, which on the CPU means `POCKETLLM_CPU_KV_F32=1`.
  */
 
 #include <cstdint>
@@ -39,7 +44,7 @@ namespace {
 int usage(const char *argv0) {
   std::fprintf(stderr,
                "usage: %s <checkpoint.gguf> <planes.bin> <logits.bin>\n"
-               "       [--positions FILE] [--device cpu|cuda]\n",
+               "       [--positions FILE] [--non-causal] [--device cpu|cuda]\n",
                argv0);
   return 2;
 }
@@ -84,6 +89,7 @@ int main(int argc, char **argv) {
   std::vector<std::string> positional;
   std::string device = "cpu";
   std::string positions_path;
+  bool non_causal = false;
   for (int i = 1; i < argc; ++i) {
     const std::string argument = argv[i];
     if (argument == "--device") {
@@ -96,6 +102,8 @@ int main(int argc, char **argv) {
         return usage(argv[0]);
       }
       positions_path = argv[++i];
+    } else if (argument == "--non-causal") {
+      non_causal = true;
     } else if (argument == "--help" || argument == "-h") {
       return usage(argv[0]);
     } else {
@@ -130,7 +138,7 @@ int main(int argc, char **argv) {
     }
     const pocketllm::kernel::DeviceBuffer logits_device =
         model->forward_embeddings(planes.data(), positions.empty() ? nullptr : positions.data(),
-                                  n_tokens, /*start_pos=*/0);
+                                  n_tokens, /*start_pos=*/0, non_causal);
     std::vector<float> logits(static_cast<std::size_t>(model->n_vocab()));
     backend->copy_to_host(logits.data(), logits_device, model->n_vocab() * 4);
 

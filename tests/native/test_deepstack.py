@@ -31,16 +31,17 @@ something *new* with.
 
 **Two cases, and the second is the first one's control.**  With the levels zeroed
 the input is exactly what the token path would build, so the comparison is the
-token path's own agreement on this checkpoint -- and it is measured, at 2.9% of
-the logit spread, because a `q4_k_m` checkpoint is compared across widths
-(llama.cpp quantizes activations to `q8_K` blocks for a quantized weight).
-:data:`QUANTIZED_RTOL` is the bound `test_quantized_forward.py` uses for that same
-checkpoint class, and the deepstack case measures 3-4%: **the injection is inside
-the noise the token path already has**, which is the strongest statement the
-comparison can make.  The argmax is asserted only on the zero-level case: with
-the levels in place the top two tokens of a five-token prompt can be a near-tie,
-and a flipped argmax there would be the checkpoint's margin rather than this
-graph's arithmetic.
+token path's own agreement on this checkpoint -- 2.9% of the logit spread, which
+is the same figure `test_quantized_forward.py` sees on a prompt.  With the levels
+in place it is 4.8%: **the injection is inside the noise the token path already
+has**, which is the strongest statement the comparison can make.  Both sides run
+an f32 cache (`kv_f32`, see :func:`_engine_logits`), so what is left between them
+is the weight quantization rather than two cache widths as well.
+
+The argmax is asserted only on the zero-level case: with the levels in place the
+top two tokens of a five-token prompt are not guaranteed to be a margin apart, and
+a flip there would be the checkpoint's near-tie rather than this graph's
+arithmetic.
 
 Run on `cpu` only.  The device dimension of this graph is `test_forward.py`'s
 (cpu and the card, same checkpoint, same weights), the one kernel this path adds
@@ -51,6 +52,7 @@ devices; what is new here is which rows are fed and where an addition lands.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 
@@ -63,11 +65,22 @@ from pocketllm.loader.gguf.tensor_reader import GGUFTensorDataReader
 
 CHECKPOINT = pathlib.Path("/mnt/data1/models/qwen3vl-2b-q4_k_m.gguf")
 
-#: `test_quantized_forward.py`'s bound for a `q4_k_m` checkpoint, and for the same
-#: reason: llama.cpp quantizes activations to `q8_K` blocks for a quantized
-#: weight, so the two engines are compared across widths rather than at f32
-#: rounding.  Measured here at 2.9% of the spread for the zero-level control.
-QUANTIZED_RTOL = 5e-2
+#: How far this engine may sit from llama.cpp on this checkpoint, as a fraction of
+#: the logit spread -- and it is deliberately **not** `test_quantized_forward.py`'s
+#: 5e-2, which is the bound for a *prompt*.  The measurements say why: the
+#: comparison is across widths (llama.cpp quantizes activations to `q8_K` blocks
+#: for a `q4_K` weight, where every kernel here contracts in f32), and the inputs
+#: in this file are not sentences the checkpoint was tuned on.  Engine against
+#: oracle: **2.9%** for the zero-level control -- which is the token path's own
+#: agreement, and the figure `test_quantized_forward.py` sees -- **4.8%** with the
+#: synthetic levels in place, and **9.0%** for an image span.
+#:
+#: What the bound has to catch is not that band but a *wrong* convention, and those
+#: were measured too: **24%** for the block form of the multi-section rotary
+#: (against the interleaved one this architecture uses) and **60-109%** for the
+#: four combinations of the image span's mask.  An order below the smallest of
+#: those is the room this needs.
+QUANTIZED_RTOL = 1e-1
 
 #: A real prompt, so that the base plane is what the graph is normally fed.  It is
 #: `test_forward.py`'s, which is a sentence the checkpoint has an opinion about.
@@ -85,21 +98,31 @@ def engine_tool_path() -> pathlib.Path:
     return repository_root() / "build" / "pocketllm-forward-embd"
 
 
-def _oracle_logits(rows: np.ndarray, tmp: pathlib.Path,
-                   positions: pathlib.Path | None = None) -> np.ndarray:
+def _oracle_logits(rows: np.ndarray, tmp: pathlib.Path, positions: pathlib.Path | None = None,
+                   non_causal: bool = False) -> np.ndarray:
     """llama.cpp's logits for an embeddings batch, one row per token.
 
     `positions`, when given, is the file `oracle.cpp --positions` takes: four
     sections consecutive within a token.  Without it every section gets the
     token's own index, which is what a text batch means.
+
+    `non_causal` is the image span's attention: every token sees every token of
+    the batch.  The oracle asks for it with `llama_set_causal_attn`, the same
+    context-level flag `tools/mtmd/mtmd-helper.cpp` sets around an image chunk.
     """
     if not oracle_tool_path().is_file():
         compile_tool()
     path = tmp / "embeddings.bin"
     path.write_bytes(np.ascontiguousarray(rows, dtype=np.float32).tobytes())
     command = [str(oracle_tool_path()), str(CHECKPOINT), "--embeddings", str(path)]
+    # The f32 cache `llama_oracle.py` pins the token path to, and for its reason:
+    # llama.cpp's f16 cache is not self-consistent between its prefill and its
+    # decode, so there is no single "llama.cpp on f16" to compare against.
+    command += ["--kv-type", "f32"]
     if positions is not None:
         command += ["--positions", str(positions)]
+    if non_causal:
+        command += ["--non-causal"]
     result = subprocess.run(
         command, capture_output=True, text=True
     )
@@ -108,17 +131,29 @@ def _oracle_logits(rows: np.ndarray, tmp: pathlib.Path,
     return np.array(json.loads(result.stdout)["logits"], dtype=np.float64)
 
 
-def _engine_logits(planes: np.ndarray, tmp: pathlib.Path,
-                   positions: pathlib.Path | None = None) -> np.ndarray:
-    """This engine's logits for the same numbers, in its own plane-major layout."""
+def _engine_logits(planes: np.ndarray, tmp: pathlib.Path, positions: pathlib.Path | None = None,
+                   non_causal: bool = False, kv_f32: bool = False) -> np.ndarray:
+    """This engine's logits for the same numbers, in its own plane-major layout.
+
+    `kv_f32` asks the CPU backend for an f32 cache through its own environment
+    knob.  It is needed for a non-causal batch -- that arm refuses an f16 cache
+    rather than widening it -- and it is the same width the oracle is pinned to,
+    so a comparison that sets both is comparing like with like rather than across
+    two cache widths.
+    """
     path = tmp / "planes.bin"
     out = tmp / "logits.bin"
     path.write_bytes(np.ascontiguousarray(planes, dtype=np.float32).tobytes())
     command = [str(engine_tool_path()), str(CHECKPOINT), str(path), str(out)]
     if positions is not None:
         command += ["--positions", str(positions)]
+    if non_causal:
+        command += ["--non-causal"]
+    env = dict(os.environ)
+    if kv_f32:
+        env["POCKETLLM_CPU_KV_F32"] = "1"
     result = subprocess.run(
-        command, capture_output=True, text=True
+        command, capture_output=True, text=True, env=env
     )
     if result.returncode != 0:
         raise RuntimeError(f"pocketllm-forward-embd failed: {result.stderr.strip()}")
@@ -143,7 +178,9 @@ def _both(n_embd: int, base: np.ndarray, levels: list[np.ndarray], tmp: pathlib.
     # order of the plane axis -- stated here so that a mistake in either is a
     # comparison against different data rather than a silent pass.
     assert np.array_equal(planes.transpose(1, 0, 2).reshape(rows.shape), rows)
-    return _engine_logits(planes, tmp), _oracle_logits(rows, tmp)
+    # An f32 cache on both sides, so the comparison is the weight quantization and
+    # not two cache widths as well.
+    return _engine_logits(planes, tmp, kv_f32=True), _oracle_logits(rows, tmp)
 
 
 @pytest.mark.parametrize("with_levels", [False, True], ids=["zero-levels", "synthetic-levels"])

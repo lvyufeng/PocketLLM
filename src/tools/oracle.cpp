@@ -20,6 +20,8 @@
  *   `oracle <model> <token>... --steps N`    N greedily generated tokens
  *   `oracle <model> --embeddings FILE`       the logits of a forward whose input
  *                                            embeddings are the caller's
+ *                                            (`--positions` and `--non-causal`
+ *                                            describe an image span)
  *
  * The second exists because `llama-cli` is a *chat client*: given a prompt it
  * wraps it in the checkpoint's chat template and answers a different question
@@ -138,7 +140,7 @@ std::vector<float> read_floats(const std::string &path) {
  * axis, so a caller transposes one into the other and nothing else has to move.
  */
 int run_embeddings(llama_context *ctx, const llama_model *model, const std::string &path,
-                   const std::string &positions_path, int32_t n_vocab) {
+                   const std::string &positions_path, bool non_causal, int32_t n_vocab) {
   const int32_t row = llama_model_n_embd_inp(model);
   std::vector<float> data = read_floats(path);
   if (row <= 0 || data.empty() || data.size() % static_cast<std::size_t>(row) != 0) {
@@ -209,9 +211,20 @@ int run_embeddings(llama_context *ctx, const llama_model *model, const std::stri
   batch.n_seq_id = n_seq_id.data();
   batch.seq_id = seq_ids.data();
   batch.logits = logit_flags.data();
+  /* An image span attends non-causally -- every token to every token -- and
+   * llama.cpp exposes that as a *context* flag rather than a per-token mask,
+   * which is the same shape this engine's `forward_embeddings` takes it in.
+   * `tools/mtmd/mtmd-helper.cpp` sets and restores it around the decode of one
+   * image chunk. */
+  if (non_causal) {
+    llama_set_causal_attn(ctx, false);
+  }
   if (llama_decode(ctx, batch) != 0) {
     std::fprintf(stderr, "llama_decode failed on the embeddings batch\n");
     return 1;
+  }
+  if (non_causal) {
+    llama_set_causal_attn(ctx, true);
   }
   const float *logits = llama_get_logits_ith(ctx, n_tokens - 1);
   if (logits == nullptr) {
@@ -239,6 +252,7 @@ int main(int argc, char **argv) {
   std::vector<llama_token> tokens;
   std::string embeddings_path;
   std::string positions_path;
+  bool non_causal = false;
   int steps = 0;
   /* The full-softmax convention by default -- see the file header for what the
    * two conventions disagree about and why the CPU path needs this one. */
@@ -274,6 +288,8 @@ int main(int argc, char **argv) {
       embeddings_path = argv[++i];
     } else if (std::string(argv[i]) == "--positions" && i + 1 < argc) {
       positions_path = argv[++i];
+    } else if (std::string(argv[i]) == "--non-causal") {
+      non_causal = true;
     } else {
       tokens.push_back(static_cast<llama_token>(std::strtol(argv[i], nullptr, 10)));
     }
@@ -338,11 +354,15 @@ int main(int argc, char **argv) {
       std::fprintf(stderr, "--embeddings takes no tokens: the two are different inputs\n");
       return 2;
     }
-    return run_embeddings(ctx, model, embeddings_path, positions_path, n_vocab);
+    return run_embeddings(ctx, model, embeddings_path, positions_path, non_causal, n_vocab);
   }
   if (!positions_path.empty()) {
     std::fprintf(stderr, "--positions is for the embeddings mode; a token batch takes positions "
                          "from the cache\n");
+    return 2;
+  }
+  if (non_causal) {
+    std::fprintf(stderr, "--non-causal is for the embeddings mode; a token batch is causal\n");
     return 2;
   }
 

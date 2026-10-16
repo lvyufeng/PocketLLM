@@ -180,7 +180,11 @@ class Backend {
    * silent cross-backend assumption that is correct on exactly one of them.
    *
    * `max_span` must be at least `q_offset + q_len - first_key` for the call it
-   * is sizing. */
+   * is sizing -- *for a causal call*.  A non-causal arm reads no scratch at all
+   * (it recomputes each row rather than holding it), so a graph that sizes one
+   * buffer for a batch it may run either way is within this contract; what is not
+   * allowed is an arm that starts reading a buffer its caller sized for the other
+   * one. */
   virtual int64_t attention_scratch(int64_t q_len, int64_t n_heads, int64_t max_span) const = 0;
 
   /* Grouped-query attention over a cache laid out ``[position][head][d]``, with
