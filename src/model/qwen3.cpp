@@ -1246,10 +1246,28 @@ kernel::DeviceBuffer Qwen3Model::forward_impl(const int32_t *tokens, const float
 
 void Qwen3Model::ensure_kv(int64_t positions, int64_t n_seq) {
   /* Grow when either the positions or the sequence slots exceed what the slabs
-   * hold.  The buffers are released and reallocated, not copied -- the same
-   * growth the single-sequence path always had, kept so its behavior at B=1 is
-   * unchanged -- and a session that has not decoded past the initial window
-   * never pays this. */
+   * hold, and **carry the rows already written across the growth**.
+   *
+   * They were not carried once, and that was a bug with a long reach: the slabs
+   * were released and reallocated empty, on the argument that a single sequence's
+   * positions grow contiguously so the rows it has already written are the ones it
+   * is about to write again.  They are not -- a decode writes only the new row --
+   * so every row below the growth point became keys of zero.
+   *
+   * It went unnoticed because the paths that exercise the cache in this tree stay
+   * inside the initial window: `kInitialPositions` is 256, a twelve-step walk never
+   * crosses it, and the single-sequence decode tests are shorter still.  A vision
+   * prompt is what crossed it first, and loudly: the text before an image is six
+   * rows, the image span needs 576, and the span's attention then read six zeroed
+   * keys where the prompt's own `<|vision_start|>` tokens should have been.  The
+   * measured effect on that path was a correlation of 0.10 against llama.cpp;
+   * raising the initial capacity so the growth never happened moved it to 0.99,
+   * which is how the mechanism was confirmed rather than argued.
+   *
+   * The copy is per layer, because the slab is `[layer][sequence][position][kv]`
+   * and a sequence's rows are not contiguous across layers.  It runs once per
+   * growth (the capacity doubles), and only for the `min(old, new)` rows and
+   * `min(old_slots, n_seq)` slots that both allocations have. */
   if (k_cache_.handle != 0 && positions <= cache_capacity_ && n_seq <= kv_slots_) {
     return;
   }
@@ -1260,12 +1278,43 @@ void Qwen3Model::ensure_kv(int64_t positions, int64_t n_seq) {
   const int64_t elem = kernel::kv_dtype_size(kv_dtype_);
   const std::size_t per_layer = static_cast<std::size_t>(grown) *
                                 static_cast<std::size_t>(n_head_kv_ * head_dim_);
+  kernel::DeviceBuffer grown_k = backend_->allocate(
+      static_cast<int64_t>(per_layer) * n_layer_ * n_seq * elem);
+  kernel::DeviceBuffer grown_v = backend_->allocate(
+      static_cast<int64_t>(per_layer) * n_layer_ * n_seq * elem);
+
   if (k_cache_.handle != 0) {
+    /* Carry every `(layer, slot)` slab that exists in both, row by row within the
+     * layer: the destination's row stride is the new capacity's, the source's is
+     * the old one's, so this is a per-layer copy rather than one large one. */
+    const int64_t rows = std::min<int64_t>(cache_capacity_, grown);
+    const int64_t slots = std::min<int64_t>(kv_slots_, n_seq);
+    const int64_t old_stride = cache_capacity_ * n_head_kv_ * head_dim_;
+    const int64_t new_stride = grown * n_head_kv_ * head_dim_;
+    for (int64_t layer = 0; layer < n_layer_; ++layer) {
+      for (int64_t slot = 0; slot < slots; ++slot) {
+        const int64_t from = (layer * kv_slots_ + slot) * old_stride;
+        const int64_t to = (layer * n_seq + slot) * new_stride;
+        const int64_t bytes = rows * n_head_kv_ * head_dim_ * elem;
+        backend_->copy_device_to_device(
+            kernel::DeviceBuffer{grown_k.handle + static_cast<uintptr_t>(to * elem),
+                                 bytes},
+            kernel::DeviceBuffer{k_cache_.handle + static_cast<uintptr_t>(from * elem),
+                                 bytes},
+            bytes);
+        backend_->copy_device_to_device(
+            kernel::DeviceBuffer{grown_v.handle + static_cast<uintptr_t>(to * elem),
+                                 bytes},
+            kernel::DeviceBuffer{v_cache_.handle + static_cast<uintptr_t>(from * elem),
+                                 bytes},
+            bytes);
+      }
+    }
     backend_->release(k_cache_);
     backend_->release(v_cache_);
   }
-  k_cache_ = backend_->allocate(static_cast<int64_t>(per_layer) * n_layer_ * n_seq * elem);
-  v_cache_ = backend_->allocate(static_cast<int64_t>(per_layer) * n_layer_ * n_seq * elem);
+  k_cache_ = grown_k;
+  v_cache_ = grown_v;
   cache_capacity_ = grown;
   kv_slots_ = n_seq;
 }

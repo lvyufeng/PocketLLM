@@ -27,56 +27,47 @@ each other can, and that needs no oracle, no geometry and no tolerance -- which 
 what makes it the right shape for this bug rather than a tighter bound on an
 existing case.
 
-## And the second case is where the composition actually stands
+## And the second case is the one that closed it
 
-The other half of the disagreement is **not** a bug and is still open.  Feeding the
-engine llama.cpp's *own* image planes -- `--planes`, which takes the tower out of
-the picture -- still disagrees with the reference, so what is missing is in how the
-three calls compose.
+It spent four commits as an `xfail` recording a 70%-of-spread disagreement, and the
+cause turned out to be an **engine bug with nothing to do with images**:
+`ensure_kv` released the KV slabs and reallocated them empty on growth, so the six
+`<|vision_start|>` tokens written before the span were zeros in the span's key set.
+A vision prompt crosses the initial 256-position capacity *inside its image span*,
+which is why this path found it and no other test did.  Carrying the rows across the
+growth took this case from correlation 0.103 to 0.994.
 
-Four candidates have since been eliminated by measurement rather than by argument,
-and each elimination is worth more than the bound it replaces:
+Thirteen candidates were eliminated by measurement before that, and they are recorded
+here because each is a place the next reader does not have to look:
 
   - **The mask.**  Flipping the span's causal flag moves the engine by ~28% of the
-    spread and the *wrong way* (the shipped causal arm agrees better), against a
-    ~70% gap.  The engine's causal arm is also entry-for-entry identical to the
-    reference's `(y, x)`-lexicographic rule on this grid.
-  - **The cell count.**  The span does append 576 cache rows -- an append of one
-    row would fit a 512-position window and it does not; the boundary is between
-    512 (fails) and 576 (succeeds).  So the engine's own 576-row append is the
-    right layout and the "it should share one slot" reading was wrong.
-  - **The positions.**  The span's four components are element-wise identical to
-    `mtmd_helper_image_get_decoder_pos`, including the row/column order and the
-    `span_start` base.
-  - **The tower.**  `--planes` removes it and the gap barely moves.
-  - **The rotary itself.**  The engine's per-token table was recovered angle by
-    angle and compared with `ggml_rope_multi`'s: every pair agrees to 6e-8, which is
-    float32 rounding.  Same section assignment, same ramp, same base.  (Getting
-    there took two attempts, and the first reported 199% -- a comparison measured
-    against a misaligned input, which is the failure mode this file's own history
-    warns about.  The angles are recoverable without ggml exposing its cache: feed
-    the rotation a vector that is 1 in both members of every pair, and
-    `atan2(out[p+half] - out[p], out[p+half] + out[p])` is the angle.)
+    spread and the *wrong way*, and the engine's causal arm is entry-for-entry
+    identical to the reference's `(y, x)`-lexicographic rule on this grid.
+  - **The key set and visibility.**  A per-row set comparison: 0 of 576 span rows
+    differ, 166176/166176 inside the span and 169632/169632 with the text before it.
+  - **The cell count.**  The span does append 576 cache rows -- `n_ctx` 512 fails and
+    576 succeeds -- so the engine's layout is right and "it should share one slot"
+    was wrong.
+  - **The positions.**  Element-wise identical to
+    `mtmd_helper_image_get_decoder_pos`, row/column order and base included.
+  - **The rotary table.**  Every pair agrees with `ggml_rope_multi` to 6e-8, angles
+    recovered pair by pair.  (This one took two attempts and the first reported 199%
+    -- a comparison whose two sides were not driven from the same input, which is the
+    failure mode this file has now hit three times.  The angles are recoverable
+    without ggml exposing its cache: feed the rotation a vector that is 1 in both
+    members of every pair and `atan2(out[p+half] - out[p], out[p+half] + out[p])` is
+    the angle.)
+  - **The tower.**  Feeding llama.cpp's own `mtmd_encode` features moves the gap from
+    0.75 to 0.79 -- no closer.
+  - **The span's inputs.**  The tensor-by-tensor comparison that finally pointed at
+    the answer: every input to block 0's attention -- embeddings, post-norm, Q, K
+    after the rotary, V -- agreed to float32 noise while the attention *output* was
+    86% of its own scale off.  Inputs right and output wrong is what reading zeroed
+    keys looks like; the elimination was of the hypothesis that any of those tensors
+    was wrong, and it is what made the search look at memory instead of arithmetic.
 
-What is left, and it is a *lead rather than a diagnosis*: the span batch's
-activation **diverges with depth**.  Dumping its last row per block gives 3.5e3 at
-block 0, 2.0e4 at block 12, 3.7e5 at block 20 and 6.2e6 at block 27, where the
-reference's final hidden for the same batch is 1.8e4 -- a factor of 340, growing
-exponentially from about block 13.  The plain token path does not do that (it
-reaches 7.3e3 by block 7, the same order as the reference).
-
-So the fault is in something only the span batch does, and the next probe is the
-one that has not been run: the span batch's **Q, K and V as the engine actually
-produces them**, post-projection and post-rotary, against llama.cpp's for the same
-block -- rather than the table the rotary is run from, which is now known good.
-The 576-row append interacting with the attention window is the other candidate,
-and both are decided by the same comparison.
-
-The case below asserts the facts that *are* settled (the token flow, and the span's
-position count) and records that the logits do not yet match, rather than pretending
-to a bound the path does not meet.  When the composition lands this is the file
-whose assertions tighten, and `test_the_composition_is_what_is_missing` is the one
-that turns into a logits comparison.
+The two cases below are therefore an assertion each: the path is deterministic, and
+it agrees with llama.cpp's own composition over the whole prompt.
 """
 
 from __future__ import annotations
@@ -91,6 +82,7 @@ import pytest
 from llama_oracle import LLAMA_LIB, repository_root
 from mtmd_vlm import compile_tool as compile_vlm_oracle
 from mtmd_vlm import n_pos, n_tokens, run as run_oracle, tool_path as oracle_tool_path
+from test_op_conformance import QUANTIZED_RTOL
 
 #: The two files a vision checkpoint is.
 MMPROJ = pathlib.Path("/mnt/data1/models/mmproj-qwen3vl-2b-f16.gguf")
@@ -237,27 +229,24 @@ def test_the_composition_carries_the_reference_layout(tmp_path: pathlib.Path) ->
     )
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="the composition of the three calls does not match llama.cpp yet; the tower is "
-    "exonerated by --planes, and this case is the one that turns green when the rest lands",
-)
-def test_the_composition_is_what_is_missing(tmp_path: pathlib.Path) -> None:
-    """The tower is not the disagreement, and this records how far off the rest is.
+def test_the_whole_path_matches_llama_cpp(tmp_path: pathlib.Path) -> None:
+    """The composition, against llama.cpp's own.
 
-    Feeding the engine llama.cpp's own image planes takes the tower out of the
-    picture, and the logits still do not match the reference -- so whatever is
-    missing is in how the three calls compose.  Measured with the tower replaced by
-    the reference's own features: **70%** of the logit spread, correlation 0.13.
+    This case spent four commits as an `xfail` recording a 70%-of-spread
+    disagreement, and it is the case that found the bug: the engine's `ensure_kv`
+    released the KV slabs and reallocated them **empty** on growth, so the six
+    `<|vision_start|>` tokens written before the image were zeros in the span's key
+    set -- a vision prompt crosses the initial 256-position capacity inside its image
+    span.  Carrying the rows across the growth took this from correlation 0.103 to
+    0.994.
 
-    **Marked expected-to-fail rather than deleted or loosened**, and the
-    distinction matters.  A bound loose enough to pass here would accept an
-    unrelated answer, which is exactly what a correlation of 0.13 is; deleting it
-    would throw away the measurement; and recording it in
-    `tests/baseline_failures.txt` would make it a permanent part of the tree's
-    definition of normal, which a path that is meant to work is not.  `strict=False`
-    means the case stops being an xfail the moment the composition lands, without
-    anyone having to remember to come back for it.
+    It is deliberately kept as a whole-path case rather than replaced by tighter
+    per-op ones, because the failure it caught was invisible to every narrower test:
+    the tower, the span's positions, its mask, its key set and every input to block
+    0's attention were all measured correct while this disagreed.
+
+    The features come from this engine's own tower (`--planes`); what that isolates
+    and what it does not is spelled out below.
     """
     reason = _skip_reason()
     if reason is not None:
@@ -286,11 +275,15 @@ def test_the_composition_is_what_is_missing(tmp_path: pathlib.Path) -> None:
 
     spread = float(want.max() - want.min())
     worst = float(np.max(np.abs(got - want)))
-    assert worst <= 0.05 * spread, (
+    # `QUANTIZED_RTOL` is the tree's bound for this kind of comparison -- a quantized
+    # llama.cpp against this engine's f32 path -- and the measured value is 4.3% of the
+    # spread at correlation 0.994.  Left at the named bound rather than tightened
+    # around the measurement: the residue here is the two engines' arithmetic, which
+    # moves with the checkpoint and the card, and a bound fitted to one run of one
+    # checkpoint fails the next one for a reason that is not a regression.
+    assert worst <= QUANTIZED_RTOL * spread, (
         f"the engine and the reference disagree by {worst:.4g} over a logit spread of "
-        f"{spread:.4g} ({worst / spread:.1%}), correlation {np.corrcoef(want, got)[0, 1]:.3f}, "
-        "with the tower's graph taken out of the path -- so what remains is in how the "
-        "three calls compose"
+        f"{spread:.4g} ({worst / spread:.1%}), correlation {np.corrcoef(want, got)[0, 1]:.3f}"
     )
 
 
