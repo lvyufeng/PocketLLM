@@ -1,6 +1,7 @@
 #include "model/qwen3vl_vision.h"
 
 #include "model/image_preprocess.h"
+#include "model/tower_loader.h"
 #include "quant/q8_0.h"
 
 #include <cmath>
@@ -37,30 +38,6 @@ std::string vision_key(const std::string &suffix) { return "clip.vision." + suff
  * model may or may not have.  These are not optional: every one is geometry the
  * graph allocates from, and a defaulted `n_embd` of zero is a division rather
  * than a message. */
-int64_t require_int(const GgufReader &checkpoint, const std::string &name) {
-  const int64_t value = checkpoint.get_int(name, 0);
-  if (value <= 0) {
-    throw Error("the mmproj has no positive metadata key '" + name +
-                "'; this build reads a vision tower's geometry from the file rather than assuming "
-                "it");
-  }
-  return value;
-}
-
-const GgufArray *require_array(const GgufReader &checkpoint, const std::string &name) {
-  const GgufValue *value = checkpoint.find(name);
-  const GgufArray *array = value == nullptr ? nullptr : std::get_if<GgufArray>(value);
-  if (array == nullptr) {
-    throw Error("the mmproj has no metadata array '" + name + "'");
-  }
-  return array;
-}
-
-/* A metadata flag, which GGUF writes as its own boolean type and which the
- * reader's integer accessor therefore does not see -- asking for it as an integer
- * answers the fallback, so a file that *has* a vision encoder reads as one that
- * does not.  Both spellings are accepted because a converter is free to write
- * either, and the answer is the same. */
 bool metadata_flag(const GgufReader &checkpoint, const std::string &name) {
   const GgufValue *value = checkpoint.find(name);
   if (value == nullptr) {
@@ -74,11 +51,14 @@ bool metadata_flag(const GgufReader &checkpoint, const std::string &name) {
   }
   return false;
 }
-
-/* The per-channel normalization, which the preprocessing applies after its
- * resize.  Three values each, and read rather than assumed: a checkpoint whose
- * tower was trained with different statistics would otherwise be normalized with
- * this one's and answer with a different model. */
+const GgufArray *require_array(const GgufReader &checkpoint, const std::string &name) {
+  const GgufValue *value = checkpoint.find(name);
+  const GgufArray *array = value == nullptr ? nullptr : std::get_if<GgufArray>(value);
+  if (array == nullptr) {
+    throw Error("the mmproj has no metadata array '" + name + "'");
+  }
+  return array;
+}
 void read_channel_stats(const GgufReader &checkpoint, const std::string &name, float (&out)[3]) {
   const GgufArray *array = require_array(checkpoint, name);
   if (array->floats.size() != 3) {
@@ -94,83 +74,27 @@ void read_channel_stats(const GgufReader &checkpoint, const std::string &name, f
   }
 }
 
-/* A tensor's bytes, widened to f32 and uploaded.
- *
- * The same rule as `qwen3.cpp`'s `bind_dense` -- f32 is copied, f16 is widened,
- * anything else is refused by name -- and deliberately a second copy of it rather
- * than a shared helper.  The two loaders read two different kinds of file (a
- * quantized text model and a dense tower), and the text path is the one every
- * existing checkpoint goes through, so moving the helper would put this change's
- * blast radius on the model that already works. */
-kernel::DeviceBuffer bind_dense(const GgufReader &checkpoint, kernel::Backend &backend,
-                                std::vector<kernel::DeviceBuffer> &owned, const std::string &name) {
-  uint64_t nbytes = 0;
-  const uint8_t *bytes = checkpoint.tensor_data(name, &nbytes);
-  const GgufTensorInfo *info = checkpoint.tensor(name);
-  int64_t elements = 1;
-  for (uint64_t dim : info->dimensions) {
-    elements *= static_cast<int64_t>(dim);
-  }
+/* The loader is shared with the audio tower (`model/tower_loader.h`): both read the
+ * same kind of file and the part where being nearly right is worst is the same part.
+ * What this file keeps is what is specific to a *vision* tower -- `VisionLinear`'s two
+ * shapes, and the convolution binder below, whose tensor is not (rows, cols). */
 
-  std::vector<float> widened(static_cast<std::size_t>(elements));
-  if (info->type_id == kTypeF32) {
-    std::memcpy(widened.data(), bytes, static_cast<std::size_t>(nbytes));
-  } else if (info->type_id == kTypeF16) {
-    for (int64_t i = 0; i < elements; ++i) {
-      widened[static_cast<std::size_t>(i)] = half_to_float(load_u16(bytes + 2 * i));
-    }
-  } else if (info->type_id == kTypeQ8_0) {
-    /* Widened to f32 rather than kept packed: a GEMM that reads the weights in
-     * eight bits has to quantize the activation to match, which is the other path
-     * (`quant/q8k.h`) and a change of its own.  Decoding here is the shortest road
-     * to a tower whose numbers can be compared with the reference, and the format
-     * is a multiply per weight -- `d * qs[i]` -- so it is not the expensive part of
-     * anything. */
-    quant::q8_0_dequantize(bytes, elements, widened.data());
-  } else {
-    throw Error("tensor '" + name + "' is " + ggml_type_of(info->type_id).name +
-                ", and this loader reads f32, f16 and q8_0");
-  }
-
-  kernel::DeviceBuffer device = backend.allocate(elements * 4);
-  backend.copy_to_device(device, widened.data(), elements * 4);
-  owned.push_back(device);
-  return device;
-}
-
-/* A matrix projection with its bias.  `base` is the tensor name without the
- * `.weight`/`.bias` suffix, which is how the checkpoint names both halves of
- * every projection in the tower. */
-VisionLinear bind_linear(const GgufReader &checkpoint, kernel::Backend &backend,
-                         std::vector<kernel::DeviceBuffer> &owned, const std::string &base,
-                         int64_t expected_rows, int64_t expected_cols) {
-  const std::string name = base + ".weight";
-  const GgufTensorInfo *info = checkpoint.tensor(name);
-  if (info == nullptr) {
-    throw Error("the vision tower is missing tensor '" + name +
-                "'; a tower missing one weight answers with a plausible embedding rather than an "
-                "error");
-  }
-  /* GGUF writes the fastest-varying axis first, so a matrix arrives as
-   * (contraction, output) -- the transpose of how the product is written.  The
-   * bytes are already row-major in that order, so nothing is transposed here and
-   * these two lines are the only place the conventions meet. */
-  if (info->dimensions.size() != 2 || static_cast<int64_t>(info->dimensions[0]) != expected_cols ||
-      static_cast<int64_t>(info->dimensions[1]) != expected_rows) {
-    throw Error("tensor '" + name + "' is not (" + std::to_string(expected_cols) + ", " +
-                std::to_string(expected_rows) + ")");
-  }
+/* The shared binder returns `tower::Linear`; a vision block also needs to remember
+ * the shape it was bound at, because the qkv projection is read back in three panels
+ * and `qkv.cols` is how wide each one is.  The check inside `tower::bind_linear` is
+ * the one that matters -- this only records what it already verified. */
+VisionLinear bind_vision_linear(const GgufReader &checkpoint, kernel::Backend &backend,
+                                std::vector<kernel::DeviceBuffer> &owned, const std::string &base,
+                                int64_t rows, int64_t cols) {
+  const tower::Linear shared = tower::bind_linear(checkpoint, backend, owned, base, rows, cols);
   VisionLinear linear;
-  linear.rows = expected_rows;
-  linear.cols = expected_cols;
-  linear.weight = bind_dense(checkpoint, backend, owned, name);
-  linear.bias = bind_dense(checkpoint, backend, owned, base + ".bias");
+  linear.weight = shared.weight;
+  linear.bias = shared.bias;
+  linear.rows = rows;
+  linear.cols = cols;
   return linear;
 }
 
-/* The convolution's weight, whose four dimensions are the kernel's two spatial
- * axes and then the channel pair.  `conv2d`'s header says why that is already the
- * matrix layout and not something that has to be rearranged. */
 VisionLinear bind_conv(const GgufReader &checkpoint, kernel::Backend &backend,
                        std::vector<kernel::DeviceBuffer> &owned, const std::string &name,
                        int64_t out_ch, int64_t in_ch, int64_t kernel) {
@@ -189,7 +113,7 @@ VisionLinear bind_conv(const GgufReader &checkpoint, kernel::Backend &backend,
   VisionLinear linear;
   linear.rows = out_ch;
   linear.cols = in_ch * kernel * kernel;
-  linear.weight = bind_dense(checkpoint, backend, owned, name);
+  linear.weight = tower::bind_tensor(checkpoint, backend, owned, name);
   return linear;
 }
 
@@ -244,14 +168,14 @@ std::unique_ptr<Qwen3VlVision> Qwen3VlVision::load(const GgufReader &checkpoint,
   }
   std::unique_ptr<Qwen3VlVision> model(new Qwen3VlVision(backend));
 
-  model->n_layer_ = require_int(checkpoint, vision_key("block_count"));
-  model->n_embd_ = require_int(checkpoint, vision_key("embedding_length"));
-  model->n_head_ = require_int(checkpoint, vision_key("attention.head_count"));
-  model->n_ff_ = require_int(checkpoint, vision_key("feed_forward_length"));
-  model->patch_size_ = require_int(checkpoint, vision_key("patch_size"));
-  model->image_size_ = require_int(checkpoint, vision_key("image_size"));
-  model->projection_dim_ = require_int(checkpoint, vision_key("projection_dim"));
-  model->merge_ = require_int(checkpoint, vision_key("spatial_merge_size"));
+  model->n_layer_ = tower::require_int(checkpoint, vision_key("block_count"));
+  model->n_embd_ = tower::require_int(checkpoint, vision_key("embedding_length"));
+  model->n_head_ = tower::require_int(checkpoint, vision_key("attention.head_count"));
+  model->n_ff_ = tower::require_int(checkpoint, vision_key("feed_forward_length"));
+  model->patch_size_ = tower::require_int(checkpoint, vision_key("patch_size"));
+  model->image_size_ = tower::require_int(checkpoint, vision_key("image_size"));
+  model->projection_dim_ = tower::require_int(checkpoint, vision_key("projection_dim"));
+  model->merge_ = tower::require_int(checkpoint, vision_key("spatial_merge_size"));
   /* The pixel limits the preprocessing uses to choose a size, read here because
    * `align` needs `merge_`.  A file that does not state them gets the reference's own
    * defaults for this projector family -- llama.cpp's `set_limit_image_tokens(8,
@@ -331,9 +255,10 @@ std::unique_ptr<Qwen3VlVision> Qwen3VlVision::load(const GgufReader &checkpoint,
       bind_conv(checkpoint, backend, model->owned_, "v.patch_embd.weight", model->n_embd_, 3, kernel);
   model->patch_w1_ = bind_conv(checkpoint, backend, model->owned_, "v.patch_embd.weight.1",
                                model->n_embd_, 3, kernel);
-  model->patch_bias_ = bind_dense(checkpoint, backend, model->owned_, "v.patch_embd.bias");
+  model->patch_bias_ =
+      tower::bind_tensor(checkpoint, backend, model->owned_, "v.patch_embd.bias");
   model->position_table_ =
-      bind_dense(checkpoint, backend, model->owned_, "v.position_embd.weight");
+      tower::bind_tensor(checkpoint, backend, model->owned_, "v.position_embd.weight");
   /* The same table on the host, for the interpolation an image of another size
    * needs: `bind_dense` widens f32/f16 into a device buffer and drops the host copy,
    * and the interpolation happens in the coordinates of the target grid, so it has
@@ -361,42 +286,42 @@ std::unique_ptr<Qwen3VlVision> Qwen3VlVision::load(const GgufReader &checkpoint,
                   ", and this loader reads f32 and f16 only");
     }
   }
-  model->post_ln_w_ = bind_dense(checkpoint, backend, model->owned_, "v.post_ln.weight");
-  model->post_ln_b_ = bind_dense(checkpoint, backend, model->owned_, "v.post_ln.bias");
-  model->mm0_ = bind_linear(checkpoint, backend, model->owned_, "mm.0", model->merged_width_,
+  model->post_ln_w_ = tower::bind_tensor(checkpoint, backend, model->owned_, "v.post_ln.weight");
+  model->post_ln_b_ = tower::bind_tensor(checkpoint, backend, model->owned_, "v.post_ln.bias");
+  model->mm0_ = bind_vision_linear(checkpoint, backend, model->owned_, "mm.0", model->merged_width_,
                             model->merged_width_);
-  model->mm2_ = bind_linear(checkpoint, backend, model->owned_, "mm.2", model->projection_dim_,
+  model->mm2_ = bind_vision_linear(checkpoint, backend, model->owned_, "mm.2", model->projection_dim_,
                             model->merged_width_);
 
   model->blocks_.resize(static_cast<std::size_t>(model->n_layer_));
   for (int64_t layer = 0; layer < model->n_layer_; ++layer) {
     VisionBlock &block = model->blocks_[static_cast<std::size_t>(layer)];
     const std::string base = "v.blk." + std::to_string(layer);
-    block.ln1_w = bind_dense(checkpoint, backend, model->owned_, base + ".ln1.weight");
-    block.ln1_b = bind_dense(checkpoint, backend, model->owned_, base + ".ln1.bias");
-    block.ln2_w = bind_dense(checkpoint, backend, model->owned_, base + ".ln2.weight");
-    block.ln2_b = bind_dense(checkpoint, backend, model->owned_, base + ".ln2.bias");
-    block.qkv = bind_linear(checkpoint, backend, model->owned_, base + ".attn_qkv",
+    block.ln1_w = tower::bind_tensor(checkpoint, backend, model->owned_, base + ".ln1.weight");
+    block.ln1_b = tower::bind_tensor(checkpoint, backend, model->owned_, base + ".ln1.bias");
+    block.ln2_w = tower::bind_tensor(checkpoint, backend, model->owned_, base + ".ln2.weight");
+    block.ln2_b = tower::bind_tensor(checkpoint, backend, model->owned_, base + ".ln2.bias");
+    block.qkv = bind_vision_linear(checkpoint, backend, model->owned_, base + ".attn_qkv",
                             3 * model->n_embd_, model->n_embd_);
-    block.attn_out = bind_linear(checkpoint, backend, model->owned_, base + ".attn_out",
+    block.attn_out = bind_vision_linear(checkpoint, backend, model->owned_, base + ".attn_out",
                                  model->n_embd_, model->n_embd_);
     block.ffn_up =
-        bind_linear(checkpoint, backend, model->owned_, base + ".ffn_up", model->n_ff_, model->n_embd_);
-    block.ffn_down = bind_linear(checkpoint, backend, model->owned_, base + ".ffn_down",
+        bind_vision_linear(checkpoint, backend, model->owned_, base + ".ffn_up", model->n_ff_, model->n_embd_);
+    block.ffn_down = bind_vision_linear(checkpoint, backend, model->owned_, base + ".ffn_down",
                                  model->n_embd_, model->n_ff_);
   }
   for (int64_t layer : model->deepstack_layers_) {
     VisionBlock &block = model->blocks_[static_cast<std::size_t>(layer)];
     const std::string base = "v.deepstack." + std::to_string(layer);
     block.has_deepstack = true;
-    block.ds_norm_w = bind_dense(checkpoint, backend, model->owned_, base + ".norm.weight");
-    block.ds_norm_b = bind_dense(checkpoint, backend, model->owned_, base + ".norm.bias");
+    block.ds_norm_w = tower::bind_tensor(checkpoint, backend, model->owned_, base + ".norm.weight");
+    block.ds_norm_b = tower::bind_tensor(checkpoint, backend, model->owned_, base + ".norm.bias");
     /* The tap normalizes the *merged* row: llama.cpp puts the norm after the
      * reshape, which is what separates a deepstack merger from the final one --
      * whose norm is `v.post_ln`, on the 1024-wide patch. */
-    block.ds_fc1 = bind_linear(checkpoint, backend, model->owned_, base + ".fc1",
+    block.ds_fc1 = bind_vision_linear(checkpoint, backend, model->owned_, base + ".fc1",
                                model->merged_width_, model->merged_width_);
-    block.ds_fc2 = bind_linear(checkpoint, backend, model->owned_, base + ".fc2",
+    block.ds_fc2 = bind_vision_linear(checkpoint, backend, model->owned_, base + ".fc2",
                                model->projection_dim_, model->merged_width_);
   }
 
