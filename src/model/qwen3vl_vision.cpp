@@ -1,6 +1,7 @@
 #include "model/qwen3vl_vision.h"
 
 #include "model/image_preprocess.h"
+#include "quant/q8_0.h"
 
 #include <cmath>
 #include <cstring>
@@ -16,6 +17,10 @@ namespace {
 
 constexpr int kTypeF32 = 0;
 constexpr int kTypeF16 = 1;
+/* `q8_0`, which the *audio* tower's file stores its attention and FFN weights in.
+ * The vision tower's own file is dense, so this branch is here for the second
+ * tower; `src/quant/q8_0.h` is the format. */
+constexpr int kTypeQ8_0 = 8;
 
 /* The tower's rotary base.  A constant here rather than a read, because the
  * mmproj carries no rope key at all: llama.cpp builds a `qwen3vl` vision graph
@@ -114,9 +119,17 @@ kernel::DeviceBuffer bind_dense(const GgufReader &checkpoint, kernel::Backend &b
     for (int64_t i = 0; i < elements; ++i) {
       widened[static_cast<std::size_t>(i)] = half_to_float(load_u16(bytes + 2 * i));
     }
+  } else if (info->type_id == kTypeQ8_0) {
+    /* Widened to f32 rather than kept packed: a GEMM that reads the weights in
+     * eight bits has to quantize the activation to match, which is the other path
+     * (`quant/q8k.h`) and a change of its own.  Decoding here is the shortest road
+     * to a tower whose numbers can be compared with the reference, and the format
+     * is a multiply per weight -- `d * qs[i]` -- so it is not the expensive part of
+     * anything. */
+    quant::q8_0_dequantize(bytes, elements, widened.data());
   } else {
     throw Error("tensor '" + name + "' is " + ggml_type_of(info->type_id).name +
-                ", and the vision tower is dense: this loader reads f32 and f16 only");
+                ", and this loader reads f32, f16 and q8_0");
   }
 
   kernel::DeviceBuffer device = backend.allocate(elements * 4);
