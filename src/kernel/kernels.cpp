@@ -1928,25 +1928,34 @@ void gelu(const float *x, float *out, int64_t n) {
   });
 }
 
-void conv2d(const float *x, const float *weight, const float *bias, float *out, int64_t in_ch,
-            int64_t height, int64_t width, int64_t out_ch, int64_t kernel, int64_t stride,
-            int64_t pad) {
+void conv2d(const float *x, const float *weight, const float *bias, float *out, int64_t batch,
+            int64_t in_ch, int64_t height, int64_t width, int64_t out_ch, int64_t kernel,
+            int64_t stride, int64_t pad) {
   const int64_t out_h = (height + 2 * pad - kernel) / stride + 1;
   const int64_t out_w = (width + 2 * pad - kernel) / stride + 1;
   const int64_t k = in_ch * kernel * kernel;
+  const int64_t in_image = in_ch * height * width;
+  const int64_t out_image = out_ch * out_h * out_w;
   /* Over the patches, one output row each.  A patch's output is a sum over its
    * own receptive field and touches no other patch's output, so this is the
    * outer-index split `parallel.h` asks for and not a split reduction -- the
    * answer is bit-identical however many threads take it. */
-  parallel_for(out_h * out_w, /*min_per_task=*/1, [&](int64_t lo, int64_t hi, int64_t) {
-    for (int64_t p = lo; p < hi; ++p) {
+  /* The batch is folded into the parallel range rather than looped outside it: a
+   * chunk's patches touch no other chunk's, so the split is still an outer-index
+   * one and the answer is bit-identical however many threads take it. */
+  parallel_for(batch * out_h * out_w, /*min_per_task=*/1, [&](int64_t lo, int64_t hi, int64_t) {
+    for (int64_t q = lo; q < hi; ++q) {
+      const int64_t b = q / (out_h * out_w);
+      const int64_t p = q % (out_h * out_w);
       const int64_t oy = p / out_w;
       const int64_t ox = p % out_w;
+      const float *const image = x + b * in_image;
+      float *const image_out = out + b * out_image;
       for (int64_t o = 0; o < out_ch; ++o) {
         const float *const row = weight + o * k;
         float acc = bias != nullptr ? bias[o] : 0.0F;
         for (int64_t ic = 0; ic < in_ch; ++ic) {
-          const float *const plane = x + ic * height * width;
+          const float *const plane = image + ic * height * width;
           const float *const krow = row + ic * kernel * kernel;
           for (int64_t ky = 0; ky < kernel; ++ky) {
             const int64_t iy = oy * stride + ky - pad;
@@ -1964,7 +1973,7 @@ void conv2d(const float *x, const float *weight, const float *bias, float *out, 
             }
           }
         }
-        out[p * out_ch + o] = acc;
+        image_out[p * out_ch + o] = acc;
       }
     }
   });

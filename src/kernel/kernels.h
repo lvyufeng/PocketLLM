@@ -176,10 +176,17 @@ void gelu(const float *x, float *out, int64_t n);
  * Padding is zero, and the guard is a `continue` rather than a pre-padded copy
  * of the image: an edge patch's out-of-range taps contribute nothing, so
  * materialising zeros only to multiply them would cost more than skipping them.
+ *
+ * **`batch` is the outermost axis of both `x` and `out`, and one call runs every
+ * image in it.**  The vision tower passes 1; the audio tower passes the number of
+ * 100-frame mel chunks, because that is what its file's graph views its input as
+ * and driving them one at a time would be the same arithmetic with a loop around
+ * the *outside* of an op that already has the axis.  The weight is shared across
+ * the batch, which is what a convolution means.
  */
-void conv2d(const float *x, const float *weight, const float *bias, float *out, int64_t in_ch,
-            int64_t height, int64_t width, int64_t out_ch, int64_t kernel, int64_t stride,
-            int64_t pad);
+void conv2d(const float *x, const float *weight, const float *bias, float *out, int64_t batch,
+            int64_t in_ch, int64_t height, int64_t width, int64_t out_ch, int64_t kernel,
+            int64_t stride, int64_t pad);
 
 /* ``out = a + b``, elementwise over the whole tensor.
  *

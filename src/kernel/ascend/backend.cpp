@@ -1339,8 +1339,8 @@ class AscendBackend final : public Backend {
    * caller learns the tower cannot run here rather than receiving an image that
    * was never convolved. */
   void conv2d(DeviceBuffer /*x*/, DeviceBuffer /*weight*/, DeviceBuffer /*bias*/,
-              DeviceBuffer /*out*/, int64_t /*in_ch*/, int64_t /*height*/, int64_t /*width*/,
-              int64_t /*out_ch*/, int64_t /*kernel*/, int64_t /*stride*/,
+              DeviceBuffer /*out*/, int64_t /*batch*/, int64_t /*in_ch*/, int64_t /*height*/,
+              int64_t /*width*/, int64_t /*out_ch*/, int64_t /*kernel*/, int64_t /*stride*/,
               int64_t /*pad*/) override {
     throw Error("ascend: conv2d is not implemented; this backend's custom-op set has no "
                 "convolution");

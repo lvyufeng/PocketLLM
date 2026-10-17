@@ -532,10 +532,11 @@ void Qwen3VlVision::encode(const uint8_t *rgb, int64_t height, int64_t width, fl
    * still image the tower takes are two convolutions of the same picture summed,
    * plus the one bias. */
   const int64_t kernel = patch_size_;
-  backend_->conv2d(pixels_, patch_w0_.weight, patch_bias_, conv_, 3, image_h, side, n_embd_,
+  backend_->conv2d(pixels_, patch_w0_.weight, patch_bias_, conv_, /*batch=*/1, 3, image_h,
+                   side, n_embd_,
                    kernel, kernel, 0);
-  backend_->conv2d(pixels_, patch_w1_.weight, kernel::DeviceBuffer{}, conv_tmp_, 3, image_h,
-                   side, n_embd_, kernel, kernel, 0);
+  backend_->conv2d(pixels_, patch_w1_.weight, kernel::DeviceBuffer{}, conv_tmp_, /*batch=*/1, 3,
+                   image_h, side, n_embd_, kernel, kernel, 0);
   backend_->add(conv_, conv_tmp_, conv_, patches * n_embd_);
 
   /* Into merge order -- one permutation applied to the patches and to the

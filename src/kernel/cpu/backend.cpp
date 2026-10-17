@@ -132,10 +132,10 @@ class CpuBackend final : public Backend {
   }
 
   void conv2d(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out,
-              int64_t in_ch, int64_t height, int64_t width, int64_t out_ch, int64_t kernel,
-              int64_t stride, int64_t pad) override {
-    kernel::conv2d(f(x), f(weight), bias.handle != 0 ? f(bias) : nullptr, w(out), in_ch, height,
-                   width, out_ch, kernel, stride, pad);
+              int64_t batch, int64_t in_ch, int64_t height, int64_t width, int64_t out_ch,
+              int64_t kernel, int64_t stride, int64_t pad) override {
+    kernel::conv2d(f(x), f(weight), bias.handle != 0 ? f(bias) : nullptr, w(out), batch, in_ch,
+                   height, width, out_ch, kernel, stride, pad);
   }
 
   void add(DeviceBuffer a, DeviceBuffer b, DeviceBuffer out, int64_t n) override {
