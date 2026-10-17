@@ -21,6 +21,7 @@
 
 #include "kernel/kernels.h"
 #include "runtime/session.h"
+#include "runtime/vlm_session.h"
 #include "runtime/status.h"
 
 namespace {
@@ -41,6 +42,19 @@ const std::string &abi_version_string() {
  * one-place change. */
 pocketllm::Session *as_session(pocketllm_session *handle) {
   return reinterpret_cast<pocketllm::Session *>(handle);
+}
+
+/* The vision handle is a `VlmSession`, for the same reason and with the same
+ * one-place rule.  Two handles rather than one because the two answer different
+ * questions -- a session runs a text graph, a vision session runs a composition --
+ * and a caller that has one should not be able to call the other's entry points by
+ * accident. */
+pocketllm::VlmSession *as_vlm(pocketllm_vlm *handle) {
+  return reinterpret_cast<pocketllm::VlmSession *>(handle);
+}
+
+const pocketllm::VlmSession *as_vlm(const pocketllm_vlm *handle) {
+  return reinterpret_cast<const pocketllm::VlmSession *>(handle);
 }
 
 /* `encode` and `decode` take a `const` session in the header -- they do not
@@ -239,6 +253,96 @@ int pocketllm_reset(pocketllm_session *session) {
   }
   try {
     as_session(session)->reset();
+    return 0;
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+
+pocketllm_vlm *pocketllm_vlm_open(const char *mmproj_path, const char *gguf_path,
+                                   const char *backend, char *err, size_t err_cap) {
+  if (mmproj_path == nullptr) {
+    pocketllm::write_error(err, err_cap, std::string("pocketllm_vlm_open: mmproj_path is NULL"));
+    return nullptr;
+  }
+  if (gguf_path == nullptr) {
+    pocketllm::write_error(err, err_cap, std::string("pocketllm_vlm_open: gguf_path is NULL"));
+    return nullptr;
+  }
+  try {
+    std::string device = backend == nullptr ? "" : backend;
+    auto session = pocketllm::VlmSession::open(mmproj_path, gguf_path, device);
+    return reinterpret_cast<pocketllm_vlm *>(session.release());
+  } catch (const std::exception &e) {
+    pocketllm::write_error(err, err_cap, e);
+    return nullptr;
+  }
+}
+
+void pocketllm_vlm_close(pocketllm_vlm *session) {
+  delete as_vlm(session);
+}
+
+int64_t pocketllm_vlm_image_tokens(const pocketllm_vlm *session, int64_t width, int64_t height) {
+  if (session == nullptr) {
+    return -1;
+  }
+  try {
+    return as_vlm(session)->image_tokens(width, height);
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+
+const char *pocketllm_vlm_marker(void) { return pocketllm::VlmSession::marker(); }
+
+int pocketllm_vlm_forward(pocketllm_vlm *session, const char *prompt, const uint8_t *rgb,
+                          int64_t width, int64_t height, float *logits, int logits_cap) {
+  if (session == nullptr || prompt == nullptr || logits == nullptr) {
+    return -1;
+  }
+  try {
+    const pocketllm::VlmSession::Composition result =
+        as_vlm(session)->compose(prompt, rgb, width, height);
+    const int vocabulary = static_cast<int>(result.logits.size());
+    if (logits_cap < vocabulary) {
+      /* The header promises the vocabulary size is what gets written, so a buffer
+       * too small is a refusal rather than a truncation: a caller that took a short
+       * write as success would sample from a half-filled array. */
+      return -1;
+    }
+    std::memcpy(logits, result.logits.data(), result.logits.size() * sizeof(float));
+    return vocabulary;
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+
+int pocketllm_vlm_forward_argmax(pocketllm_vlm *session, const char *prompt, const uint8_t *rgb,
+                                 int64_t width, int64_t height, int32_t *out_token) {
+  if (session == nullptr || prompt == nullptr || out_token == nullptr) {
+    return -1;
+  }
+  try {
+    const pocketllm::VlmSession::Composition result =
+        as_vlm(session)->compose(prompt, rgb, width, height);
+    if (result.logits.empty()) {
+      return -1;
+    }
+    /* The comparison runs here rather than on the device the way
+     * `pocketllm_forward_argmax` does it, and the difference is worth stating: the
+     * composition has to hand the logits back anyway -- there is no device-side
+     * entry point in `VlmSession` that returns just an index -- so the saving the
+     * text path gets from keeping the vocabulary resident does not exist on this
+     * one yet.  What is promised and kept is that the id is the same one
+     * `pocketllm_argmax` picks over the same logits, ties to the lowest index. */
+    int32_t best = 0;
+    for (std::size_t i = 1; i < result.logits.size(); ++i) {
+      if (result.logits[i] > result.logits[static_cast<std::size_t>(best)]) {
+        best = static_cast<int32_t>(i);
+      }
+    }
+    *out_token = best;
     return 0;
   } catch (const std::exception &) {
     return -1;

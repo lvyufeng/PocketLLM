@@ -65,7 +65,7 @@ extern "C" {
  * a change to a signature in this file.  The minor version moves for an
  * additive change and a host may ignore it. */
 #define POCKETLLM_ABI_VERSION_MAJOR 1
-#define POCKETLLM_ABI_VERSION_MINOR 1
+#define POCKETLLM_ABI_VERSION_MINOR 2
 
 /* The largest error message the engine writes, including the terminator.  A
  * caller that passes a smaller buffer gets a truncated message, never an
@@ -189,6 +189,77 @@ POCKETLLM_API int pocketllm_reserve(pocketllm_session *session, int64_t position
 /* Drop the KV cache and the position counter.  The next `pocketllm_forward`
  * starts a fresh sequence.  Returns 0 on success, negative on failure. */
 POCKETLLM_API int pocketllm_reset(pocketllm_session *session);
+
+/* --- Vision-language -------------------------------------------------------
+ *
+ * A vision prompt is a text model, a projector, and a *composition* of three
+ * calls: the text before the image, the image span as embeddings, and the text
+ * after it.  That order is the engine's contract rather than a caller's
+ * convenience -- the span's attention is a property of a batch and not of a range
+ * inside one -- so it is one call here, not three.  A caller that assembled the
+ * three itself would be a second implementation of the one thing this ABI exists
+ * to fix.
+ *
+ * The image is raw RGB, `width * height * 3` bytes, three interleaved channels,
+ * row-major, top to bottom, at any size: the engine resizes it the way the
+ * reference does, choosing a target with the checkpoint's own pixel limits.  That
+ * choice is not cosmetic -- the span's token count is `(nx / 32) * (ny / 32)` --
+ * so `pocketllm_vlm_image_tokens` reports what a shape becomes before a caller
+ * commits to it. */
+
+typedef struct pocketllm_vlm pocketllm_vlm;
+
+/* Open a tower and a text model on one device.  Both paths are required: the
+ * language model without its projector cannot take an image, and the projector
+ * without its language model produces features nothing reads.  Returns NULL on
+ * failure, with `err` written the same way `pocketllm_open` writes it. */
+POCKETLLM_API pocketllm_vlm *pocketllm_vlm_open(const char *mmproj_path, const char *gguf_path,
+                                                const char *backend, char *err, size_t err_cap);
+
+/* Release a vision session.  A NULL argument is a no-op. */
+POCKETLLM_API void pocketllm_vlm_close(pocketllm_vlm *session);
+
+/* How many image tokens an input of this shape becomes, or negative on failure.
+ *
+ * Worth its own call because the answer is not a function of the pixel count
+ * alone: the preprocessing rounds the shape onto the patch grid and then clamps it
+ * by the checkpoint's own limits, so a caller that guesses from area sizes its
+ * prompt wrong.  An image already at the checkpoint's own size is unchanged. */
+POCKETLLM_API int64_t pocketllm_vlm_image_tokens(const pocketllm_vlm *session, int64_t width,
+                                                 int64_t height);
+
+/* The marker the prompt splits on -- `"<__media__>"`, which is `libmtmd`'s
+ * default.  A prompt holds exactly one of them; two is refused rather than
+ * resolved to the first, because the composition above places one image per call.
+ * The returned string is static and must not be freed. */
+POCKETLLM_API const char *pocketllm_vlm_marker(void);
+
+/* Run the whole path and write the logits of the last position into `logits`.
+ *
+ * `prompt` holds one marker; `rgb` is `width * height * 3` bytes as described
+ * above.  Returns the vocabulary size -- also the number of floats written -- or a
+ * negative value on failure, the same convention `pocketllm_forward` uses.
+ *
+ * This is a *prefill*: the three calls are one prompt, so the session's cache is
+ * reset first and a caller that wants a second turn starts one here rather than
+ * continuing from the last.  Leaving a previous composition's rows in place would
+ * have the span attend to them, which is a different prompt and not an error
+ * anything downstream would catch. */
+POCKETLLM_API int pocketllm_vlm_forward(pocketllm_vlm *session, const char *prompt,
+                                        const uint8_t *rgb, int64_t width, int64_t height,
+                                        float *logits, int logits_cap);
+
+/* The greedy fast path: run the composition and write only the index of the
+ * largest logit into `out_token`.
+ *
+ * This is `pocketllm_vlm_forward` with the vocabulary left on the device, for the
+ * reason `pocketllm_forward_argmax` gives -- a caller that wants one token should
+ * not materialize 151936 floats -- and the id is the same one
+ * `pocketllm_argmax` would pick over those logits.  Returns 0 on success, a
+ * negative value on failure. */
+POCKETLLM_API int pocketllm_vlm_forward_argmax(pocketllm_vlm *session, const char *prompt,
+                                               const uint8_t *rgb, int64_t width, int64_t height,
+                                               int32_t *out_token);
 
 /* The index of the largest of `n` logits, which is greedy sampling.  Returns a
  * non-negative index, or negative if `n` is not positive.  It takes no session

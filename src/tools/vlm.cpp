@@ -29,13 +29,21 @@
  * in llama.cpp, which is the `<__media__>` below -- and this tool splits it there.
  * More than one marker is refused: the flow above is one image per call.
  *
- * The image is handed over as raw RGB bytes for the reason the tower's own oracle
- * gives, and at the checkpoint's own `image_size` square for the reason the tower
- * gives: the resize that would let it take another size is not implemented, and
- * this tool says so rather than resampling.
+ * The image is handed over as raw RGB bytes at **any** size: the tower resizes it
+ * with the checkpoint's own pixel limits and the reference's kernels, so a
+ * 512x512 input is 256 tokens where a 768x768 one is 576.  The tool prints what it
+ * chose (`target`, `n_image_tokens`) because a caller comparing against the
+ * reference needs the number rather than the shape it passed in.
  *
- * On the CPU this needs `POCKETLLM_CPU_KV_F32=1`: the span is non-causal, and that
- * arm refuses an f16 cache rather than widening it.
+ * The default path goes through `VlmSession`, which owns the three-call order; the
+ * two flags below are bisect instruments that reach the model directly and keep
+ * their own copy of it.  Nothing else may: a third copy is how a bug gets reported
+ * against the instrument instead of the engine.
+ *
+ * No environment variable is needed.  The span is decoded *causally* -- which is a
+ * measured fact about this architecture, not a simplification -- and the causal arm
+ * runs on the default f16 cache.  `POCKETLLM_CPU_KV_F32=1` is still honoured and
+ * still works; it is simply no longer required.
  */
 
 #include <cmath>
@@ -50,6 +58,7 @@
 #include "model/qwen3.h"
 #include "model/qwen3vl_vision.h"
 #include "runtime/status.h"
+#include "runtime/vlm_session.h"
 #include "tokenizer/bpe.h"
 
 namespace {
@@ -62,7 +71,8 @@ int usage(const char *argv0) {
   std::fprintf(stderr,
                "usage: %s <mmproj.gguf> <text_model.gguf> <rgb.bin> <width> <height> "
                "<prompt> <logits.bin> [--planes FILE] [--skip-vision] [--device cpu|cuda]\n"
-               "  the image arguments are still required with --planes, and unused;\n"
+               "  the image arguments are still required with --planes, and must\n"
+               "  describe the grid the file was written for;\n"
                "  --skip-vision does not load the tower at all, which is the bisect for\n"
                "  whether a disagreement is the tower's or the composition's\n",
                argv0);
@@ -116,6 +126,53 @@ int main(int argc, char **argv) {
   }
 
   try {
+    /* The default path goes through `VlmSession`, which owns the three-call
+     * composition; the two flags below are bisect instruments that need to reach
+     * the model directly, and they keep their own copy of the order.  Nothing
+     * else may: an instrument that reimplements what it measures is how this
+     * repository once reported a planes bug that was a misplaced command-line
+     * argument. */
+    if (planes_path.empty() && !skip_vision) {
+      const std::vector<uint8_t> rgb = read_bytes(positional[2]);
+      const int64_t width = std::atoll(positional[3].c_str());
+      const int64_t height = std::atoll(positional[4].c_str());
+      if (static_cast<int64_t>(rgb.size()) != width * height * 3) {
+        throw pocketllm::Error("'" + positional[2] + "' is not width * height * 3 bytes");
+      }
+      auto session = pocketllm::VlmSession::open(positional[0], positional[1], device);
+      const pocketllm::VlmSession::Composition report =
+          session->compose(positional[5], rgb.data(), width, height);
+
+      std::FILE *out = std::fopen(positional[6].c_str(), "wb");
+      if (out == nullptr) {
+        throw pocketllm::Error("cannot write '" + positional[6] + "'");
+      }
+      const std::size_t written =
+          std::fwrite(report.logits.data(), sizeof(float), report.logits.size(), out);
+      const bool short_write = written != report.logits.size();
+      std::fclose(out);
+      if (short_write) {
+        throw pocketllm::Error("short write to '" + positional[6] + "'");
+      }
+
+      int64_t best = 0;
+      for (std::size_t i = 1; i < report.logits.size(); ++i) {
+        if (report.logits[i] > report.logits[static_cast<std::size_t>(best)]) {
+          best = static_cast<int64_t>(i);
+        }
+      }
+      std::printf("n_tokens %lld\n", static_cast<long long>(report.tokens_before +
+                                                          report.image_tokens + report.tokens_after));
+      std::printf("n_image_tokens %lld\n", static_cast<long long>(report.image_tokens));
+      std::printf("target %lld %lld\n", static_cast<long long>(report.target_width),
+                  static_cast<long long>(report.target_height));
+      std::printf("n_positions %lld\n", static_cast<long long>(report.positions));
+      std::printf("n_cache_rows %lld\n", static_cast<long long>(report.cache_rows));
+      std::printf("n_vocab %lld\n", static_cast<long long>(report.logits.size()));
+      std::printf("argmax %lld\n", static_cast<long long>(best));
+      return 0;
+    }
+
     pocketllm::GgufReader mmproj(positional[0]);
     pocketllm::GgufReader text_model(positional[1]);
     auto backend = pocketllm::kernel::make_backend(device);

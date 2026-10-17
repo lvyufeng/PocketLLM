@@ -92,6 +92,12 @@ def test_the_library_exports_exactly_the_abi(lib: "ctypes.CDLL") -> None:
         "pocketllm_argmax",
         "pocketllm_temperature",
         "pocketllm_sample",
+        "pocketllm_vlm_open",
+        "pocketllm_vlm_close",
+        "pocketllm_vlm_image_tokens",
+        "pocketllm_vlm_marker",
+        "pocketllm_vlm_forward",
+        "pocketllm_vlm_forward_argmax",
     }
     exported = _exported_pocketllm_symbols()
     assert exported == expected, (

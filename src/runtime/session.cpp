@@ -111,6 +111,44 @@ std::vector<float> Session::forward(const int32_t *tokens, int64_t n, int64_t *a
   return host;
 }
 
+std::vector<float> Session::forward_embeddings(const float *planes, const int64_t *positions,
+                                                int64_t n, int64_t start_pos) {
+  if (model_ == nullptr) {
+    throw Error(no_graph_message());
+  }
+  /* The image span is decoded causally, which is a measured fact about this
+   * architecture rather than a simplification: llama.cpp's rule is
+   * `mtmd_decode_use_non_causal`, and it answers true only for the Gemma
+   * projectors.  A `qwen3vl_merger` span sees the tokens before it and not the
+   * ones after, so the causal arm is the correct one -- and it is also the arm
+   * that does not need an f32 cache, which is why this call carries no
+   * environment requirement the way the non-causal one would. */
+  const kernel::DeviceBuffer logits =
+      model_->forward_embeddings(planes, positions, n, start_pos, /*non_causal=*/false);
+  position_ = model_->cache_length();
+
+  std::vector<float> host(static_cast<std::size_t>(model_->n_vocab()));
+  backend_->copy_to_host(host.data(), logits, model_->n_vocab() * 4);
+  return host;
+}
+
+std::vector<float> Session::forward_positions(const int32_t *tokens, const int64_t *positions,
+                                              int64_t n, int64_t start_pos) {
+  if (model_ == nullptr) {
+    throw Error(no_graph_message());
+  }
+  const kernel::DeviceBuffer logits = model_->forward_positions(tokens, positions, n, start_pos);
+  position_ = model_->cache_length();
+
+  std::vector<float> host(static_cast<std::size_t>(model_->n_vocab()));
+  backend_->copy_to_host(host.data(), logits, model_->n_vocab() * 4);
+  return host;
+}
+
+int64_t Session::cache_length() const {
+  return model_ == nullptr ? 0 : model_->cache_length();
+}
+
 void Session::forward_batch(const int32_t *tokens, const int64_t *n_per_seq, int64_t n_seq,
                             int32_t *out_tokens) {
   if (model_ == nullptr) {

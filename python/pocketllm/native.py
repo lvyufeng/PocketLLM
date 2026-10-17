@@ -209,6 +209,48 @@ def _bind(lib: "CDLL") -> None:
         ctypes.c_float,
     ]
 
+    # The vision-language entry points.  A `pocketllm_vlm` handle is its own
+    # opaque type, not a `pocketllm_session`: the two answer different questions
+    # and a caller holding one must not be able to call the other's functions.
+    lib.pocketllm_vlm_open.restype = ctypes.c_void_p
+    lib.pocketllm_vlm_open.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+
+    lib.pocketllm_vlm_close.restype = None
+    lib.pocketllm_vlm_close.argtypes = [ctypes.c_void_p]
+
+    lib.pocketllm_vlm_image_tokens.restype = ctypes.c_int64
+    lib.pocketllm_vlm_image_tokens.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64]
+
+    lib.pocketllm_vlm_marker.restype = ctypes.c_char_p
+    lib.pocketllm_vlm_marker.argtypes = []
+
+    lib.pocketllm_vlm_forward.restype = ctypes.c_int
+    lib.pocketllm_vlm_forward.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+    ]
+
+    lib.pocketllm_vlm_forward_argmax.restype = ctypes.c_int
+    lib.pocketllm_vlm_forward_argmax.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.POINTER(ctypes.c_int32),
+    ]
+
 
 def load(path: pathlib.Path | str | None = None) -> "CDLL":
     """Load and bind the engine library.

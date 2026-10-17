@@ -63,6 +63,11 @@ class Session {
    * open's error rather than in the first `encode`'s. */
   const Tokenizer *tokenizer() const { return tokenizer_.get(); }
 
+  /* The device this session bound to.  Exposed for a second model that has to
+   * live on the same one -- a vision tower shares the text model's device, and a
+   * tower on another device would mean a copy of the activations per image. */
+  kernel::Backend &backend() { return *backend_; }
+
   /* The bound model, or nullptr for a checkpoint whose architecture this build
    * does not implement.  Built in `open` for the same reason the tokenizer is.
    * nullptr is still possible -- a checkpoint with a vocabulary but an
@@ -89,14 +94,41 @@ class Session {
   void forward_batch(const int32_t *tokens, const int64_t *n_per_seq, int64_t n_seq,
                      int32_t *out_tokens);
 
+  /* Run an image span: `n` tokens whose input rows come from `planes` rather than
+   * from the vocabulary, each with its own multi-section rotary positions, and
+   * continuing from `start_pos`.  Returns the logits of the span's last row.
+   *
+   * This is the second of the three calls a vision prompt is (see
+   * `runtime/vlm_session.h`), and it is here rather than reached through
+   * `model()` because a caller outside this class must not be able to run the
+   * graph without the session's position counter following it -- which is the
+   * whole reason the counter is private. */
+  std::vector<float> forward_embeddings(const float *planes, const int64_t *positions, int64_t n,
+                                        int64_t start_pos);
+
+  /* The third call: a token batch whose rotary positions are explicit rather than
+   * its cache rows, which an image's tokens are -- the span consumes `side`
+   * positions for `side * side` tokens, so the text after it continues from a
+   * position the cache length does not name. */
+  std::vector<float> forward_positions(const int32_t *tokens, const int64_t *positions, int64_t n,
+                                       int64_t start_pos);
+
+  /* The number of positions the cache holds, which is where the next call
+   * continues from. */
+  int64_t cache_length() const;
+
   /* Drop the KV cache and rewind to position 0. */
   void reset();
 
   /* Pre-size the KV slabs to `slots` sequence slots of `positions` rows each,
-   * before a batch is admitted.  The scheduler calls this because the slabs
-   * cannot grow once more than one sequence is live -- `ensure_kv` grows by
-   * release and reallocate without copying, which would wipe the batch.  See
-   * `Qwen3Model::reserve`.  Throws `ContextLengthError` if past the window. */
+   * before a batch is admitted.  See `Qwen3Model::reserve`; throws
+   * `ContextLengthError` if past the window.
+   *
+   * The scheduler calls this because a *batch* cannot be grown into: `ensure_kv`
+   * carries a single sequence's rows across a growth now -- it used to drop them,
+   * which was a bug -- but its copy is per `(layer, slot)` and a growth in the
+   * middle of a batch would still have to move every live sequence's rows.  One
+   * reservation up front is cheaper than that and simpler to reason about. */
   void reserve(int64_t positions, int64_t slots);
 
  private:
