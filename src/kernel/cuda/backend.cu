@@ -762,19 +762,25 @@ __global__ void gelu_kernel(const float *x, float *out, int64_t n) {
 __global__ void conv2d_kernel(const float *x, const float *weight, const float *bias, float *out,
                               int64_t in_ch, int64_t height, int64_t width, int64_t out_ch,
                               int64_t kernel, int64_t stride, int64_t pad, int64_t out_w,
-                              int64_t total) {
+                              int64_t per_image, int64_t total) {
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= total) {
     return;
   }
-  const int64_t o = i % out_ch;
-  const int64_t p = i / out_ch;
+  /* `i` runs over (image, patch, channel) with the channel fastest; the batch is the
+   * slowest axis of both operands and the weight is shared across it. */
+  const int64_t b = i / per_image;
+  const int64_t within = i % per_image;
+  const int64_t o = within % out_ch;
+  const int64_t p = within / out_ch;
   const int64_t oy = p / out_w;
   const int64_t ox = p % out_w;
   const float *const row = weight + o * (in_ch * kernel * kernel);
+  const float *const image = x + b * (in_ch * height * width);
+  float *const image_out = out + b * per_image;
   float acc = bias != nullptr ? bias[o] : 0.0F;
   for (int64_t ic = 0; ic < in_ch; ++ic) {
-    const float *const plane = x + ic * height * width;
+    const float *const plane = image + ic * height * width;
     const float *const krow = row + ic * kernel * kernel;
     for (int64_t ky = 0; ky < kernel; ++ky) {
       const int64_t iy = oy * stride + ky - pad;
@@ -792,7 +798,10 @@ __global__ void conv2d_kernel(const float *x, const float *weight, const float *
       }
     }
   }
-  out[i] = acc;
+  /* The within-image patch and channel, because `image_out` already carries the
+   * batch offset -- writing at `i` would put the second image's first patch where
+   * the first image's last one goes. */
+  image_out[p * out_ch + o] = acc;
 }
 
 /* One thread per element, the same shape as `gelu_kernel`: no reduction, so
@@ -1346,19 +1355,22 @@ class CudaBackend final : public Backend {
     check(cudaGetLastError(), "gelu");
   }
 
-  void conv2d(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out, int64_t in_ch,
-              int64_t height, int64_t width, int64_t out_ch, int64_t kernel, int64_t stride,
-              int64_t pad) override {
+  void conv2d(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out,
+              int64_t batch, int64_t in_ch, int64_t height, int64_t width, int64_t out_ch,
+              int64_t kernel, int64_t stride, int64_t pad) override {
     const int64_t out_w = (width + 2 * pad - kernel) / stride + 1;
     const int64_t out_h = (height + 2 * pad - kernel) / stride + 1;
-    const int64_t total = out_h * out_w * out_ch;
+    /* The batch is the outermost axis of both operands, so it multiplies the work
+     * rather than changing the arithmetic: one launch covers every image. */
+    const int64_t per_image = out_h * out_w * out_ch;
+    const int64_t total = batch * per_image;
     if (total <= 0) {
       return;
     }
     const unsigned threads = 256;
     conv2d_kernel<<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
         f(x), f(weight), bias.handle != 0 ? f(bias) : nullptr, w(out), in_ch, height, width, out_ch,
-        kernel, stride, pad, out_w, total);
+        kernel, stride, pad, out_w, per_image, total);
     check(cudaGetLastError(), "conv2d");
   }
 

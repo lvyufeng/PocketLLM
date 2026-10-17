@@ -143,3 +143,53 @@ def test_the_towers_patch_embedding_matches_ggml(ggml_tool) -> None:
         want.reshape(-1, 1024),
         note="the tower's patch embedding against ggml_conv_2d",
     )
+
+
+def _engine_batched(
+    images: np.ndarray, weight_rows: np.ndarray, *, kernel: int, stride: int, pad: int
+) -> np.ndarray:
+    """The C kernel over a batch, through `pocketllm-opcheck`."""
+    request = write_request(
+        "conv2d",
+        {"x": images, "w": weight_rows},
+        {"kernel": kernel, "stride": stride, "pad": pad},
+    )
+    answer = run(request, "cpu")
+    return np.array(answer["values"], dtype=np.float64).reshape(answer["out_shape"])
+
+
+def test_the_batch_axis_is_the_same_convolution_per_image() -> None:
+    """A batched call equals one call per image, stacked.
+
+    That is the whole of what a batch axis means, and the failure it guards against
+    is not subtle in principle and is easy in practice: the output offset for image
+    `b` is `b * out_ch * out_h * out_w`, and getting it right for the first image and
+    wrong for the rest is exactly the shape of mistake that a single-image test cannot
+    see.  The audio tower's mel is viewed as chunks and the reference runs all of them
+    in one convolution, so this axis is what that graph is built on.
+
+    Compared against the *unbatched* call rather than against ggml, because that is
+    the property being asserted -- the weight is shared, each image is convolved
+    independently -- and it holds whatever the arithmetic is.
+    """
+    rng = np.random.default_rng(SEED)
+    batch, in_ch, height, width = 3, 2, 9, 11
+    kernel, stride, pad = 3, 2, 1
+    out_ch = 5
+
+    weight = rng.standard_normal((out_ch, in_ch * kernel * kernel)).astype(np.float32)
+    images = rng.standard_normal((batch, in_ch, height, width)).astype(np.float32)
+
+    batched = _engine_batched(images, weight, kernel=kernel, stride=stride, pad=pad)
+    assert batched.shape[0] == batch, batched.shape
+
+    for b in range(batch):
+        single = _engine(images[b], weight, kernel=kernel, stride=stride, pad=pad)
+        # Bit-identical, not close: the batched path runs the same arithmetic with a
+        # different offset, so any difference is the offset.
+        differing = int(np.count_nonzero(batched[b].reshape(-1) != single.reshape(-1)))
+        assert differing == 0, (
+            f"image {b} of the batch differs from its own single call in {differing} of "
+            f"{single.size} values, worst "
+            f"{float(np.abs(batched[b].reshape(-1) - single.reshape(-1)).max())}"
+        )

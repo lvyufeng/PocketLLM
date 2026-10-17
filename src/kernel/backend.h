@@ -140,14 +140,18 @@ class Backend {
 
   /* The vision tower's patch embedding, as `kernels.h` documents it: a
    * square-kernel 2-D convolution with `weight` in GGUF's
-   * `(out_ch, in_ch * kernel^2)` order and `out` patch-major.
+   * `(out_ch, in_ch * kernel^2)` order and `out` patch-major.  `batch` is the
+   * outermost axis of both `x` and `out`, shared weights, and one call runs every
+   * image in it: the audio tower views its mel as chunks and the reference's graph
+   * does the same, so a loop here would be the same arithmetic with the axis
+   * outside the op that has it.
    *
    * A backend whose arithmetic goes through a vendor op with no convolution in
    * it refuses this by name -- the same shape of refusal `gelu` gets -- rather
    * than answering with an image the tower never described. */
   virtual void conv2d(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out,
-                      int64_t in_ch, int64_t height, int64_t width, int64_t out_ch, int64_t kernel,
-                      int64_t stride, int64_t pad) = 0;
+                      int64_t batch, int64_t in_ch, int64_t height, int64_t width, int64_t out_ch,
+                      int64_t kernel, int64_t stride, int64_t pad) = 0;
 
   /* ``out = a + b``, elementwise, as `kernels.h` documents it.  The graph this
    * engine ran before the vision tower had no caller: every residual is

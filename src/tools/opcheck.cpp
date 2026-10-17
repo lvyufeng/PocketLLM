@@ -551,8 +551,17 @@ void run_conv2d(std::ostream &out, Backend &backend, const Request &request) {
   /* Optional in the ABI, so a request without it is legal and the backend is
    * handed the null buffer, exactly as for `layer_norm`'s. */
   const Tensor *bias = request.tensor("bias");
-  if (x.shape.size() != 3) {
-    throw pocketllm::Error("conv2d: x must be (in_ch, height, width)");
+  /* `(in_ch, height, width)` or `(batch, in_ch, height, width)`.  The second form is
+   * what the audio tower drives -- a mel viewed as chunks -- and it is here rather
+   * than only in that graph because a batch axis that is never checked on its own is
+   * a batch axis whose off-by-one shows up as a wrong answer from a model. */
+  if (x.shape.size() != 3 && x.shape.size() != 4) {
+    throw pocketllm::Error("conv2d: x must be (in_ch, height, width) or (batch, in_ch, ...)");
+  }
+  const int64_t batch = x.shape.size() == 4 ? x.shape[0] : 1;
+  const std::size_t axis = x.shape.size() == 4 ? 1 : 0;
+  if (batch <= 0) {
+    throw pocketllm::Error("conv2d: the batch must be positive");
   }
   if (weight.shape.size() != 2) {
     throw pocketllm::Error("conv2d: w must be (out_ch, in_ch * kernel * kernel)");
@@ -563,9 +572,9 @@ void run_conv2d(std::ostream &out, Backend &backend, const Request &request) {
   if (kernel <= 0 || stride <= 0 || pad < 0) {
     throw pocketllm::Error("conv2d: kernel and stride must be positive and pad non-negative");
   }
-  const int64_t in_ch = x.shape[0];
-  const int64_t height = x.shape[1];
-  const int64_t width = x.shape[2];
+  const int64_t in_ch = x.shape[axis];
+  const int64_t height = x.shape[axis + 1];
+  const int64_t width = x.shape[axis + 2];
   const int64_t out_ch = weight.shape[0];
   if (weight.shape[1] != in_ch * kernel * kernel) {
     throw pocketllm::Error("conv2d: w's column count must be in_ch * kernel * kernel");
@@ -584,8 +593,16 @@ void run_conv2d(std::ostream &out, Backend &backend, const Request &request) {
   if (bias != nullptr) {
     db = upload(backend, bias->floats);
   }
-  run_and_report(out, backend, request, {out_h * out_w, out_ch}, [&](DeviceBuffer result) {
-    backend.conv2d(dx, dw, db, result, in_ch, height, width, out_ch, kernel, stride, pad);
+  /* One image: the conformance request describes a single convolution, and the batch
+   * axis is covered by the graph that uses it rather than by this tool's shapes. */
+  /* The reported shape mirrors the request's: a 3-D input keeps the 2-D output it
+   * always had, and only a 4-D one reports its batch.  Changing the single-image
+   * shape would be a silent break for every request already written against it. */
+  const std::vector<int64_t> out_shape = x.shape.size() == 4
+                                             ? std::vector<int64_t>{batch, out_h * out_w, out_ch}
+                                             : std::vector<int64_t>{out_h * out_w, out_ch};
+  run_and_report(out, backend, request, out_shape, [&](DeviceBuffer result) {
+    backend.conv2d(dx, dw, db, result, batch, in_ch, height, width, out_ch, kernel, stride, pad);
   });
   backend.release(dx);
   backend.release(dw);
