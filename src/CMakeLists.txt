@@ -221,6 +221,7 @@ add_library(pocketllm SHARED
   model/qwen3.cpp
   model/qwen3vl_vision.cpp
   model/image_preprocess.cpp
+  runtime/vlm_session.cpp
   ${POCKETLLM_CUDA_SOURCES}
 )
 
@@ -379,6 +380,8 @@ add_executable(pocketllm-vlm
   model/qwen3.cpp
   model/qwen3vl_vision.cpp
   model/image_preprocess.cpp
+  runtime/vlm_session.cpp
+  runtime/session.cpp
   ${POCKETLLM_CUDA_SOURCES}
 )
 if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)

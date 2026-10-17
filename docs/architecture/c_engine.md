@@ -239,9 +239,22 @@ so the resampler is exercised on every pixel -- agrees with llama.cpp at correla
 matching argmax.  Past the checkpoint's own grid the position table is what carries the agreement:
 `1024x1024` matches at 0.994 with the same argmax.
 
-What the image path still does not have is an **ABI entry point that takes an image**: all of it is
-reachable through `pocketllm-vlm` and the C++ model classes, and nothing above that takes a picture
-yet.  `libmtmd` remains the oracle for the whole of it.
+**The ABI takes an image now.**  `pocketllm_vlm_open` / `pocketllm_vlm_forward` /
+`pocketllm_vlm_forward_argmax` / `pocketllm_vlm_close` reach the whole path from C, with
+`pocketllm_vlm_image_tokens` to ask what a shape will cost and `pocketllm_vlm_marker` for the string
+the prompt splits on.  The three-call composition is **one** call there rather than three, and that is
+the point of the entry point: a host that assembled the calls itself would be a second implementation
+of the one thing this path is, and the two would drift.  `runtime/vlm_session.h` owns the order and
+both callers reach it -- the ABI below and `pocketllm-vlm` above -- so the instrument and the thing it
+measures cannot disagree about it.
+
+The ABI also keeps the distinction the composition turns on, and it is worth stating because getting
+it wrong is silent: an image span writes **one cache row per token** but advances the **position**
+counter by one per grid cell, so a 576-token span on a 24x24 grid costs 24 positions.  The tool reports
+both (`n_cache_rows` 583, `n_positions` 31, on the same prompt) because a caller that computed one from
+the other would build a prompt the reference never sees.
+
+`libmtmd` remains the oracle for all of it.
 
 The tokenizer carries **two pre-tokenizers**, because the vocabularies in this project's scope are
 built on two. They differ in exactly one place -- `\p{N}` against `\p{N}{1,3}`, so a number is cut
