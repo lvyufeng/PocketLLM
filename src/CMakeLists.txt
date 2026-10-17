@@ -220,6 +220,7 @@ add_library(pocketllm SHARED
   kernel/registry.cpp
   model/qwen3.cpp
   model/qwen3vl_vision.cpp
+  model/audio_frontend.cpp
   model/image_preprocess.cpp
   runtime/vlm_session.cpp
   ${POCKETLLM_CUDA_SOURCES}
@@ -318,6 +319,7 @@ add_executable(pocketllm-vision
   kernel/cpu/backend.cpp
   kernel/registry.cpp
   model/qwen3vl_vision.cpp
+  model/audio_frontend.cpp
   model/image_preprocess.cpp
   ${POCKETLLM_CUDA_SOURCES}
 )
@@ -379,6 +381,7 @@ add_executable(pocketllm-vlm
   kernel/registry.cpp
   model/qwen3.cpp
   model/qwen3vl_vision.cpp
+  model/audio_frontend.cpp
   model/image_preprocess.cpp
   runtime/vlm_session.cpp
   runtime/session.cpp
