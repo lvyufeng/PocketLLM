@@ -220,6 +220,7 @@ add_library(pocketllm SHARED
   kernel/registry.cpp
   model/qwen3.cpp
   model/qwen3vl_vision.cpp
+  model/qwen3a_audio.cpp
   model/tower_loader.cpp
   model/audio_frontend.cpp
   model/image_preprocess.cpp
@@ -320,9 +321,8 @@ add_executable(pocketllm-vision
   kernel/cpu/backend.cpp
   kernel/registry.cpp
   model/qwen3vl_vision.cpp
-  model/tower_loader.cpp
-  model/audio_frontend.cpp
   model/image_preprocess.cpp
+  model/tower_loader.cpp
   ${POCKETLLM_CUDA_SOURCES}
 )
 if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)
@@ -334,10 +334,36 @@ if(POCKETLLM_ASCEND_SOURCES)
   pocketllm_add_ascend(pocketllm-vision)
 endif()
 
+# Encode audio: PCM in, the tower's features out.
+#
+# The audio side's counterpart to `pocketllm-vision`, and it chains the two pieces
+# that only exist for audio -- the log-mel front end and the `qwen3a` tower -- so a
+# single command covers the whole path from samples to features.
+add_executable(pocketllm-audio
+  tools/audio.cpp
+  abi/spec.cpp
+  gguf/reader.cpp
+  runtime/status.cpp
+  kernel/kernels.cpp
+  kernel/repack_q4k.cpp
+  kernel/cpu/backend.cpp
+  kernel/registry.cpp
+  model/qwen3a_audio.cpp
+  model/tower_loader.cpp
+  model/audio_frontend.cpp
+  ${POCKETLLM_CUDA_SOURCES}
+)
+if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)
+  target_compile_definitions(pocketllm-audio PRIVATE POCKETLLM_WITH_CUDA=1)
+  set_target_properties(pocketllm-audio PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+endif()
+target_link_libraries(pocketllm-audio PRIVATE pocketllm-kernel-options)
+if(POCKETLLM_ASCEND_SOURCES)
+  pocketllm_add_ascend(pocketllm-audio)
+endif()
+
 # Run the text graph from caller-supplied input embeddings and dump the logits,
-# for comparing against llama.cpp's own embeddings path -- which is the only
-# other implementation of a deepstack.  A tool rather than an ABI call for the
-# same reason as the one above: an image is not part of the ABI's surface yet.
+# for comparing against llama.cpp's own embeddings path.
 add_executable(pocketllm-forward-embd
   tools/forward_embd.cpp
   abi/spec.cpp
@@ -383,6 +409,7 @@ add_executable(pocketllm-vlm
   kernel/registry.cpp
   model/qwen3.cpp
   model/qwen3vl_vision.cpp
+  model/qwen3a_audio.cpp
   model/tower_loader.cpp
   model/audio_frontend.cpp
   model/image_preprocess.cpp
