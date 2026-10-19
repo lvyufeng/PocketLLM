@@ -40,6 +40,7 @@
 #include "kernel/backend.h"
 #include "model/audio_frontend.h"
 #include "model/qwen3a_audio.h"
+#include "runtime/asr_session.h"
 #include "runtime/status.h"
 
 namespace {
@@ -70,6 +71,9 @@ std::vector<uint8_t> read_bytes(const std::string &path) {
 int main(int argc, char **argv) {
   std::vector<std::string> positional;
   std::string device = "cpu";
+  std::string text_model;
+  std::string prompt = "Transcribe the audio.";
+  int64_t steps = 32;
   for (int i = 1; i < argc; ++i) {
     const std::string argument = argv[i];
     if (argument == "--device") {
@@ -77,6 +81,21 @@ int main(int argc, char **argv) {
         return usage(argv[0]);
       }
       device = argv[++i];
+    } else if (argument == "--text-model") {
+      if (i + 1 >= argc) {
+        return usage(argv[0]);
+      }
+      text_model = argv[++i];
+    } else if (argument == "--prompt") {
+      if (i + 1 >= argc) {
+        return usage(argv[0]);
+      }
+      prompt = argv[++i];
+    } else if (argument == "--steps") {
+      if (i + 1 >= argc) {
+        return usage(argv[0]);
+      }
+      steps = std::atoll(argv[++i]);
     } else if (argument == "--help" || argument == "-h") {
       return usage(argv[0]);
     } else {
@@ -85,6 +104,58 @@ int main(int argc, char **argv) {
   }
   if (positional.size() != 3) {
     return usage(argv[0]);
+  }
+
+  /* With a text model, this is the whole path: samples in, a transcript out.  Without
+   * one it stops at the features, which is what a caller comparing towers wants. */
+  if (!text_model.empty()) {
+    try {
+      auto session = pocketllm::AsrSession::open(positional[0], text_model, device);
+      const std::vector<uint8_t> raw = read_bytes(positional[1]);
+      std::vector<float> samples(raw.size() / sizeof(float));
+      std::memcpy(samples.data(), raw.data(), raw.size());
+
+      const pocketllm::AsrSession::Composition report =
+          session->compose(prompt, samples.data(), static_cast<int64_t>(samples.size()));
+      const pocketllm::Tokenizer *tokenizer = session->text().tokenizer();
+      int32_t next = 0;
+      for (std::size_t i = 0; i < report.logits.size(); ++i) {
+        if (report.logits[i] > report.logits[static_cast<std::size_t>(next)]) {
+          next = static_cast<int32_t>(i);
+        }
+      }
+      std::string text;
+      std::vector<int32_t> emitted{next};
+      /* Greedy to `--steps`, which is the same decode loop `pocketllm-run` uses and
+       * the same one the reference's CLI runs by default.  A vision-language comparison
+       * stops at logits because one answer is the point; a transcript needs the tokens
+       * after it. */
+      for (int64_t step = 1; step < steps; ++step) {
+        std::vector<float> logits_step = session->text().forward(&next, 1, nullptr);
+        int32_t best = 0;
+        for (std::size_t i = 1; i < logits_step.size(); ++i) {
+          if (logits_step[i] > logits_step[static_cast<std::size_t>(best)]) {
+            best = static_cast<int32_t>(i);
+          }
+        }
+        if (tokenizer != nullptr && tokenizer->special().eos >= 0 && best == tokenizer->special().eos) {
+          break;
+        }
+        next = best;
+        emitted.push_back(next);
+      }
+      /* Decoded once at the end rather than per token: a byte-level BPE piece is not
+       * necessarily a string on its own, and decoding each one separately is how a
+       * multi-byte character becomes replacement characters. */
+      if (tokenizer != nullptr) {
+        text = tokenizer->decode(emitted);
+      }
+      std::printf("text %s\n", text.c_str());
+      return 0;
+    } catch (const std::exception &e) {
+      std::fprintf(stderr, "%s: %s\n", argv[0], e.what());
+      return 1;
+    }
   }
 
   try {

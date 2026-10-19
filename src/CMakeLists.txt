@@ -225,6 +225,7 @@ add_library(pocketllm SHARED
   model/audio_frontend.cpp
   model/image_preprocess.cpp
   runtime/vlm_session.cpp
+  runtime/asr_session.cpp
   ${POCKETLLM_CUDA_SOURCES}
 )
 
@@ -348,9 +349,16 @@ add_executable(pocketllm-audio
   kernel/repack_q4k.cpp
   kernel/cpu/backend.cpp
   kernel/registry.cpp
+  tokenizer/unicode_data.cpp
+  tokenizer/unicode.cpp
+  tokenizer/pretokenize.cpp
+  tokenizer/bpe.cpp
+  model/qwen3.cpp
   model/qwen3a_audio.cpp
   model/tower_loader.cpp
   model/audio_frontend.cpp
+  runtime/session.cpp
+  runtime/asr_session.cpp
   ${POCKETLLM_CUDA_SOURCES}
 )
 if(CMAKE_CUDA_COMPILER AND POCKETLLM_CUDA_SOURCES)
@@ -414,6 +422,7 @@ add_executable(pocketllm-vlm
   model/audio_frontend.cpp
   model/image_preprocess.cpp
   runtime/vlm_session.cpp
+  runtime/asr_session.cpp
   runtime/session.cpp
   ${POCKETLLM_CUDA_SOURCES}
 )
