@@ -9,6 +9,7 @@
 #include "abi/spec.h"
 #include "kernel/parallel.h"
 #include "kernel/repack_q4k.h"
+#include "quant/q8_0.h"
 #include "quant/q8k.h"
 #include "quant/blocks.h"
 #include "quant/half.h"
@@ -44,6 +45,7 @@ namespace {
  * and the day the two disagree is the day a quantized kernel is added. */
 constexpr int kTypeF32 = 0;
 constexpr int kTypeF16 = 1;
+constexpr int kTypeQ8_0 = 8;
 
 /* The packed formats this build decodes, which is `src/quant/blocks.h`'s set: the
  * whole K-quant rung of the width ladder (Q2_K through Q6_K) and the IQ2 rung
@@ -173,6 +175,11 @@ kernel::DeviceBuffer Qwen3Model::bind_dense(const GgufReader &checkpoint, const 
     for (int64_t i = 0; i < elements; ++i) {
       widened[static_cast<std::size_t>(i)] = half_to_float(load_u16(bytes + 2 * i));
     }
+  } else if (info->type_id == kTypeQ8_0) {
+    /* `q8_0` alongside the dense formats because its *block* is 32 weights where the
+     * quantized kernels assume 256: a table bound this way is a gather source and not a
+     * GEMM operand, and widening it is the whole of what a gather needs. */
+    quant::q8_0_dequantize(bytes, elements, widened.data());
   } else {
     /* A quantized tensor reaching this function is a caller that chose the
      * dense binding for it, not a format this build cannot read: the paths are
@@ -221,6 +228,14 @@ Weight Qwen3Model::bind_matrix(const GgufReader &checkpoint, const std::string &
   weight.nbytes = static_cast<int64_t>(info->nbytes);
 
   if (info->type_id == kTypeF32 || info->type_id == kTypeF16) {
+    weight.data = bind_dense(checkpoint, name);
+    return weight;
+  }
+  if (info->type_id == kTypeQ8_0) {
+    /* Widened rather than run packed, for the same reason the table is: `q8_0`'s block is
+     * 32 weights and every packed kernel here is written for 256.  A GEMM over the widened
+     * f32 runs the f32 path, which is exact and slower than a packed kernel would be --
+     * and the checkpoint that needs it is a projector's text model, not a decoder's. */
     weight.data = bind_dense(checkpoint, name);
     return weight;
   }
@@ -358,11 +373,20 @@ Weight Qwen3Model::bind_table(const GgufReader &checkpoint, const std::string &n
     table.data = bind_dense(checkpoint, name);
     return table;
   }
+  if (info->type_id == kTypeQ8_0) {
+    /* Widened to f32 rather than gathered in place: the quantized gather runs over
+     * 256-weight blocks and `q8_0` is 32, so reaching it through that path means a second
+     * block size in a kernel that has one.  What that costs is `n_vocab * n_embd * 4`
+     * bytes resident -- for the Qwen3-ASR text model 1.2 GB against 2.1 GB of weights --
+     * and what it buys is a table this build already knows how to read. */
+    table.data = bind_dense(checkpoint, name);
+    return table;
+  }
   if (!has_packed_kernel(info->type_id) || table.cols % 256 != 0) {
     throw Error(std::string("token_embd.weight is ") + ggml_type_of(info->type_id).name +
                 " with " + std::to_string(table.cols) +
-                " columns; this build gathers from f32, f16, the k-quants q2_k through q6_k and "
-                "iq2_xxs/iq2_xs, whose row is a whole number of 256-weight blocks");
+                " columns; this build gathers from f32, f16, q8_0, the k-quants q2_k through q6_k "
+                "and iq2_xxs/iq2_xs, whose row is a whole number of 256-weight blocks");
   }
   table.quantized = true;
   table.blocks = bind_packed(checkpoint, name).blocks;
@@ -965,10 +989,11 @@ kernel::DeviceBuffer Qwen3Model::forward(const int32_t *tokens, int64_t n, int64
 kernel::DeviceBuffer Qwen3Model::forward_embeddings(const float *planes, const int64_t *positions,
                                                     int64_t n, int64_t start_pos,
                                                     bool non_causal) {
-  if (n_deepstack_ <= 0) {
-    throw Error("this checkpoint carries no deepstack levels, so its input is the token table "
-                "and `forward` is the entry point");
-  }
+  /* No deepstack levels is not a refusal any more: an audio tower's projector feeds the
+   * same entry point, and that checkpoint's text graph carries one plane.  What the
+   * check was protecting against -- a caller that meant `forward` and got this one --
+   * is covered by the plane count the caller has to supply, which is `n_embd` wide for
+   * such a checkpoint and `n_embd * (1 + n_deepstack)` wide for a vision one. */
   if (start_pos != cache_length()) {
     throw Error("forward at position " + std::to_string(start_pos) + " but the cache holds " +
                 std::to_string(cache_length()) + " positions");
@@ -976,8 +1001,13 @@ kernel::DeviceBuffer Qwen3Model::forward_embeddings(const float *planes, const i
   const int64_t sections = rope_sections_[0] + rope_sections_[1] + rope_sections_[2] +
                            rope_sections_[3];
   if (positions != nullptr && sections == 0) {
+    /* A one-dimensional rotary has no per-section positions to be told, so a caller that
+     * passes some has misunderstood something: its span's positions are `start_pos`
+     * counting up, which is what `starts` already says.  A null `positions` on such a
+     * checkpoint is the audio path's, and it is exactly right. */
     throw Error("this checkpoint declares no `rope.dimension_sections`, so its rotary has one "
-                "position per token and per-token positions are not a thing it can be told");
+                "position per token and per-token positions are not a thing it can be told; "
+                "pass no positions and let `start_pos` count");
   }
   const int64_t n_per_seq[1] = {n};
   const int64_t starts[1] = {start_pos};
