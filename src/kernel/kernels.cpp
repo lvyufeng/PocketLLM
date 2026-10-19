@@ -1928,6 +1928,19 @@ void gelu(const float *x, float *out, int64_t n) {
   });
 }
 
+void gelu_erf(const float *x, float *out, int64_t n) {
+  /* The same grain as its tanh sibling, for the same reason: a map over
+   * `tokens * intermediate` elements whose transcendental dominates, so the split is a
+   * scheduling choice and not a numeric one. */
+  constexpr float kInvSqrt2 = 0.70710678118654752440F;
+  parallel_for(n, /*min_per_task=*/64, [&](int64_t lo, int64_t hi, int64_t) {
+    for (int64_t i = lo; i < hi; ++i) {
+      const float v = x[i];
+      out[i] = 0.5F * v * (1.0F + std::erf(v * kInvSqrt2));
+    }
+  });
+}
+
 void conv2d(const float *x, const float *weight, const float *bias, float *out, int64_t batch,
             int64_t in_ch, int64_t height, int64_t width, int64_t out_ch, int64_t kernel,
             int64_t stride, int64_t pad) {

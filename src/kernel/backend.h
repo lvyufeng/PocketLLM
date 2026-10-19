@@ -138,6 +138,11 @@ class Backend {
   /* The tanh-approximated GELU, as `kernels.h` documents it. */
   virtual void gelu(DeviceBuffer x, DeviceBuffer out, int64_t n) = 0;
 
+  /* The exact-erf GELU, `kernels.h`'s `gelu_erf`.  A separate entry point rather than a
+   * mode on `gelu`, because the two are different functions and a caller that picked the
+   * wrong one would be building a different model. */
+  virtual void gelu_erf(DeviceBuffer x, DeviceBuffer out, int64_t n) = 0;
+
   /* The vision tower's patch embedding, as `kernels.h` documents it: a
    * square-kernel 2-D convolution with `weight` in GGUF's
    * `(out_ch, in_ch * kernel^2)` order and `out` patch-major.  `batch` is the

@@ -186,6 +186,20 @@ def gelu(x, **_attrs):
     return (0.5 * x32 * (1.0 + np.tanh(inner))).astype(np.float32)
 
 
+def gelu_erf(x, **_attrs):
+    """The exact GELU, `0.5*x*(1+erf(x/sqrt(2)))`.
+
+    The other half of the pair `gelu` documents: llama.cpp reaches this one
+    through its own `ffn_op` value, and a `qwen3a` audio tower names it. The two
+    differ by roughly 0.01 around `|x| = 1` in the *output* -- far more than a
+    rounding difference, and enough that a tower built with the wrong one answers a
+    different question. `math.erf` rather than a tanh fit, because the point of
+    this op is that it is not the approximation.
+    """
+    x32 = x.astype(np.float32)
+    return (0.5 * x32 * (1.0 + np.vectorize(math.erf)(x32 / math.sqrt(2.0)))).astype(np.float32)
+
+
 def conv2d(x, w, bias=None, *, kernel, stride, pad, **_attrs):
     """The patch embedding: a square 2-D convolution, as a gather plus a product.
 

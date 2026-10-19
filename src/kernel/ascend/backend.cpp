@@ -1351,6 +1351,11 @@ class AscendBackend final : public Backend {
    * but a bare `a + b` over two activations is not one of theirs -- so this is
    * refused by name like `gelu`.  Nothing on the board's own path calls it: the
    * LLM's residuals are `MatmulCubeCustom` with the accumulator turned on. */
+  void gelu_erf(DeviceBuffer /*x*/, DeviceBuffer /*out*/, int64_t /*n*/) override {
+    throw Error("ascend: gelu_erf is not implemented; this backend's custom-op set has the "
+                "tanh GELU and not the exact one");
+  }
+
   void add(DeviceBuffer /*a*/, DeviceBuffer /*b*/, DeviceBuffer /*out*/, int64_t /*n*/) override {
     throw Error("ascend: add is not implemented; this backend's custom-op set has no elementwise "
                 "sum");
