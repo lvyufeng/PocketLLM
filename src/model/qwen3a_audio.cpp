@@ -293,7 +293,7 @@ void Qwen3Audio::encode(const AudioMel &mel, float *out) {
       const int64_t out_w = conv_side(w);
       backend_->conv2d(source, conv.weight, conv.bias, dest, /*batch=*/1, in_ch, h, w, conv_ch_,
                        3, 2, 1);
-      backend_->gelu(dest, dest, conv_ch_ * out_h * out_w);
+      backend_->gelu_erf(dest, dest, conv_ch_ * out_h * out_w);
       h = out_h;
       w = out_w;
       in_ch = conv_ch_;
@@ -361,8 +361,7 @@ void Qwen3Audio::encode(const AudioMel &mel, float *out) {
      * wrong way the shapes still "work" as numbers and the read runs past the
      * activation, which is a heap overrun rather than a wrong answer. */
     backend_->gemm(x_norm_, block.up_w, block.up_b, ffn_, tokens, n_ff_, n_embd_, false);
-    /* `gelu_erf`, which is this projector's `ffn_op` and the arm the vision tower uses. */
-    backend_->gelu(ffn_, ffn_, tokens * n_ff_);
+    backend_->gelu_erf(ffn_, ffn_, tokens * n_ff_);
     backend_->gemm(ffn_, block.down_w, block.down_b, x_, tokens, n_embd_, n_ff_,
                    /*accumulate=*/true);
   }
@@ -370,7 +369,7 @@ void Qwen3Audio::encode(const AudioMel &mel, float *out) {
   /* The head: a layer norm, then the two-layer MLP that is the projector. */
   backend_->layer_norm(x_, post_ln_w_, post_ln_b_, x_norm_, tokens, n_embd_, eps_);
   backend_->gemm(x_norm_, mlp1_w_, mlp1_b_, up_, tokens, n_embd_, n_embd_, false);
-  backend_->gelu(up_, up_, tokens * n_embd_);
+  backend_->gelu_erf(up_, up_, tokens * n_embd_);
   backend_->gemm(up_, mlp2_w_, mlp2_b_, out_, tokens, projection_dim_, n_embd_, false);
   backend_->copy_to_host(out, out_, tokens * projection_dim_ * 4);
 }

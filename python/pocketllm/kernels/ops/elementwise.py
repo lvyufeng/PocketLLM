@@ -54,4 +54,21 @@ _GELU = OpSchema(
     semantics="out = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))",
 )
 
-SCHEMAS = (_ADD, _MUL, _SOFTMAX, _GELU)
+#: The exact-erf GELU, `0.5*x*(1+erf(x/sqrt(2)))`.
+#:
+#: A *separate op* rather than a flag on `gelu`, because the two are different
+#: functions and the difference is not a rounding one: they disagree by about 0.01
+#: around |x| = 1, which survives a tower's twenty-four blocks.  llama.cpp carries
+#: them as separate `ffn_op` values for the same reason -- a vision tower asks for
+#: the tanh form and a `qwen3a` audio tower asks for this one -- and a checkpoint
+#: that named its activation and got the other would be a different model.
+_GELU_ERF = OpSchema(
+    name="gelu_erf",
+    args=(ArgSpec("x", Kind.TENSOR, shape=("m", "n")),),
+    returns=(ArgSpec("out", Kind.TENSOR, shape=("m", "n")),),
+    dtypes=_FLOAT,
+    shape_rule=lambda shapes, attrs: [shapes["x"]],
+    semantics="out = 0.5 * x * (1 + erf(x / sqrt(2)))",
+)
+
+SCHEMAS = (_ADD, _MUL, _SOFTMAX, _GELU, _GELU_ERF)

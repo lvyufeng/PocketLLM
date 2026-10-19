@@ -138,6 +138,10 @@ class CpuBackend final : public Backend {
                    height, width, out_ch, kernel, stride, pad);
   }
 
+  void gelu_erf(DeviceBuffer x, DeviceBuffer out, int64_t n) override {
+    kernel::gelu_erf(f(x), w(out), n);
+  }
+
   void add(DeviceBuffer a, DeviceBuffer b, DeviceBuffer out, int64_t n) override {
     kernel::add(f(a), f(b), w(out), n);
   }

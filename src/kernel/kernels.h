@@ -150,6 +150,20 @@ void silu_mul(const float *gate, const float *up, float *out, int64_t n);
  * the last bit of float32. */
 void gelu(const float *x, float *out, int64_t n);
 
+/* The exact GELU, `0.5*x*(1+erf(x/sqrt(2)))`.
+ *
+ * The other half of the pair above, and a separate op rather than a flag because the two
+ * are different functions: they disagree by roughly 0.01 around `|x| = 1` in the output,
+ * which survives a tower's twenty-four blocks.  llama.cpp carries them as separate
+ * `ffn_op` values -- a vision tower asks for the tanh form and a `qwen3a` audio tower asks
+ * for this one -- so a checkpoint that named its activation and got the other would be a
+ * different model with no symptom but a wrong answer.
+ *
+ * `erff` from the C library rather than a polynomial: the point of this op is that it is
+ * not an approximation, and a fit would reintroduce exactly the difference it exists to
+ * avoid. */
+void gelu_erf(const float *x, float *out, int64_t n);
+
 /* The vision tower's patch embedding: a square-kernel 2-D convolution.
  *
  * `x` is an `(in_ch, height, width)` image with `width` fastest, `weight` is

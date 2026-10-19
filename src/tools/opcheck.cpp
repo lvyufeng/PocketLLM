@@ -545,6 +545,18 @@ void run_gelu(std::ostream &out, Backend &backend, const Request &request) {
   backend.release(dx);
 }
 
+/* The exact GELU, which is a separate op from the tanh one rather than a mode: the two
+ * are different functions, and the conformance suite checks each against its own numpy
+ * reference so a backend that implemented one and aliased the other would fail. */
+void run_gelu_erf(std::ostream &out, Backend &backend, const Request &request) {
+  const Tensor &x = request.require("x");
+  DeviceBuffer dx = upload(backend, x.floats);
+  run_and_report(out, backend, request, x.shape, [&](DeviceBuffer result) {
+    backend.gelu_erf(dx, result, x.elements());
+  });
+  backend.release(dx);
+}
+
 void run_conv2d(std::ostream &out, Backend &backend, const Request &request) {
   const Tensor &x = request.require("x");
   const Tensor &weight = request.require("w");
@@ -811,6 +823,7 @@ struct Entry {
 const Entry kOps[] = {
     {"rms_norm", run_rms_norm},   {"layer_norm", run_layer_norm},
     {"gelu", run_gelu},
+    {"gelu_erf", run_gelu_erf},
     {"conv2d", run_conv2d},
     {"gemm", run_gemm},
     {"gemm_quant", run_gemm_quant}, {"embedding", run_embedding},

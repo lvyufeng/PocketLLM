@@ -804,6 +804,17 @@ __global__ void conv2d_kernel(const float *x, const float *weight, const float *
   image_out[p * out_ch + o] = acc;
 }
 
+/* `erff` is exact to the CUDA math library's own rounding, which is what the CPU's
+ * `std::erf` is too: the op exists to avoid a tanh fit, so a fit here would defeat it. */
+__global__ void gelu_erf_kernel(const float *x, float *out, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  const float v = x[i];
+  out[i] = 0.5F * v * (1.0F + erff(v * 0.70710678118654752440F));
+}
+
 /* One thread per element, the same shape as `gelu_kernel`: no reduction, so
  * nothing about the answer depends on how the work is split. */
 __global__ void add_kernel(const float *a, const float *b, float *out, int64_t n) {
@@ -1372,6 +1383,16 @@ class CudaBackend final : public Backend {
         f(x), f(weight), bias.handle != 0 ? f(bias) : nullptr, w(out), in_ch, height, width, out_ch,
         kernel, stride, pad, out_w, per_image, total);
     check(cudaGetLastError(), "conv2d");
+  }
+
+  void gelu_erf(DeviceBuffer x, DeviceBuffer out, int64_t n) override {
+    if (n <= 0) {
+      return;
+    }
+    const unsigned threads = 256;
+    gelu_erf_kernel<<<static_cast<unsigned>((n + threads - 1) / threads), threads>>>(f(x), w(out),
+                                                                                    n);
+    check(cudaGetLastError(), "gelu_erf");
   }
 
   void add(DeviceBuffer a, DeviceBuffer b, DeviceBuffer out, int64_t n) override {
