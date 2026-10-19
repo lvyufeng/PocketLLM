@@ -209,6 +209,11 @@ class Qwen3VlVision {
    * `image_size` implies. */
   int64_t max_patches_ = 0;
   int64_t max_side_ = 0; /* the pixel width that `max_patches_` is the grid of */
+  /* The patch count `scores_` currently holds scratch for.  It is the only buffer here
+   * whose size is quadratic in the patch count, so it is allocated for the checkpoint's
+   * own grid and reallocated when a larger image arrives -- reserving the declared maximum
+   * would be 34 GB against the 42 MB this needs. */
+  int64_t scores_capacity_ = 0;
   /* The grid the merge permutation and the rotary tables were last built for.  They
    * are a function of the grid, so a caller encoding images of different shapes pays
    * a rebuild per change and one encoding one shape pays once. */

@@ -373,7 +373,16 @@ void Qwen3VlVision::allocate_activations() {
    * the sequence.  The non-causal arm never reads the scratch -- it recomputes
    * the row per pass rather than holding it -- but sizing it to the contract is
    * what keeps that a kernel detail instead of something the graph knows. */
-  scores_ = backend_->allocate(backend_->attention_scratch(max_patches, n_head_, 2 * max_patches - 1));
+  /* Sized for the checkpoint's own grid, and grown on demand in `encode`.  It is the one
+   * allocation here that is quadratic in the patch count: `attention_scratch` is
+   * `tasks * rows * (2 * patches - 1)`, so 576 patches want 42 MB and the 16384 that
+   * `image_max_pixels` admits want 34 GB.  Allocating the maximum up front "worked" on the
+   * CPU only because `new float[]` is lazy; on CUDA it is an immediate `cudaMalloc` and it
+   * failed.  A tower whose declared limit is larger than its scratch buffer is a limit that
+   * has to be enforced at `encode`, not reserved at `load`. */
+  scores_capacity_ = n_patches_;
+  scores_ = backend_->allocate(backend_->attention_scratch(scores_capacity_, n_head_,
+                                                          2 * scores_capacity_ - 1));
   cos_ = backend_->allocate(max_patches * (head_dim_ / 2) * 4);
   sin_ = backend_->allocate(max_patches * (head_dim_ / 2) * 4);
   merge_index_ = backend_->allocate(max_patches * 4);
@@ -496,6 +505,14 @@ void Qwen3VlVision::encode(const uint8_t *rgb, int64_t height, int64_t width, fl
   if (grid_w != active_grid_w_ || grid_h != active_grid_h_) {
     build_merge_index(grid_w, grid_h);
     build_rope_tables(grid_w, grid_h);
+    /* `scores_` is the one buffer that has to grow with the grid rather than being
+     * reserved for the largest one it could ever be. */
+    if (patches > scores_capacity_) {
+      backend_->release(scores_);
+      scores_capacity_ = patches;
+      scores_ = backend_->allocate(
+          backend_->attention_scratch(scores_capacity_, n_head_, 2 * scores_capacity_ - 1));
+    }
     /* The position table is a *weight*, one row per patch of the grid the checkpoint
      * was trained on, so an image of another size needs it resampled onto that size's
      * grid -- which is what the reference does rather than refusing the image.  The
