@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -264,6 +267,25 @@ void Qwen3Audio::encode(const AudioMel &mel, float *out) {
   }
   const int64_t chunks = mel.n_len / conv_chunk_;
   const int64_t tokens = chunks * conv_out_w_;
+  /* Timing that survives an asynchronous backend: every stage ends with a synchronise, so
+   * the number is the work and not the launch queue.  Off unless asked for. */
+  const bool profiling = std::getenv("POCKETLLM_AUDIO_PROFILE") != nullptr;
+  const auto mark = [&]() {
+    if (!profiling) {
+      return 0.0;
+    }
+    backend_->synchronize();
+    return static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count()) /
+           1000.0;
+  };
+  double t_conv = 0.0;
+  double t_proj = 0.0;
+  double t_pos = 0.0;
+  double t_blocks = 0.0;
+  double t_head = 0.0;
+  double t_prev = mark();
 
   std::vector<float> stage_in(static_cast<std::size_t>(n_mel_ * conv_chunk_));
   std::vector<float> conv_host(static_cast<std::size_t>(conv_flat_ * conv_out_w_));
@@ -291,28 +313,14 @@ void Qwen3Audio::encode(const AudioMel &mel, float *out) {
       kernel::DeviceBuffer dest = stage == 1 ? conv_b_ : conv_a_;
       const int64_t out_h = conv_side(h);
       const int64_t out_w = conv_side(w);
+      /* The *last* stage leaves the patch-major layout the rearrange below expects; the
+       * earlier ones ask for the channel-major one, because that is what the next
+       * convolution reads.  `conv2d` writes either, so the transpose that would otherwise
+       * go through the host -- 123 MB over PCIe for this tower's five chunks -- does not
+       * exist. */
       backend_->conv2d(source, conv.weight, conv.bias, dest, /*batch=*/1, in_ch, h, w, conv_ch_,
-                       3, 2, 1);
+                       3, 2, 1, /*channel_major_out=*/stage + 1 < 3);
       backend_->gelu_erf(dest, dest, conv_ch_ * out_h * out_w);
-      /* `conv2d` **writes** `(row, col, channel)` -- the channel fastest, because a patch
-       * row is what the vision tower's graph wants -- and **reads** `(channel, row, col)`,
-       * the channel slowest.  The two are not the same layout, so a stack of convolutions
-       * needs a transpose between each pair.  The vision tower never hit this: its patch
-       * embedding is one convolution and then an add, so its output is never an input. */
-      if (stage + 1 < 3) {
-        std::vector<float> written(static_cast<std::size_t>(conv_ch_ * out_h * out_w));
-        backend_->copy_to_host(written.data(), dest, conv_ch_ * out_h * out_w * 4);
-        std::vector<float> transposed(written.size());
-        for (int64_t oc = 0; oc < conv_ch_; ++oc) {
-          for (int64_t oy = 0; oy < out_h; ++oy) {
-            for (int64_t ox = 0; ox < out_w; ++ox) {
-              transposed[static_cast<std::size_t>((oc * out_h + oy) * out_w + ox)] =
-                  written[static_cast<std::size_t>((oy * out_w + ox) * conv_ch_ + oc)];
-            }
-          }
-        }
-        backend_->copy_to_device(dest, transposed.data(), conv_ch_ * out_h * out_w * 4);
-      }
       h = out_h;
       w = out_w;
       in_ch = conv_ch_;
@@ -347,6 +355,8 @@ void Qwen3Audio::encode(const AudioMel &mel, float *out) {
     }
   }
   backend_->copy_to_device(patches_, patches.data(), tokens * conv_flat_ * 4);
+  t_conv = mark() - t_prev;
+  t_prev = mark();
 
   /* 7680 -> d_model. */
   /* (tokens, conv_flat) times (n_embd, conv_flat)^T gives (tokens, n_embd): the
@@ -354,6 +364,9 @@ void Qwen3Audio::encode(const AudioMel &mel, float *out) {
   backend_->gemm(patches_, conv_out_weight_, conv_out_bias_, x_, tokens, n_embd_, conv_flat_,
                  /*accumulate=*/false);
 
+  t_proj = t_prev > 0.0 ? 0.0 : 0.0;
+  t_proj = mark() - t_prev;
+  t_prev = mark();
   /* The learned positions, and the index **resets every chunk**: token `t` takes row
    * `t % conv_out_w_`, not row `t`.  A gather over the table's own rows is the same
    * numbers as the reference's repeat, and it is the operator the graph already has. */
@@ -371,6 +384,8 @@ void Qwen3Audio::encode(const AudioMel &mel, float *out) {
     backend_->add(x_, x_norm_, x_, tokens * n_embd_);
   }
 
+  t_pos = mark() - t_prev;
+  t_prev = mark();
   const float scale = 1.0F / std::sqrt(static_cast<float>(head_dim_));
   for (int64_t layer = 0; layer < n_layer_; ++layer) {
     const Block &block = blocks_[static_cast<std::size_t>(layer)];
@@ -394,12 +409,21 @@ void Qwen3Audio::encode(const AudioMel &mel, float *out) {
                    /*accumulate=*/true);
   }
 
+  t_blocks = mark() - t_prev;
+  t_prev = mark();
   /* The head: a layer norm, then the two-layer MLP that is the projector. */
   backend_->layer_norm(x_, post_ln_w_, post_ln_b_, x_norm_, tokens, n_embd_, eps_);
   backend_->gemm(x_norm_, mlp1_w_, mlp1_b_, up_, tokens, n_embd_, n_embd_, false);
   backend_->gelu_erf(up_, up_, tokens * n_embd_);
   backend_->gemm(up_, mlp2_w_, mlp2_b_, out_, tokens, projection_dim_, n_embd_, false);
   backend_->copy_to_host(out, out_, tokens * projection_dim_ * 4);
+  t_head = mark() - t_prev;
+  if (profiling) {
+    std::fprintf(stderr,
+                 "[tower] conv %.1f ms, proj %.1f ms, pos %.1f ms, blocks %.1f ms, head %.1f ms"
+                 "  (tokens %lld)\n",
+                 t_conv, t_proj, t_pos, t_blocks, t_head, (long long) tokens);
+  }
 }
 
 }  // namespace pocketllm

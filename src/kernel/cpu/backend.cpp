@@ -133,9 +133,10 @@ class CpuBackend final : public Backend {
 
   void conv2d(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out,
               int64_t batch, int64_t in_ch, int64_t height, int64_t width, int64_t out_ch,
-              int64_t kernel, int64_t stride, int64_t pad) override {
+              int64_t kernel, int64_t stride, int64_t pad,
+              bool channel_major_out) override {
     kernel::conv2d(f(x), f(weight), bias.handle != 0 ? f(bias) : nullptr, w(out), batch, in_ch,
-                   height, width, out_ch, kernel, stride, pad);
+                   height, width, out_ch, kernel, stride, pad, channel_major_out);
   }
 
   void gelu_erf(DeviceBuffer x, DeviceBuffer out, int64_t n) override {

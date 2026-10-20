@@ -1943,7 +1943,7 @@ void gelu_erf(const float *x, float *out, int64_t n) {
 
 void conv2d(const float *x, const float *weight, const float *bias, float *out, int64_t batch,
             int64_t in_ch, int64_t height, int64_t width, int64_t out_ch, int64_t kernel,
-            int64_t stride, int64_t pad) {
+            int64_t stride, int64_t pad, bool channel_major_out) {
   const int64_t out_h = (height + 2 * pad - kernel) / stride + 1;
   const int64_t out_w = (width + 2 * pad - kernel) / stride + 1;
   const int64_t k = in_ch * kernel * kernel;
@@ -1986,7 +1986,14 @@ void conv2d(const float *x, const float *weight, const float *bias, float *out, 
             }
           }
         }
-        image_out[p * out_ch + o] = acc;
+        if (channel_major_out) {
+          /* The transposed layout, written here rather than by a caller that would have to
+           * bring the value back to the host to move it: `(o, patch)` instead of
+           * `(patch, o)`. */
+          image_out[o * out_h * out_w + p] = acc;
+        } else {
+          image_out[p * out_ch + o] = acc;
+        }
       }
     }
   });
