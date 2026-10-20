@@ -762,7 +762,8 @@ __global__ void gelu_kernel(const float *x, float *out, int64_t n) {
 __global__ void conv2d_kernel(const float *x, const float *weight, const float *bias, float *out,
                               int64_t in_ch, int64_t height, int64_t width, int64_t out_ch,
                               int64_t kernel, int64_t stride, int64_t pad, int64_t out_w,
-                              int64_t per_image, int64_t total) {
+                              int64_t per_image, int64_t out_h, int64_t channel_major_out,
+                              int64_t total) {
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= total) {
     return;
@@ -801,7 +802,11 @@ __global__ void conv2d_kernel(const float *x, const float *weight, const float *
   /* The within-image patch and channel, because `image_out` already carries the
    * batch offset -- writing at `i` would put the second image's first patch where
    * the first image's last one goes. */
-  image_out[p * out_ch + o] = acc;
+  if (channel_major_out != 0) {
+    image_out[o * out_h * out_w + p] = acc;
+  } else {
+    image_out[p * out_ch + o] = acc;
+  }
 }
 
 /* `erff` is exact to the CUDA math library's own rounding, which is what the CPU's
@@ -1368,7 +1373,7 @@ class CudaBackend final : public Backend {
 
   void conv2d(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out,
               int64_t batch, int64_t in_ch, int64_t height, int64_t width, int64_t out_ch,
-              int64_t kernel, int64_t stride, int64_t pad) override {
+              int64_t kernel, int64_t stride, int64_t pad, bool channel_major_out) override {
     const int64_t out_w = (width + 2 * pad - kernel) / stride + 1;
     const int64_t out_h = (height + 2 * pad - kernel) / stride + 1;
     /* The batch is the outermost axis of both operands, so it multiplies the work
@@ -1381,7 +1386,7 @@ class CudaBackend final : public Backend {
     const unsigned threads = 256;
     conv2d_kernel<<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
         f(x), f(weight), bias.handle != 0 ? f(bias) : nullptr, w(out), in_ch, height, width, out_ch,
-        kernel, stride, pad, out_w, per_image, total);
+        kernel, stride, pad, out_w, per_image, out_h, channel_major_out ? 1 : 0, total);
     check(cudaGetLastError(), "conv2d");
   }
 

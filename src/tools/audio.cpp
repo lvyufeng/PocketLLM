@@ -28,7 +28,9 @@
  * tool prints so the caller does not have to work it out.
  */
 
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -191,18 +193,30 @@ int main(int argc, char **argv) {
     }
     int64_t written = 0;
     int64_t first_tokens = 0;
+    /* Where the time goes, which is the question this tool could not answer before.  The
+     * front end and the tower are separate stages with separate shapes of arithmetic -- a
+     * 400-point transform per frame against twenty-four blocks over `tokens` -- so a total
+     * wall time says nothing about which one to look at. */
+    const bool timing = std::getenv("POCKETLLM_TIMING") != nullptr;
+    double frontend_ms = 0.0;
+    double tower_ms = 0.0;
     for (int64_t window = 0; window < windows; ++window) {
       /* The front end windows the *whole* signal, so each call is given every sample and
        * an index rather than a slice: slicing first would move every frame relative to
        * the reflection padding. */
+      const auto front_start = std::chrono::steady_clock::now();
       const pocketllm::AudioMel mel = pocketllm::audio_log_mel_window(
           samples.data(), static_cast<int64_t>(samples.size()), params, window);
+      const auto tower_start = std::chrono::steady_clock::now();
+      frontend_ms += std::chrono::duration<double, std::milli>(tower_start - front_start).count();
       const int64_t tokens = tower->tokens_for_frames(mel.n_len);
       if (window == 0) {
         first_tokens = tokens;
       }
       std::vector<float> features(static_cast<std::size_t>(tokens * tower->projection_dim()));
       tower->encode(mel, features.data());
+      tower_ms += std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - tower_start).count();
       const std::size_t count = std::fwrite(features.data(), sizeof(float), features.size(), out);
       if (static_cast<std::size_t>(count) != features.size()) {
         std::fclose(out);
@@ -217,6 +231,9 @@ int main(int argc, char **argv) {
     std::printf("tokens_per_window %lld\n", static_cast<long long>(first_tokens));
     std::printf("projection_dim %lld\n", static_cast<long long>(tower->projection_dim()));
     std::printf("n_floats %lld\n", static_cast<long long>(written));
+    if (timing) {
+      std::fprintf(stderr, "[timing] frontend %.1f ms, tower %.1f ms\n", frontend_ms, tower_ms);
+    }
     return 0;
   } catch (const std::exception &e) {
     std::fprintf(stderr, "%s: %s\n", argv[0], e.what());

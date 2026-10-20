@@ -156,7 +156,8 @@ class Backend {
    * than answering with an image the tower never described. */
   virtual void conv2d(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out,
                       int64_t batch, int64_t in_ch, int64_t height, int64_t width, int64_t out_ch,
-                      int64_t kernel, int64_t stride, int64_t pad) = 0;
+                      int64_t kernel, int64_t stride, int64_t pad,
+                      bool channel_major_out = false) = 0;
 
   /* ``out = a + b``, elementwise, as `kernels.h` documents it.  The graph this
    * engine ran before the vision tower had no caller: every residual is

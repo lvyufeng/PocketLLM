@@ -200,7 +200,7 @@ void gelu_erf(const float *x, float *out, int64_t n);
  */
 void conv2d(const float *x, const float *weight, const float *bias, float *out, int64_t batch,
             int64_t in_ch, int64_t height, int64_t width, int64_t out_ch, int64_t kernel,
-            int64_t stride, int64_t pad);
+            int64_t stride, int64_t pad, bool channel_major_out = false);
 
 /* ``out = a + b``, elementwise over the whole tensor.
  *
