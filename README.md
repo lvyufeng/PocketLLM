@@ -77,22 +77,37 @@ greedily from the cache the composition filled.
 
 **What the two multimodal paths are not is fast.** Everything above is a *correctness* claim, and
 both were brought up on this machine at `f16`/`q8_0` without a benchmark of their own: the only
-number taken is a 4-second transcription in **12.8 s** on one RTX 2080 Ti. The width ladder does not
+number taken is a 4-second transcription in **12.8 s** on one RTX 2080 Ti -- which is since down to
+about a second, after the two CUDA kernels `#747` and `#748` rewrote (the tower reached 2.2 s for an
+image, and the audio tower went from 719 ms to 251 ms for the same reason). The width ladder does not
 reach them yet either — the vision tower's loader widens to f32, so the `q2_k`…`iq2` rungs the text
 rows are checked on have no multimodal counterpart. Both paths also have an ABI entry point now
 (`pocketllm_vlm_*` and `pocketllm_asr_*`, ABI 1.3), which is how a host reaches them without C++.
 
-### Reference performance — Qwen3-1.7B, `q4_k_m`, against llama.cpp
+### Reference performance — Qwen3-1.7B, `f16`, on one RTX 2080 Ti
 
-| | prefill (`pp512`) | decode (`tg128`/`tg64`) |
+| | prefill (`pp512`) | decode (`tg128`) |
 |---|---|---|
-| **CPU**, 22 threads | **1.04×** (ahead) | **1.37×** (ahead) |
-| **1× CUDA** | 0.11× | 0.40× |
+| **CUDA**, before the f32 GEMM was blocked | 37.9 t/s | 10.8 t/s |
+| **CUDA**, after (`#747`, `#748`) | **433 t/s** | 10.6 t/s |
 
-The CPU path is **ahead of llama.cpp on both halves** and is the one to quote for the reference. The
-CUDA kernels are deliberately naive (prefill is slow next to a tuned BLAS); its decode GEMM's
-k-split took it from 0.259× to **0.404×**, and the `dp4a` activation path that would close more has
-been measured and **closed** — see [the C engine page](https://lvyufeng.github.io/PocketLLM/architecture/c_engine/).
+Eleven times the prefill, from two kernels rewritten to use a tile's worth of reuse: a blocked f32
+GEMM (`#747`) and a streaming-softmax attention (`#748`).  The same two moved a 768x768 image through
+the vision tower from **31.6 s to 2.2 s**.
+
+**What this table does not say, and used not to be honest about.**  It carried a
+`q4_k_m`-against-llama.cpp ratio for both `cpu` and `cuda`, and neither is measurable here any more:
+the llama.cpp build on this host reports `(none)` for `--list-devices`, so there is no CUDA reference
+to divide by, and the CPU numbers move by several percent with the machine's load (`load average
+21` while this was written -- 218.9 and 228.3 t/s on two runs of the same binary).  A ratio taken
+under that is a fact about the load and not about the engine.  What is left in the table is the one
+comparison that is stable and does not need llama.cpp: f16 on the card, before against after, on one
+machine at one time.  The `q4_k_m` arm of the ladder is unaffected by either change -- it runs
+`gemm_quant`, not `gemm` -- and its ratio is owed a quiet machine and a CUDA llama.cpp.
+
+The f16 numbers above also explain something the old table obscured: the engine's f32 GEMM was the
+slow term for **every** path, not just the multimodal ones. That is why a commit aimed at a vision
+tower's tower moved the text prefill an order of magnitude.
 Full per-device numbers, methods and provenance:
 [the fleet support matrix](https://lvyufeng.github.io/PocketLLM/architecture/fleet_support_matrix/).
 
@@ -111,7 +126,7 @@ What works, what is a stub, and what has not been written. This table is the hon
 
 | Piece | State |
 |---|---|
-| `src/` — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B and 1.7B in `f16` and the seven packed formats `q2_k` through `q6_k` plus `iq2_xxs`/`iq2_xs`** on `cpu` and one `cuda` card — GGUF read, BPE tokenize, forward, greedy decode, and `temperature`/`top-k`/`top-p`/`min-p`/`seed` sampling; every one of them decodes inside the kernel. Greedy is checked token-for-token against llama.cpp on both widths, and each packed format against llama.cpp's own decode of the same file block for block. The sampler is checked against the numpy reference. The CPU path is **ahead of llama.cpp on prefill and decode**; the CUDA path is correctness-complete and slow, with the open lever (int8 activations) measured and closed. The same library runs the two multimodal paths — see the  row below. Details: [the C engine page](https://lvyufeng.github.io/PocketLLM/architecture/c_engine/) |
+| `src/` — the C++ engine (`libpocketllm.so`) | **Runs Qwen3-0.6B and 1.7B in `f16` and the seven packed formats `q2_k` through `q6_k` plus `iq2_xxs`/`iq2_xs`** on `cpu` and one `cuda` card — GGUF read, BPE tokenize, forward, greedy decode, and `temperature`/`top-k`/`top-p`/`min-p`/`seed` sampling; every one of them decodes inside the kernel. Greedy is checked token-for-token against llama.cpp on both widths, and each packed format against llama.cpp's own decode of the same file block for block. The sampler is checked against the numpy reference. The CUDA path is correctness-complete and, since `#747`, no longer slow for the reason this row used to give: its f32 GEMM and its non-causal attention were both rewritten to use a tile's worth of reuse, which took f16 prefill from 37.9 to 433 t/s on a 2080 Ti. The `dp4a` activation lever on the packed path was measured and closed separately. The same library runs the two multimodal paths — see the next row. Details: [the C engine page](https://lvyufeng.github.io/PocketLLM/architecture/c_engine/) |
 | `src/kernel/ascend/` — Ascend 310B backend | **Runs Qwen3-0.6B … 8B** on an Orange Pi AIpro, at the quantizer's own floor. |
 | `src/model/` — the multimodal paths | **Runs `qwen3vl` and `qwen3a` end to end**, both compared against `libmtmd` on the same inputs: a vision tower with any-size preprocessing in, an image span and the text around it out; and a log-mel front end, an audio tower, and a transcript. Correctness is measured (correlation 0.9926-0.9942 for images, 0.99983003 for the audio tower, and `llama-cli`'s own transcript for speech). **Neither is benchmarked and neither has the width ladder**: the vision tower widens its weights to f32, so `q2_k`…`iq2` have no multimodal counterpart. `runtime/vlm_session.h` and `runtime/asr_session.h` own the two compositions, so a tool and the ABI cannot disagree about the order. Details: [the C engine page](https://lvyufeng.github.io/PocketLLM/architecture/c_engine/) |
 | `pocketllm.cli` | **Done** for all six commands — `devices`, `backends`, `architectures`, `ops`, `run`, `serve` |
@@ -282,7 +297,8 @@ Published at **<https://lvyufeng.github.io/PocketLLM/>**.
       tower at 0.99983003 against the reference and speech transcribing to the reference's own
       answer. Reachable from C through `pocketllm_asr_*`.
 - [ ] **Performance for the two multimodal paths.** Both were brought up for correctness and neither
-      has been benchmarked; the one number taken is 12.8 s for a 4-second transcription on a card.
+      has a benchmark: the vision tower reached 2.2 s for a 768x768 image and the audio tower 251 ms
+      for a window after `#747`/`#748`, and what is left is the ladder rather than the kernels.
 - [ ] **The width ladder for the two multimodal paths.** The vision tower's loader widens to f32, so
       none of the `q2_k`…`iq2` rungs reach multimodal weights, and the multimodal towers are the
       largest thing this engine asks a phone to hold.
