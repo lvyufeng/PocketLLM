@@ -276,30 +276,61 @@ What is verified, each by its own measurement:
     before this: the vision tower's patch embedding is `stride 16, padding 0`.
   - the tower agrees with **itself** across backends (CPU against CUDA, 0.999991), so nothing here is
     a precision question.
+  - the **tower's output** agrees with the reference's `projected` at **0.99983003**, and the whole
+    path transcribes `mlk.flac`'s first four seconds to `language English<asr_text>I have a dream that
+    one day.` -- the reference's own answer.
 
-What is **not** verified: the tower's output.  Against the reference's `projected` it sits at
-correlation 0.32, and a **numpy tower written independently from the same reading of the graph**
-lands at 0.3049 -- two implementations built the same way are the same distance from the target,
-which says the *reading* is what is wrong and not either implementation.  Searching it op by op was
-therefore the wrong search, and that is the useful thing the investigation bought.
+**Getting there took three fixes in the tower, and each was invisible until the one before it was
+right.**  They are worth naming because all three produced plausible numbers of the right magnitude:
+
+  - **A stack of convolutions needs a transpose between each pair.**  `conv2d` *writes* its output
+    patch-major with the channel fastest and *reads* its input with the channel slowest, so its output
+    is not its own input's layout.  The vision tower never met this: its patch embedding is one
+    convolution followed by an add.  The audio tower's three convolutions chained them directly, and
+    the first stage agreed while the second did not -- with one input channel the difference is
+    invisible, and with 480 it is everything.
+  - **The feature index is `oc * conv_out_h + oy`, not `oy * conv_ch + oc`.**  Recovered by trying the
+    orderings against the reference's own `after_conv_out`: the right one reproduces it at 0.99999993,
+    the transposed guess at 0.479.
+  - **The patch matrix is `(tokens, features)`, and the contraction axis has to be the fast one.**
+    Writing `feature * tokens + token` puts the token axis fast, so the GEMM read a transposed matrix
+    -- and a transposed matrix still multiplies, which is why this looked like rounding for several
+    rounds.
+
+The way in was a **numpy tower** (`/tmp/tower_ref.py`) built independently and checked against the
+reference's own dumps before being used on the engine.  It was the thing that turned "the engine
+disagrees" into "the reading disagrees": both implementations sat at 0.30-0.32, the same distance from
+the target, so the next step was to fix the understanding and not either implementation.
 
 Three traps, each of which cost a round:
 
   - **The reference's intermediate dumps are not usable.**  `after_conv_blocks` and
     `after_conv_out`, captured through the eval callback, do not satisfy the relation that connects
     them (`rel 15.1`, correlation -0.02, under every axis permutation), and `inp_chunks` came back
-    all zeros.  The callback fires before some tensors hold their data.  Only `projected` -- what
-    `mtmd_get_output_embd` returns -- is a trustworthy target.
-  - **The Python `tensor_reader` returns `nan` for this file's f16 tensors.**  Every numpy comparison
-    built on it compared against `nan`.  Reading the raw bytes and decoding them from the type id the
-    header states is what replaced it.
+    all zeros.  **The callback is not broken and the dumps are not garbage: they were taken at the
+    wrong moment.**  `ggml_backend_sched` calls it with `ask == true` to *ask whether a tensor is
+    wanted*, before the tensor is computed, and with `ask == false` afterwards; reading on the first
+    of those reads a buffer nobody has written yet.  `inp_chunks` was all zeros because at that
+    instant it was all zeros.  Reading on `ask == false` brings `after_conv_blocks` back to
+    `[-0.17, 2.87]`, which is where the engine's own conv stack is, and from there the whole
+    comparison above becomes possible.
+  - **A `nan` that was the investigation's own, not the tree's.**  A round was lost to
+    `pocketllm.loader.gguf.tensor_reader` appearing to return `nan` for this file's f16 tensors, and
+    every numpy comparison built on that reading was comparing against `nan`.  It does not: the reader
+    returns `(480, 1, 3, 3)` f16 in `[-1.398, 1.578]`, all finite.  The `nan` came from the code
+    that consumed the array -- a `np.round` on an f16 buffer, which casts through a type that
+    overflows on these weights.  So the lesson is the opposite of the one first written down here:
+    check whether the instrument is being misused before concluding it is broken, and prefer reading
+    raw bytes when a decode is in doubt -- which is what the tower's own loader does.
   - **`conv2d` writes patch-major with the channel fastest** -- `out[p * out_ch + o]`.  Reading its
     dump as `(oc, oy, ox)` produced a 39% error that was entirely the reading; the same array is
     correlation 1.000000 in `(oy, ox, oc)`.
 
-The next thing to settle is the reading rather than the code: until an intermediate target is
-obtained another way -- `mtmd_get_output_embd` after encoding a *shorter* signal, so that fewer
-layers are involved -- there is nothing trustworthy to bisect against above `projected`.
+What the audio path still does not have is an **ABI entry point**: all of it is reachable through
+`pocketllm-audio` and the C++ classes, and nothing above that takes a recording yet.  That is the
+same shape the image path was in before `pocketllm_vlm_*`, and the session class it would sit on
+(`runtime/asr_session.h`) is already the one the tool drives, so the entry point is a wrapper rather
+than a composition.
 
 The tokenizer carries **two pre-tokenizers**, because the vocabularies in this project's scope are
 built on two. They differ in exactly one place -- `\p{N}` against `\p{N}{1,3}`, so a number is cut

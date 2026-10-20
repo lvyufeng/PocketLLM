@@ -294,6 +294,25 @@ void Qwen3Audio::encode(const AudioMel &mel, float *out) {
       backend_->conv2d(source, conv.weight, conv.bias, dest, /*batch=*/1, in_ch, h, w, conv_ch_,
                        3, 2, 1);
       backend_->gelu_erf(dest, dest, conv_ch_ * out_h * out_w);
+      /* `conv2d` **writes** `(row, col, channel)` -- the channel fastest, because a patch
+       * row is what the vision tower's graph wants -- and **reads** `(channel, row, col)`,
+       * the channel slowest.  The two are not the same layout, so a stack of convolutions
+       * needs a transpose between each pair.  The vision tower never hit this: its patch
+       * embedding is one convolution and then an add, so its output is never an input. */
+      if (stage + 1 < 3) {
+        std::vector<float> written(static_cast<std::size_t>(conv_ch_ * out_h * out_w));
+        backend_->copy_to_host(written.data(), dest, conv_ch_ * out_h * out_w * 4);
+        std::vector<float> transposed(written.size());
+        for (int64_t oc = 0; oc < conv_ch_; ++oc) {
+          for (int64_t oy = 0; oy < out_h; ++oy) {
+            for (int64_t ox = 0; ox < out_w; ++ox) {
+              transposed[static_cast<std::size_t>((oc * out_h + oy) * out_w + ox)] =
+                  written[static_cast<std::size_t>((oy * out_w + ox) * conv_ch_ + oc)];
+            }
+          }
+        }
+        backend_->copy_to_device(dest, transposed.data(), conv_ch_ * out_h * out_w * 4);
+      }
       h = out_h;
       w = out_w;
       in_ch = conv_ch_;
@@ -301,18 +320,27 @@ void Qwen3Audio::encode(const AudioMel &mel, float *out) {
     /* Stage 0 wrote `conv_a_`, stage 1 `conv_b_`, stage 2 `conv_a_` again. */
     backend_->copy_to_host(conv_host.data(), conv_a_, conv_flat_ * conv_out_w_ * 4);
 
-    /* `conv2d` writes patch-major with the row slowest: `(oy * out_w + ox) * out_ch + oc`.
-     * The graph wants, for token `c * conv_out_w + ox`, the feature `oy * out_ch + oc` --
-     * which is what the reference's permute-then-reshape produces.  Written out here
-     * rather than folded into index arithmetic at each use, so the difference between
-     * the two orders is one place a reader can check. */
+    /* `conv2d` writes patch-major with the channel fastest:
+     * `(oy * out_w + ox) * out_ch + oc`.
+     *
+     * The graph wants the matrix `(oc * out_h + oh, chunk * out_w + ow)` -- the channel
+     * slowest within a feature and the chunk slowest within a token.  That order was
+     * recovered from the reference's own `after_conv_out` by trying the alternatives: it
+     * reproduces the projection at correlation 0.99999993 where the transposed guess
+     * (`oh * out_h + oc` for the feature) reached 0.479.  One line, and it cost the whole
+     * tower being wrong from the projection onward. */
     for (int64_t oy = 0; oy < conv_out_h_; ++oy) {
       for (int64_t ox = 0; ox < conv_out_w_; ++ox) {
         for (int64_t oc = 0; oc < conv_ch_; ++oc) {
           const int64_t from = (oy * conv_out_w_ + ox) * conv_ch_ + oc;
           const int64_t token = c * conv_out_w_ + ox;
-          const int64_t feature = oy * conv_ch_ + oc;
-          patches[static_cast<std::size_t>(feature * tokens + token)] =
+          const int64_t feature = oc * conv_out_h_ + oy;
+          /* `(token, feature)`: the GEMM reads its left operand as `(m, k)` rows, so the
+           * contraction axis has to be the *fast* one.  Writing `feature * tokens + token`
+           * puts the token axis fast instead, and the product then reads a transposed
+           * matrix -- which still produces plausible numbers of the right magnitude, and
+           * is why this looked like a rounding problem for several rounds. */
+          patches[static_cast<std::size_t>(token * conv_flat_ + feature)] =
               conv_host[static_cast<std::size_t>(from)];
         }
       }
