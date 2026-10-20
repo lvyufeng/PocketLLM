@@ -203,6 +203,97 @@ __global__ void gemm_kernel(const float *x, const float *w, const float *bias, f
   *dst = accumulate ? *dst + value : value;
 }
 
+/* The blocked f32 GEMM: the prefill path, and where this file's tower time lives.
+ *
+ * `gemm_kernel` below is one thread per output element reading `w + j * k`, so adjacent
+ * threads are `k` floats apart -- 128 threads touch 128 cache lines per step.  The first
+ * attempt at this was a tile with **one output row per block**, which coalesces the read
+ * and still fetches every weight `m` times; measured, it converted 4.83 GFLOP in 181 ms,
+ * 0.027 TFLOPS against this card's 13.  A row is not a tile.
+ *
+ * This is a tile: `kRows` output rows by `kCols` output columns, with the weight block and
+ * the activation block both staged in shared memory and each element used `kRows` or
+ * `kCols` times before it is evicted.  `kRows = kCols = 32` makes the two tiles
+ * `32 x 32 = 1024` floats each -- 8 KB, well inside sm_75's 48 KB -- and gives every
+ * thread a `4 x 4` sub-block to keep in registers, which is what turns the inner loop from
+ * memory-bound into arithmetic.
+ *
+ * The **arithmetic is unchanged**: each output element is a serial sum over `k` in
+ * ascending order, accumulated in four partial sums the way `dot4` does and combined at
+ * the end the way `dot4` does.  The sub-block's four rows each carry their own four sums,
+ * so no output depends on how the block is split.
+ */
+constexpr int kTile = 32;      /* kRows and kCols: the output block a CUDA block owns */
+constexpr int kStep = 32;      /* the contraction chunk staged into shared memory */
+constexpr int kThreads = 256;  /* 16 x 16 threads, each owning a 2 x 2 output sub-block */
+
+__global__ void gemm_blocked_kernel(const float *__restrict__ x, const float *__restrict__ w,
+                                    const float *__restrict__ bias, float *__restrict__ out,
+                                    int64_t m, int64_t n, int64_t k, int accumulate) {
+  __shared__ float xs[kStep][kTile];   /* a kStep x kRows slice of the activations */
+  __shared__ float ws[kStep][kTile];   /* a kStep x kCols slice of the weights, transposed */
+
+  const int tx = threadIdx.x % 16;
+  const int ty = threadIdx.x / 16;
+  const int64_t row0 = static_cast<int64_t>(blockIdx.y) * kTile;
+  const int64_t col0 = static_cast<int64_t>(blockIdx.x) * kTile;
+
+  /* Four accumulators over a 2 x 2 sub-block: rows `row0 + ty * 2 + {0,1}`, columns
+   * `col0 + tx * 2 + {0,1}`. */
+  float acc[2][2] = {{0.0F, 0.0F}, {0.0F, 0.0F}};
+
+  for (int64_t k0 = 0; k0 < k; k0 += kStep) {
+    /* Stage both operands.  A tile is `kStep * kTile = 1024` elements and a block is
+     * `kThreads = 256` threads, so each contributes four -- not two, which fills half of
+     * the tile and leaves the other half as whatever the previous step left there. */
+    for (int i = 0; i < 4; ++i) {
+      const int flat = threadIdx.x + i * kThreads;
+      const int kr = flat / kTile;
+      const int jc = flat % kTile;
+      const int64_t kk = k0 + kr;
+      /* The activation slice is `(row, k)`; out of range reads a zero so the tail of a
+       * contraction that is not a multiple of `kStep` contributes nothing. */
+      xs[kr][jc] = (kk < k && row0 + jc < m) ? x[(row0 + jc) * k + kk] : 0.0F;
+      /* The weight slice is `(col, k)` on disk and `(k, col)` here, so the inner loop
+       * reads along `k` in contiguous shared memory. */
+      ws[kr][jc] = (kk < k && col0 + jc < n) ? w[(col0 + jc) * k + kk] : 0.0F;
+    }
+    __syncthreads();
+
+    const int64_t r0 = row0 + ty * 2;
+    const int64_t c0 = col0 + tx * 2;
+    const int rj = ty * 2;
+    const int cj = tx * 2;
+    for (int kk = 0; kk < kStep; ++kk) {
+      const float a00 = xs[kk][rj];
+      const float a10 = xs[kk][rj + 1];
+      const float b00 = ws[kk][cj];
+      const float b01 = ws[kk][cj + 1];
+      acc[0][0] += a00 * b00;
+      acc[0][1] += a00 * b01;
+      acc[1][0] += a10 * b00;
+      acc[1][1] += a10 * b01;
+    }
+    __syncthreads();
+  }
+
+  for (int i = 0; i < 2; ++i) {
+    for (int j = 0; j < 2; ++j) {
+      const int64_t r = row0 + ty * 2 + i;
+      const int64_t c = col0 + tx * 2 + j;
+      if (r >= m || c >= n) {
+        continue;
+      }
+      float value = acc[i][j];
+      if (bias != nullptr) {
+        value += bias[c];
+      }
+      float *dst = out + r * n + c;
+      *dst = accumulate ? *dst + value : value;
+    }
+  }
+}
+
 /* One 256-weight super-block added into a running sum, with the block's own
  * scale/min decode hoisted out of the weight loop.
  *
@@ -1025,6 +1116,123 @@ __global__ void attention_full_kernel(const float *q, const float *k_cache, cons
   }
 }
 
+/* One warp per (query, head), which is what the kernel above should have been.
+ *
+ * `attention_full_kernel` gives a thread one (query, head) pair and has it walk the whole
+ * key span serially -- twice, once for the maximum and once for the sum -- before a third
+ * pass accumulates the values.  For the vision tower that is 9216 threads on a card with
+ * 4352 cores, each running `3 * span * d` serial multiplies, and `nsys` measures it at
+ * **19.6 s of the tower's 32.7**: 60% of the work in the least parallel form available.
+ *
+ * This assigns a warp to one pair and lets the thirty-two lanes split the head dimension,
+ * so a dot product is a warp reduction.  `d` is a multiple of the warp width for every
+ * model here (64 and 128), so each lane owns `d / kAttnLanes` slots -- two, for the
+ * vision tower -- and holds their accumulators in registers across the whole span.
+ *
+ * The passes are the same three the serial kernel runs and in the same order, so the
+ * answer differs only in where the warp's reduction rounds; the conformance suite holds it
+ * to the same tolerance every other kernel is held to.
+ */
+constexpr int kAttnLanes = 32;
+
+__device__ __forceinline__ float warp_sum(float value) {
+  for (int offset = kAttnLanes / 2; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(0xffffffffU, value, offset);
+  }
+  return value;
+}
+
+__global__ void attention_full_warp_kernel(const float *__restrict__ q,
+                                           const float *__restrict__ k_cache,
+                                           const float *__restrict__ v_cache, int64_t q_len,
+                                           int64_t n_heads, int64_t n_head_kv, int64_t d,
+                                           int64_t first_key, int64_t q_offset, float scale,
+                                           float *__restrict__ out) {
+  const int lane = threadIdx.x % kAttnLanes;
+  const int64_t warp = static_cast<int64_t>(blockIdx.x) * (blockDim.x / kAttnLanes) +
+                       (threadIdx.x / kAttnLanes);
+  if (warp >= q_len * n_heads) {
+    return;
+  }
+  const int64_t group = n_heads / n_head_kv;
+  const int64_t kv = (warp % n_heads) / group;
+  const float *qrow = q + warp * d;
+  float *orow = out + warp * d;
+  const int64_t span = q_offset + 1 - first_key;
+  if (span <= 0) {
+    for (int64_t i = lane; i < d; i += kAttnLanes) {
+      orow[i] = 0.0F;
+    }
+    return;
+  }
+  const int64_t cache_row = n_head_kv * d;
+  const float *khead = k_cache + first_key * cache_row + kv * d;
+  const float *vhead = v_cache + first_key * cache_row + kv * d;
+
+  /* The query stays in registers for the whole span, and so do the value accumulators:
+   * each lane owns the slots `lane, lane + 32, ...`, which is what makes the reduction
+   * over `d` a warp sum and the accumulation over `span` private. */
+  constexpr int kMaxSlots = 8;
+  float qv[kMaxSlots];
+  float acc[kMaxSlots];
+  const int slots = static_cast<int>((d + kAttnLanes - 1) / kAttnLanes);
+  const int held = slots < kMaxSlots ? slots : kMaxSlots;
+  for (int i = 0; i < held; ++i) {
+    const int64_t at = lane + static_cast<int64_t>(i) * kAttnLanes;
+    qv[i] = at < d ? qrow[at] : 0.0F;
+    acc[i] = 0.0F;
+  }
+
+  float best = -INFINITY;
+  for (int64_t s = 0; s < span; ++s) {
+    const float *krow = khead + s * cache_row;
+    float dot = 0.0F;
+    for (int i = 0; i < held; ++i) {
+      const int64_t at = lane + static_cast<int64_t>(i) * kAttnLanes;
+      if (at < d) {
+        dot += qv[i] * krow[at];
+      }
+    }
+    dot = warp_sum(dot);
+    best = fmaxf(best, __shfl_sync(0xffffffffU, dot, 0) * scale);
+  }
+
+  float total = 0.0F;
+  for (int64_t s = 0; s < span; ++s) {
+    const float *krow = khead + s * cache_row;
+    float dot = 0.0F;
+    for (int i = 0; i < held; ++i) {
+      const int64_t at = lane + static_cast<int64_t>(i) * kAttnLanes;
+      if (at < d) {
+        dot += qv[i] * krow[at];
+      }
+    }
+    dot = warp_sum(dot);
+    const float weight = expf(__shfl_sync(0xffffffffU, dot, 0) * scale - best);
+    /* Every lane sees the same broadcast weight, so the running sum is private to one of
+     * them; accumulating it in all thirty-two and reducing afterwards multiplies it by the
+     * warp width, which is a factor of 32 that looks like a wrong answer rather than a
+     * wrong reduction. */
+    if (lane == 0) {
+      total += weight;
+    }
+    const float *vrow = vhead + s * cache_row;
+    for (int i = 0; i < held; ++i) {
+      const int64_t at = lane + static_cast<int64_t>(i) * kAttnLanes;
+      if (at < d) {
+        acc[i] += weight * vrow[at];
+      }
+    }
+  }
+  total = __shfl_sync(0xffffffffU, total, 0);
+  for (int i = 0; i < held; ++i) {
+    const int64_t at = lane + static_cast<int64_t>(i) * kAttnLanes;
+    if (at < d) {
+      orow[at] = acc[i] / total;
+    }
+  }
+}
+
 /* One block for the whole vector. The logits are 151936 floats -- 600 KB, a
  * single pass over what is already in L2 -- so a grid-wide reduction would cost
  * more in a second launch than it saves.
@@ -1169,6 +1377,18 @@ class CudaBackend final : public Backend {
   void gemm(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer bias, DeviceBuffer out, int64_t m,
             int64_t n, int64_t k, bool accumulate) override {
     if (m <= 0 || n <= 0) {
+      return;
+    }
+    /* The tile is worth a block per output row when there is more than one row to amortise
+     * the weight fetch over; at `m == 1` there is nothing to reuse and the plain kernel
+     * has no tile-fill to pay for.  The same crossover `gemm_quant` documents between its
+     * row and tile kernels. */
+    if (m > 1) {
+      const dim3 grid(static_cast<unsigned>((n + kTile - 1) / kTile),
+                      static_cast<unsigned>((m + kTile - 1) / kTile));
+      gemm_blocked_kernel<<<grid, kThreads>>>(f(x), f(weight), bias.handle ? f(bias) : nullptr,
+                                              w(out), m, n, k, accumulate ? 1 : 0);
+      check(cudaGetLastError(), "gemm");
       return;
     }
     const unsigned threads = 256;
@@ -1484,12 +1704,22 @@ class CudaBackend final : public Backend {
        * `scores` is unused here, which the compiler is told rather than left to
        * notice. */
       (void)scores;
+      /* One warp per (query, head); eight warps to a block.  The slot loop inside is
+       * bounded by kMaxSlots, so a head dimension larger than 32 * 8 is refused here
+       * rather than silently computing part of the row. */
       const int64_t units = q_len * n_heads;
-      const unsigned threads = 256;
-      attention_full_kernel<<<static_cast<unsigned>((units + threads - 1) / threads), threads>>>(
-          f(q), f(k_cache), f(v_cache), q_len, n_heads, n_head_kv, d, first_key, q_offset, scale,
-          w(out));
-      check(cudaGetLastError(), "attention_full");
+      constexpr int kWarpsPerBlock = 8;
+      constexpr int kMaxHeadDim = kAttnLanes * 8;
+      if (d > kMaxHeadDim) {
+        throw Error("cuda attention: head dimension " + std::to_string(d) +
+                    " is past the " + std::to_string(kMaxHeadDim) +
+                    " this kernel holds in registers");
+      }
+      const unsigned threads = kAttnLanes * kWarpsPerBlock;
+      attention_full_warp_kernel<<<static_cast<unsigned>((units + kWarpsPerBlock - 1) / kWarpsPerBlock),
+                                   threads>>>(f(q), f(k_cache), f(v_cache), q_len, n_heads,
+                                              n_head_kv, d, first_key, q_offset, scale, w(out));
+      check(cudaGetLastError(), "attention_full_warp");
       return;
     }
     /* The stride every block indexes its row with, and it has to be the number
