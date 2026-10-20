@@ -1,6 +1,9 @@
 #include "runtime/vlm_session.h"
 
 #include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "runtime/status.h"
@@ -88,6 +91,25 @@ VlmSession::Composition VlmSession::compose(const std::string &prompt, const uin
                 "', and this composition places one image per call");
   }
 
+  /* Where the time goes.  A synchronise after each stage, because the card's launches are
+   * asynchronous and a total wall time says nothing about which of the four to look at. */
+  const bool profiling = std::getenv("POCKETLLM_VLM_PROFILE") != nullptr;
+  const auto mark = [&]() {
+    if (!profiling) {
+      return 0.0;
+    }
+    text_->backend().synchronize();
+    return static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count()) /
+           1000.0;
+  };
+  double t_tower = 0.0;
+  double t_before = 0.0;
+  double t_span = 0.0;
+  double t_after = 0.0;
+  double t_prev = mark();
+
   const Tokenizer *tokenizer = text_->tokenizer();
   if (tokenizer == nullptr) {
     throw Error("this checkpoint has no vocabulary this build can read, so it cannot tokenize "
@@ -101,6 +123,8 @@ VlmSession::Composition VlmSession::compose(const std::string &prompt, const uin
   std::vector<float> planes(
       static_cast<std::size_t>(tower_->n_planes() * tokens * tower_->projection_dim()), 0.0F);
   tower_->encode(rgb, height, width, planes.data());
+  t_tower = mark() - t_prev;
+  t_prev = mark();
 
   const std::string before = prompt.substr(0, at) + kVisionStart;
   const std::string after = std::string(kVisionEnd) + prompt.substr(at + media.size());
@@ -122,6 +146,8 @@ VlmSession::Composition VlmSession::compose(const std::string &prompt, const uin
   /* 1. The text before the image, at its own positions. */
   text_->forward(tokens_before.data(), static_cast<int64_t>(tokens_before.size()),
                  /*argmax_out=*/nullptr);
+  t_before = mark() - t_prev;
+  t_prev = mark();
 
   /* 2. The span.  Its positions are llama.cpp's for this projector: one temporal
    * position for the whole span, and each patch's row and column offset by it --
@@ -146,6 +172,8 @@ VlmSession::Composition VlmSession::compose(const std::string &prompt, const uin
     span_positions[static_cast<std::size_t>(i * 4 + 3)] = 0;
   }
   text_->forward_embeddings(planes.data(), span_positions.data(), tokens, span_start);
+  t_span = mark() - t_prev;
+  t_prev = mark();
 
   /* 3. The text after it.  Its *positions* continue from the span's, which are
    * `side` of them and not `tokens`, while its cache rows continue from the
@@ -171,6 +199,12 @@ VlmSession::Composition VlmSession::compose(const std::string &prompt, const uin
    * the position the text after it ends at is `after_base + its own length`, and
    * the cache holds one row per token.  Computing the first from the second is the
    * mistake this field exists to make impossible. */
+  t_after = mark() - t_prev;
+  if (profiling) {
+    std::fprintf(stderr,
+                 "[vlm] tower %.1f ms, text-before %.1f ms, span %.1f ms, text-after %.1f ms\n",
+                 t_tower, t_before, t_span, t_after);
+  }
   report.positions = after_base + static_cast<int64_t>(tokens_after.size());
   report.cache_rows = text_->cache_length();
   return report;
