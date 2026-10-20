@@ -36,8 +36,13 @@ slower; their packed kernels are the follow-up. **The dense graph serves three a
 optional per-head QK norm, tied-or-not head, and the **rotary convention** (split-half for Qwen,
 interleaved for `llama`, which is why there are two kernels). Both extra arms are checked against
 llama.cpp token for token on `cpu` and on the card: MiniCPM5-1B for `llama`, and **Qwen3-VL-2B's text
-half** for `qwen3vl` (whose multi-section rotary collapses to the 1-D one for text; images are not
-wired). The **tokenizer carries two
+half** for `qwen3vl` (whose multi-section rotary collapses to the 1-D one for text). **The two
+multimodal paths are wired**: `qwen3vl` runs the tower, any-size preprocessing and the image span end
+to end (correlation 0.99 against `libmtmd`), and `qwen3a` runs a log-mel front end, an audio tower and
+a transcript (tower correlation 0.99983003, and `llama-cli`'s own transcript for speech). **Both are
+correctness-only for now**: neither is benchmarked, and the width ladder does not reach them — the
+vision tower's loader widens its weights to f32, so `q2_k`…`iq2` have no multimodal counterpart.
+The **tokenizer carries two
 pre-tokenizers** for the same reason, Qwen's and `llama-bpe`'s — one alternation apart (whether a
 number is cut digit by digit or in runs of up to three) — each checked against llama.cpp's own. The
 same core's **Ascend backend**
