@@ -251,6 +251,49 @@ def _bind(lib: "CDLL") -> None:
         ctypes.POINTER(ctypes.c_int32),
     ]
 
+    # The speech entry points.  The samples are float32 rather than bytes, and a
+    # recording is several windows rather than one image, which is why the window count
+    # has a call of its own.
+    lib.pocketllm_asr_open.restype = ctypes.c_void_p
+    lib.pocketllm_asr_open.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+
+    lib.pocketllm_asr_close.restype = None
+    lib.pocketllm_asr_close.argtypes = [ctypes.c_void_p]
+
+    lib.pocketllm_asr_marker.restype = ctypes.c_char_p
+    lib.pocketllm_asr_marker.argtypes = []
+
+    lib.pocketllm_asr_windows.restype = ctypes.c_int64
+    lib.pocketllm_asr_windows.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+
+    lib.pocketllm_asr_tokens_per_window.restype = ctypes.c_int64
+    lib.pocketllm_asr_tokens_per_window.argtypes = [ctypes.c_void_p]
+
+    lib.pocketllm_asr_forward.restype = ctypes.c_int
+    lib.pocketllm_asr_forward.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int64,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+    ]
+
+    lib.pocketllm_asr_forward_argmax.restype = ctypes.c_int
+    lib.pocketllm_asr_forward_argmax.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int64,
+        ctypes.POINTER(ctypes.c_int32),
+    ]
+
 
 def load(path: pathlib.Path | str | None = None) -> "CDLL":
     """Load and bind the engine library.

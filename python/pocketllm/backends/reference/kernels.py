@@ -451,6 +451,7 @@ KERNELS = {
     "layer_norm": layer_norm,
     "silu_mul": silu_mul,
     "gelu": gelu,
+    "gelu_erf": gelu_erf,
     "conv2d": conv2d,
     "add": add,
     "mul": mul,

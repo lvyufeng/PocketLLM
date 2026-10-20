@@ -80,6 +80,19 @@ class AsrSession {
    * that wants a second turn starts one here rather than continuing. */
   Composition compose(const std::string &prompt, const float *pcm, int64_t n_samples);
 
+  /* The composition and then greedy decoding, returned as the tokens produced.
+   *
+   * Decoding belongs here rather than in the caller because the *session* is what owns
+   * the cache the composition filled: a caller that had only the logits would have to
+   * reopen the text model to continue from them, which is a second session reading a
+   * cache it did not build.  `max_tokens` bounds the loop; stop at EOS if the vocabulary
+   * declares one.
+   *
+   * Greedy rather than sampled, and not as a placeholder: it is the decode the reference
+   * CLI runs by default, so it is what a transcript can be compared against. */
+  std::vector<int32_t> generate(const std::string &prompt, const float *pcm, int64_t n_samples,
+                                int64_t max_tokens);
+
  private:
   AsrSession(std::unique_ptr<Session> text, std::unique_ptr<Qwen3Audio> tower);
 

@@ -21,6 +21,7 @@
 
 #include "kernel/kernels.h"
 #include "runtime/session.h"
+#include "runtime/asr_session.h"
 #include "runtime/vlm_session.h"
 #include "runtime/status.h"
 
@@ -55,6 +56,17 @@ pocketllm::VlmSession *as_vlm(pocketllm_vlm *handle) {
 
 const pocketllm::VlmSession *as_vlm(const pocketllm_vlm *handle) {
   return reinterpret_cast<const pocketllm::VlmSession *>(handle);
+}
+
+/* The speech handle, on the same one-place rule.  Two media handles rather than one
+ * because the entry points differ -- samples against pixels, and a window count the
+ * audio side has and the image side does not. */
+pocketllm::AsrSession *as_asr(pocketllm_asr *handle) {
+  return reinterpret_cast<pocketllm::AsrSession *>(handle);
+}
+
+const pocketllm::AsrSession *as_asr(const pocketllm_asr *handle) {
+  return reinterpret_cast<const pocketllm::AsrSession *>(handle);
 }
 
 /* `encode` and `decode` take a `const` session in the header -- they do not
@@ -344,6 +356,125 @@ int pocketllm_vlm_forward_argmax(pocketllm_vlm *session, const char *prompt, con
     }
     *out_token = best;
     return 0;
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+
+pocketllm_asr *pocketllm_asr_open(const char *mmproj_path, const char *gguf_path,
+                                   const char *backend, char *err, size_t err_cap) {
+  if (mmproj_path == nullptr) {
+    pocketllm::write_error(err, err_cap, std::string("pocketllm_asr_open: mmproj_path is NULL"));
+    return nullptr;
+  }
+  if (gguf_path == nullptr) {
+    pocketllm::write_error(err, err_cap, std::string("pocketllm_asr_open: gguf_path is NULL"));
+    return nullptr;
+  }
+  try {
+    std::string device = backend == nullptr ? "" : backend;
+    auto session = pocketllm::AsrSession::open(mmproj_path, gguf_path, device);
+    return reinterpret_cast<pocketllm_asr *>(session.release());
+  } catch (const std::exception &e) {
+    pocketllm::write_error(err, err_cap, e);
+    return nullptr;
+  }
+}
+
+void pocketllm_asr_close(pocketllm_asr *session) { delete as_asr(session); }
+
+const char *pocketllm_asr_marker(void) { return pocketllm::AsrSession::marker(); }
+
+int64_t pocketllm_asr_windows(const pocketllm_asr *session, int64_t n_samples) {
+  if (session == nullptr || n_samples <= 0) {
+    return -1;
+  }
+  try {
+    return as_asr(session)->windows_for(n_samples);
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+
+int64_t pocketllm_asr_tokens_per_window(const pocketllm_asr *session) {
+  if (session == nullptr) {
+    return -1;
+  }
+  try {
+    /* A full window is the front end's own window length, which is a property of the
+     * front end rather than of the caller's signal -- so this asks for the token count
+     * that window produces and not for one a particular recording happens to. */
+    const pocketllm::AudioFrontendParams params = as_asr(session)->tower().frontend_params();
+    return as_asr(session)->tower().tokens_for_frames(params.window_frames);
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+
+int pocketllm_asr_forward(pocketllm_asr *session, const char *prompt, const float *pcm,
+                          int64_t n_samples, float *logits, int logits_cap) {
+  if (session == nullptr || prompt == nullptr || logits == nullptr) {
+    return -1;
+  }
+  try {
+    const pocketllm::AsrSession::Composition result =
+        as_asr(session)->compose(prompt, pcm, n_samples);
+    const int vocabulary = static_cast<int>(result.logits.size());
+    if (logits_cap < vocabulary) {
+      /* A buffer too small is a refusal rather than a truncation: a caller that took a
+       * short write as success would sample from a half-filled array. */
+      return -1;
+    }
+    std::memcpy(logits, result.logits.data(), result.logits.size() * sizeof(float));
+    return vocabulary;
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+
+int pocketllm_asr_forward_argmax(pocketllm_asr *session, const char *prompt, const float *pcm,
+                                 int64_t n_samples, int32_t *out_token) {
+  if (session == nullptr || prompt == nullptr || out_token == nullptr) {
+    return -1;
+  }
+  try {
+    const pocketllm::AsrSession::Composition result =
+        as_asr(session)->compose(prompt, pcm, n_samples);
+    if (result.logits.empty()) {
+      return -1;
+    }
+    int32_t best = 0;
+    for (std::size_t i = 1; i < result.logits.size(); ++i) {
+      if (result.logits[i] > result.logits[static_cast<std::size_t>(best)]) {
+        best = static_cast<int32_t>(i);
+      }
+    }
+    *out_token = best;
+    return 0;
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+
+int pocketllm_asr_generate(pocketllm_asr *session, const char *prompt, const float *pcm,
+                           int64_t n_samples, int64_t max_tokens, char *out, int cap) {
+  if (session == nullptr || prompt == nullptr || out == nullptr || cap <= 0) {
+    return -1;
+  }
+  try {
+    pocketllm::AsrSession *handle = as_asr(session);
+    const std::vector<int32_t> tokens = handle->generate(prompt, pcm, n_samples, max_tokens);
+    const std::string text =
+        handle->text().tokenizer() != nullptr ? handle->text().tokenizer()->decode(tokens)
+                                              : std::string();
+    if (static_cast<int>(text.size()) + 1 > cap) {
+      /* Half a sentence is a worse answer than none: a caller that sized by the
+       * vocabulary's worst case does not hit this, and one that guessed should be told. */
+      return -1;
+    }
+    std::memcpy(out, text.data(), text.size());
+    out[text.size()] = '\0';
+    return static_cast<int>(text.size());
   } catch (const std::exception &) {
     return -1;
   }
