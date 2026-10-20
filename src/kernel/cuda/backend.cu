@@ -1183,20 +1183,22 @@ __global__ void attention_full_warp_kernel(const float *__restrict__ q,
     acc[i] = 0.0F;
   }
 
+  /* Streaming softmax: one pass over the span instead of three.
+   *
+   * The serial kernel and this one until now each walked the keys three times -- once for
+   * the maximum, once for the sum, once for the values -- and the dot product was
+   * recomputed every time.  That is `3 * span * d` multiplies per (query, head) where one
+   * pass is `span * d` plus the exponentials.
+   *
+   * The trick is that the running maximum can *move*, so the accumulator and the sum are
+   * rescaled whenever a larger score arrives: `exp(a - m_new) = exp(a - m_old) *
+   * exp(m_old - m_new)`.  Rescaling is exact in the sense that matters -- it is the same
+   * real number the two-pass version computes, evaluated in a different order -- and the
+   * rescale factor is one whenever the maximum has not moved, which is most steps.
+   *
+   * `best` lives in lane 0 like the sum does: every lane derives the same maximum, but
+   * only one of them owns the counterweight. */
   float best = -INFINITY;
-  for (int64_t s = 0; s < span; ++s) {
-    const float *krow = khead + s * cache_row;
-    float dot = 0.0F;
-    for (int i = 0; i < held; ++i) {
-      const int64_t at = lane + static_cast<int64_t>(i) * kAttnLanes;
-      if (at < d) {
-        dot += qv[i] * krow[at];
-      }
-    }
-    dot = warp_sum(dot);
-    best = fmaxf(best, __shfl_sync(0xffffffffU, dot, 0) * scale);
-  }
-
   float total = 0.0F;
   for (int64_t s = 0; s < span; ++s) {
     const float *krow = khead + s * cache_row;
@@ -1208,22 +1210,27 @@ __global__ void attention_full_warp_kernel(const float *__restrict__ q,
       }
     }
     dot = warp_sum(dot);
-    const float weight = expf(__shfl_sync(0xffffffffU, dot, 0) * scale - best);
-    /* Every lane sees the same broadcast weight, so the running sum is private to one of
-     * them; accumulating it in all thirty-two and reducing afterwards multiplies it by the
-     * warp width, which is a factor of 32 that looks like a wrong answer rather than a
-     * wrong reduction. */
+    const float score = __shfl_sync(0xffffffffU, dot, 0) * scale;
+    const float moved = fmaxf(best, score);
+    const float correction = expf(best - moved);
+    const float weight = expf(score - moved);
+    best = moved;
+    /* Every lane applies the same correction, so the accumulators stay consistent; only
+     * lane 0 owns the denominator, and the reduction that multiplies it by the warp width
+     * is what went wrong here the first time. */
     if (lane == 0) {
-      total += weight;
+      total = total * correction + weight;
     }
     const float *vrow = vhead + s * cache_row;
     for (int i = 0; i < held; ++i) {
       const int64_t at = lane + static_cast<int64_t>(i) * kAttnLanes;
       if (at < d) {
-        acc[i] += weight * vrow[at];
+        acc[i] = acc[i] * correction + weight * vrow[at];
       }
     }
   }
+  /* Only lane 0 kept the denominator, so every other lane divides by zero without this
+   * broadcast -- and the result is `inf`, not a wrong-looking number. */
   total = __shfl_sync(0xffffffffU, total, 0);
   for (int i = 0; i < held; ++i) {
     const int64_t at = lane + static_cast<int64_t>(i) * kAttnLanes;
