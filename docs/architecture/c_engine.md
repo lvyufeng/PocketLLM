@@ -256,6 +256,51 @@ the other would build a prompt the reference never sees.
 
 `libmtmd` remains the oracle for all of it.
 
+**The audio half is built but is not yet right, and the difference is stated here rather than
+discovered again.**  A `qwen3a` checkpoint (Qwen3-ASR) is the same two-file shape as a vision one, and
+every piece of it now exists: `model/audio_frontend.{h,cpp}` (log-mel), `model/qwen3a_audio.{h,cpp}`
+(the tower), `runtime/asr_session.{h,cpp}` (the composition) and `pocketllm-audio` (the tool), plus the
+`gelu_erf` op this projector names and the `q8_0` branch both its weights and its text model's tables
+needed.
+
+What is verified, each by its own measurement:
+
+  - the **front end** agrees with the reference's own log-mel at correlation 1.0000000 and 6.4e-07
+    in the mean, which is that file's float32 storage and nothing else.  Two of its constants are
+    easy to get wrong: the periodic Hann divides by `length` and not `length + 1`, and the mel bank
+    carries **no** step factor -- librosa multiplies by one and this reference does not, which is a
+    constant 1.793 in log10 across every value.
+  - the **`q8_0` decoder** is bit-identical to the tree's Python one, checked on a real tensor.
+  - **`conv2d`** matches a direct numpy convolution at rel 1.2e-07 for `pad` 1 and 0, single and
+    multi-channel, and on the tower's real weights.  The padding path had never been exercised
+    before this: the vision tower's patch embedding is `stride 16, padding 0`.
+  - the tower agrees with **itself** across backends (CPU against CUDA, 0.999991), so nothing here is
+    a precision question.
+
+What is **not** verified: the tower's output.  Against the reference's `projected` it sits at
+correlation 0.32, and a **numpy tower written independently from the same reading of the graph**
+lands at 0.3049 -- two implementations built the same way are the same distance from the target,
+which says the *reading* is what is wrong and not either implementation.  Searching it op by op was
+therefore the wrong search, and that is the useful thing the investigation bought.
+
+Three traps, each of which cost a round:
+
+  - **The reference's intermediate dumps are not usable.**  `after_conv_blocks` and
+    `after_conv_out`, captured through the eval callback, do not satisfy the relation that connects
+    them (`rel 15.1`, correlation -0.02, under every axis permutation), and `inp_chunks` came back
+    all zeros.  The callback fires before some tensors hold their data.  Only `projected` -- what
+    `mtmd_get_output_embd` returns -- is a trustworthy target.
+  - **The Python `tensor_reader` returns `nan` for this file's f16 tensors.**  Every numpy comparison
+    built on it compared against `nan`.  Reading the raw bytes and decoding them from the type id the
+    header states is what replaced it.
+  - **`conv2d` writes patch-major with the channel fastest** -- `out[p * out_ch + o]`.  Reading its
+    dump as `(oc, oy, ox)` produced a 39% error that was entirely the reading; the same array is
+    correlation 1.000000 in `(oy, ox, oc)`.
+
+The next thing to settle is the reading rather than the code: until an intermediate target is
+obtained another way -- `mtmd_get_output_embd` after encoding a *shorter* signal, so that fewer
+layers are involved -- there is nothing trustworthy to bisect against above `projected`.
+
 The tokenizer carries **two pre-tokenizers**, because the vocabularies in this project's scope are
 built on two. They differ in exactly one place -- `\p{N}` against `\p{N}{1,3}`, so a number is cut
 digit by digit or in runs of up to three -- and that place decides ids, so the variant is named by
