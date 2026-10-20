@@ -65,7 +65,7 @@ extern "C" {
  * a change to a signature in this file.  The minor version moves for an
  * additive change and a host may ignore it. */
 #define POCKETLLM_ABI_VERSION_MAJOR 1
-#define POCKETLLM_ABI_VERSION_MINOR 2
+#define POCKETLLM_ABI_VERSION_MINOR 3
 
 /* The largest error message the engine writes, including the terminator.  A
  * caller that passes a smaller buffer gets a truncated message, never an
@@ -260,6 +260,88 @@ POCKETLLM_API int pocketllm_vlm_forward(pocketllm_vlm *session, const char *prom
 POCKETLLM_API int pocketllm_vlm_forward_argmax(pocketllm_vlm *session, const char *prompt,
                                                const uint8_t *rgb, int64_t width, int64_t height,
                                                int32_t *out_token);
+
+/* --- Speech ----------------------------------------------------------------
+ *
+ * A `qwen3a` checkpoint (Qwen3-ASR) is the same two-file shape as a vision one and the
+ * same three-part composition -- the text before, the audio span as embeddings, the
+ * text after -- so this mirrors the vision entry points deliberately rather than
+ * inventing a second vocabulary for the same idea.
+ *
+ * Two things differ and both are visible to a caller:
+ *
+ *   - **The samples are float32, not bytes.**  The front end takes mono PCM at the
+ *     checkpoint's own rate (16 kHz here) and resampling is the caller's: doing it here
+ *     would put a resampler in the engine that the reference does not have, and a
+ *     different resampler is a different spectrogram.
+ *   - **A recording is several spans, not one.**  Anything longer than 800 mel frames
+ *     becomes several windows, each with its own `<|audio_start|>`...`<|audio_end|>`.
+ *     `pocketllm_asr_windows` answers how many before anything is decoded. */
+
+typedef struct pocketllm_asr pocketllm_asr;
+
+/* Open an audio tower and a text model on one device.  Both are required for the
+ * reason `pocketllm_vlm_open` gives.  Returns NULL on failure, with `err` written the
+ * same way `pocketllm_open` writes it. */
+POCKETLLM_API pocketllm_asr *pocketllm_asr_open(const char *mmproj_path, const char *gguf_path,
+                                                const char *backend, char *err, size_t err_cap);
+
+/* Release a speech session.  A NULL argument is a no-op. */
+POCKETLLM_API void pocketllm_asr_close(pocketllm_asr *session);
+
+/* The marker the prompt splits on -- `"<__media__>"`, the same string the vision path
+ * uses because it is `libmtmd`'s default for both.  A prompt holds exactly one. */
+POCKETLLM_API const char *pocketllm_asr_marker(void);
+
+/* How many inference windows `n_samples` becomes, or negative on failure.
+ *
+ * Worth asking before decoding because the answer decides how much audio is being
+ * handled at all, and because a signal too short to make one window is a failure the
+ * caller can see here rather than from a negative return later. */
+POCKETLLM_API int64_t pocketllm_asr_windows(const pocketllm_asr *session, int64_t n_samples);
+
+/* How many tokens one window's audio becomes in the prompt, or negative on failure.
+ * That is the span length for a full 800-frame window; a shorter final window is
+ * padded up to a whole number of 100-frame chunks and produces its own count. */
+POCKETLLM_API int64_t pocketllm_asr_tokens_per_window(const pocketllm_asr *session);
+
+/* Run the whole path and write the logits of the last position into `logits`.
+ *
+ * `prompt` holds one marker; `pcm` is `n_samples` float32 values, mono.  Returns the
+ * vocabulary size -- also the number of floats written -- or a negative value on
+ * failure.
+ *
+ * A *prefill*, like `pocketllm_vlm_forward` and for the same reason. */
+POCKETLLM_API int pocketllm_asr_forward(pocketllm_asr *session, const char *prompt,
+                                        const float *pcm, int64_t n_samples, float *logits,
+                                        int logits_cap);
+
+/* The greedy fast path: run the composition and write only the index of the largest
+ * logit into `out_token`.  The same call with the vocabulary left behind, and the id
+ * is the one `pocketllm_argmax` would pick over the logits `pocketllm_asr_forward`
+ * would have written.  Returns 0 on success, a negative value on failure. */
+POCKETLLM_API int pocketllm_asr_forward_argmax(pocketllm_asr *session, const char *prompt,
+                                               const float *pcm, int64_t n_samples,
+                                               int32_t *out_token);
+
+/* Transcribe: run the composition and decode greedily, writing the text into `out`.
+ *
+ * This is the call a host actually wants -- a recording in, a transcript out -- and it
+ * exists as one entry point rather than a loop over `pocketllm_asr_forward` because the
+ * decoding has to continue from the cache the composition filled.  A caller with only
+ * the logits would have to reopen the text model to take the next step, which is a second
+ * session reading a cache it did not build.
+ *
+ * Greedy, not sampled: it is what the reference CLI does by default, so it is what a
+ * transcript can be compared against.  `max_tokens` bounds the loop and a vocabulary that
+ * declares an EOS stops it early.
+ *
+ * Returns the number of bytes written, excluding the terminator, or a negative value on
+ * failure.  A `cap` too small for the transcript is a refusal rather than a truncation --
+ * half a sentence is a worse answer than none. */
+POCKETLLM_API int pocketllm_asr_generate(pocketllm_asr *session, const char *prompt,
+                                         const float *pcm, int64_t n_samples,
+                                         int64_t max_tokens, char *out, int cap);
 
 /* The index of the largest of `n` logits, which is greedy sampling.  Returns a
  * non-negative index, or negative if `n` is not positive.  It takes no session

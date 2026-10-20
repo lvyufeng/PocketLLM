@@ -3,6 +3,8 @@
 #include <cmath>
 #include <cstring>
 
+#include "tokenizer/bpe.h"
+
 #include "runtime/status.h"
 
 namespace pocketllm {
@@ -125,6 +127,41 @@ AsrSession::Composition AsrSession::compose(const std::string &prompt, const flo
                                  /*argmax_out=*/nullptr);
   report.positions = text_->cache_length();
   return report;
+}
+
+std::vector<int32_t> AsrSession::generate(const std::string &prompt, const float *pcm,
+                                          int64_t n_samples, int64_t max_tokens) {
+  const Composition first = compose(prompt, pcm, n_samples);
+  std::vector<int32_t> produced;
+  if (first.logits.empty() || max_tokens <= 0) {
+    return produced;
+  }
+
+  const Tokenizer *tokenizer = text_->tokenizer();
+  const int32_t eos = tokenizer != nullptr ? tokenizer->special().eos : -1;
+
+  int32_t next = 0;
+  for (std::size_t i = 1; i < first.logits.size(); ++i) {
+    if (first.logits[i] > first.logits[static_cast<std::size_t>(next)]) {
+      next = static_cast<int32_t>(i);
+    }
+  }
+  produced.push_back(next);
+  for (int64_t step = 1; step < max_tokens; ++step) {
+    if (eos >= 0 && next == eos) {
+      break;
+    }
+    const std::vector<float> logits = text_->forward(&next, 1, /*argmax_out=*/nullptr);
+    int32_t best = 0;
+    for (std::size_t i = 1; i < logits.size(); ++i) {
+      if (logits[i] > logits[static_cast<std::size_t>(best)]) {
+        best = static_cast<int32_t>(i);
+      }
+    }
+    next = best;
+    produced.push_back(next);
+  }
+  return produced;
 }
 
 }  // namespace pocketllm

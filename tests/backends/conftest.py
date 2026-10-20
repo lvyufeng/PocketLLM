@@ -204,7 +204,10 @@ def sample_args(op: str, session, quant: str | None = None) -> tuple[list, dict]
         return [t(rand(_TOKENS, _HIDDEN)), t(rand(_TOKENS, _HIDDEN) * 3.0 + 1.0)], {}
     if op in {"silu_mul", "mul"}:
         return [t(rand(_TOKENS, _HIDDEN)), t(rand(_TOKENS, _HIDDEN))], {}
-    if op == "gelu":
+    if op in {"gelu", "gelu_erf"}:
+        # The same operand for both, and the same shape: they are two functions over one
+        # domain, and the conformance harness gives each its own reference, so a backend
+        # that implemented one and aliased the other shows up as one of them failing.
         return [t(rand(_TOKENS, _HIDDEN))], {}
     if op == "conv2d":
         # A 3-channel 12x16 image with a 4x4 kernel at stride 4: twelve patches on

@@ -326,11 +326,20 @@ Three traps, each of which cost a round:
     dump as `(oc, oy, ox)` produced a 39% error that was entirely the reading; the same array is
     correlation 1.000000 in `(oy, ox, oc)`.
 
-What the audio path still does not have is an **ABI entry point**: all of it is reachable through
-`pocketllm-audio` and the C++ classes, and nothing above that takes a recording yet.  That is the
-same shape the image path was in before `pocketllm_vlm_*`, and the session class it would sit on
-(`runtime/asr_session.h`) is already the one the tool drives, so the entry point is a wrapper rather
-than a composition.
+**The ABI takes a recording now**, mirroring `pocketllm_vlm_*` rather than inventing a second
+vocabulary for the same idea: `pocketllm_asr_open` / `_close` / `_marker` / `_windows` /
+`_tokens_per_window` / `_forward` / `_forward_argmax` / `_generate`.  Two things differ from the
+vision side and both are visible to a caller -- the samples are **float32** rather than bytes,
+because resampling is the caller's and a different resampler is a different spectrogram, and a
+recording is **several spans**, so `_windows` answers how many before anything is decoded.
+
+`pocketllm_asr_generate` is the call a host actually wants -- a recording in, a transcript out --
+and it is one entry point rather than a loop over `_forward` because the decoding has to continue
+from the cache the composition filled.  A caller holding only the logits would have to reopen the
+text model to take the next step, which is a second session reading a cache it did not build.
+`tests/native/test_asr_abi.py` checks the thing that matters, which is the transcript: four seconds
+of `mlk.flac` must come back starting with `language English<asr_text>I have a dream that one day`,
+`llama-cli`'s own answer for that clip.
 
 The tokenizer carries **two pre-tokenizers**, because the vocabularies in this project's scope are
 built on two. They differ in exactly one place -- `\p{N}` against `\p{N}{1,3}`, so a number is cut
