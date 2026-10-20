@@ -402,6 +402,10 @@ DEVICE_EXCLUDED_CASES: dict[str, dict[str, str]] = {
         # GELU, and the backend refuses it by name rather than substituting.
         "gelu": "ascend: gelu is not implemented (the custom-op set has silu_mul only)",
         "gelu_large_magnitudes": "ascend: gelu is not implemented (the custom-op set has silu_mul only)",
+        # The exact-erf GELU, which the vendor's set does not carry either -- and which
+        # must be refused rather than answered with the tanh form it does have.
+        "gelu_erf": "ascend: gelu_erf is not implemented; this backend's custom-op set has the tanh GELU and not the exact one",
+        "gelu_erf_large_magnitudes": "ascend: gelu_erf is not implemented; this backend's custom-op set has the tanh GELU and not the exact one",
         # The patch embedding: the vendor's custom-op set is norms, `silu_mul`,
         # the cube matmul and a causal decode attention, and a 2-D convolution is
         # none of them.  Refused by name, as `gelu` is.
@@ -901,6 +905,35 @@ def case_gelu(rng):
     return ({"x": x}, {}, ref.gelu(x))
 
 
+def case_gelu_erf(rng):
+    """The exact GELU, over the same operand shape `case_gelu` uses.
+
+    The same shape on purpose: `gelu` and `gelu_erf` are two functions over one domain, and
+    a backend that wired one to the other would pass whichever case matched its
+    implementation and fail the other.
+    """
+    x = rng.standard_normal((3, 1024), dtype=np.float32) * 2.0
+    return ({"x": x}, {}, ref.gelu_erf(x))
+
+
+def case_gelu_erf_large_magnitudes(rng):
+    """The same extremes `case_gelu_large_magnitudes` probes.
+
+    `erf` saturates at both ends just as `tanh` does, so -60 maps to 0 and +60 to itself;
+    what this catches is an `erff` that was never called -- a backend that answered with
+    the tanh form would part from the reference in the middle of this row, where the two
+    functions differ by most.
+    """
+    x = np.concatenate(
+        [
+            np.array([-60.0, -20.0, -10.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 10.0,
+                      20.0, 60.0], dtype=np.float32),
+            rng.standard_normal(16, dtype=np.float32) * 3.0,
+        ]
+    ).reshape(1, -1)
+    return ({"x": x}, {}, ref.gelu_erf(x))
+
+
 def case_gelu_large_magnitudes(rng):
     """The two limits the tanh form reaches on its own, plus the range where the
     three GELU approximations disagree.
@@ -1370,6 +1403,8 @@ CASES = {
     "silu_mul_large_negative": case_silu_mul_large_negative,
     "gelu": case_gelu,
     "gelu_large_magnitudes": case_gelu_large_magnitudes,
+    "gelu_erf": case_gelu_erf,
+    "gelu_erf_large_magnitudes": case_gelu_erf_large_magnitudes,
     "conv2d": case_conv2d,
     "conv2d_padded": case_conv2d_padded,
     "add": case_add,
@@ -1434,6 +1469,8 @@ OP_OF_CASE = {
     "silu_mul_large_negative": "silu_mul",
     "gelu": "gelu",
     "gelu_large_magnitudes": "gelu",
+    "gelu_erf": "gelu_erf",
+    "gelu_erf_large_magnitudes": "gelu_erf",
     "conv2d": "conv2d",
     "conv2d_padded": "conv2d",
     "add": "add",
